@@ -2,7 +2,7 @@ export interface RawSegment {
   start: number;
   end: number;
   text: string;
-  speaker: string | null | undefined;
+  speaker?: string | null;
   language?: string | null;
 }
 

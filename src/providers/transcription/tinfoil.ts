@@ -40,7 +40,7 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     form.set("model", this.opts.model);
     form.set("response_format", "verbose_json");
     if (input.language) form.set("language", input.language);
-    form.set("file", new Blob([audio.bytes as BlobPart], { type: audio.contentType }), audio.filename);
+    form.set("file", new Blob([audio.bytes as unknown as ArrayBuffer], { type: audio.contentType }), audio.filename);
 
     let res: Response;
     try {
