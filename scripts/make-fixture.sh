@@ -9,7 +9,7 @@ mkdir -p "$ROOT/fixtures"
 sudo docker run --rm -v "$ROOT/fixtures:/out" debian:stable-slim bash -c '
   set -e
   apt-get update -qq >/dev/null && apt-get install -y -qq espeak-ng ffmpeg >/dev/null
-  espeak-ng -v en-us+f3 -s 140 -p 50 -a 180 "'"$PHRASE"'" -w /tmp/raw.wav
+  espeak-ng -v en-us+f2 -s 130 -p 55 -a 180 -g 6 "'"$PHRASE"'" -w /tmp/raw.wav
   # 1.5 s lead-in silence + phrase + 2.5 s tail, then 48k mono s16le. Silence lets VAD/segmenters settle.
   ffmpeg -y -loglevel error -f lavfi -t 1.5 -i anullsrc=r=48000:cl=mono -i /tmp/raw.wav -f lavfi -t 2.5 -i anullsrc=r=48000:cl=mono \
     -filter_complex "[1:a]aresample=48000,aformat=channel_layouts=mono[v];[0:a][v][2:a]concat=n=3:v=0:a=1[a]" -map "[a]" \
