@@ -50,7 +50,12 @@ VEXA_API_KEY=vxa_mock bun run worker
 bun run cli create-key --project demo
 ```
 
-`bun test` runs everything (needs the dev Postgres/Redis; the mock Vexa is started in-process).
+`bun test` runs unit + integration (needs the dev Postgres/Redis; the mock Vexa is started in-process).
+`bun run test:e2e` runs the REAL happy path (`test/e2e/happy-path.test.ts`, skipped unless `E2E=1`) against
+the capture rig — it brings up nothing itself: follow [infra/README.md](./infra/README.md) first, then
+run it; it mints a Vexa key via admin-api, starts api+worker in-process, creates a meeting in a random
+`https://jitsi.local:8443/<room>`, sends Alice, waits for `completed`, checks transcript + signed webhook,
+then deletes. Green 2/2 on 2026-08-17 (~2 min each; evidence in `tmp/e2e-<room>.json`).
 
 ### Env vars
 
@@ -59,7 +64,7 @@ bun run cli create-key --project demo
 | `PORT` | `8080` | API port |
 | `DATABASE_URL` | `postgres://ptx:ptx@localhost:55432/ptx` | |
 | `REDIS_URL` | `redis://localhost:56379` | queue |
-| `VEXA_BASE_URL` | `http://localhost:18056` | Vexa API gateway |
+| `VEXA_BASE_URL` | `http://localhost:18066` | Vexa API gateway (capture rig). Mock: `http://localhost:18056` |
 | `VEXA_API_KEY` | – | sent as `X-API-Key` |
 | `VEXA_POLL_INTERVAL_MS` | `5000` | worker status/transcript poll |
 | `TRANSCRIPTION_PROVIDER` | `vexa` | `vexa` (WhisperLive passthrough) or `tinfoil` |
@@ -76,6 +81,8 @@ export KEY=tc_live_...            # from `bun run cli create-key`
 export API=http://localhost:8080
 
 # create → {"id":"mtg_…","status":"queued",...}
+# (against the local rig use a https://jitsi.local:8443/<room> URL and put someone in the room:
+#  `bun run fake-participant -- --url https://jitsi.local:8443/<room> --seconds 80`)
 curl -s -X POST $API/v1/meetings -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: demo-1' \
   -d '{"meeting_url":"https://meet.jit.si/TinyCloudDemo","bot_name":"TinyCloud Notetaker","language":"en",
@@ -90,7 +97,7 @@ curl -s -i $API/v1/meetings/$ID/transcript -H "Authorization: Bearer $KEY"
 # stop (idempotent) → {"id","status"}
 curl -s -X POST $API/v1/meetings/$ID/stop -H "Authorization: Bearer $KEY"
 
-# delete (also deletes the Vexa meeting) → 204
+# delete → 204 (asks Vexa to delete too; Vexa v0.12 keeps bot-owned rows and answers 409 — logged, see "Known gaps")
 curl -s -X DELETE $API/v1/meetings/$ID -H "Authorization: Bearer $KEY"
 
 curl -s $API/health   # {"status":"ok","checks":{postgres,redis,vexa,bot_capacity,transcription_provider}}
@@ -121,12 +128,57 @@ persisted in `webhook_deliveries`. Webhook failure never changes meeting status.
 bot_removed, meeting_ended, capture_failed, transcription_failed, provider_timeout, provider_unavailable,
 internal_error` (+ `unauthorized`, `invalid_request`, `idempotency_conflict`). Vexa errors are never forwarded raw.
 
-## Vexa mapping (re-type against the real JSON when the stack is up)
+## Vexa mapping (typed against the real v0.12 payloads in `docs/vexa-samples/`)
 
-Types in `src/providers/vexa/types.ts` come from Vexa's frozen OpenAPI (`core/gateway/contracts/api.v1/api.schema.json`, v1.5.0):
+Types in `src/providers/vexa/types.ts`; pure mapping in `src/providers/vexa/adapter.ts` (unit-tested against
+`docs/vexa-samples/vexa-transcript.json`). Behaviour observed on the pinned rig (`docs/vexa-findings.md`):
 
-- `POST /bots` `{platform, native_meeting_id, meeting_url, bot_name, language}` → `MeetingResponse` (201). Vexa platform for Teams is `teams` (ours: `microsoft_teams`). Self-hosted Jitsi native id is `room@host`; `meeting_url` is passed through (Vexa requires https, non-IP hosts).
-- `GET /transcripts/{platform}/{native_meeting_id}` → `{status, segments[{start,end,text,language,speaker,completed}], data.completion_reason?}` — the worker polls this for both status and segments.
-- `DELETE /bots/{platform}/{native_meeting_id}` → stop; `DELETE /meetings/{platform}/{native_meeting_id}` → delete data.
-- Status map: `requested|joining→joining`, `awaiting_admission|needs_human_help→waiting_for_admission`, `active→in_progress`, `stopping|completed→processing` (then `completed` once our transcript is stored), `failed→failed`; `completion_reason` → our error codes (`src/domain/state.ts`).
-- **GUESS**: `/recordings` shape (untyped upstream) used only for the Tinfoil batch path (`fetchVexaAudio` in `src/worker/meeting-job.ts`). Whether `recording_enabled` persists audio is unverified.
+- `POST /bots` `{platform:"jitsi", meeting_url, bot_name, language}` → 201 `MeetingResponse` (`status:"requested"`,
+  integer `id`, `native_meeting_id` = `<room>@<host>` for self-hosted Jitsi). Everything else is addressed by
+  `(platform, native_meeting_id)`; we store the native id as an opaque string.
+- `GET /transcripts/{platform}/{native_meeting_id}` is the worker's single poll: `status`
+  (`requested → joining → active → stopping → completed`, or `failed`), `start_time` (bot active), `segments[]`,
+  `recordings[]`, and **`data.completion_reason`** (that is where it lives on transcript rows; the top-level
+  field exists only on MeetingResponse rows). `data.failure_stage`, `data.last_error`, `data.status_transition[]` also exist.
+- Segments: `{start,end,text,language,speaker,completed,segment_id,absolute_start_time,absolute_end_time}`.
+  `start`/`end` are **epoch seconds** → we rebase to meeting-relative seconds (origin = `start_time` when it
+  precedes the first segment, else the first segment). `segment_id` is `turn:N:<seq>` (confirmed; a turn can
+  have several) or `turn:N:p<seq>` (draft) → drafts of a turn that has confirmed rows are dropped, ids are
+  upserted (last wins), `completed:false` rows are dropped. `speaker` is the Jitsi display name.
+- Status map: `requested|joining→joining`, `awaiting_admission|needs_help→waiting_for_admission`,
+  `active→in_progress`, `stopping|completed→processing` (then `completed` once our transcript is stored),
+  `failed→failed`; `completion_reason` → our error codes (`src/domain/state.ts`).
+- `DELETE /bots/{p}/{id}` → 200 `{status:"stopping",meeting_id,native_meeting_id}`; 404 once no bot is active.
+- `GET /bots/status` → `{running:[MeetingResponse…], running_bots:[…same], count}` (non-terminal rows only).
+- Recordings (Tinfoil batch input): `recordings[]` on the transcript row (or `GET /recordings`, filtered by
+  `meeting_id`) → `GET /recordings/{id}/master?type=audio` assembles `master.webm` → `raw_url` streams the bytes
+  (`X-API-Key` required). `src/worker/meeting-job.ts#fetchVexaAudio` applies a content sanity check
+  (bytes/second below ~1 kB/s ⇒ treated as the known silent-tap failure and skipped).
+
+### Known gaps / risks
+
+- **Vexa data retention on DELETE**: Vexa v0.12 only deletes *planned* rows; `DELETE /meetings/{p}/{id}` on a
+  meeting the bot lifecycle touched answers `409 "Meeting is no longer planned (bot lifecycle owns it)"`.
+  Our DELETE removes our data and logs the 409; purging Vexa's copy needs an upstream route or a direct
+  DB/MinIO purge inside the CVM (follow-up).
+- **Silent recording** (1 of 3 rig runs): the bot's recording tap can latch onto a stale element on the very
+  first meeting after a cold stack. Batch Tinfoil is "viable with content sanity check"; the fallback is
+  the WhisperLive shim (not built).
+- **Jitsi live validation** is marked pending upstream; it works against docker-jitsi-meet stable-11146-2
+  (bot needs `https://` + hostname + a trusted cert).
+- The capture rig needed a host iptables fix (Docker's FORWARD/NAT chains had been flushed) — see infra/README.md.
+
+## CVM plan (dstack / Phala)
+
+`infra/dstack/app-compose.yaml` runs api + worker + postgres + redis and the pinned Vexa v0.12 stack
+(admin-api, runtime, meeting-api, gateway, valkey, postgres, MinIO, CPU whisper) in ONE CVM; only `:8080`
+is published. Bot spawning needs `/var/run/docker.sock` mounted into Vexa's `runtime` (one container per
+bot on the fixed `ptx-vexa` network). A one-shot `vexa-provision` job mints the Vexa API key at first boot.
+Encrypted env: `infra/dstack/.env.example`. Deploy:
+
+```bash
+phala deploy -n ptx-dev -c infra/dstack/app-compose.yaml -e infra/dstack/.env -t tdx.large --disk-size 40G --wait
+```
+
+If the docker.sock bind is refused by the platform, the alternative is Vexa's process backend ("Vexa Lite":
+bot as a sibling service / in-process instead of docker-spawned containers).
