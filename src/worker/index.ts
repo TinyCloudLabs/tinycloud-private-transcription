@@ -8,7 +8,6 @@ export async function processJob(ctx: AppContext, job: Job): Promise<void> {
     case "meeting.start":
       return handleMeetingStart(ctx, job.meetingId, job.attempt ?? 1);
     case "meeting.poll":
-    case "meeting.stop":
       return handleMeetingPoll(ctx, job.meetingId);
     case "webhook.deliver":
       return deliverWebhook(ctx, job.deliveryId);

@@ -29,7 +29,7 @@ const canonical = (v: unknown): string => {
   }
   return JSON.stringify(v);
 };
-const hashRequest = (input: CreateMeetingInput) => createHash("sha256").update(canonical(input)).digest("hex");
+export const hashCreateRequest = (input: CreateMeetingInput) => createHash("sha256").update(canonical(input)).digest("hex");
 
 export async function createMeeting(
   ctx: AppContext,
@@ -37,7 +37,7 @@ export async function createMeeting(
   input: CreateMeetingInput,
   idempotencyKey: string | null,
 ): Promise<{ meeting: MeetingRow; created: boolean }> {
-  const requestHash = hashRequest(input);
+  const requestHash = hashCreateRequest(input);
   if (idempotencyKey) {
     const [existing] = await ctx.db
       .select()
