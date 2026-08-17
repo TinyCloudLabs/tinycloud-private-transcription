@@ -12,7 +12,7 @@
  * meeting.completed webhook → DELETE → our 404; Vexa row outcome recorded (v0.12 keeps bot-owned rows: 409).
  *
  * Env: VEXA_BASE_URL (http://localhost:18066) VEXA_API_KEY (minted via admin-api if unset)
- *      JITSI_BASE_URL (https://jitsi.local:8443) E2E_ALICE_SECONDS (120) E2E_TIMEOUT_S (300)
+ *      JITSI_BASE_URL (https://jitsi.local:8443) JITSI_HOST_IP (127.0.0.1) E2E_ALICE_SECONDS (75) E2E_TIMEOUT_S (300)
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -34,7 +34,7 @@ import { mintVexaApiKey } from "../../scripts/vexa-admin.ts";
 const E2E = process.env.E2E === "1";
 const VEXA_URL = process.env.VEXA_BASE_URL ?? "http://localhost:18066";
 const JITSI = (process.env.JITSI_BASE_URL ?? "https://jitsi.local:8443").replace(/\/$/, "");
-const ALICE_SECONDS = Number(process.env.E2E_ALICE_SECONDS ?? 120);
+const ALICE_SECONDS = Number(process.env.E2E_ALICE_SECONDS ?? 75);
 const TIMEOUT_S = Number(process.env.E2E_TIMEOUT_S ?? 300);
 const ROOM = `ptx-e2e-${Date.now().toString(36)}`;
 const NATIVE_ID = `${ROOM}@${new URL(JITSI).hostname}`;
@@ -81,8 +81,10 @@ describe.skipIf(!E2E)("E2E happy path against the real capture rig", () => {
     // Preconditions: real gateway + Jitsi reachable (do not start anything ourselves).
     const gw = await fetch(`${VEXA_URL}/health`).then((r) => r.json()).catch((e) => ({ error: String(e) }));
     if ((gw as any).status !== "ok") throw new Error(`Vexa gateway not healthy at ${VEXA_URL}: ${JSON.stringify(gw)} — see infra/README.md`);
-    const jitsiOk = await fetch(`${JITSI}/config.js`, { tls: { rejectUnauthorized: false } } as any).then((r) => r.ok).catch(() => false);
-    if (!jitsiOk) throw new Error(`Jitsi not reachable at ${JITSI} — see infra/README.md`);
+    // jitsi.local is not in /etc/hosts on the host (Alice maps it via --host-resolver-rules); probe by IP.
+    const jitsiProbe = `${JITSI.replace(new URL(JITSI).hostname, process.env.JITSI_HOST_IP ?? "127.0.0.1")}/config.js`;
+    const jitsiOk = await fetch(jitsiProbe, { headers: { Host: new URL(JITSI).host }, tls: { rejectUnauthorized: false } } as any).then((r) => r.ok).catch(() => false);
+    if (!jitsiOk) throw new Error(`Jitsi not reachable (${jitsiProbe}) — see infra/README.md`);
 
     const vexaKey = process.env.VEXA_API_KEY || (await mintVexaApiKey());
     const config = { ...baseConfig, vexa: { baseUrl: VEXA_URL, apiKey: vexaKey, pollIntervalMs: 3000 }, transcriptionProvider: "vexa" as const };
@@ -127,9 +129,10 @@ describe.skipIf(!E2E)("E2E happy path against the real capture rig", () => {
     const body = (await r.json()) as any;
     log(`POST /v1/meetings → ${r.status} ${JSON.stringify(body)}`);
     expect(r.status).toBe(201);
-    expect(body).toMatchObject({ id: expect.stringMatching(/^mtg_/), status: "queued", platform: "jitsi" });
-    meetingId = body.id;
-    evidence.create = body;
+    meetingId = body.id; // capture before toMatchObject (asymmetric matchers must not leak into the id)
+    evidence.create = structuredClone(body);
+    expect(meetingId).toMatch(/^mtg_/);
+    expect(body).toMatchObject({ status: "queued", platform: "jitsi" });
   });
 
   test("Alice joins; bot joins; meeting reaches in_progress", async () => {
