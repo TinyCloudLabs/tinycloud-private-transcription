@@ -1,0 +1,115 @@
+{
+    "recordings": [
+        {
+            "id": 440464823505,
+            "source": "bot",
+            "status": "completed",
+            "user_id": 1,
+            "created_at": "2026-08-17T17:09:07.588062Z",
+            "meeting_id": 1,
+            "media_files": [
+                {
+                    "id": 433432982412,
+                    "type": "audio",
+                    "format": "webm",
+                    "is_final": true,
+                    "metadata": {
+                        "sample_rate": 16000
+                    },
+                    "chunk_seq": 2,
+                    "created_at": "2026-08-17T17:10:00.134291Z",
+                    "chunk_count": 4,
+                    "finalized_at": "2026-08-17T17:10:47.747225Z",
+                    "finalized_by": "recording_finalizer.master",
+                    "storage_path": "recordings/1/440464823505/02a27ddc-7e19-4525-baad-8ff5b55e1fad/audio/master.webm",
+                    "first_chunk_at": "2026-08-17T17:09:07.588082Z",
+                    "file_size_bytes": 9041,
+                    "storage_backend": "minio",
+                    "duration_seconds": null,
+                    "assembled_chunk_count": 4,
+                    "last_chunk_size_bytes": 1849
+                }
+            ],
+            "session_uid": "02a27ddc-7e19-4525-baad-8ff5b55e1fad",
+            "completed_at": "2026-08-17T17:09:29.859848Z",
+            "playback_url": {
+                "audio": "/recordings/440464823505/master?type=audio",
+                "video": null
+            }
+        },
+        {
+            "id": 414429117675,
+            "source": "bot",
+            "status": "completed",
+            "user_id": 1,
+            "created_at": "2026-08-17T17:12:19.664660Z",
+            "meeting_id": 2,
+            "media_files": [
+                {
+                    "id": 905922707503,
+                    "type": "audio",
+                    "format": "webm",
+                    "is_final": true,
+                    "metadata": {
+                        "sample_rate": 16000
+                    },
+                    "chunk_seq": 0,
+                    "created_at": "2026-08-17T17:12:49.944961Z",
+                    "chunk_count": 2,
+                    "finalized_at": "2026-08-17T17:12:58.902860Z",
+                    "finalized_by": "recording_finalizer.master",
+                    "storage_path": "recordings/1/414429117675/5aff8b5b-dc2d-4f11-b5d1-2eb0ee00fbe5/audio/master.webm",
+                    "first_chunk_at": "2026-08-17T17:12:19.664687Z",
+                    "file_size_bytes": 121488,
+                    "storage_backend": "minio",
+                    "duration_seconds": null,
+                    "assembled_chunk_count": 2,
+                    "last_chunk_size_bytes": 121488
+                }
+            ],
+            "session_uid": "5aff8b5b-dc2d-4f11-b5d1-2eb0ee00fbe5",
+            "completed_at": "2026-08-17T17:12:19.664747Z",
+            "playback_url": {
+                "audio": "/recordings/414429117675/master?type=audio",
+                "video": null
+            }
+        },
+        {
+            "id": 606273685666,
+            "source": "bot",
+            "status": "completed",
+            "user_id": 1,
+            "created_at": "2026-08-17T17:13:46.174858Z",
+            "meeting_id": 3,
+            "media_files": [
+                {
+                    "id": 551585519181,
+                    "type": "audio",
+                    "format": "webm",
+                    "is_final": true,
+                    "metadata": {
+                        "sample_rate": 16000
+                    },
+                    "chunk_seq": 1,
+                    "created_at": "2026-08-17T17:14:24.181544Z",
+                    "chunk_count": 3,
+                    "finalized_at": "2026-08-17T17:14:56.882074Z",
+                    "finalized_by": "recording_finalizer.master",
+                    "storage_path": "recordings/1/606273685666/f419fc54-ed57-400b-954c-404b9e04ed48/audio/master.webm",
+                    "first_chunk_at": "2026-08-17T17:13:46.174875Z",
+                    "file_size_bytes": 243183,
+                    "storage_backend": "minio",
+                    "duration_seconds": null,
+                    "assembled_chunk_count": 3,
+                    "last_chunk_size_bytes": 117027
+                }
+            ],
+            "session_uid": "f419fc54-ed57-400b-954c-404b9e04ed48",
+            "completed_at": "2026-08-17T17:13:53.903988Z",
+            "playback_url": {
+                "audio": "/recordings/606273685666/master?type=audio",
+                "video": null
+            }
+        }
+    ]
+}

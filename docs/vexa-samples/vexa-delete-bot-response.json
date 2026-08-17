@@ -1,0 +1,8 @@
+{
+  "http_status": 200,
+  "body": {
+    "status": "stopping",
+    "meeting_id": 3,
+    "native_meeting_id": "ptx-smoke-msxhsvli@jitsi.local"
+  }
+}

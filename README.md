@@ -15,8 +15,20 @@ src/providers/transcription/ TranscriptionProvider: VexaNativeProvider | Tinfoil
 src/services/       meeting service (create/get/stop/delete/transition)
 src/webhooks/       HMAC signature + delivery/retry
 test/               unit + integration (API ↔ mock Vexa ↔ worker ↔ Postgres/Redis)
-infra/dstack/       app-compose.yaml draft for the Phala/dstack CVM
+infra/dstack/       app-compose.yaml for the Phala/dstack CVM
+infra/vexa/, infra/jitsi/, infra/certs/  local meeting-capture rig (pinned Vexa + docker-jitsi-meet + dev CA)
+scripts/            fake-participant.ts (Playwright Alice), vexa-smoke.ts (rig gate), make-fixture.sh
+docs/               vexa-findings.md (observed Vexa behaviour) + vexa-samples/*.json (real payloads)
+test/e2e/           real end-to-end test against the capture rig (E2E=1)
 ```
+
+## Meeting-capture rig (real Vexa + Jitsi, no GPU)
+
+Local pinned Vexa (v012 images, CPU faster-whisper) on gateway **:18066**, docker-jitsi-meet at
+`https://jitsi.local:8443` (anonymous rooms, our dev CA baked into a derived bot image) and a Playwright
+fake participant ("Alice", plays `fixtures/alice.wav`). Exact bring-up commands: [infra/README.md](./infra/README.md).
+Gate: `bun run vexa:smoke` (green 3/3). Observed API shapes: [docs/vexa-findings.md](./docs/vexa-findings.md).
+
 
 ## Run locally
 

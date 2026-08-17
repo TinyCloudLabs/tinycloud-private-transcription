@@ -1,0 +1,26 @@
+{
+  "http_status": 201,
+  "body": {
+    "id": 3,
+    "user_id": 1,
+    "platform": "jitsi",
+    "native_meeting_id": "ptx-smoke-msxhsvli@jitsi.local",
+    "constructed_meeting_url": "https://jitsi.local:8443/ptx-smoke-msxhsvli",
+    "status": "requested",
+    "bot_container_id": "mtg-3-f419fc54",
+    "start_time": null,
+    "end_time": null,
+    "completion_reason": null,
+    "failure_stage": null,
+    "data": {
+      "recording_enabled": true,
+      "transcribe_enabled": true,
+      "constructed_meeting_url": "https://jitsi.local:8443/ptx-smoke-msxhsvli",
+      "sessions": [
+        "f419fc54-ed57-400b-954c-404b9e04ed48"
+      ]
+    },
+    "created_at": "2026-08-17T17:13:23.194547Z",
+    "updated_at": "2026-08-17T17:13:23.548222Z"
+  }
+}
