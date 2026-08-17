@@ -1,0 +1,121 @@
+# dstack / Phala CVM app-compose DRAFT for tinycloud-private-transcription.
+# One CVM runs: api, worker, postgres, redis, and the Vexa capture stack.
+# NOT deployed yet. Secrets come from dstack encrypted env (see `x-env` notes).
+#
+# TODO(capture-rig): the Vexa services below are PLACEHOLDERS. The capture teammate
+# (feat/capture-rig) owns the real, pinned Vexa compose (Vexa-ai/vexa main; gateway,
+# meeting-api/collector, bot-manager, whisperlive-cpu, vexa postgres/redis, ...).
+# Replace the `vexa-*` block with that compose's services and keep VEXA_BASE_URL pointing at
+# the gateway service name. Vexa's own DB/redis must be separate from ours (below).
+
+services:
+  api:
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription:${IMAGE_TAG:-latest}
+    command: ["bun", "run", "src/api/server.ts"]
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      DATABASE_URL: postgres://ptx:${POSTGRES_PASSWORD}@postgres:5432/ptx
+      REDIS_URL: redis://redis:6379
+      VEXA_BASE_URL: http://vexa-gateway:8056       # TODO(capture-rig): confirm service name/port
+      VEXA_API_KEY: ${VEXA_API_KEY}                 # encrypted env
+      TRANSCRIPTION_PROVIDER: ${TRANSCRIPTION_PROVIDER:-vexa}
+      TINFOIL_BASE_URL: https://inference.tinfoil.sh
+      TINFOIL_API_KEY: ${TINFOIL_API_KEY:-}         # encrypted env; empty until we have a key
+      TINFOIL_MODEL: voxtral-small-24b
+      AUTO_MIGRATE: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription:${IMAGE_TAG:-latest}
+    command: ["bun", "run", "src/worker/index.ts"]
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://ptx:${POSTGRES_PASSWORD}@postgres:5432/ptx
+      REDIS_URL: redis://redis:6379
+      VEXA_BASE_URL: http://vexa-gateway:8056       # TODO(capture-rig)
+      VEXA_API_KEY: ${VEXA_API_KEY}
+      VEXA_POLL_INTERVAL_MS: "5000"
+      TRANSCRIPTION_PROVIDER: ${TRANSCRIPTION_PROVIDER:-vexa}
+      TINFOIL_BASE_URL: https://inference.tinfoil.sh
+      TINFOIL_API_KEY: ${TINFOIL_API_KEY:-}
+      TINFOIL_MODEL: voxtral-small-24b
+    depends_on:
+      api:
+        condition: service_started
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ptx
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ptx
+    volumes:
+      - ptx-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ptx"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ptx-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # ---------------------------------------------------------------------------
+  # TODO(capture-rig): PLACEHOLDER Vexa stack. Replace with the pinned upstream compose.
+  # ---------------------------------------------------------------------------
+  vexa-gateway:
+    image: vexaai/api-gateway:TODO_PIN            # TODO(capture-rig): real image + tag
+    restart: unless-stopped
+    environment:
+      ADMIN_API_TOKEN: ${VEXA_ADMIN_API_TOKEN}      # encrypted env
+    # expose 8056 to api/worker only (no host port); the Vexa dashboard is not part of V1.
+
+  vexa-bot-manager:
+    image: vexaai/bot-manager:TODO_PIN            # TODO(capture-rig)
+    restart: unless-stopped
+    # TODO(capture-rig): bot containers need the docker socket / DinD inside the CVM — confirm
+    # dstack supports this (privileged/docker.sock mount) or use Vexa's in-CVM runtime.
+
+  vexa-whisperlive:
+    image: vexaai/whisperlive-cpu:TODO_PIN        # TODO(capture-rig): CPU mode (no GPU in CVM)
+    restart: unless-stopped
+
+  vexa-postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${VEXA_POSTGRES_PASSWORD}
+    volumes:
+      - vexa-postgres:/var/lib/postgresql/data
+
+  vexa-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+volumes:
+  ptx-postgres:
+  ptx-redis:
+  vexa-postgres:
+
+# dstack notes:
+# - Encrypted env keys expected: POSTGRES_PASSWORD, VEXA_API_KEY, VEXA_ADMIN_API_TOKEN,
+#   VEXA_POSTGRES_PASSWORD, TINFOIL_API_KEY (optional), IMAGE_TAG.
+# - Only `api` publishes a port; front it with dstack's gateway/TLS.
+# - Bootstrap: `bun run src/cli.ts create-key --project demo` inside the api container.
