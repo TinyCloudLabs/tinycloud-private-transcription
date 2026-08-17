@@ -1,0 +1,139 @@
+{
+  "id": 3,
+  "platform": "jitsi",
+  "native_meeting_id": "ptx-smoke-msxhsvli@jitsi.local",
+  "constructed_meeting_url": "https://jitsi.local:8443/ptx-smoke-msxhsvli",
+  "status": "completed",
+  "start_time": "2026-08-17T17:13:31.012065Z",
+  "end_time": "2026-08-17T17:13:59.399751Z",
+  "recordings": [
+    {
+      "id": 606273685666,
+      "source": "bot",
+      "status": "completed",
+      "user_id": 1,
+      "created_at": "2026-08-17T17:13:46.174858Z",
+      "meeting_id": 3,
+      "media_files": [
+        {
+          "id": 551585519181,
+          "type": "audio",
+          "format": "webm",
+          "is_final": true,
+          "metadata": {
+            "sample_rate": 16000
+          },
+          "chunk_seq": 2,
+          "created_at": "2026-08-17T17:13:53.903964Z",
+          "chunk_count": 2,
+          "finalized_at": null,
+          "finalized_by": null,
+          "storage_path": "recordings/1/606273685666/f419fc54-ed57-400b-954c-404b9e04ed48/audio/000000.webm",
+          "first_chunk_at": "2026-08-17T17:13:46.174875Z",
+          "file_size_bytes": 126156,
+          "storage_backend": "minio",
+          "duration_seconds": null,
+          "last_chunk_size_bytes": 0
+        }
+      ],
+      "session_uid": "f419fc54-ed57-400b-954c-404b9e04ed48",
+      "completed_at": "2026-08-17T17:13:53.903988Z",
+      "playback_url": {
+        "audio": "/recordings/606273685666/master?type=audio",
+        "video": null
+      }
+    }
+  ],
+  "notes": null,
+  "data": {
+    "recordings": [
+      {
+        "id": 606273685666,
+        "source": "bot",
+        "status": "completed",
+        "user_id": 1,
+        "created_at": "2026-08-17T17:13:46.174858Z",
+        "meeting_id": 3,
+        "media_files": [
+          {
+            "id": 551585519181,
+            "type": "audio",
+            "format": "webm",
+            "is_final": true,
+            "metadata": {
+              "sample_rate": 16000
+            },
+            "chunk_seq": 2,
+            "created_at": "2026-08-17T17:13:53.903964Z",
+            "chunk_count": 2,
+            "finalized_at": null,
+            "finalized_by": null,
+            "storage_path": "recordings/1/606273685666/f419fc54-ed57-400b-954c-404b9e04ed48/audio/000000.webm",
+            "first_chunk_at": "2026-08-17T17:13:46.174875Z",
+            "file_size_bytes": 126156,
+            "storage_backend": "minio",
+            "duration_seconds": null,
+            "last_chunk_size_bytes": 0
+          }
+        ],
+        "session_uid": "f419fc54-ed57-400b-954c-404b9e04ed48",
+        "completed_at": "2026-08-17T17:13:53.903988Z",
+        "playback_url": {
+          "audio": "/recordings/606273685666/master?type=audio",
+          "video": null
+        }
+      }
+    ],
+    "stop_requested": true,
+    "completion_reason": "stopped",
+    "recording_enabled": true,
+    "segments_captured": 0,
+    "status_transition": [
+      {
+        "to": "joining",
+        "from": null,
+        "source": "bot_callback",
+        "timestamp": "2026-08-17T17:13:26.191872Z"
+      },
+      {
+        "to": "active",
+        "from": "joining",
+        "source": "bot_callback",
+        "timestamp": "2026-08-17T17:13:31.008047Z"
+      },
+      {
+        "to": "completed",
+        "from": "active",
+        "source": "bot_callback",
+        "timestamp": "2026-08-17T17:13:59.391755Z",
+        "completion_reason": "stopped"
+      }
+    ],
+    "transcribe_enabled": true,
+    "constructed_meeting_url": "https://jitsi.local:8443/ptx-smoke-msxhsvli"
+  },
+  "segments": [
+    {
+      "start": 1786986814.905,
+      "end": 1786986819.905,
+      "text": "The quick brown fox jumps over the lazy dog.",
+      "language": "en",
+      "speaker": "Alice",
+      "completed": true,
+      "segment_id": "turn:0:0",
+      "absolute_start_time": "2026-08-17T17:13:34.905000Z",
+      "absolute_end_time": "2026-08-17T17:13:39.905000Z"
+    },
+    {
+      "start": 1786986819.905,
+      "end": 1786986821.905,
+      "text": "Hello from Alice.",
+      "language": "en",
+      "speaker": "Alice",
+      "completed": true,
+      "segment_id": "turn:0:1",
+      "absolute_start_time": "2026-08-17T17:13:39.905000Z",
+      "absolute_end_time": "2026-08-17T17:13:41.905000Z"
+    }
+  ]
+}
