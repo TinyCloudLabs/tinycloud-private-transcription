@@ -1,0 +1,13 @@
+{
+  "name": "tinycloud-private-transcription",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "fake-participant": "bun run scripts/fake-participant.ts",
+    "vexa:smoke": "bun run scripts/vexa-smoke.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "playwright": "^1.55.0"
+  }
+}
