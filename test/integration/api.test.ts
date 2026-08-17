@@ -172,12 +172,15 @@ describe("happy path: create -> joined -> completed -> transcript + webhook", ()
     expect(await r.json()).toEqual({ id, status: "completed" });
   });
 
-  test("DELETE removes our record and the Vexa meeting", async () => {
+  test("DELETE removes our record and asks Vexa to delete (v0.12 answers 409 for bot-owned rows: tolerated)", async () => {
     const r = await h.api(`/v1/meetings/${id}`, { method: "DELETE" });
     expect(r.status).toBe(204);
-    expect(h.vexa.meetings.has(`jitsi/${nativeId}`)).toBe(false);
     expect((await h.api(`/v1/meetings/${id}`)).status).toBe(404);
     expect(h.vexa.requests.some((q) => q.method === "DELETE" && q.path === `/meetings/jitsi/${encodeURIComponent(nativeId)}`)).toBe(true);
+    // The mock mirrors real Vexa: the completed row is retained (409). A planned row is actually removed:
+    await h.vexa.control("jitsi", nativeId, { planned: true });
+    await h.ctx.vexa.deleteMeeting("jitsi", nativeId);
+    expect(h.vexa.meetings.has(`jitsi/${nativeId}`)).toBe(false);
   });
 });
 

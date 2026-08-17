@@ -167,14 +167,20 @@ async function stopInVexa(ctx: AppContext, meeting: MeetingRow) {
   }
 }
 
-/** Removes our record + transcript and the Vexa meeting (best-effort, 404-tolerant). */
+/**
+ * Removes our record + transcript and asks Vexa to delete its meeting (404-tolerant). Vexa v0.12 only
+ * deletes PLANNED rows and answers 409 for anything the bot lifecycle touched — we log that ("retained
+ * by capture provider") and still remove our data; purging Vexa's copy is a documented gap.
+ */
 export async function deleteMeeting(ctx: AppContext, meeting: MeetingRow): Promise<void> {
   if (meeting.vexaPlatform && meeting.vexaNativeMeetingId) {
     if (!isTerminal(meeting.status as MeetingStatus)) await stopInVexa(ctx, meeting);
     try {
       await ctx.vexa.deleteMeeting(meeting.vexaPlatform, meeting.vexaNativeMeetingId);
     } catch (e) {
-      if (!(e instanceof VexaHttpError && e.notFound)) {
+      if (e instanceof VexaHttpError && e.conflict) {
+        ctx.log.warn("vexa retains meeting row (409: bot lifecycle owns it)", { meetingId: meeting.id, vexaNativeMeetingId: meeting.vexaNativeMeetingId });
+      } else if (!(e instanceof VexaHttpError && e.notFound)) {
         ctx.log.warn("vexa deleteMeeting failed", { meetingId: meeting.id, error: String(e) });
         throw new ApiError("provider_unavailable", "Could not delete the meeting from the capture provider");
       }

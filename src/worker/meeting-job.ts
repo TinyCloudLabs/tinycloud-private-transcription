@@ -4,6 +4,8 @@ import { ApiError } from "../domain/errors.ts";
 import type { Platform } from "../domain/platform.ts";
 import { isTerminal, mapVexaFailure, mapVexaStatus, type MeetingStatus } from "../domain/state.ts";
 import { VexaHttpError } from "../providers/vexa/client.ts";
+import { adaptVexaSegments, completionReasonOf } from "../providers/vexa/adapter.ts";
+import type { VexaRecording, VexaTranscriptionResponse } from "../providers/vexa/types.ts";
 import { toVexaPlatform } from "../providers/vexa/platform-map.ts";
 import type { AudioBlob } from "../providers/transcription/types.ts";
 import { failMeeting, getMeetingById, storeTranscript, transition } from "../services/meetings.ts";
@@ -85,7 +87,8 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
     return;
   }
 
-  const reason = (vexa.data?.completion_reason as string | null | undefined) ?? null;
+  // completion_reason lives under `data` on transcript rows (top-level only on MeetingResponse rows).
+  const reason = completionReasonOf(vexa);
   const mapped = mapVexaStatus(vexa.status);
 
   if (mapped === "failed") {
@@ -103,7 +106,8 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
   }
 
   // Bot has left. A "completed" with a failure-ish reason and no audio is a failure for us.
-  if (vexa.segments.length === 0 && reason && reason !== "stopped") {
+  const segments = adaptVexaSegments(vexa); // deduped by turn, epoch → meeting-relative seconds
+  if (segments.length === 0 && reason && reason !== "stopped") {
     const f = mapVexaFailure(reason);
     const { meeting: failed } = await failMeeting(ctx, meeting, f.code, f.message);
     await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
@@ -111,16 +115,16 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
   }
 
   ({ meeting } = await transition(ctx, meeting, "processing"));
-  await finalize(ctx, meeting, vexa.segments, vexa.id);
+  await finalize(ctx, meeting, vexa, segments);
 }
 
-async function finalize(ctx: AppContext, meeting: MeetingRow, vexaSegments: Parameters<AppContext["transcription"]["transcribe"]>[0]["vexaSegments"], vexaMeetingId: number) {
+async function finalize(ctx: AppContext, meeting: MeetingRow, vexa: VexaTranscriptionResponse, vexaSegments: ReturnType<typeof adaptVexaSegments>) {
   try {
     const transcript = await ctx.transcription.transcribe({
       meetingId: meeting.id,
       language: meeting.language,
       vexaSegments,
-      fetchAudio: () => fetchVexaAudio(ctx, vexaMeetingId),
+      fetchAudio: () => fetchVexaAudio(ctx, vexa),
     });
     await storeTranscript(ctx, meeting.id, transcript);
     const { meeting: done } = await transition(ctx, meeting, "completed");
@@ -145,24 +149,39 @@ async function finalize(ctx: AppContext, meeting: MeetingRow, vexaSegments: Para
   }
 }
 
+/** Below this the opus master is almost certainly silence (run 1 of the capture rig: 9 KB / 38 s ≈ 240 B/s; real speech ≈ 5 KB/s). */
+const MIN_AUDIO_BYTES_PER_SECOND = 1000;
+
 /**
- * GUESS: Vexa /recordings shape is untyped in the frozen contract. Returns null when no audio
- * is persisted, which makes the Tinfoil provider fail with transcription_failed.
+ * Persisted meeting audio for the Tinfoil batch path (`recording_enabled` default true): the recording
+ * list comes with the transcript row (`recordings[]`, else GET /recordings filtered by meeting_id),
+ * `GET /recordings/{id}/master?type=audio` assembles master.webm, `raw_url` streams the bytes.
+ * Returns null when nothing usable is persisted (Tinfoil provider then fails with transcription_failed).
+ * Content sanity check: a master far below speech bitrate is treated as the known "silent tap" failure
+ * (docs/vexa-findings.md) rather than sent to Tinfoil.
  */
-async function fetchVexaAudio(ctx: AppContext, vexaMeetingId: number): Promise<AudioBlob | null> {
+async function fetchVexaAudio(ctx: AppContext, vexa: VexaTranscriptionResponse): Promise<AudioBlob | null> {
   try {
-    const list = await ctx.vexa.listRecordings(vexaMeetingId);
-    for (const rec of list.recordings ?? []) {
-      for (const f of rec.media_files ?? []) {
-        const url = f.download_url ?? f.url;
-        if (!url || (f.content_type && !f.content_type.startsWith("audio/"))) continue;
-        const res = await fetch(url, { signal: AbortSignal.timeout(60_000) });
-        if (!res.ok) continue;
-        return { bytes: new Uint8Array(await res.arrayBuffer()), filename: "meeting.wav", contentType: f.content_type ?? "audio/wav" };
+    let recordings: VexaRecording[] = (vexa.recordings ?? []).filter((r) => r.meeting_id === vexa.id);
+    if (recordings.length === 0) {
+      recordings = (await ctx.vexa.listRecordings()).recordings.filter((r) => r.meeting_id === vexa.id);
+    }
+    const durationSec =
+      vexa.start_time && vexa.end_time ? (Date.parse(vexa.end_time) - Date.parse(vexa.start_time)) / 1000 : null;
+    for (const rec of recordings) {
+      if (!rec.media_files?.some((f) => f.type === "audio")) continue;
+      const master = await ctx.vexa.recordingMaster(rec.id, "audio");
+      if (!master.raw_url) continue;
+      const { bytes, contentType } = await ctx.vexa.fetchBytes(master.raw_url);
+      if (bytes.length === 0) continue;
+      if (durationSec && durationSec > 5 && bytes.length / durationSec < MIN_AUDIO_BYTES_PER_SECOND) {
+        ctx.log.warn("vexa recording looks silent; skipping", { vexaMeetingId: vexa.id, recordingId: rec.id, bytes: bytes.length, durationSec });
+        continue;
       }
+      return { bytes, filename: "meeting.webm", contentType: contentType.startsWith("audio/") ? contentType : "audio/webm" };
     }
   } catch (e) {
-    ctx.log.warn("could not fetch vexa recording", { vexaMeetingId, error: String(e) });
+    ctx.log.warn("could not fetch vexa recording", { vexaMeetingId: vexa.id, error: String(e) });
   }
   return null;
 }

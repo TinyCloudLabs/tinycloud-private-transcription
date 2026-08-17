@@ -1,7 +1,10 @@
 /**
  * Mock Vexa API gateway for tests and local dev. Implements the subset of Vexa's public API we
- * use, with the same shapes as ./types.ts, plus `/_mock/*` control endpoints so tests can drive
- * the meeting lifecycle (status + segments + completion_reason).
+ * use, mirroring the REAL v0.12 shapes in docs/vexa-samples (epoch-second segment timing, turn:N:x
+ * segment ids, `data.completion_reason`, `{running,running_bots,count}` bot status, 409 on deleting a
+ * bot-lifecycle row), plus `/_mock/*` control endpoints so tests can drive the meeting lifecycle.
+ * Control segments may be given meeting-relative (start < 1e9); they are stored as epoch seconds
+ * relative to the meeting's `start_time`, exactly like the real gateway returns them.
  */
 import { Hono } from "hono";
 import type {
@@ -17,6 +20,8 @@ interface MockMeeting extends VexaMeetingResponse {
   bot_name?: string;
   language?: string;
   meeting_url?: string;
+  /** Deletable via DELETE /meetings (real Vexa: idle/scheduled rows only). */
+  planned?: boolean;
 }
 
 export interface MockVexaOptions {
@@ -78,23 +83,12 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
     return c.json(strip(m), 201);
   });
 
-  app.get("/bots/status", (c) =>
-    c.json({
-      running_bots: [...meetings.values()]
-        .filter((m) => ["joining", "awaiting_admission", "active", "stopping"].includes(m.status))
-        .map((m) => ({
-          container_id: m.bot_container_id,
-          container_name: m.bot_container_id,
-          platform: m.platform,
-          native_meeting_id: m.native_meeting_id,
-          status: "Up 1 minute",
-          normalized_status: m.status,
-          created_at: m.created_at,
-          start_time: m.start_time,
-          labels: {},
-        })),
-    }),
-  );
+  app.get("/bots/status", (c) => {
+    const running = [...meetings.values()]
+      .filter((m) => ["requested", "joining", "awaiting_admission", "active", "stopping"].includes(m.status))
+      .map(strip);
+    return c.json({ running, running_bots: running, count: running.length });
+  });
 
   app.get("/meetings", (c) => c.json({ meetings: [...meetings.values()].map(strip) }));
 
@@ -111,26 +105,28 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       end_time: m.end_time,
       recordings: [],
       notes: null,
-      data: { ...m.data, completion_reason: m.completion_reason },
+      data: { ...m.data, completion_reason: m.completion_reason, failure_stage: m.failure_stage },
       segments: m.segments,
     });
   });
 
   app.delete("/bots/:platform/:native_meeting_id", (c) => {
     const m = meetings.get(key(c.req.param("platform"), c.req.param("native_meeting_id")));
-    if (!m) return c.json({ detail: "Meeting not found" }, 404);
-    if (!["completed", "failed"].includes(m.status)) {
-      m.status = "stopping";
-      m.updated_at = now();
-    }
-    return c.json(strip(m));
+    if (!m || ["completed", "failed"].includes(m.status)) return c.json({ detail: "No active meeting for this bot" }, 404);
+    m.status = "stopping";
+    m.updated_at = now();
+    return c.json({ status: "stopping", meeting_id: m.id, native_meeting_id: m.native_meeting_id });
   });
 
+  // Real v0.12: only PLANNED (idle/scheduled) rows are deletable; every row created via POST /bots is
+  // bot-lifecycle owned → 409. `/_mock/*` can flip `planned` to exercise the 200 path.
   app.delete("/meetings/:platform/:native_meeting_id", (c) => {
     const k = key(c.req.param("platform"), c.req.param("native_meeting_id"));
-    if (!meetings.has(k)) return c.json({ detail: "Meeting not found" }, 404);
+    const m = meetings.get(k);
+    if (!m) return c.json({ detail: `Meeting not found for platform ${c.req.param("platform")} and ID ${c.req.param("native_meeting_id")}` }, 404);
+    if (!m.planned) return c.json({ detail: "Meeting is no longer planned (bot lifecycle owns it)" }, 409);
     meetings.delete(k);
-    return c.json({ status: "deleted" });
+    return c.json({ status: "deleted", id: m.id, platform: m.platform, native_meeting_id: m.native_meeting_id });
   });
 
   app.get("/recordings", (c) => c.json({ recordings: [] }));
@@ -144,15 +140,34 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       segments?: VexaTranscriptionSegment[];
       append_segments?: VexaTranscriptionSegment[];
       completion_reason?: VexaCompletionReason | null;
+      planned?: boolean;
     };
     if (body.status) {
       m.status = body.status;
-      if (body.status === "active" && !m.start_time) m.start_time = now();
+      if (["active", "completed"].includes(body.status) && !m.start_time) m.start_time = now();
       if (["completed", "failed"].includes(body.status)) m.end_time = now();
     }
-    if (body.segments) m.segments = body.segments;
-    if (body.append_segments) m.segments.push(...body.append_segments);
+    if (body.segments || body.append_segments) {
+      if (!m.start_time) m.start_time = now();
+      const originSec = Date.parse(m.start_time) / 1000;
+      const toReal = (seg: VexaTranscriptionSegment, i: number): VexaTranscriptionSegment => {
+        const epoch = seg.start >= 1e9;
+        const start = epoch ? seg.start : originSec + seg.start;
+        const end = epoch ? seg.end : originSec + seg.end;
+        return {
+          ...seg,
+          start,
+          end,
+          segment_id: seg.segment_id ?? `turn:${i}:0`,
+          absolute_start_time: seg.absolute_start_time ?? new Date(start * 1000).toISOString(),
+          absolute_end_time: seg.absolute_end_time ?? new Date(end * 1000).toISOString(),
+        };
+      };
+      if (body.segments) m.segments = body.segments.map(toReal);
+      if (body.append_segments) m.segments.push(...body.append_segments.map((s, i) => toReal(s, m.segments.length + i)));
+    }
     if (body.completion_reason !== undefined) m.completion_reason = body.completion_reason;
+    if (body.planned !== undefined) m.planned = body.planned;
     m.updated_at = now();
     return c.json(strip(m));
   });
@@ -170,8 +185,8 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
   return { app, meetings, requests, apiKey };
 }
 
-function strip(m: { segments?: unknown; bot_name?: unknown; language?: unknown; meeting_url?: unknown } & VexaMeetingResponse): VexaMeetingResponse {
-  const { segments: _s, bot_name: _b, language: _l, meeting_url: _u, ...rest } = m;
+function strip(m: { segments?: unknown; bot_name?: unknown; language?: unknown; meeting_url?: unknown; planned?: unknown } & VexaMeetingResponse): VexaMeetingResponse {
+  const { segments: _s, bot_name: _b, language: _l, meeting_url: _u, planned: _p, ...rest } = m;
   return rest;
 }
 

@@ -5,6 +5,9 @@ import type {
   VexaTranscriptionResponse,
   VexaBotStatusResponse,
   VexaRecordingsResponse,
+  VexaRecordingMasterResponse,
+  VexaStopBotResponse,
+  VexaDeleteMeetingResponse,
 } from "./types.ts";
 
 export interface VexaClientOptions {
@@ -26,6 +29,10 @@ export class VexaHttpError extends Error {
   get notFound() {
     return this.status === 404;
   }
+  /** Vexa v0.12 refuses to delete rows the bot lifecycle owns ("Meeting is no longer planned"). */
+  get conflict() {
+    return this.status === 409;
+  }
 }
 
 export class VexaClient {
@@ -41,7 +48,7 @@ export class VexaClient {
     this.fetchImpl = opts.fetch ?? fetch;
   }
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async raw(method: string, path: string, body?: unknown, timeoutMs = this.timeoutMs): Promise<Response> {
     let res: Response;
     try {
       res = await this.fetchImpl(`${this.baseUrl}${path}`, {
@@ -51,7 +58,7 @@ export class VexaClient {
           ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
         },
         body: body !== undefined ? JSON.stringify(body) : undefined,
-        signal: AbortSignal.timeout(this.timeoutMs),
+        signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (e) {
       const timeout = e instanceof Error && e.name === "TimeoutError";
@@ -64,6 +71,11 @@ export class VexaClient {
       const detail = await res.text().catch(() => "");
       throw new VexaHttpError(res.status, detail, path);
     }
+    return res;
+  }
+
+  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const res = await this.raw(method, path, body);
     if (res.status === 204) return undefined as T;
     return (await res.json()) as T;
   }
@@ -79,16 +91,20 @@ export class VexaClient {
     );
   }
 
+  /** DELETE /bots/{p}/{id} → {status:"stopping", meeting_id, native_meeting_id}; 404 once no bot is active. */
   stopBot(platform: string, nativeMeetingId: string) {
-    return this.request<VexaMeetingResponse>(
+    return this.request<VexaStopBotResponse>(
       "DELETE",
       `/bots/${encodeURIComponent(platform)}/${encodeURIComponent(nativeMeetingId)}`,
     );
   }
 
-  /** DELETE /meetings/{p}/{id} — "Delete meeting transcripts and anonymize data". */
+  /**
+   * DELETE /meetings/{p}/{id}. In Vexa v0.12 this only deletes PLANNED (idle/scheduled) rows;
+   * a row the bot lifecycle has touched answers 409 — callers must treat that as "retained by Vexa".
+   */
   deleteMeeting(platform: string, nativeMeetingId: string) {
-    return this.request<unknown>(
+    return this.request<VexaDeleteMeetingResponse>(
       "DELETE",
       `/meetings/${encodeURIComponent(platform)}/${encodeURIComponent(nativeMeetingId)}`,
     );
@@ -98,9 +114,20 @@ export class VexaClient {
     return this.request<VexaBotStatusResponse>("GET", "/bots/status");
   }
 
-  /** GUESS: shape of /recordings is untyped upstream; see types.ts. */
-  listRecordings(vexaMeetingId: number) {
-    return this.request<VexaRecordingsResponse>("GET", `/recordings?meeting_id=${vexaMeetingId}`);
+  /** GET /recordings — all of the key's recordings; filter by `meeting_id` client-side. */
+  listRecordings() {
+    return this.request<VexaRecordingsResponse>("GET", "/recordings");
+  }
+
+  /** GET /recordings/{id}/master?type=audio — assembles master.webm and returns its raw byte URL. */
+  recordingMaster(recordingId: number, type = "audio") {
+    return this.request<VexaRecordingMasterResponse>("GET", `/recordings/${recordingId}/master?type=${type}`);
+  }
+
+  /** Fetch bytes from a gateway-relative path such as `raw_url` (needs X-API-Key). */
+  async fetchBytes(gatewayPath: string, timeoutMs = 60_000): Promise<{ bytes: Uint8Array; contentType: string }> {
+    const res = await this.raw("GET", gatewayPath, undefined, timeoutMs);
+    return { bytes: new Uint8Array(await res.arrayBuffer()), contentType: res.headers.get("content-type") ?? "application/octet-stream" };
   }
 
   async health(): Promise<boolean> {

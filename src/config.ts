@@ -11,7 +11,8 @@ export const config = {
   databaseUrl: env("DATABASE_URL", "postgres://ptx:ptx@localhost:55432/ptx"),
   redisUrl: env("REDIS_URL", "redis://localhost:56379"),
   vexa: {
-    baseUrl: env("VEXA_BASE_URL", "http://localhost:18056"),
+    /** Real gateway of the capture rig (infra/README.md). Tests point this at the in-process mock (:18056 when run standalone). */
+    baseUrl: env("VEXA_BASE_URL", "http://localhost:18066"),
     apiKey: env("VEXA_API_KEY", ""),
     pollIntervalMs: Number(env("VEXA_POLL_INTERVAL_MS", "5000")),
   },
