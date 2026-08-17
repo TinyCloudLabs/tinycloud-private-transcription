@@ -28,12 +28,18 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
       bot_name: meeting.botName ?? undefined,
       language: meeting.language ?? undefined,
     });
-    const { changed } = await transition(ctx, meeting, "joining", {
+    const vexaNativeMeetingId = created.native_meeting_id ?? meeting.vexaNativeMeetingId;
+    const { meeting: updated, changed } = await transition(ctx, meeting, "joining", {
       vexaPlatform: created.platform ?? vexaPlatform,
-      vexaNativeMeetingId: created.native_meeting_id ?? meeting.vexaNativeMeetingId,
+      vexaNativeMeetingId,
       vexaBotId: created.bot_container_id ?? String(created.id),
     });
-    if (changed) await ctx.queue.push({ type: "meeting.poll", meetingId }, ctx.config.vexa.pollIntervalMs);
+    if (changed) {
+      await ctx.queue.push({ type: "meeting.poll", meetingId }, ctx.config.vexa.pollIntervalMs);
+    } else if (updated.status === "cancelled" && vexaNativeMeetingId) {
+      // Stopped while we were dispatching the bot: don't leave it orphaned in Vexa.
+      await ctx.vexa.stopBot(created.platform ?? vexaPlatform, vexaNativeMeetingId).catch(() => {});
+    }
   } catch (e) {
     await handleStartError(ctx, meeting, e, attempt);
   }
