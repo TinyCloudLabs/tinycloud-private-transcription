@@ -16,6 +16,7 @@
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { runFakeParticipant } from "./fake-participant";
+import { mintVexaApiKey } from "./vexa-admin";
 
 const API = process.env.VEXA_API_URL ?? "http://localhost:18066";
 const ADMIN = process.env.VEXA_ADMIN_URL ?? "http://localhost:18057";
@@ -32,24 +33,8 @@ const log = (m: string) => console.log(`[vexa-smoke ${new Date().toISOString().s
 const save = (name: string, data: unknown) => writeFileSync(`${OUT}/${name}`, JSON.stringify(data, null, 2) + "\n");
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-async function mintApiKey(): Promise<string> {
-  const h = { "X-Admin-API-Key": ADMIN_TOKEN, "Content-Type": "application/json" };
-  const email = "self-host@vexa.ai";
-  let r = await fetch(`${ADMIN}/admin/users/email/${email}`, { headers: h });
-  let user: any = r.ok ? await r.json() : null;
-  if (!user) {
-    r = await fetch(`${ADMIN}/admin/users`, { method: "POST", headers: h, body: JSON.stringify({ email, max_concurrent_bots: 5 }) });
-    if (!r.ok) throw new Error(`admin create user failed: ${r.status} ${await r.text()}`);
-    user = await r.json();
-  }
-  r = await fetch(`${ADMIN}/admin/users/${user.id}/tokens?scopes=bot,tx`, { method: "POST", headers: h });
-  if (!r.ok) throw new Error(`admin mint token failed: ${r.status} ${await r.text()}`);
-  const tok = (await r.json()) as { token: string };
-  return tok.token;
-}
-
 async function main() {
-  const apiKey = process.env.VEXA_API_KEY ?? (await mintApiKey());
+  const apiKey = process.env.VEXA_API_KEY ?? (await mintVexaApiKey({ adminUrl: ADMIN, adminToken: ADMIN_TOKEN }));
   const H = { "X-API-Key": apiKey, "Content-Type": "application/json" };
   const meetingUrl = `${JITSI}/${ROOM}`;
   const nativeId = `${ROOM}@${new URL(JITSI).hostname}`; // Vexa's jitsi convention: room@host (bare room only for meet.jit.si)

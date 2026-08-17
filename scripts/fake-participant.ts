@@ -15,6 +15,9 @@ import { chromium, type Page } from "playwright";
 import { resolve } from "node:path";
 import { existsSync } from "node:fs";
 
+// Browser global used inside page.evaluate callbacks (typechecked with Bun libs only).
+declare const window: any;
+
 export interface FakeParticipantOptions {
   url: string;
   name?: string;
