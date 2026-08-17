@@ -1,0 +1,10 @@
+{
+  "task": "transcribe",
+  "language": "en",
+  "duration": 6.4,
+  "text": "Hello, this is a test of the private transcription pipeline. Sounds good to me.",
+  "segments": [
+    { "id": 0, "seek": 0, "start": 0.0, "end": 3.9, "text": " Hello, this is a test of the private transcription pipeline.", "tokens": [], "temperature": 0.0, "avg_logprob": -0.2, "compression_ratio": 1.1, "no_speech_prob": 0.01 },
+    { "id": 1, "seek": 0, "start": 4.1, "end": 6.4, "text": " Sounds good to me.", "tokens": [], "temperature": 0.0, "avg_logprob": -0.2, "compression_ratio": 1.1, "no_speech_prob": 0.01 }
+  ]
+}
