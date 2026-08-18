@@ -187,20 +187,34 @@ CLI profile `openkey-prod`), not in the personal "skgbafa's projects" workspace.
 and never modify the `openkey-api` CVM.
 
 **Image.** The api/worker image is `ghcr.io/tinycloudlabs/tinycloud-private-transcription` (`:<git sha>`
-immutable, `:v1` moving on feat/v1 + main, `:latest` on main). It is built by `infra/ci/publish-image.yml`
-— a GitHub Actions workflow that must be moved to `.github/workflows/publish-image.yml` from a session whose
-GitHub token has the `workflow` scope (`gh auth refresh -s workflow,write:packages,read:packages`; the
-default `gh` OAuth token cannot push workflow files). It pushes with `GITHUB_TOKEN` (`packages: write`).
-The CVM pulls anonymously, so after the first publish make the package **public** (GitHub → TinyCloudLabs
-→ Packages → tinycloud-private-transcription → Package settings → Change visibility), or seal
-`DSTACK_DOCKER_USERNAME` / `DSTACK_DOCKER_PASSWORD` (a PAT with `read:packages`) into the env file.
-Interim/dev builds without registry creds (expire in 24 h):
+immutable, `:v1` moving on feat/v1 + main, `:latest` on main), built for linux/amd64 and pushed by the
+GitHub Actions workflow `.github/workflows/publish-image.yml` on every push to `feat/v1` / `main` that touches
+the Dockerfile, `src/`, or the lockfile (or `gh workflow run publish-image.yml`). It authenticates with the
+workflow's `GITHUB_TOKEN` (`packages: write`); watch it with `gh run watch` and take the digest from the run
+summary. Pin `PTX_IMAGE=ghcr.io/tinycloudlabs/tinycloud-private-transcription:<sha>` (or `:v1`) in
+`infra/dstack/.env`.
+
+The CVM must be able to pull that image. dstack's pre-launch script runs `docker image prune -af` on every
+boot and `docker compose pull` before `up`, so a pre-pulled image does not survive an update — the registry
+itself has to be reachable. Two options:
+
+1. **Public package (preferred).** The repo is private, so the package is created private and there is no
+   REST endpoint to change container-package visibility; a human flips it once in the UI: GitHub → org
+   TinyCloudLabs → Packages → `tinycloud-private-transcription` → Package settings → Danger Zone → Change
+   visibility → Public. Verify with `sudo docker logout ghcr.io && sudo docker pull ghcr.io/tinycloudlabs/tinycloud-private-transcription:v1`.
+2. **Sealed pull credentials.** Add `DSTACK_DOCKER_REGISTRY=ghcr.io`, `DSTACK_DOCKER_USERNAME=<github user>`,
+   `DSTACK_DOCKER_PASSWORD=<PAT with read:packages only>` to `infra/dstack/.env`; the pre-launch script does
+   `docker login ghcr.io` with them before pulling. Do not use a broad-scope OAuth/PAT here.
+
+**Fallback (no registry access, expires in 24 h)** — anonymous ttl.sh push from the dev host:
 
 ```bash
 git archive HEAD Dockerfile package.json bun.lock src drizzle.config.ts tsconfig.json | tar -x -C /tmp/ptx-build
 sudo docker build --platform linux/amd64 -t ttl.sh/ptx-api-$(git rev-parse --short HEAD):24h /tmp/ptx-build
 sudo docker push ttl.sh/ptx-api-$(git rev-parse --short HEAD):24h      # then set PTX_IMAGE to that tag
 ```
+Containers already running keep their image across restarts (compose pull is fail-soft, and referenced images
+are not pruned), but a redeploy after expiry cannot re-pull it.
 
 **Env.** `cp infra/dstack/.env.example infra/dstack/.env` (gitignored) and fill it: random 32-char values for
 `POSTGRES_PASSWORD`, `VEXA_DB_PASSWORD`, `VEXA_ADMIN_TOKEN`, `VEXA_INTERNAL_API_SECRET`, `MINIO_ROOT_PASSWORD`;
