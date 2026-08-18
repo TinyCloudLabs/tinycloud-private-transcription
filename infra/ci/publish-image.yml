@@ -1,0 +1,89 @@
+name: Publish image
+# PARKED at infra/ci/ because the dev-host gh OAuth token lacks the `workflow` scope needed to push files under
+# .github/workflows/. Move it: `git mv infra/ci/publish-image.yml .github/workflows/publish-image.yml` from a
+# session with `gh auth refresh -s workflow,write:packages,read:packages` (see README "Deploy (Phala/dstack)").
+
+# Builds the api/worker image (Dockerfile at repo root, linux/amd64 only — Phala CVMs are TDX x86_64)
+# and pushes it to GHCR with the workflow's GITHUB_TOKEN. Tags:
+#   ghcr.io/tinycloudlabs/tinycloud-private-transcription:<git sha>   (immutable; pin this in infra/dstack/.env PTX_IMAGE)
+#   ghcr.io/tinycloudlabs/tinycloud-private-transcription:v1          (moving; on feat/v1 + main)
+#   ghcr.io/tinycloudlabs/tinycloud-private-transcription:latest      (moving; on main only)
+# The package must be PUBLIC for the CVM to pull it anonymously (GitHub → org packages → tinycloud-private-transcription
+# → Package settings → Change visibility), or set DSTACK_DOCKER_USERNAME/DSTACK_DOCKER_PASSWORD in the sealed env.
+
+on:
+  push:
+    branches: [main, feat/v1]
+    paths:
+      - Dockerfile
+      - package.json
+      - bun.lock
+      - drizzle.config.ts
+      - tsconfig.json
+      - src/**
+      - .github/workflows/publish-image.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/tinycloudlabs/tinycloud-private-transcription
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          tags="${IMAGE}:${GITHUB_SHA}"$'\n'"${IMAGE}:v1"
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then tags="${tags}"$'\n'"${IMAGE}:latest"; fi
+          {
+            echo "tags<<EOF"
+            echo "$tags"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=TinyCloud Private Transcription api/worker
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### Image"
+            echo
+            echo '```'
+            echo "${{ steps.tags.outputs.tags }}"
+            echo '```'
+            echo "- digest: \`${{ steps.build.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

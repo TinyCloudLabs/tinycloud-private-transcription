@@ -168,17 +168,68 @@ Types in `src/providers/vexa/types.ts`; pure mapping in `src/providers/vexa/adap
   (bot needs `https://` + hostname + a trusted cert).
 - The capture rig needed a host iptables fix (Docker's FORWARD/NAT chains had been flushed) — see infra/README.md.
 
-## CVM plan (dstack / Phala)
+## Deploy (Phala/dstack)
 
 `infra/dstack/app-compose.yaml` runs api + worker + postgres + redis and the pinned Vexa v0.12 stack
 (admin-api, runtime, meeting-api, gateway, valkey, postgres, MinIO, CPU whisper) in ONE CVM; only `:8080`
 is published. Bot spawning needs `/var/run/docker.sock` mounted into Vexa's `runtime` (one container per
 bot on the fixed `ptx-vexa` network). A one-shot `vexa-provision` job mints the Vexa API key at first boot.
-Encrypted env: `infra/dstack/.env.example`. Deploy:
+If the docker.sock bind is ever refused by the platform, the alternative is Vexa's process backend
+("Vexa Lite": bot as a sibling service / in-process instead of docker-spawned containers).
+
+**Workspace.** The dev CVM `ptx-dev` lives in the **TinyCloud** Phala workspace (slug `tinycloudxyz`,
+CLI profile `openkey-prod`), not in the personal "skgbafa's projects" workspace. Always
+`phala switch openkey-prod` (and check `phala status` says `Current Workspace: TinyCloud`) before touching it,
+and never modify the `openkey-api` CVM.
+
+**Image.** The api/worker image is `ghcr.io/tinycloudlabs/tinycloud-private-transcription` (`:<git sha>`
+immutable, `:v1` moving on feat/v1 + main, `:latest` on main). It is built by `infra/ci/publish-image.yml`
+— a GitHub Actions workflow that must be moved to `.github/workflows/publish-image.yml` from a session whose
+GitHub token has the `workflow` scope (`gh auth refresh -s workflow,write:packages,read:packages`; the
+default `gh` OAuth token cannot push workflow files). It pushes with `GITHUB_TOKEN` (`packages: write`).
+The CVM pulls anonymously, so after the first publish make the package **public** (GitHub → TinyCloudLabs
+→ Packages → tinycloud-private-transcription → Package settings → Change visibility), or seal
+`DSTACK_DOCKER_USERNAME` / `DSTACK_DOCKER_PASSWORD` (a PAT with `read:packages`) into the env file.
+Interim/dev builds without registry creds (expire in 24 h):
 
 ```bash
-phala deploy -n ptx-dev -c infra/dstack/app-compose.yaml -e infra/dstack/.env -t tdx.large --disk-size 40G --wait
+git archive HEAD Dockerfile package.json bun.lock src drizzle.config.ts tsconfig.json | tar -x -C /tmp/ptx-build
+sudo docker build --platform linux/amd64 -t ttl.sh/ptx-api-$(git rev-parse --short HEAD):24h /tmp/ptx-build
+sudo docker push ttl.sh/ptx-api-$(git rev-parse --short HEAD):24h      # then set PTX_IMAGE to that tag
 ```
 
-If the docker.sock bind is refused by the platform, the alternative is Vexa's process backend ("Vexa Lite":
-bot as a sibling service / in-process instead of docker-spawned containers).
+**Env.** `cp infra/dstack/.env.example infra/dstack/.env` (gitignored) and fill it: random 32-char values for
+`POSTGRES_PASSWORD`, `VEXA_DB_PASSWORD`, `VEXA_ADMIN_TOKEN`, `VEXA_INTERNAL_API_SECRET`, `MINIO_ROOT_PASSWORD`;
+`PTX_IMAGE`; and for private transcription `TRANSCRIPTION_PROVIDER=tinfoil`, `TINFOIL_API_KEY`,
+`TINFOIL_MODEL` (from the project `.env`). Everything in that file is encrypted client-side and sealed into
+the CVM (`phala deploy -e`); nothing secret lives in `app-compose.yaml`.
+
+**Deploy / update.**
+
+```bash
+phala switch openkey-prod && phala status                       # Current Workspace: TinyCloud
+sudo docker compose -f infra/dstack/app-compose.yaml --env-file infra/dstack/.env config -q   # compose sanity
+phala deploy -n ptx-dev -c infra/dstack/app-compose.yaml -e infra/dstack/.env -t tdx.large --disk-size 40G --wait
+phala cvms get ptx-dev --json | jq '{status, app_id, gateway}'
+# update in place (new image tag / env / compose):
+phala deploy --cvm-id ptx-dev -c infra/dstack/app-compose.yaml -e infra/dstack/.env --wait
+phala switch openkey-secondary                                  # restore the default profile when done
+```
+
+`tdx.large` (4 vCPU / 8 GB, ~$0.24/h incl. 40 GB disk) is the smallest size that fits whisper small.en +
+one bot + the control plane; smaller types OOM. First boot takes ~5–10 min (Vexa images ≈ 3.6 GB bot image
++ whisper model download).
+
+**Verify.** `https://<app_id>-8080.<gateway base_domain>/health` →
+`{"status":"ok","checks":{"postgres":true,"redis":true,"vexa":true,...}}`. Then mint a key inside the CVM
+and run the [curl walkthrough](#curl-walkthrough-definition-of-done):
+
+```bash
+phala ssh ptx-dev -- "docker exec \$(docker ps -qf name=api) bun run src/cli.ts create-key --project demo"
+export API=https://<app_id>-8080.<base_domain> KEY=tc_live_...
+curl -s -X POST $API/v1/meetings -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"meeting_url":"https://meet.jit.si/<room>","bot_name":"TinyCloud Notetaker","language":"en"}'
+```
+
+Debug: `phala logs ptx-dev -f`, `phala logs ptx-dev --serial --tail 200` (image pull / compose errors), `phala ps ptx-dev`.
+
