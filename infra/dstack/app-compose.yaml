@@ -188,6 +188,16 @@ services:
     networks: [vexa]
     restart: unless-stopped
 
+  # Vexa's runtime does `docker create` (no pull) for each bot, so the bot image must already be in the CVM's
+  # docker image store — AND dstack runs `docker image prune -af` after every `compose up`, which deletes any
+  # image no container references. This no-op service makes compose pull vexaai/vexa-bot at boot (~1.6 GB
+  # compressed) and its exited container pins the image so the prune keeps it.
+  bot-image-keeper:
+    image: vexaai/vexa-bot:${VEXA_IMAGE_TAG:-v012}
+    entrypoint: ["/bin/true"]
+    restart: "no"
+    network_mode: none
+
   runtime:
     image: vexaai/v012-runtime:${VEXA_IMAGE_TAG:-v012}
     group_add: ["0"]
@@ -211,6 +221,8 @@ services:
     depends_on:
       vexa-redis:
         condition: service_healthy
+      bot-image-keeper:
+        condition: service_completed_successfully
     networks: [vexa]
     restart: unless-stopped
 

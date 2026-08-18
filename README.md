@@ -174,6 +174,10 @@ Types in `src/providers/vexa/types.ts`; pure mapping in `src/providers/vexa/adap
 (admin-api, runtime, meeting-api, gateway, valkey, postgres, MinIO, CPU whisper) in ONE CVM; only `:8080`
 is published. Bot spawning needs `/var/run/docker.sock` mounted into Vexa's `runtime` (one container per
 bot on the fixed `ptx-vexa` network). A one-shot `vexa-provision` job mints the Vexa API key at first boot.
+`bot-image-keeper` (a no-op container on `vexaai/vexa-bot`) makes compose pull the bot image and pins it:
+Vexa's runtime does `docker create` without pulling, and dstack runs `docker image prune -af` after every
+`compose up`, so without a referencing container the bot image is pruned and every meeting fails with
+`provider_unavailable` ("No such image: vexaai/vexa-bot:v012").
 If the docker.sock bind is ever refused by the platform, the alternative is Vexa's process backend
 ("Vexa Lite": bot as a sibling service / in-process instead of docker-spawned containers).
 
@@ -220,12 +224,18 @@ phala switch openkey-secondary                                  # restore the de
 one bot + the control plane; smaller types OOM. First boot takes ~5–10 min (Vexa images ≈ 3.6 GB bot image
 + whisper model download).
 
+**Current dev CVM** (2026-08-18): `ptx-dev`, app id `7fd569fb6ac2cae943cea1d1aff247cd8ea61fdc`, uuid
+`9a79a27e-8243-4fd7-b17d-fc9300333784`, node prod5 (US-WEST-1), `tdx.large`, dev OS (SSH enabled via
+`phala ssh-keys add` + restart), API at
+`https://7fd569fb6ac2cae943cea1d1aff247cd8ea61fdc-8080.dstack-pha-prod5.phala.network`.
+
 **Verify.** `https://<app_id>-8080.<gateway base_domain>/health` →
 `{"status":"ok","checks":{"postgres":true,"redis":true,"vexa":true,...}}`. Then mint a key inside the CVM
 and run the [curl walkthrough](#curl-walkthrough-definition-of-done):
 
 ```bash
-phala ssh ptx-dev -- "docker exec \$(docker ps -qf name=api) bun run src/cli.ts create-key --project demo"
+phala ssh-keys add --name <host> --key-file ~/.ssh/id_ed25519.pub && phala cvms restart ptx-dev   # once (dev OS only)
+phala ssh ptx-dev -- -i ~/.ssh/id_ed25519 "docker exec dstack-api-1 bun run src/cli.ts create-key --project demo"
 export API=https://<app_id>-8080.<base_domain> KEY=tc_live_...
 curl -s -X POST $API/v1/meetings -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   -d '{"meeting_url":"https://meet.jit.si/<room>","bot_name":"TinyCloud Notetaker","language":"en"}'
