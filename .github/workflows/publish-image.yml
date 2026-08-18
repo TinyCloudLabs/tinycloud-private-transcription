@@ -1,8 +1,4 @@
 name: Publish image
-# PARKED at infra/ci/ because the dev-host gh OAuth token lacks the `workflow` scope needed to push files under
-# .github/workflows/. Move it: `git mv infra/ci/publish-image.yml .github/workflows/publish-image.yml` from a
-# session with `gh auth refresh -s workflow,write:packages,read:packages` (see README "Deploy (Phala/dstack)").
-
 # Builds the api/worker image (Dockerfile at repo root, linux/amd64 only — Phala CVMs are TDX x86_64)
 # and pushes it to GHCR with the workflow's GITHUB_TOKEN. Tags:
 #   ghcr.io/tinycloudlabs/tinycloud-private-transcription:<git sha>   (immutable; pin this in infra/dstack/.env PTX_IMAGE)
