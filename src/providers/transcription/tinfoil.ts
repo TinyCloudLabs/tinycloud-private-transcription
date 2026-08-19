@@ -121,6 +121,7 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
       throw new TranscriptionFallbackError(`Recording could not be decoded: ${String(e)}`, "undecodable");
     }
     const level = rmsDbfs(pcm);
+    log?.debug("tinfoil: recording decoded", { meetingId: input.meetingId, audio_seconds: round(pcm.durationSec), rms_dbfs: round(level), vexa_segments: vexa.length });
     if (pcm.durationSec < 0.5 || level < (this.opts.silenceDbfs ?? -60)) {
       throw new TranscriptionFallbackError("Recording is silent", "silent_recording", { audio_seconds: round(pcm.durationSec), rms_dbfs: round(level) });
     }
@@ -148,6 +149,7 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
           const { body, attempts } = await this.postWithRetry(wav, `turn-${i + 1}.wav`, "audio/wav", input.language);
           calls += attempts;
           results[i] = { text: body.text ?? "", language: body.language ?? null };
+          log?.debug("tinfoil: turn transcribed", { meetingId: input.meetingId, turn: i + 1, of: eligible.length, speaker: c.turn.speaker, start: c.turn.start, end: c.turn.end, attempts, chars: results[i]!.text.length });
         } catch (e) {
           calls += (e as { attempts?: number }).attempts ?? 1;
           failed++;

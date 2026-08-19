@@ -14,8 +14,11 @@
  * Env: VEXA_BASE_URL (http://localhost:18066) VEXA_API_KEY (minted via admin-api if unset)
  *      JITSI_BASE_URL (https://jitsi.local:8443) JITSI_HOST_IP (127.0.0.1) E2E_ALICE_SECONDS (75) E2E_TIMEOUT_S (300)
  *      TRANSCRIPTION_PROVIDER (vexa|tinfoil, from .env) + TINFOIL_* — with `tinfoil` the worker downloads the Vexa
- *      recording and sends it to Tinfoil (ONE live call, ~30-45 s of audio); if the recording is unusable (silent
- *      tap) it falls back to the Vexa-native transcript. Which path ran is recorded in evidence.transcription.
+ *      recording, cuts it per Vexa speaker turn and sends each turn to Tinfoil (TINFOIL_SEGMENTATION=turns, default;
+ *      a handful of live calls of a few seconds each; `whole` = ONE call). With `tinfoil` the test REQUIRES
+ *      `transcript.provider === "tinfoil"`: if the recording was unusable (silent tap on a cold stack) the worker
+ *      falls back to the Vexa-native transcript, the assertion fails, and the fallback reason + Tinfoil call count
+ *      are in evidence.transcription — rerun. Which path ran is always recorded in evidence.transcription.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -28,6 +31,7 @@ import { runMigrations } from "../../src/db/migrate.ts";
 import { logger, type Logger } from "../../src/log.ts";
 import { VexaClient, VexaHttpError } from "../../src/providers/vexa/client.ts";
 import { createTranscriptionProvider } from "../../src/providers/transcription/index.ts";
+import type { TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
 import { verifyWebhookSignature } from "../../src/webhooks/signature.ts";
 import { Queue } from "../../src/worker/queue.ts";
 import { startWorker, type WorkerHandle } from "../../src/worker/index.ts";
@@ -65,6 +69,7 @@ describe.skipIf(!E2E)("E2E happy path against the real capture rig", () => {
   let server: ReturnType<typeof Bun.serve>;
   let receiver: ReturnType<typeof Bun.serve>;
   let worker: WorkerHandle;
+  let transcription: ReturnType<typeof createTranscriptionProvider>;
   const hooks: Hook[] = [];
   let webhookUrl: string;
   let meetingId: string;
@@ -103,7 +108,8 @@ describe.skipIf(!E2E)("E2E happy path against the real capture rig", () => {
     const redis = new RedisClient(config.redisUrl);
     const queue = new Queue(redis, `e2e:${crypto.randomUUID()}`);
     vexa = new VexaClient({ baseUrl: VEXA_URL, apiKey: vexaKey });
-    ctx = createContext({ config, db, redis, queue, vexa, transcription: createTranscriptionProvider(config), log: log2 });
+    transcription = createTranscriptionProvider(config, log2);
+    ctx = createContext({ config, db, redis, queue, vexa, transcription, log: log2 });
     ({ key: apiKey, webhookSecret } = await createApiKey(ctx, `e2e-${ROOM}`));
 
     server = Bun.serve({ port: 0, fetch: createApp(ctx).fetch });
@@ -118,7 +124,7 @@ describe.skipIf(!E2E)("E2E happy path against the real capture rig", () => {
     });
     webhookUrl = `http://127.0.0.1:${receiver.port}/hook`;
     worker = startWorker(ctx, { popTimeoutSec: 1 });
-    log(`api=${apiUrl} vexa=${VEXA_URL} room=${JITSI}/${ROOM} provider=${config.transcriptionProvider}`);
+    log(`api=${apiUrl} vexa=${VEXA_URL} room=${JITSI}/${ROOM} provider=${config.transcriptionProvider}${config.transcriptionProvider === "tinfoil" ? ` segmentation=${config.tinfoil.segmentation}` : ""}`);
   }, 60_000);
 
   afterAll(async () => {
@@ -204,10 +210,20 @@ describe.skipIf(!E2E)("E2E happy path against the real capture rig", () => {
     }
     expect(tr.duration_seconds).toBeGreaterThan(0);
     const finalized = workerLogs.find((l) => l.msg === "transcript finalized");
-    const path = finalized?.data?.fallback_from ? `fallback:${finalized.data.fallback_from}→vexa` : String(finalized?.data?.provider ?? "unknown");
-    evidence.transcription = { path, worker_logs: workerLogs };
-    log(`transcription path: ${path}`);
+    const path = finalized?.data?.fallback_from ? `fallback:${finalized.data.fallback_from}→vexa (${finalized.data.fallback_reason})` : String(finalized?.data?.provider ?? "unknown");
+    const tinfoil = transcription.name === "tinfoil" ? (transcription as TinfoilTranscriptionProvider) : null;
+    evidence.transcription = { path, provider: tr.provider, tinfoil_calls: tinfoil?.calls ?? 0, tinfoil_stats: tinfoil?.lastStats ?? null, worker_logs: workerLogs };
+    log(`transcription path: ${path}; transcript.provider=${tr.provider}; tinfoil calls=${tinfoil?.calls ?? 0}`);
     expect(finalized).toBeDefined();
+    expect(["vexa", "tinfoil"]).toContain(tr.provider);
+    if (tinfoil) {
+      // Confidential path must have run for real (a fallback here = unusable recording; see header, rerun).
+      expect(tr.provider).toBe("tinfoil");
+      expect(finalized?.data?.provider).toBe("tinfoil");
+      expect(tinfoil.calls).toBeGreaterThan(0);
+    } else {
+      expect(tr.provider).toBe("vexa");
+    }
   });
 
   test("meeting.completed webhook delivered with valid X-Webhook-Signature", async () => {
