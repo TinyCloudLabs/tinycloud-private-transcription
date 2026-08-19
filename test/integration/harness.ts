@@ -5,10 +5,11 @@ import { createApiKey } from "../../src/api/auth.ts";
 import { config as baseConfig } from "../../src/config.ts";
 import { createContext, type AppContext } from "../../src/context.ts";
 import { runMigrations } from "../../src/db/migrate.ts";
-import { silentLogger } from "../../src/log.ts";
+import { silentLogger, type Logger } from "../../src/log.ts";
 import { VexaClient } from "../../src/providers/vexa/client.ts";
 import { startMockVexa } from "../../src/providers/vexa/mock-server.ts";
 import { VexaNativeProvider } from "../../src/providers/transcription/vexa-native.ts";
+import type { TranscriptionProvider } from "../../src/providers/transcription/types.ts";
 import { Queue } from "../../src/worker/queue.ts";
 import { startWorker, type WorkerHandle } from "../../src/worker/index.ts";
 
@@ -31,12 +32,12 @@ export interface Harness {
   stop: () => Promise<void>;
 }
 
-export async function startHarness(opts: { webhookRetryDelaysMs?: number[] } = {}): Promise<Harness> {
+export async function startHarness(opts: { webhookRetryDelaysMs?: number[]; transcription?: TranscriptionProvider; log?: Logger } = {}): Promise<Harness> {
   const vexa = startMockVexa(0);
   const config = {
     ...baseConfig,
     vexa: { baseUrl: vexa.baseUrl, apiKey: vexa.apiKey, pollIntervalMs: 50 },
-    transcriptionProvider: "vexa" as const,
+    transcriptionProvider: (opts.transcription?.name ?? "vexa") as "vexa" | "tinfoil",
   };
   const db = await runMigrations(config.databaseUrl);
   await db.execute(sql`truncate table webhook_deliveries, transcripts, meetings, api_keys, projects cascade`);
@@ -48,8 +49,8 @@ export async function startHarness(opts: { webhookRetryDelaysMs?: number[] } = {
     redis,
     queue,
     vexa: new VexaClient({ baseUrl: vexa.baseUrl, apiKey: vexa.apiKey }),
-    transcription: new VexaNativeProvider(),
-    log: silentLogger,
+    transcription: opts.transcription ?? new VexaNativeProvider(),
+    log: opts.log ?? silentLogger,
     webhookRetryDelaysMs: opts.webhookRetryDelaysMs ?? [0, 100, 200],
   });
   const { key, webhookSecret } = await createApiKey(ctx, "demo");

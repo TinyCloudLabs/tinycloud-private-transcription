@@ -8,6 +8,7 @@ import { adaptVexaSegments, completionReasonOf } from "../providers/vexa/adapter
 import type { VexaRecording, VexaTranscriptionResponse } from "../providers/vexa/types.ts";
 import { toVexaPlatform } from "../providers/vexa/platform-map.ts";
 import type { AudioBlob } from "../providers/transcription/types.ts";
+import { VexaNativeProvider } from "../providers/transcription/vexa-native.ts";
 import { failMeeting, getMeetingById, storeTranscript, transition } from "../services/meetings.ts";
 import { enqueueMeetingWebhook } from "../webhooks/dispatcher.ts";
 import { eq } from "drizzle-orm";
@@ -29,6 +30,9 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
       meeting_url: meeting.meetingUrl,
       bot_name: meeting.botName ?? undefined,
       language: meeting.language ?? undefined,
+      // Batch providers (Tinfoil) transcribe the persisted recording: ask for it explicitly (Vexa's
+      // default is true, but a deployment can flip RECORDING_ENABLED off).
+      ...(needsRecording(ctx) ? { recording_enabled: true } : {}),
     });
     const vexaNativeMeetingId = created.native_meeting_id ?? meeting.vexaNativeMeetingId;
     const { meeting: updated, changed } = await transition(ctx, meeting, "joining", {
@@ -118,14 +122,34 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
   await finalize(ctx, meeting, vexa, segments);
 }
 
+/** True for providers that transcribe persisted audio (anything but the WhisperLive passthrough). */
+const needsRecording = (ctx: AppContext) => ctx.transcription.name !== "vexa";
+
 async function finalize(ctx: AppContext, meeting: MeetingRow, vexa: VexaTranscriptionResponse, vexaSegments: ReturnType<typeof adaptVexaSegments>) {
   try {
-    const transcript = await ctx.transcription.transcribe({
+    let audioMissing = false;
+    const input = {
       meetingId: meeting.id,
       language: meeting.language,
       vexaSegments,
-      fetchAudio: () => fetchVexaAudio(ctx, vexa),
-    });
+      fetchAudio: async () => {
+        const audio = await fetchVexaAudio(ctx, vexa);
+        if (!audio) audioMissing = true;
+        return audio;
+      },
+    };
+    let transcript;
+    try {
+      transcript = await ctx.transcription.transcribe(input);
+      ctx.log.info("transcript finalized", { meetingId: meeting.id, provider: ctx.transcription.name, segments: transcript.segments.length });
+    } catch (e) {
+      // No usable recording (none persisted, or the known silent-tap capture — docs/vexa-findings.md):
+      // the batch provider cannot run, but Vexa's live segments are still a valid transcript.
+      if (!(audioMissing && needsRecording(ctx) && vexaSegments.length > 0)) throw e;
+      ctx.log.warn("no usable recording; falling back to vexa-native transcript", { meetingId: meeting.id, provider: ctx.transcription.name, error: String(e) });
+      transcript = await new VexaNativeProvider().transcribe(input);
+      ctx.log.info("transcript finalized", { meetingId: meeting.id, provider: "vexa", fallback_from: ctx.transcription.name, segments: transcript.segments.length });
+    }
     await storeTranscript(ctx, meeting.id, transcript);
     const { meeting: done } = await transition(ctx, meeting, "completed");
     await enqueueMeetingWebhook(ctx, done, "meeting.completed");

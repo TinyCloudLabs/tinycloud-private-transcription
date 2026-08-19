@@ -13,6 +13,9 @@
  *
  * Env: VEXA_BASE_URL (http://localhost:18066) VEXA_API_KEY (minted via admin-api if unset)
  *      JITSI_BASE_URL (https://jitsi.local:8443) JITSI_HOST_IP (127.0.0.1) E2E_ALICE_SECONDS (75) E2E_TIMEOUT_S (300)
+ *      TRANSCRIPTION_PROVIDER (vexa|tinfoil, from .env) + TINFOIL_* — with `tinfoil` the worker downloads the Vexa
+ *      recording and sends it to Tinfoil (ONE live call, ~30-45 s of audio); if the recording is unusable (silent
+ *      tap) it falls back to the Vexa-native transcript. Which path ran is recorded in evidence.transcription.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -22,9 +25,9 @@ import { createApiKey } from "../../src/api/auth.ts";
 import { config as baseConfig } from "../../src/config.ts";
 import { createContext, type AppContext } from "../../src/context.ts";
 import { runMigrations } from "../../src/db/migrate.ts";
-import { logger } from "../../src/log.ts";
+import { logger, type Logger } from "../../src/log.ts";
 import { VexaClient, VexaHttpError } from "../../src/providers/vexa/client.ts";
-import { VexaNativeProvider } from "../../src/providers/transcription/vexa-native.ts";
+import { createTranscriptionProvider } from "../../src/providers/transcription/index.ts";
 import { verifyWebhookSignature } from "../../src/webhooks/signature.ts";
 import { Queue } from "../../src/worker/queue.ts";
 import { startWorker, type WorkerHandle } from "../../src/worker/index.ts";
@@ -67,7 +70,14 @@ describe.skipIf(!E2E)("E2E happy path against the real capture rig", () => {
   let meetingId: string;
   let alice: Promise<void> | null = null;
   const aliceLog: string[] = [];
-  const evidence: Record<string, unknown> = { room: ROOM, native_meeting_id: NATIVE_ID, statuses: [] as string[] };
+  const evidence: Record<string, unknown> = { room: ROOM, native_meeting_id: NATIVE_ID, provider: baseConfig.transcriptionProvider, statuses: [] as string[] };
+  // Worker log lines about transcription (which provider finalized, fallback, silent recording) → evidence.
+  const workerLogs: { level: string; msg: string; data?: Record<string, unknown> }[] = [];
+  const tap = (level: keyof Logger) => (msg: string, data?: Record<string, unknown>) => {
+    if (/transcri|recording/i.test(msg)) workerLogs.push({ level, msg, data });
+    logger[level](msg, data);
+  };
+  const log2: Logger = { debug: tap("debug"), info: tap("info"), warn: tap("warn"), error: tap("error") };
 
   const api = async (path: string, init: RequestInit & { json?: unknown } = {}) => {
     const { json, ...rest } = init;
@@ -87,12 +97,13 @@ describe.skipIf(!E2E)("E2E happy path against the real capture rig", () => {
     if (!jitsiOk) throw new Error(`Jitsi not reachable (${jitsiProbe}) — see infra/README.md`);
 
     const vexaKey = process.env.VEXA_API_KEY || (await mintVexaApiKey());
-    const config = { ...baseConfig, vexa: { baseUrl: VEXA_URL, apiKey: vexaKey, pollIntervalMs: 3000 }, transcriptionProvider: "vexa" as const };
+    const config = { ...baseConfig, vexa: { baseUrl: VEXA_URL, apiKey: vexaKey, pollIntervalMs: 3000 } };
+    if (config.transcriptionProvider === "tinfoil" && !config.tinfoil.apiKey) throw new Error("TRANSCRIPTION_PROVIDER=tinfoil needs TINFOIL_API_KEY");
     const db = await runMigrations(config.databaseUrl);
     const redis = new RedisClient(config.redisUrl);
     const queue = new Queue(redis, `e2e:${crypto.randomUUID()}`);
     vexa = new VexaClient({ baseUrl: VEXA_URL, apiKey: vexaKey });
-    ctx = createContext({ config, db, redis, queue, vexa, transcription: new VexaNativeProvider(), log: logger });
+    ctx = createContext({ config, db, redis, queue, vexa, transcription: createTranscriptionProvider(config), log: log2 });
     ({ key: apiKey, webhookSecret } = await createApiKey(ctx, `e2e-${ROOM}`));
 
     server = Bun.serve({ port: 0, fetch: createApp(ctx).fetch });
@@ -107,7 +118,7 @@ describe.skipIf(!E2E)("E2E happy path against the real capture rig", () => {
     });
     webhookUrl = `http://127.0.0.1:${receiver.port}/hook`;
     worker = startWorker(ctx, { popTimeoutSec: 1 });
-    log(`api=${apiUrl} vexa=${VEXA_URL} room=${JITSI}/${ROOM}`);
+    log(`api=${apiUrl} vexa=${VEXA_URL} room=${JITSI}/${ROOM} provider=${config.transcriptionProvider}`);
   }, 60_000);
 
   afterAll(async () => {
@@ -192,6 +203,11 @@ describe.skipIf(!E2E)("E2E happy path against the real capture rig", () => {
       expect(s.end).toBeGreaterThanOrEqual(s.start);
     }
     expect(tr.duration_seconds).toBeGreaterThan(0);
+    const finalized = workerLogs.find((l) => l.msg === "transcript finalized");
+    const path = finalized?.data?.fallback_from ? `fallback:${finalized.data.fallback_from}→vexa` : String(finalized?.data?.provider ?? "unknown");
+    evidence.transcription = { path, worker_logs: workerLogs };
+    log(`transcription path: ${path}`);
+    expect(finalized).toBeDefined();
   });
 
   test("meeting.completed webhook delivered with valid X-Webhook-Signature", async () => {

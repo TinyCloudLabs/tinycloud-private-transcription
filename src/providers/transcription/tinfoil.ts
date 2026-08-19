@@ -9,14 +9,23 @@ export interface TinfoilOptions {
   model: string;
   timeoutMs?: number;
   fetch?: typeof fetch;
+  /**
+   * OpenAI `response_format`. Verified live (2026-08-18): Tinfoil answers 400
+   * "Currently do not support verbose_json for voxtral-small-24b", and `json` returns
+   * `{text, usage:{type:"duration",seconds}}` — so `json` is the default; `segments[]`/`duration`
+   * are still honoured when a model returns them (verbose_json-capable models).
+   */
+  responseFormat?: "json" | "verbose_json";
 }
 
-/** OpenAI-compatible `verbose_json` response from POST /v1/audio/transcriptions. */
+/** OpenAI-compatible response from POST /v1/audio/transcriptions (`json` or `verbose_json`). */
 export interface OpenAIVerboseTranscription {
   text: string;
   language?: string;
   duration?: number;
   segments?: { id?: number; start: number; end: number; text: string }[];
+  /** Tinfoil (`json`): billed audio duration. */
+  usage?: { type?: string; seconds?: number };
 }
 
 /**
@@ -38,7 +47,7 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     }
     const form = new FormData();
     form.set("model", this.opts.model);
-    form.set("response_format", "verbose_json");
+    form.set("response_format", this.opts.responseFormat ?? "json");
     if (input.language) form.set("language", input.language);
     form.set("file", new Blob([audio.bytes as unknown as ArrayBuffer], { type: audio.contentType }), audio.filename);
 
@@ -61,10 +70,15 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
       throw new ApiError("provider_unavailable", "Transcription provider is unavailable");
     }
     if (!res.ok) {
-      throw new ApiError("transcription_failed", "Transcription provider rejected the request");
+      const detail = (await res.text().catch(() => "")).slice(0, 300);
+      throw new ApiError("transcription_failed", `Transcription provider rejected the request (HTTP ${res.status}${detail ? `: ${detail}` : ""})`);
     }
     const body = (await res.json()) as OpenAIVerboseTranscription;
-    const segs = body.segments?.length ? body.segments : [{ start: 0, end: body.duration ?? 0, text: body.text }];
+    // Without word/segment timestamps (voxtral `json`) the whole transcript is one segment spanning the
+    // audio; its speaker is whoever Vexa heard the most. Duration: provider's, else Vexa's last segment end.
+    const vexaEnd = input.vexaSegments.reduce((m, s) => Math.max(m, s.end), 0);
+    const duration = body.duration ?? body.usage?.seconds ?? vexaEnd;
+    const segs = body.segments?.length ? body.segments : [{ start: 0, end: duration, text: body.text }];
     const raw: RawSegment[] = segs.map((s) => ({
       start: s.start,
       end: s.end,
