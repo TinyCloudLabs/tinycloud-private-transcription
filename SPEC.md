@@ -35,12 +35,12 @@ States: `queued → joining → waiting_for_admission → in_progress → proces
 `POST /v1/meetings/{id}/stop` → idempotent, returns `{id,status}`.
 `GET /v1/meetings/{id}/transcript` → 202 `{meeting_id,status}` until complete; then
 ```json
-{"meeting_id":"…","status":"completed","language":"en","duration_seconds":0,
+{"meeting_id":"…","status":"completed","language":"en","duration_seconds":0,"provider":"tinfoil",
  "speakers":[{"id":"speaker_0","name":"Alice"}],
  "segments":[{"id":"seg_001","speaker_id":"speaker_0","speaker_name":"Alice","start":0.0,"end":3.2,"text":"…"}],
  "text":"Alice: …","created_at":"…"}
 ```
-`speaker_id` is stable within a meeting only. `DELETE /v1/meetings/{id}` removes our record + transcript and the Vexa meeting.
+`speaker_id` is stable within a meeting only. `provider` is which engine produced the words: `"tinfoil"` (confidential batch path, per speaker turn) or `"vexa"` (WhisperLive passthrough, or the fallback when the recording is unusable). `DELETE /v1/meetings/{id}` removes our record + transcript and the Vexa meeting.
 `GET /health` → `{status:"ok"}` (internally check Postgres, Redis, Vexa, bot capacity; Tinfoil outage must not block recording — retry in `processing`).
 
 Errors: `{"error":{"type":"meeting_join_failed","code":"waiting_room_timeout","message":"…"}}`. Codes: invalid_meeting_url, unsupported_platform, meeting_not_found, meeting_join_failed, waiting_room_timeout, bot_removed, meeting_ended, capture_failed, transcription_failed, provider_timeout, provider_unavailable, internal_error. Never leak Vexa errors raw.
@@ -51,7 +51,7 @@ Webhook event: `{"id":"evt_…","type":"meeting.completed","created_at":"…","d
 
 ## Persistence (Postgres)
 `meetings(id, project_id, meeting_url, platform, status, bot_name, vexa_native_meeting_id, vexa_bot_id, created_at, started_at, ended_at, completed_at, metadata, error_code, error_message, idempotency_key)`
-`transcripts(meeting_id, language, duration_seconds, segments_json, created_at)`
+`transcripts(meeting_id, language, duration_seconds, segments_json, provider, created_at)`
 `webhook_deliveries(id, meeting_id, event_type, endpoint, attempt, status, response_code, created_at)`
 `api_keys(id, project_id, key_hash, scopes, created_at)`
 
