@@ -7,9 +7,10 @@
  *
  * Flow: mint API key → POST /v1/meetings (random Jitsi room, webhook_url → local receiver) → Alice
  * (Playwright fake participant, fixtures/alice.wav: "The quick brown fox jumps over the lazy dog. Hello
- * from Alice.") joins and talks → wait until Vexa has heard "brown fox" → POST /stop → wait for
- * `completed` → assert transcript (speaker Alice, "brown fox", non-empty text) + signed
- * meeting.completed webhook → DELETE → our 404; Vexa row outcome recorded (v0.12 keeps bot-owned rows: 409).
+ * from Alice.") joins and talks → wait until Vexa has heard "brown fox" → Alice leaves with no Stop
+ * call → Vexa completes as `left_alone` → TinyCloud reaches `completed` → assert transcript (speaker
+ * Alice, "brown fox", non-empty text), zero running capacity, and signed meeting.completed webhook →
+ * DELETE → our 404; Vexa row outcome recorded (v0.12 keeps bot-owned rows: 409).
  *
  * Env: VEXA_BASE_URL (http://localhost:18066) VEXA_API_KEY (minted via admin-api if unset)
  *      JITSI_BASE_URL (https://jitsi.local:8443) JITSI_HOST_IP (127.0.0.1) E2E_ALICE_SECONDS (75) E2E_TIMEOUT_S (300)
@@ -171,16 +172,15 @@ describe.skipIf(!E2E)("E2E happy path against the real capture rig", () => {
     expect(t.status).toBe(202); // not ready while live
   }, TIMEOUT_S * 1000);
 
-  test("Vexa hears 'brown fox' → POST /stop → completed", async () => {
+  test("Vexa hears 'brown fox'; after Alice leaves, automatic_leave completes TinyCloud without POST /stop", async () => {
     await waitFor(async () => {
       const tr = await vexa.getTranscript("jitsi", NATIVE_ID).catch(() => null);
       const segs = tr?.segments ?? [];
       if (segs.length) log(`vexa transcript: ${segs.length} segment(s); latest: ${JSON.stringify(segs.at(-1)).slice(0, 160)}`);
       return segs.some((s) => /brown fox/i.test(s.text) && s.completed !== false) ? tr : null;
     }, "'brown fox' in Vexa transcript", TIMEOUT_S * 1000, 5000);
-    const r = await api(`/v1/meetings/${meetingId}/stop`, { method: "POST" });
-    log(`POST /stop → ${r.status} ${await r.text()}`);
-    expect(r.status).toBe(200);
+    await alice;
+    log("Alice left; waiting for Vexa automatic_leave completion without POST /stop");
     const statuses = evidence.statuses as string[];
     const done = await waitFor(async () => {
       const b = (await (await api(`/v1/meetings/${meetingId}`)).json()) as any;
@@ -190,8 +190,15 @@ describe.skipIf(!E2E)("E2E happy path against the real capture rig", () => {
     }, "completed", 120_000);
     evidence.final_meeting = done;
     expect(done.completed_at).toBeTruthy();
+    const vexaMeeting = await vexa.getTranscript("jitsi", NATIVE_ID);
+    expect(vexaMeeting.status).toBe("completed");
+    expect(vexaMeeting.data?.completion_reason).toBe("left_alone");
+    evidence.vexa_completion = { status: vexaMeeting.status, reason: vexaMeeting.data?.completion_reason };
+    const health = await (await fetch(`${apiUrl}/health`)).json() as any;
+    expect(health.checks.bot_capacity.running).toBe(0);
+    evidence.health_after_completion = health;
     log(`statuses: ${statuses.join(" → ")}`);
-  }, TIMEOUT_S * 1000);
+  }, (TIMEOUT_S + ALICE_SECONDS / 2) * 1000);
 
   test("GET /transcript: Alice, 'brown fox', non-empty text, meeting-relative timing", async () => {
     const r = await api(`/v1/meetings/${meetingId}/transcript`);
