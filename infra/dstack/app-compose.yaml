@@ -20,7 +20,7 @@
 services:
   # ─── ours ────────────────────────────────────────────────────────────────────────────────────
   api:
-    image: ${PTX_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription:v1}
+    image: ${PTX_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:v1}
     # VEXA_API_KEY is minted at first boot by `vexa-provision` (below) into a shared volume.
     command: ["sh", "-c", "while [ ! -s /run/vexa/api-key ]; do sleep 2; done; export VEXA_API_KEY=$(cat /run/vexa/api-key); exec bun run src/api/server.ts"]
     restart: unless-stopped
@@ -49,7 +49,7 @@ services:
     networks: [ptx, vexa]
 
   worker:
-    image: ${PTX_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription:v1}
+    image: ${PTX_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:v1}
     command: ["sh", "-c", "while [ ! -s /run/vexa/api-key ]; do sleep 2; done; export VEXA_API_KEY=$(cat /run/vexa/api-key); exec bun run src/worker/index.ts"]
     restart: unless-stopped
     environment:

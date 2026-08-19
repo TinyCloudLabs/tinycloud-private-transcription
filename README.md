@@ -212,22 +212,25 @@ If the docker.sock bind is ever refused by the platform, the alternative is Vexa
 **Workspace.** Deploy from a Phala Cloud workspace you control (`phala switch <profile>` and confirm with
 `phala status` before touching anything); the examples below use a CVM named `ptx-dev`.
 
-**Image.** The api/worker image is `ghcr.io/tinycloudlabs/tinycloud-private-transcription` (`:<git sha>`
+**Image.** The api/worker image is `ghcr.io/tinycloudlabs/tinycloud-private-transcription/api` (`:<git sha>`
 immutable, `:v1` moving on feat/v1 + main, `:latest` on main), built for linux/amd64 and pushed by the
 GitHub Actions workflow `.github/workflows/publish-image.yml` on every push to `feat/v1` / `main` that touches
 the Dockerfile, `src/`, or the lockfile (or `gh workflow run publish-image.yml`). It authenticates with the
 workflow's `GITHUB_TOKEN` (`packages: write`); watch it with `gh run watch` and take the digest from the run
-summary. Pin `PTX_IMAGE=ghcr.io/tinycloudlabs/tinycloud-private-transcription:<sha>` (or `:v1`) in
-`infra/dstack/.env`.
+summary. Pin `PTX_IMAGE=ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:<sha>` (or `:v1`) in
+`infra/dstack/.env`. (The older package `ghcr.io/tinycloudlabs/tinycloud-private-transcription` — no `/api`
+suffix — was created while the repo was private, is stuck private, and is deprecated; nothing pushes to it.)
 
 The CVM must be able to pull that image. dstack's pre-launch script runs `docker image prune -af` on every
 boot and `docker compose pull` before `up`, so a pre-pulled image does not survive an update — the registry
 itself has to be reachable. Two options:
 
-1. **Public package (preferred).** A GHCR package created by a workflow inherits the repository's visibility
-   at creation time; if it was created while the repo was private there is no REST endpoint to change it,
-   so flip it once in the UI: GitHub → org TinyCloudLabs → Packages → `tinycloud-private-transcription` →
-   Package settings → Danger Zone → Change visibility → Public. Verify with `sudo docker logout ghcr.io && sudo docker pull ghcr.io/tinycloudlabs/tinycloud-private-transcription:v1`.
+1. **Public package (preferred, current setup).** A GHCR package created by a workflow inherits the repository's
+   visibility at creation time (the `org.opencontainers.image.source` label links it to the repo). The `/api`
+   package was created after the repo went public and is public; if it ever ends up private there is no REST
+   endpoint to change it — flip it once in the UI: GitHub → org TinyCloudLabs → Packages →
+   `tinycloud-private-transcription/api` → Package settings → Danger Zone → Change visibility → Public. Verify
+   with `sudo docker logout ghcr.io && sudo docker manifest inspect ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:v1`.
 2. **Sealed pull credentials.** Add `DSTACK_DOCKER_REGISTRY=ghcr.io`, `DSTACK_DOCKER_USERNAME=<github user>`,
    `DSTACK_DOCKER_PASSWORD=<PAT with read:packages only>` to `infra/dstack/.env`; the pre-launch script does
    `docker login ghcr.io` with them before pulling. Do not use a broad-scope OAuth/PAT here.
