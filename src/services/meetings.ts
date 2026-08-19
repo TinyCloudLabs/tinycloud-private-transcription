@@ -128,19 +128,12 @@ export async function failMeeting(ctx: AppContext, meeting: MeetingRow, code: Er
   return transition(ctx, meeting, "failed", { errorCode: code, errorMessage: message });
 }
 
-export async function storeTranscript(ctx: AppContext, meetingId: string, t: NormalizedTranscript) {
+export async function storeTranscript(ctx: AppContext, meetingId: string, t: NormalizedTranscript, provider: string) {
+  const row = { language: t.language, durationSeconds: t.duration_seconds, segmentsJson: { speakers: t.speakers, segments: t.segments, text: t.text }, provider };
   await ctx.db
     .insert(transcripts)
-    .values({
-      meetingId,
-      language: t.language,
-      durationSeconds: t.duration_seconds,
-      segmentsJson: { speakers: t.speakers, segments: t.segments, text: t.text },
-    })
-    .onConflictDoUpdate({
-      target: transcripts.meetingId,
-      set: { language: t.language, durationSeconds: t.duration_seconds, segmentsJson: { speakers: t.speakers, segments: t.segments, text: t.text } },
-    });
+    .values({ meetingId, ...row })
+    .onConflictDoUpdate({ target: transcripts.meetingId, set: row });
 }
 
 /** Idempotent stop: cancels before admission, otherwise asks Vexa to leave and moves to processing. */
@@ -226,6 +219,7 @@ export function serializeTranscript(m: MeetingRow, t: TranscriptRow) {
     status: "completed",
     language: t.language,
     duration_seconds: t.durationSeconds,
+    provider: t.provider,
     speakers: body.speakers,
     segments: body.segments,
     text: body.text,

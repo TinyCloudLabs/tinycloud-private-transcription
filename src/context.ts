@@ -23,14 +23,15 @@ export const DEFAULT_WEBHOOK_RETRY_DELAYS_MS = [0, 60_000, 5 * 60_000, 30 * 60_0
 export function createContext(overrides: Partial<AppContext> & { config?: Config } = {}): AppContext {
   const cfg = overrides.config ?? defaultConfig;
   const redis = overrides.redis ?? new RedisClient(cfg.redisUrl);
+  const log = overrides.log ?? logger;
   return {
     config: cfg,
     db: overrides.db ?? createDb(cfg.databaseUrl),
     redis,
     queue: overrides.queue ?? new Queue(redis),
     vexa: overrides.vexa ?? new VexaClient({ baseUrl: cfg.vexa.baseUrl, apiKey: cfg.vexa.apiKey }),
-    transcription: overrides.transcription ?? createTranscriptionProvider(cfg),
-    log: overrides.log ?? logger,
+    transcription: overrides.transcription ?? createTranscriptionProvider(cfg, log),
+    log,
     webhookRetryDelaysMs: overrides.webhookRetryDelaysMs ?? DEFAULT_WEBHOOK_RETRY_DELAYS_MS,
   };
 }

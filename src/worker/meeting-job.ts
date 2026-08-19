@@ -7,7 +7,7 @@ import { VexaHttpError } from "../providers/vexa/client.ts";
 import { adaptVexaSegments, completionReasonOf } from "../providers/vexa/adapter.ts";
 import type { VexaRecording, VexaTranscriptionResponse } from "../providers/vexa/types.ts";
 import { toVexaPlatform } from "../providers/vexa/platform-map.ts";
-import type { AudioBlob } from "../providers/transcription/types.ts";
+import { TranscriptionFallbackError, type AudioBlob } from "../providers/transcription/types.ts";
 import { VexaNativeProvider } from "../providers/transcription/vexa-native.ts";
 import { failMeeting, getMeetingById, storeTranscript, transition } from "../services/meetings.ts";
 import { enqueueMeetingWebhook } from "../webhooks/dispatcher.ts";
@@ -126,31 +126,51 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
 const needsRecording = (ctx: AppContext) => ctx.transcription.name !== "vexa";
 
 async function finalize(ctx: AppContext, meeting: MeetingRow, vexa: VexaTranscriptionResponse, vexaSegments: ReturnType<typeof adaptVexaSegments>) {
+  const primary = ctx.transcription.name;
+  let audioMissing = false;
+  const input = {
+    meetingId: meeting.id,
+    language: meeting.language,
+    vexaSegments,
+    fetchAudio: async () => {
+      const audio = await fetchVexaAudio(ctx, vexa);
+      if (!audio) audioMissing = true;
+      return audio;
+    },
+  };
+  // Vexa's live segments are always a valid transcript: a batch provider that cannot run (no/silent
+  // recording, most turns failed, provider outage after our retries) degrades to them instead of failing.
+  const canFallback = () => needsRecording(ctx) && vexaSegments.length > 0;
+  const fallback = async (reason: string, error: unknown) => {
+    ctx.log.warn("falling back to vexa-native transcript", { meetingId: meeting.id, provider: primary, reason, error: String(error) });
+    const transcript = await new VexaNativeProvider().transcribe(input);
+    ctx.log.info("transcript finalized", { meetingId: meeting.id, provider: "vexa", fallback_from: primary, fallback_reason: reason, segments: transcript.segments.length });
+    return transcript;
+  };
   try {
-    let audioMissing = false;
-    const input = {
-      meetingId: meeting.id,
-      language: meeting.language,
-      vexaSegments,
-      fetchAudio: async () => {
-        const audio = await fetchVexaAudio(ctx, vexa);
-        if (!audio) audioMissing = true;
-        return audio;
-      },
-    };
     let transcript;
+    let provider = primary;
     try {
       transcript = await ctx.transcription.transcribe(input);
-      ctx.log.info("transcript finalized", { meetingId: meeting.id, provider: ctx.transcription.name, segments: transcript.segments.length });
+      const stats = (ctx.transcription as { lastStats?: Record<string, unknown> }).lastStats;
+      ctx.log.info("transcript finalized", { meetingId: meeting.id, provider, segments: transcript.segments.length, ...(stats ? { stats } : {}) });
     } catch (e) {
-      // No usable recording (none persisted, or the known silent-tap capture — docs/vexa-findings.md):
-      // the batch provider cannot run, but Vexa's live segments are still a valid transcript.
-      if (!(audioMissing && needsRecording(ctx) && vexaSegments.length > 0)) throw e;
-      ctx.log.warn("no usable recording; falling back to vexa-native transcript", { meetingId: meeting.id, provider: ctx.transcription.name, error: String(e) });
-      transcript = await new VexaNativeProvider().transcribe(input);
-      ctx.log.info("transcript finalized", { meetingId: meeting.id, provider: "vexa", fallback_from: ctx.transcription.name, segments: transcript.segments.length });
+      const retryable = e instanceof ApiError && (e.code === "provider_unavailable" || e.code === "provider_timeout");
+      const attempts = meeting.transcriptionAttempts + 1;
+      if (retryable && attempts < MAX_TRANSCRIPTION_ATTEMPTS) throw e; // retried below
+      if (!canFallback()) throw e;
+      if (audioMissing) {
+        transcript = await fallback("no_usable_recording", e);
+      } else if (e instanceof TranscriptionFallbackError) {
+        transcript = await fallback(e.reason, e);
+      } else if (retryable) {
+        transcript = await fallback("provider_unavailable_after_retries", e);
+      } else {
+        throw e;
+      }
+      provider = "vexa";
     }
-    await storeTranscript(ctx, meeting.id, transcript);
+    await storeTranscript(ctx, meeting.id, transcript, provider);
     const { meeting: done } = await transition(ctx, meeting, "completed");
     await enqueueMeetingWebhook(ctx, done, "meeting.completed");
   } catch (e) {

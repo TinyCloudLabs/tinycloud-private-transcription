@@ -56,7 +56,7 @@ describe("TinfoilTranscriptionProvider (mock server)", () => {
   afterAll(() => server.stop(true));
 
   const provider = () =>
-    new TinfoilTranscriptionProvider({ baseUrl: `http://127.0.0.1:${server.port}`, apiKey: "tk_test", model: "voxtral-small-24b" });
+    new TinfoilTranscriptionProvider({ baseUrl: `http://127.0.0.1:${server.port}`, apiKey: "tk_test", model: "voxtral-small-24b", segmentation: "whole" });
   const audio = async () => ({ bytes: new Uint8Array([82, 73, 70, 70, 0, 0, 0, 0]), filename: "meeting.wav", contentType: "audio/wav" });
 
   test("posts multipart audio (response_format=json by default) and honours segments when returned", async () => {
@@ -94,6 +94,6 @@ describe("TinfoilTranscriptionProvider (mock server)", () => {
 });
 
 test("provider selection by env", () => {
-  expect(createTranscriptionProvider({ transcriptionProvider: "vexa", tinfoil: { baseUrl: "", apiKey: "", model: "" } }).name).toBe("vexa");
-  expect(createTranscriptionProvider({ transcriptionProvider: "tinfoil", tinfoil: { baseUrl: "x", apiKey: "", model: "m" } }).name).toBe("tinfoil");
+  expect(createTranscriptionProvider({ transcriptionProvider: "vexa", tinfoil: { baseUrl: "", apiKey: "", model: "", segmentation: "turns" } }).name).toBe("vexa");
+  expect(createTranscriptionProvider({ transcriptionProvider: "tinfoil", tinfoil: { baseUrl: "x", apiKey: "", model: "m", segmentation: "whole" } }).name).toBe("tinfoil");
 });

@@ -49,7 +49,8 @@ describe("tinfoil provider without a usable recording", () => {
     await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${id}`)).json()).status === "completed" ? true : null), { label: "completed" });
     const t = await (await h.api(`/v1/meetings/${id}/transcript`)).json();
     expect(t.text).toBe("Alice: The quick brown fox jumps over the lazy dog.");
-    expect(logs.find((l) => l.msg === "no usable recording; falling back to vexa-native transcript")).toMatchObject({ level: "warn", data: { meetingId: id, provider: "tinfoil" } });
+    expect(logs.find((l) => l.msg === "falling back to vexa-native transcript")).toMatchObject({ level: "warn", data: { meetingId: id, provider: "tinfoil", reason: "no_usable_recording" } });
+    expect(t.provider).toBe("vexa");
     expect(logs.find((l) => l.msg === "transcript finalized")).toMatchObject({ data: { provider: "vexa", fallback_from: "tinfoil" } });
     await h.waitFor(async () => h.webhook.received.find((w) => w.body.type === "meeting.completed" && w.body.data.meeting_id === id) ?? null);
   });
