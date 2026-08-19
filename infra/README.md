@@ -32,13 +32,16 @@ infra/
 * Transcription: Vexa treats STT as an external OpenAI-compatible service. We run
   `fedirz/faster-whisper-server:latest-cpu` (`Systran/faster-whisper-small.en`) as `whisper` on the vexa
   network; the bot posts audio to `http://whisper:8000/v1/audio/transcriptions`.
+* Dev PKI is generated per checkout by `infra/certs/gen.sh` (outputs in `infra/certs/out/`, gitignored, as is
+  the `ca.crt` copy under `infra/vexa/bot/`). No CA or leaf key is in the repo or its history; every clone
+  gets its own untrusted-by-design CA, so rebuild `ptx/vexa-bot:v012-devca` after regenerating.
 * Gateway host port is **18066** (upstream default 18056 is taken by the API branch's mock Vexa).
 
 ## Bring-up (exact commands, from the repo root)
 
 ```bash
 # 0. one-time
-./infra/certs/gen.sh                                    # dev CA + jitsi.local leaf
+./infra/certs/gen.sh                                    # dev CA + jitsi.local leaf (per-checkout, throwaway; never committed)
 cp infra/certs/out/ca.crt infra/vexa/bot/ca.crt
 sudo docker build -t ptx/vexa-bot:v012-devca infra/vexa/bot   # derived bot image (pulls vexaai/vexa-bot:v012, ~1.6 GB)
 git submodule update --init infra/vexa/upstream         # pinned Vexa checkout (compose files only are used)
