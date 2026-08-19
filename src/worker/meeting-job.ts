@@ -42,6 +42,9 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
     });
     if (changed) {
       await ctx.queue.push({ type: "meeting.poll", meetingId }, ctx.config.vexa.pollIntervalMs);
+      // Worker-side join deadline: Vexa's own awaiting_admission timeout is opaque; without this a
+      // never-admitted bot leaves the meeting in joining/waiting_for_admission forever.
+      await ctx.queue.push({ type: "meeting.join_deadline", meetingId }, ctx.config.joinTimeoutSeconds * 1000);
     } else if (updated.status === "cancelled" && vexaNativeMeetingId) {
       // Stopped while we were dispatching the bot: don't leave it orphaned in Vexa.
       await ctx.vexa.stopBot(created.platform ?? vexaPlatform, vexaNativeMeetingId).catch(() => {});
@@ -69,6 +72,30 @@ async function handleStartError(ctx: AppContext, meeting: MeetingRow, e: unknown
         : "Meeting capture provider is unavailable.";
   const { meeting: failed } = await failMeeting(ctx, meeting, code, message);
   await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+}
+
+/**
+ * Job: meeting.join_deadline — fires JOIN_TIMEOUT_SECONDS after the bot was dispatched. A meeting
+ * still not admitted by then is failed (waiting_room_timeout when it reached the waiting room,
+ * meeting_join_failed otherwise), its Vexa bot is stopped, and meeting.failed is emitted.
+ */
+export async function handleJoinDeadline(ctx: AppContext, meetingId: string): Promise<void> {
+  const meeting = await getMeetingById(ctx, meetingId);
+  if (!meeting) return;
+  const status = meeting.status as MeetingStatus;
+  if (status !== "joining" && status !== "waiting_for_admission") return;
+  ctx.log.warn("join deadline exceeded; failing meeting", { meetingId, status, joinTimeoutSeconds: ctx.config.joinTimeoutSeconds });
+  if (meeting.vexaPlatform && meeting.vexaNativeMeetingId) {
+    await ctx.vexa.stopBot(meeting.vexaPlatform, meeting.vexaNativeMeetingId).catch((e) => {
+      if (!(e instanceof VexaHttpError && e.notFound)) ctx.log.warn("vexa stopBot failed at join deadline", { meetingId, error: String(e) });
+    });
+  }
+  const f =
+    status === "waiting_for_admission"
+      ? { code: "waiting_room_timeout" as const, message: "The bot was not admitted to the meeting in time." }
+      : { code: "meeting_join_failed" as const, message: "The bot could not join the meeting in time." };
+  const { meeting: failed, changed } = await failMeeting(ctx, meeting, f.code, f.message);
+  if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
 }
 
 /** Job: meeting.poll — sync status from Vexa; finalize when the bot has left. */
@@ -145,9 +172,11 @@ async function finalize(ctx: AppContext, meeting: MeetingRow, vexa: VexaTranscri
   // cannot run (no/silent recording, most turns failed, provider outage after our retries) degrades to them
   // instead of failing the meeting.
   const canFallback = () => needsRecording(ctx);
+  let fallbackInfo: { from: string; reason: string } | null = null;
   const fallback = async (reason: string, error: unknown) => {
     ctx.log.warn("falling back to vexa-native transcript", { meetingId: meeting.id, provider: primary, reason, error: String(error) });
     const transcript = await new VexaNativeProvider().transcribe(input);
+    fallbackInfo = { from: primary, reason };
     ctx.log.info("transcript finalized", { meetingId: meeting.id, provider: "vexa", fallback_from: primary, fallback_reason: reason, segments: transcript.segments.length });
     return transcript;
   };
@@ -174,7 +203,7 @@ async function finalize(ctx: AppContext, meeting: MeetingRow, vexa: VexaTranscri
       }
       provider = "vexa";
     }
-    await storeTranscript(ctx, meeting.id, transcript, provider);
+    await storeTranscript(ctx, meeting.id, transcript, provider, fallbackInfo);
     const { meeting: done } = await transition(ctx, meeting, "completed");
     await enqueueMeetingWebhook(ctx, done, "meeting.completed");
   } catch (e) {

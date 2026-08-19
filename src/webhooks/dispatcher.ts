@@ -2,6 +2,7 @@ import { eq } from "drizzle-orm";
 import type { AppContext } from "../context.ts";
 import { meetings, projects, webhookDeliveries, type MeetingRow } from "../db/schema.ts";
 import { newDeliveryId, newEventId } from "../domain/ids.ts";
+import { getTranscript, transcriptProviderFields } from "../services/meetings.ts";
 import { signWebhookBody, WEBHOOK_SIGNATURE_HEADER } from "./signature.ts";
 
 export type WebhookEventType = "meeting.completed" | "meeting.failed";
@@ -9,6 +10,7 @@ export type WebhookEventType = "meeting.completed" | "meeting.failed";
 /** Builds the event, persists a pending delivery row, and enqueues the first attempt. No-op without webhook_url. */
 export async function enqueueMeetingWebhook(ctx: AppContext, meeting: MeetingRow, type: WebhookEventType) {
   if (!meeting.webhookUrl) return null;
+  const transcript = type === "meeting.completed" ? await getTranscript(ctx, meeting.id) : null;
   const event = {
     id: newEventId(),
     type,
@@ -17,6 +19,7 @@ export async function enqueueMeetingWebhook(ctx: AppContext, meeting: MeetingRow
       meeting_id: meeting.id,
       status: meeting.status,
       metadata: meeting.metadata ?? {},
+      ...(transcript ? transcriptProviderFields(transcript) : {}),
       ...(type === "meeting.failed" && meeting.errorCode
         ? { error: { code: meeting.errorCode, message: meeting.errorMessage ?? "" } }
         : {}),

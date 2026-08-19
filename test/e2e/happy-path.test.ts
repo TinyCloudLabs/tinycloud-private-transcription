@@ -102,7 +102,7 @@ describe.skipIf(!E2E)("E2E happy path against the real capture rig", () => {
     if (!jitsiOk) throw new Error(`Jitsi not reachable (${jitsiProbe}) — see infra/README.md`);
 
     const vexaKey = process.env.VEXA_API_KEY || (await mintVexaApiKey());
-    const config = { ...baseConfig, vexa: { baseUrl: VEXA_URL, apiKey: vexaKey, pollIntervalMs: 3000 } };
+    const config = { ...baseConfig, vexa: { ...baseConfig.vexa, baseUrl: VEXA_URL, apiKey: vexaKey, pollIntervalMs: 3000 } };
     if (config.transcriptionProvider === "tinfoil" && !config.tinfoil.apiKey) throw new Error("TRANSCRIPTION_PROVIDER=tinfoil needs TINFOIL_API_KEY");
     const db = await runMigrations(config.databaseUrl);
     const redis = new RedisClient(config.redisUrl);

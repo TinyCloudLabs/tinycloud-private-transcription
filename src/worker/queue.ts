@@ -3,6 +3,7 @@ import { RedisClient } from "bun";
 export type Job =
   | { type: "meeting.start"; meetingId: string; attempt?: number }
   | { type: "meeting.poll"; meetingId: string }
+  | { type: "meeting.join_deadline"; meetingId: string }
   | { type: "webhook.deliver"; deliveryId: string };
 
 /**

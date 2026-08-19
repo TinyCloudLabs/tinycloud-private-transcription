@@ -46,6 +46,7 @@ describe("health", () => {
     const b = await r.json();
     expect(b.status).toBe("ok");
     expect(b.checks).toMatchObject({ postgres: true, redis: true, vexa: true, transcription_provider: "vexa" });
+    expect(b.checks.bot_capacity).toEqual({ running: expect.any(Number), max: 5 });
   });
 });
 
@@ -57,6 +58,16 @@ describe("validation", () => {
     r = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://example.com/x" } });
     expect(r.status).toBe(400);
     expect((await r.json()).error.code).toBe("unsupported_platform");
+    // zoom is DETECTED but gated: not in ENABLED_PLATFORMS (default "jitsi")
+    r = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://zoom.us/j/84335626851" } });
+    expect(r.status).toBe(400);
+    const gated = (await r.json()).error;
+    expect(gated.code).toBe("unsupported_platform");
+    expect(gated.message).toContain("zoom");
+    expect(gated.message).toContain("not enabled on this deployment");
+    r = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://meet.google.com/abc-defg-hij" } });
+    expect(r.status).toBe(400);
+    expect((await r.json()).error.message).toContain("google_meet");
     r = await h.api("/v1/meetings", { method: "POST", body: "{", headers: { "Content-Type": "application/json" } });
     expect(r.status).toBe(400);
     r = await h.api("/v1/meetings/mtg_doesnotexist");
@@ -126,6 +137,9 @@ describe("happy path: create -> joined -> completed -> transcript + webhook", ()
     expect(body.ended_at).toBeTruthy();
     expect(body.completed_at).toBeTruthy();
     expect(body.transcript).toEqual({ status: "completed" });
+    expect(body.transcript_provider).toBe("vexa");
+    expect(body.fallback_from).toBeUndefined();
+    expect(body.fallback_reason).toBeUndefined();
     expect(body.error).toBeUndefined();
 
     const t = await h.api(`/v1/meetings/${id}/transcript`);
@@ -155,14 +169,18 @@ describe("happy path: create -> joined -> completed -> transcript + webhook", ()
       id: expect.stringMatching(/^evt_/),
       type: "meeting.completed",
       created_at: expect.any(String),
-      data: { meeting_id: id, metadata: { customer: "acme", n: 1 } },
+      data: { meeting_id: id, metadata: { customer: "acme", n: 1 }, transcript_provider: "vexa" },
     });
+    expect(hook.body.data.fallback_from).toBeUndefined();
     expect(hook.headers["x-webhook-event"]).toBe("meeting.completed");
     expect(verifyWebhookSignature(h.webhookSecret, hook.rawBody, hook.headers["x-webhook-signature"])).toBe(true);
     expect(verifyWebhookSignature("wrong", hook.rawBody, hook.headers["x-webhook-signature"])).toBe(false);
 
-    const rows = await h.ctx.db.select().from(webhookDeliveries).where(eq(webhookDeliveries.meetingId, id));
-    expect(rows).toHaveLength(1);
+    // waitFor: the receiver sees the POST a beat before the worker records the delivery result.
+    const rows = await h.waitFor(async () => {
+      const r = await h.ctx.db.select().from(webhookDeliveries).where(eq(webhookDeliveries.meetingId, id));
+      return r.length === 1 && r[0].status === "delivered" ? r : null;
+    }, { label: "delivery row" });
     expect(rows[0]).toMatchObject({ status: "delivered", attempt: 1, responseCode: 200, eventType: "meeting.completed", endpoint: h.webhook.url });
   });
 

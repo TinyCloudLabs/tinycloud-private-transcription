@@ -13,7 +13,17 @@ export function healthRoutes(ctx: AppContext) {
     const core = postgres && redis;
     const status = !core ? "error" : vexa.ok ? "ok" : "degraded";
     return c.json(
-      { status, checks: { postgres, redis, vexa: vexa.ok, bot_capacity: vexa.running_bots, transcription_provider: ctx.transcription.name } },
+      {
+        status,
+        checks: {
+          postgres,
+          redis,
+          vexa: vexa.ok,
+          // running = bots Vexa reports as live (null when Vexa is unreachable); max = provisioned ceiling.
+          bot_capacity: { running: vexa.running_bots, max: ctx.config.vexa.maxConcurrentBots },
+          transcription_provider: ctx.transcription.name,
+        },
+      },
       core ? 200 : 503,
     );
   });

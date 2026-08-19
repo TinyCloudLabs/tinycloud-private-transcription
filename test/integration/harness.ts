@@ -32,12 +32,22 @@ export interface Harness {
   stop: () => Promise<void>;
 }
 
-export async function startHarness(opts: { webhookRetryDelaysMs?: number[]; transcription?: TranscriptionProvider; log?: Logger } = {}): Promise<Harness> {
+export async function startHarness(
+  opts: {
+    webhookRetryDelaysMs?: number[];
+    transcription?: TranscriptionProvider;
+    log?: Logger;
+    enabledPlatforms?: string[];
+    joinTimeoutSeconds?: number;
+  } = {},
+): Promise<Harness> {
   const vexa = startMockVexa(0);
   const config = {
     ...baseConfig,
-    vexa: { baseUrl: vexa.baseUrl, apiKey: vexa.apiKey, pollIntervalMs: 50 },
+    vexa: { ...baseConfig.vexa, baseUrl: vexa.baseUrl, apiKey: vexa.apiKey, pollIntervalMs: 50 },
     transcriptionProvider: (opts.transcription?.name ?? "vexa") as "vexa" | "tinfoil",
+    ...(opts.enabledPlatforms ? { enabledPlatforms: opts.enabledPlatforms } : {}),
+    ...(opts.joinTimeoutSeconds !== undefined ? { joinTimeoutSeconds: opts.joinTimeoutSeconds } : {}),
   };
   const db = await runMigrations(config.databaseUrl);
   await db.execute(sql`truncate table webhook_deliveries, transcripts, meetings, api_keys, projects cascade`);

@@ -53,6 +53,10 @@ export const transcripts = pgTable("transcripts", {
   segmentsJson: jsonb("segments_json").notNull(),
   /** Which provider produced the stored transcript: "vexa" (WhisperLive passthrough / fallback) | "tinfoil". */
   provider: text("provider").notNull().default("vexa"),
+  /** Set when the configured provider fell back to vexa-native: the provider we fell back FROM (e.g. "tinfoil"). */
+  fallbackFrom: text("fallback_from"),
+  /** Why the fallback fired (e.g. "no_usable_recording", "provider_unavailable_after_retries"). */
+  fallbackReason: text("fallback_reason"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 

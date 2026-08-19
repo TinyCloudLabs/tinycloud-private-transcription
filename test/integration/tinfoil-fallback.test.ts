@@ -51,7 +51,20 @@ describe("tinfoil provider without a usable recording", () => {
     expect(t.text).toBe("Alice: The quick brown fox jumps over the lazy dog.");
     expect(logs.find((l) => l.msg === "falling back to vexa-native transcript")).toMatchObject({ level: "warn", data: { meetingId: id, provider: "tinfoil", reason: "no_usable_recording" } });
     expect(t.provider).toBe("vexa");
+    expect(t.fallback_from).toBe("tinfoil");
+    expect(t.fallback_reason).toBe("no_usable_recording");
     expect(logs.find((l) => l.msg === "transcript finalized")).toMatchObject({ data: { provider: "vexa", fallback_from: "tinfoil" } });
-    await h.waitFor(async () => h.webhook.received.find((w) => w.body.type === "meeting.completed" && w.body.data.meeting_id === id) ?? null);
+    const hook = await h.waitFor(async () => h.webhook.received.find((w) => w.body.type === "meeting.completed" && w.body.data.meeting_id === id) ?? null);
+    expect(hook.body.data).toMatchObject({ transcript_provider: "vexa", fallback_from: "tinfoil", fallback_reason: "no_usable_recording" });
+  });
+
+  test("GET /v1/meetings/{id} surfaces the fallback once completed", async () => {
+    const m = await (await h.api(`/v1/meetings/${id}`)).json();
+    expect(m).toMatchObject({
+      status: "completed",
+      transcript_provider: "vexa",
+      fallback_from: "tinfoil",
+      fallback_reason: "no_usable_recording",
+    });
   });
 });
