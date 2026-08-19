@@ -2,6 +2,7 @@
   "name": "tinycloud-private-transcription",
   "version": "0.1.0",
   "private": true,
+  "license": "SEE LICENSE IN LICENSE.md",
   "type": "module",
   "scripts": {
     "api": "bun run src/api/server.ts",
