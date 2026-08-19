@@ -258,7 +258,9 @@ rescans for late tracks; the recording tap did not — so we maintain a fork rat
   (`DynamicElementMixer`): recorder starts immediately (even with zero audio elements) and a 2 s rescan
   (live-mixer parity) attaches new elements / detaches ended ones. Pinned by the module's
   `dynamic-tap.smoke.test.ts`.
-- **Bot image**: `ghcr.io/tinycloudlabs/vexa-bot:tc-<shortsha>` (fork workflow `tinycloud-bot-image`);
+- **Bot image**: `ghcr.io/tinycloudlabs/vexa/bot:tc-<shortsha>` (fork workflow `tinycloud-bot-image`; the older
+  `ghcr.io/tinycloudlabs/vexa-bot` package was created while the fork was private, is stuck private,
+  and is deprecated — nothing pushes to it);
   the rig layers the dev CA on top (`infra/vexa/bot/Dockerfile` → `ptx/vexa-bot:tc-devca`). Control-plane
   images stay upstream `vexaai/v012-*:v012`.
 - **Syncing upstream** (in the fork repo): `git fetch upstream --tags && git checkout main && git merge
@@ -272,10 +274,11 @@ rescans for late tracks; the recording tap did not — so we maintain a fork rat
 (admin-api, runtime, meeting-api, gateway, valkey, postgres, MinIO, CPU whisper) in ONE CVM; only `:8080`
 is published. Bot spawning needs `/var/run/docker.sock` mounted into Vexa's `runtime` (one container per
 bot on the fixed `ptx-vexa` network). A one-shot `vexa-provision` job mints the Vexa API key at first boot.
-`bot-image-keeper` (a no-op container on `vexaai/vexa-bot`) makes compose pull the bot image and pins it:
+`bot-image-keeper` (a no-op container on the fork bot image `ghcr.io/tinycloudlabs/vexa/bot`,
+overridable via `PTX_BOT_IMAGE`) makes compose pull the bot image and pins it:
 Vexa's runtime does `docker create` without pulling, and dstack runs `docker image prune -af` after every
 `compose up`, so without a referencing container the bot image is pruned and every meeting fails with
-`provider_unavailable` ("No such image: vexaai/vexa-bot:v012").
+`provider_unavailable` ("No such image: …/vexa/bot:tc-<sha>").
 If the docker.sock bind is ever refused by the platform, the alternative is Vexa's process backend
 ("Vexa Lite": bot as a sibling service / in-process instead of docker-spawned containers).
 

@@ -10,7 +10,7 @@ infra/
   vexa/upstream/               git submodule → TinyCloudLabs/vexa (OUR FORK) branch `tinycloud` @ pinned SHA (see vexa/UPSTREAM_PIN)
   vexa/vexa.env                compose interpolation env (dev defaults, no real secrets)
   vexa/docker-compose.override.yml  adds CPU faster-whisper on the vexa network
-  vexa/bot/Dockerfile          ghcr.io/tinycloudlabs/vexa-bot:tc-<sha> (fork bot, dynamic record-chunker) + our CA in Chromium's NSS store
+  vexa/bot/Dockerfile          ghcr.io/tinycloudlabs/vexa/bot:tc-<sha> (fork bot, dynamic record-chunker) + our CA in Chromium's NSS store
   vexa/compose.sh              wrapper: upstream compose + our env + overlay
   jitsi/docker-compose.yml     docker-jitsi-meet stable-11146-2 compose, copied verbatim (jitsi/UPSTREAM_PIN)
   jitsi/jitsi.env, jitsi/docker-compose.override.yml, jitsi/compose.sh
@@ -24,7 +24,7 @@ infra/
 * Vexa's bot launches Chromium **without** `--ignore-certificate-errors` (deliberate upstream choice for
   Google Meet bot-detection). Chromium on Linux trusts user certs from `$HOME/.pki/nssdb`; the bot runs
   as root, so `infra/vexa/bot/Dockerfile` derives `ptx/vexa-bot:tc-devca` from OUR FORK's published bot
-  image (`ghcr.io/tinycloudlabs/vexa-bot:tc-<sha>`, branch `tinycloud` — the record-chunker there is
+  image (`ghcr.io/tinycloudlabs/vexa/bot:tc-<sha>`, branch `tinycloud` — the record-chunker there is
   dynamic so late joiners land in master.webm; upstream's was static) and adds the CA there.
   `BROWSER_IMAGE` in `vexa.env` points at it. The control-plane images stay upstream `vexaai/v012-*`.
 * Bots are spawned by Vexa's `runtime` as containers on the compose network `vexa-v012_vexa`. Jitsi's

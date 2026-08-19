@@ -4,13 +4,14 @@
 #   phala deploy -n ptx-dev -c infra/dstack/app-compose.yaml -e infra/dstack/.env -t tdx.large --disk-size 40G
 # Encrypted env (never in this file): POSTGRES_PASSWORD, VEXA_DB_PASSWORD, VEXA_ADMIN_TOKEN,
 # VEXA_INTERNAL_API_SECRET, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD, TINFOIL_API_KEY (optional),
-# TRANSCRIPTION_PROVIDER (vexa|tinfoil), PTX_IMAGE (our api/worker image), VEXA_IMAGE_TAG (v012).
+# TRANSCRIPTION_PROVIDER (vexa|tinfoil), PTX_IMAGE (our api/worker image), VEXA_IMAGE_TAG (v012),
+# PTX_BOT_IMAGE (fork bot image override; defaults to the pinned fork tag below).
 #
 # Vexa services mirror infra/vexa/upstream/deploy/compose/docker-compose.yml @ e0b356d (+ our
 # docker-compose.override.yml whisper service), minus agent-api/mcp/terminal (not needed for V1).
 #
 # BOT SPAWNING NEEDS THE DOCKER SOCKET: Vexa's `runtime` creates one container per meeting bot
-# (BROWSER_IMAGE = vexaai/vexa-bot:v012, ~3.6 GB, Chromium+Xvfb+PulseAudio) through
+# (BROWSER_IMAGE = the fork bot image, ~3.6 GB, Chromium+Xvfb+PulseAudio) through
 # /var/run/docker.sock, on the compose network named below (DOCKER_NETWORK) so the bot resolves
 # meeting-api:8080, redis and whisper:8000. dstack runs docker inside the CVM, so the socket exists;
 # if a given dstack/Phala policy rejects the bind mount, the fallback plan is Vexa's "process backend"
@@ -190,10 +191,10 @@ services:
 
   # Vexa's runtime does `docker create` (no pull) for each bot, so the bot image must already be in the CVM's
   # docker image store — AND dstack runs `docker image prune -af` after every `compose up`, which deletes any
-  # image no container references. This no-op service makes compose pull vexaai/vexa-bot at boot (~1.6 GB
+  # image no container references. This no-op service makes compose pull the fork bot image at boot (~1.6 GB
   # compressed) and its exited container pins the image so the prune keeps it.
   bot-image-keeper:
-    image: vexaai/vexa-bot:${VEXA_IMAGE_TAG:-v012}
+    image: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-2db950b}
     entrypoint: ["/bin/true"]
     restart: "no"
     network_mode: none
@@ -202,7 +203,7 @@ services:
     image: vexaai/v012-runtime:${VEXA_IMAGE_TAG:-v012}
     group_add: ["0"]
     environment:
-      BROWSER_IMAGE: vexaai/vexa-bot:${VEXA_IMAGE_TAG:-v012}
+      BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-2db950b}
       AGENT_IMAGE: vexaai/v012-agent-api:${VEXA_IMAGE_TAG:-v012}
       AGENT_WORKER_IMAGE: vexaai/v012-agent-worker:${VEXA_IMAGE_TAG:-v012}
       REDIS_URL: redis://redis:6379/0
