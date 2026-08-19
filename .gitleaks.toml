@@ -1,0 +1,15 @@
+# gitleaks config for this repo. `gitleaks git . --log-opts=--all` should be clean.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Throwaway dev-only credentials for the local capture rig; not used anywhere reachable."
+paths = [
+  '''infra/jitsi/jitsi.env''',   # docker-jitsi-meet component passwords (ptxdev-*), local XMPP only
+  '''infra/vexa/vexa.env''',     # dev-admin-token etc. for the local Vexa compose stack
+]
+regexes = [
+  '''vxa_mock''',
+  '''tc_live_(xxx|nope|\.\.\.|…)''',
+  '''change[-_]?me''',
+]
