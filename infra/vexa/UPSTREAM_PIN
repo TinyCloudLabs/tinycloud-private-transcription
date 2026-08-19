@@ -1,0 +1,6 @@
+repo=https://github.com/Vexa-ai/vexa
+branch=main
+commit=e0b356d6de3f8322db45d3cb9d66282ae108bebf
+version=v0.12.18-29-ge0b356d6 (release notes call it v0.12.22)
+license=Apache-2.0
+pinned_at=2026-08-17

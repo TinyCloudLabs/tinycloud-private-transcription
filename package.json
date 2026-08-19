@@ -1,0 +1,31 @@
+{
+  "name": "tinycloud-private-transcription",
+  "version": "0.1.0",
+  "private": true,
+  "license": "SEE LICENSE IN LICENSE.md",
+  "type": "module",
+  "scripts": {
+    "api": "bun run src/api/server.ts",
+    "worker": "bun run src/worker/index.ts",
+    "mock-vexa": "bun run src/providers/vexa/mock-server.ts",
+    "cli": "bun run src/cli.ts",
+    "db:migrate": "bun run src/db/migrate.ts",
+    "db:generate": "drizzle-kit generate",
+    "test": "bun test test/unit test/integration",
+    "test:e2e": "E2E=1 bun test test/e2e --timeout 600000",
+    "typecheck": "tsc --noEmit",
+    "fake-participant": "bun run scripts/fake-participant.ts",
+    "vexa:smoke": "bun run scripts/vexa-smoke.ts"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.44.4",
+    "hono": "^4.9.1",
+    "ulid": "^3.0.1"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.20",
+    "drizzle-kit": "^0.31.4",
+    "playwright": "^1.55.0",
+    "typescript": "^5.9.2"
+  }
+}

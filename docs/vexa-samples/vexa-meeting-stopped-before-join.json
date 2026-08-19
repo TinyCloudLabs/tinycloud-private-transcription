@@ -1,0 +1,42 @@
+{
+    "id": 4,
+    "user_id": 1,
+    "platform": "jitsi",
+    "native_meeting_id": "PtxProbeRoomXyz",
+    "constructed_meeting_url": "https://meet.jit.si/PtxProbeRoomXyz",
+    "status": "failed",
+    "bot_container_id": "mtg-4-110eddf0",
+    "start_time": null,
+    "end_time": "2026-08-17T17:15:20.530424Z",
+    "completion_reason": "stopped",
+    "failure_stage": "requested",
+    "shared": false,
+    "created_at": "2026-08-17T17:15:19.828558Z",
+    "updated_at": "2026-08-17T17:15:20.526584Z",
+    "data": {
+        "last_error": {
+            "reason": "stopped by the user at requested (never admitted)",
+            "exit_code": null,
+            "error_details": "Bot exited with code None; reason: stopped by the user at requested (never admitted)"
+        },
+        "failure_stage": "requested",
+        "stop_requested": true,
+        "completion_reason": "stopped",
+        "recording_enabled": true,
+        "segments_captured": 0,
+        "status_transition": [
+            {
+                "to": "failed",
+                "from": null,
+                "reason": "stopped by the user at requested (never admitted)",
+                "source": "runtime_destroy",
+                "timestamp": "2026-08-17T17:15:20.525151Z",
+                "error_details": "Bot exited with code None; reason: stopped by the user at requested (never admitted)",
+                "failure_stage": "requested",
+                "completion_reason": "stopped"
+            }
+        ],
+        "transcribe_enabled": true,
+        "constructed_meeting_url": "https://meet.jit.si/PtxProbeRoomXyz"
+    }
+}

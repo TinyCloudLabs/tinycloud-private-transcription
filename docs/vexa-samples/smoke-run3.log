@@ -1,0 +1,39 @@
+[vexa-smoke 17:13:20] room=https://jitsi.local:8443/ptx-smoke-msxhsvli native_meeting_id=ptx-smoke-msxhsvli@jitsi.local api=http://localhost:18066
+[vexa-smoke 17:13:20] alice: navigating to https://jitsi.local:8443/ptx-smoke-msxhsvli#userInfo.displayName=%22Alice%22&config.prejoinConfig.enabled=false&config.startWithAudioMuted=false&config.startWithVideoMuted=true&config.disableDeepLinking=true
+    at xa (https://jitsi.local:8443/libs/lib-jitsi-meet.m
+[vexa-smoke 17:13:21] alice: local audio muted after join — unmuting
+[vexa-smoke 17:13:22] alice: joined as "Alice" ({"me":"b1a7b8a8","participants":0,"muted":false}); speaking for 90s
+[vexa-smoke 17:13:23] POST /bots → 201 {"id":3,"user_id":1,"platform":"jitsi","native_meeting_id":"ptx-smoke-msxhsvli@jitsi.local","constructed_meeting_url":"https://jitsi.local:8443/ptx-smoke-msxhsvli","status":"requested","bot_container_id":"mtg-3-f419fc54","start_time":null,"end_time":null,"completion_reason":null,"failure_stage":null
+[vexa-smoke 17:13:23] bot status → requested
+[vexa-smoke 17:13:27] alice: … 85s left, remote participants=0
+[vexa-smoke 17:13:28] bot status → joining
+[vexa-smoke 17:13:32] alice: … 80s left, remote participants=1
+[vexa-smoke 17:13:33] bot status → active
+[vexa-smoke 17:13:37] alice: … 75s left, remote participants=1
+[vexa-smoke 17:13:42] alice: … 70s left, remote participants=1
+[vexa-smoke 17:13:47] alice: … 65s left, remote participants=1
+[vexa-smoke 17:13:52] alice: … 60s left, remote participants=1
+[vexa-smoke 17:13:53] transcript: 2 segment(s); latest: {"start":1786986819.905,"end":1786986821.905,"text":"Hello from Alice.","language":"en","speaker":"Alice","completed":true,"segment_id":"turn:0:1","source":"merged","absolute_start_time":"2026-08-17T1
+[vexa-smoke 17:13:53] DELETE /bots → 200 {"status":"stopping","meeting_id":3,"native_meeting_id":"ptx-smoke-msxhsvli@jitsi.local"}
+[vexa-smoke 17:13:53] meeting status → stopping
+[vexa-smoke 17:13:57] alice: … 55s left, remote participants=0
+[vexa-smoke 17:13:59] meeting status → completed
+[vexa-smoke 17:14:02] alice: … 50s left, remote participants=0
+[vexa-smoke 17:14:07] alice: … 45s left, remote participants=0
+[vexa-smoke 17:14:12] alice: … 40s left, remote participants=0
+[vexa-smoke 17:14:17] alice: console.error: 2026-08-17T17:14:17.895Z [ERROR] [rtc:BridgeChannel] <e.onclose>:  Channel closed: undefined undefined
+[vexa-smoke 17:14:17] alice: … 35s left, remote participants=0
+[vexa-smoke 17:14:22] alice: … 30s left, remote participants=0
+[vexa-smoke 17:14:27] alice: … 25s left, remote participants=0
+[vexa-smoke 17:14:32] alice: … 20s left, remote participants=0
+[vexa-smoke 17:14:37] alice: … 15s left, remote participants=0
+[vexa-smoke 17:14:42] alice: … 10s left, remote participants=0
+[vexa-smoke 17:14:47] alice: … 5s left, remote participants=0
+[vexa-smoke 17:14:52] alice: … 0s left, remote participants=0
+[vexa-smoke 17:14:52] alice: hanging up
+[vexa-smoke 17:14:54] alice: left
+[vexa-smoke 17:14:54] statuses seen: requested → joining → active → stopping → completed
+[vexa-smoke 17:14:54] match: {"start":1786986814.905,"end":1786986819.905,"text":"The quick brown fox jumps over the lazy dog.","language":"en","speaker":"Alice","completed":true,"segment_id":"turn:0:0","source":"merged","absolute_start_time":"2026-08-17T17:13:34.905Z","absolute_end_time":"2026-08-17T17:13:39.905Z"}
+
+PASS  transcript contains "brown fox" attributed to speaker "Alice" (2 segments). Raw JSON in tmp/.
+exit=0

@@ -1,0 +1,29 @@
+# Overlay on top of the pinned upstream compose (infra/vexa/upstream/deploy/compose/docker-compose.yml).
+# Adds a CPU STT service on the same network. Nothing upstream is modified.
+services:
+  whisper:
+    image: fedirz/faster-whisper-server:latest-cpu
+    environment:
+      - WHISPER__MODEL=${WHISPER_MODEL:-Systran/faster-whisper-small.en}
+      - WHISPER__INFERENCE_DEVICE=cpu
+      - WHISPER__TTL=-1
+    volumes:
+      - whisper-cache:/root/.cache/huggingface
+    ports:
+      - "127.0.0.1:${WHISPER_HOST_PORT:-18083}:8000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    networks: [vexa]
+    restart: unless-stopped
+
+  meeting-api:
+    depends_on:
+      whisper:
+        condition: service_healthy
+
+volumes:
+  whisper-cache:

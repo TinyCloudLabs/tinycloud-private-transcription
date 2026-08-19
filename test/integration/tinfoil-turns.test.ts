@@ -1,0 +1,91 @@
+/**
+ * TRANSCRIPTION_PROVIDER=tinfoil happy path with a persisted recording: mock Vexa serves a two-speaker
+ * WAV (fixtures/alice.wav ++ fixtures/bob.wav) through the recordings API, a mock Tinfoil answers each
+ * per-turn clip, and the stored transcript keeps Vexa's speaker turns with `provider: "tinfoil"`.
+ * Needs ffmpeg (decode) — skipped otherwise.
+ */
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
+import { decodeToPcm, pcmToWav, PCM_RATE } from "../../src/providers/transcription/audio.ts";
+import { TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
+import { startHarness, type Harness } from "./harness.ts";
+
+const ffmpeg = Bun.which("ffmpeg");
+let h: Harness;
+let tinfoil: ReturnType<typeof Bun.serve>;
+const logs: { level: string; msg: string; data?: Record<string, unknown> }[] = [];
+const log = {
+  debug: (msg: string, data?: Record<string, unknown>) => logs.push({ level: "debug", msg, data }),
+  info: (msg: string, data?: Record<string, unknown>) => logs.push({ level: "info", msg, data }),
+  warn: (msg: string, data?: Record<string, unknown>) => logs.push({ level: "warn", msg, data }),
+  error: (msg: string, data?: Record<string, unknown>) => logs.push({ level: "error", msg, data }),
+};
+let recordingB64 = "";
+let aliceSec = 0;
+const tinfoilCalls: number[] = [];
+
+describe.skipIf(!ffmpeg || !existsSync("fixtures/bob.wav"))("tinfoil provider with a persisted recording (per-turn)", () => {
+  beforeAll(async () => {
+    const a = await decodeToPcm(new Uint8Array(await Bun.file("fixtures/alice.wav").arrayBuffer()));
+    const b = await decodeToPcm(new Uint8Array(await Bun.file("fixtures/bob.wav").arrayBuffer()));
+    aliceSec = a.durationSec;
+    const joined = new Int16Array(a.samples.length + b.samples.length);
+    joined.set(a.samples, 0);
+    joined.set(b.samples, a.samples.length);
+    recordingB64 = Buffer.from(pcmToWav(joined, PCM_RATE)).toString("base64");
+    tinfoil = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const form = await req.formData();
+        const file = form.get("file") as File;
+        const pcm = await decodeToPcm(new Uint8Array(await file.arrayBuffer()));
+        tinfoilCalls.push(pcm.durationSec);
+        // Pretend to be Voxtral: text depends on who is speaking (Alice's clip is the longer one at ~7 s).
+        const text = pcm.durationSec > 6.8 ? "The quick brown fox jumps over the lazy dog. Hello from Alice." : "Good morning everyone, this is Bob. The meeting starts now.";
+        return Response.json({ text, usage: { type: "duration", seconds: pcm.durationSec } });
+      },
+    });
+    h = await startHarness({
+      transcription: new TinfoilTranscriptionProvider({ baseUrl: `http://127.0.0.1:${tinfoil.port}`, apiKey: "tk_test", model: "voxtral-small-24b", log }),
+      log,
+    });
+  });
+  afterAll(async () => {
+    await h?.stop();
+    tinfoil?.stop(true);
+  });
+
+  const nativeId = "TurnsRoom@jitsi.local";
+  let id: string;
+
+  test("meeting completes with a per-turn Tinfoil transcript, provider=tinfoil", async () => {
+    const r = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/TurnsRoom", language: "en", webhook_url: h.webhook.url } });
+    expect(r.status).toBe(201);
+    id = (await r.json()).id;
+    await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${id}`)).json()).status === "joining" ? true : null));
+    await h.vexa.control("jitsi", nativeId, {
+      status: "completed",
+      completion_reason: "stopped",
+      recording_base64: recordingB64,
+      recording_content_type: "audio/wav",
+      segments: [
+        { start: 1.5, end: 6.0, text: "The quick brown fox jumps over the lazy dog.", language: "en", speaker: "Alice", completed: true },
+        { start: 6.5, end: 8.1, text: "Hello from Alice.", language: "en", speaker: "Alice", completed: true },
+        { start: aliceSec + 1.5, end: aliceSec + 3.25, text: "Good morning everyone, this is Bob.", language: "en", speaker: "Bob", completed: true },
+        { start: aliceSec + 3.75, end: aliceSec + 7.35, text: "The meeting starts now.", language: "en", speaker: "Bob", completed: true },
+      ],
+    });
+    await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${id}`)).json()).status === "completed" ? true : null), { label: "completed" });
+    const t = await (await h.api(`/v1/meetings/${id}/transcript`)).json();
+    expect(t.provider).toBe("tinfoil");
+    expect(t.speakers.map((s: any) => s.name)).toEqual(["Alice", "Bob"]);
+    expect(t.segments).toHaveLength(2);
+    expect(t.segments[0]).toMatchObject({ speaker_name: "Alice", start: 1.5, end: 8.1, text: "The quick brown fox jumps over the lazy dog. Hello from Alice." });
+    expect(t.segments[1]).toMatchObject({ speaker_name: "Bob", text: "Good morning everyone, this is Bob. The meeting starts now." });
+    expect(t.text).toBe("Alice: The quick brown fox jumps over the lazy dog. Hello from Alice.\nBob: Good morning everyone, this is Bob. The meeting starts now.");
+    expect(t.duration_seconds).toBeGreaterThan(21);
+    expect(tinfoilCalls).toHaveLength(2);
+    expect(logs.find((l) => l.msg === "transcript finalized")).toMatchObject({ data: { provider: "tinfoil", segments: 2, stats: { mode: "turns", turns: 2, transcribed: 2, calls: 2 } } });
+    await h.waitFor(async () => h.webhook.received.find((w) => w.body.type === "meeting.completed" && w.body.data.meeting_id === id) ?? null);
+  });
+});
