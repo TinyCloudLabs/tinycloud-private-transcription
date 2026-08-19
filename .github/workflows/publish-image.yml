@@ -1,11 +1,13 @@
 name: Publish image
 # Builds the api/worker image (Dockerfile at repo root, linux/amd64 only — Phala CVMs are TDX x86_64)
 # and pushes it to GHCR with the workflow's GITHUB_TOKEN. Tags:
-#   ghcr.io/tinycloudlabs/tinycloud-private-transcription:<git sha>   (immutable; pin this in infra/dstack/.env PTX_IMAGE)
-#   ghcr.io/tinycloudlabs/tinycloud-private-transcription:v1          (moving; on feat/v1 + main)
-#   ghcr.io/tinycloudlabs/tinycloud-private-transcription:latest      (moving; on main only)
-# The package must be PUBLIC for the CVM to pull it anonymously (GitHub → org packages → tinycloud-private-transcription
-# → Package settings → Change visibility), or set DSTACK_DOCKER_USERNAME/DSTACK_DOCKER_PASSWORD in the sealed env.
+#   ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:<git sha>   (immutable; pin this in infra/dstack/.env PTX_IMAGE)
+#   ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:v1          (moving; on feat/v1 + main)
+#   ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:latest      (moving; on main only)
+# The package must be PUBLIC for the CVM to pull it anonymously. The `.../api` package was created by this workflow
+# after the repo went public, so it inherits public visibility (org.opencontainers.image.source links it to the repo).
+# The older `ghcr.io/tinycloudlabs/tinycloud-private-transcription` package (created while the repo was private) is
+# DEPRECATED — it is stuck private and is no longer pushed to.
 
 on:
   push:
@@ -29,7 +31,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE: ghcr.io/tinycloudlabs/tinycloud-private-transcription
+  IMAGE: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api
 
 jobs:
   publish:
