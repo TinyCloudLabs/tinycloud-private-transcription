@@ -1,0 +1,35 @@
+name: Test
+# Unit + integration suite (`bun run test`) against the dev Postgres/Redis from
+# docker-compose.dev.yml. The e2e suite needs the local capture rig and is not run here.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Start Postgres + Redis
+        run: docker compose -f docker-compose.dev.yml up -d --wait
+
+      - name: Run tests
+        run: bun run test

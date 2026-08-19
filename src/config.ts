@@ -15,7 +15,13 @@ export const config = {
     baseUrl: env("VEXA_BASE_URL", "http://localhost:18066"),
     apiKey: env("VEXA_API_KEY", ""),
     pollIntervalMs: Number(env("VEXA_POLL_INTERVAL_MS", "5000")),
+    /** Provisioned bot ceiling (matches `max_concurrent_bots` in infra/dstack/app-compose.yaml). Reported in /health. */
+    maxConcurrentBots: Number(env("VEXA_MAX_CONCURRENT_BOTS", "5")),
   },
+  /** Platforms accepted by POST /v1/meetings. Detection still recognizes all platforms; the rest are gated with 400 unsupported_platform. */
+  enabledPlatforms: env("ENABLED_PLATFORMS", "jitsi").split(",").map((s) => s.trim()).filter(Boolean),
+  /** Worker-side join deadline: a meeting still joining/waiting_for_admission this long after bot dispatch is failed and its bot stopped. */
+  joinTimeoutSeconds: Number(env("JOIN_TIMEOUT_SECONDS", "600")),
   transcriptionProvider: env("TRANSCRIPTION_PROVIDER", "vexa") as TranscriptionProviderName,
   tinfoil: {
     baseUrl: env("TINFOIL_BASE_URL", "https://inference.tinfoil.sh"),

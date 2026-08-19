@@ -29,9 +29,9 @@ Auth: `Authorization: Bearer tc_live_xxx`.
 ```json
 {"id":"mtg_01K…","object":"meeting","status":"queued","platform":"jitsi","meeting_url":"…","created_at":"…","metadata":{}}
 ```
-States: `queued → joining → waiting_for_admission → in_progress → processing → completed`; terminal failures `failed`, `cancelled`. `in_progress` only once the bot is actually admitted. Map from Vexa statuses (`requested/joining/awaiting_admission/active/stopping/completed/failed`).
+States: `queued → joining → waiting_for_admission → in_progress → processing → completed`; terminal failures `failed`, `cancelled`. `in_progress` only once the bot is actually admitted. Map from Vexa statuses (`requested/joining/awaiting_admission/active/needs_help/stopping/completed/failed`; `awaiting_admission`/`needs_help` → `waiting_for_admission`). A meeting still `joining`/`waiting_for_admission` `JOIN_TIMEOUT_SECONDS` (default 600) after bot dispatch is failed by the worker (`meeting_join_failed`/`waiting_room_timeout`), the bot stopped, and `meeting.failed` emitted.
 
-`GET /v1/meetings/{id}` → status, platform, bot{name,joined_at}, transcript{status}, created/started/ended_at, metadata, error{type,code,message} on failure.
+`GET /v1/meetings/{id}` → status, platform, bot{name,joined_at}, transcript{status}, created/started/ended_at, metadata, error{type,code,message} on failure. Once completed also `transcript_provider` (`"tinfoil" | "vexa"`) plus `fallback_from`/`fallback_reason` when the configured provider fell back to the Vexa-native transcript.
 `POST /v1/meetings/{id}/stop` → idempotent, returns `{id,status}`.
 `GET /v1/meetings/{id}/transcript` → 202 `{meeting_id,status}` until complete; then
 ```json
@@ -40,18 +40,18 @@ States: `queued → joining → waiting_for_admission → in_progress → proces
  "segments":[{"id":"seg_001","speaker_id":"speaker_0","speaker_name":"Alice","start":0.0,"end":3.2,"text":"…"}],
  "text":"Alice: …","created_at":"…"}
 ```
-`speaker_id` is stable within a meeting only. `provider` is which engine produced the words: `"tinfoil"` (confidential batch path, per speaker turn) or `"vexa"` (WhisperLive passthrough, or the fallback when the recording is unusable). `DELETE /v1/meetings/{id}` removes our record + transcript and the Vexa meeting.
-`GET /health` → `{status:"ok"}` (internally check Postgres, Redis, Vexa, bot capacity; Tinfoil outage must not block recording — retry in `processing`).
+`speaker_id` is stable within a meeting only. `provider` is which engine produced the words: `"tinfoil"` (confidential batch path, per speaker turn) or `"vexa"` (WhisperLive passthrough, or the fallback when the recording is unusable); on fallback the transcript also carries `fallback_from`/`fallback_reason`. `DELETE /v1/meetings/{id}` removes our record + transcript and the Vexa meeting.
+`GET /health` → `{status:"ok","checks":{postgres,redis,vexa,bot_capacity:{running,max},transcription_provider}}` (`bot_capacity.max` from `VEXA_MAX_CONCURRENT_BOTS`; Tinfoil outage must not block recording — retry in `processing`).
 
 Errors: `{"error":{"type":"meeting_join_failed","code":"waiting_room_timeout","message":"…"}}`. Codes: invalid_meeting_url, unsupported_platform, meeting_not_found, meeting_join_failed, waiting_room_timeout, bot_removed, meeting_ended, capture_failed, transcription_failed, provider_timeout, provider_unavailable, internal_error. Never leak Vexa errors raw.
 
-Platform detection: meet.google.com→google_meet, zoom.us→zoom, teams.microsoft.com→microsoft_teams, meet.jit.si / self-hosted Jitsi→jitsi.
+Platform detection: meet.google.com→google_meet, zoom.us→zoom, teams.microsoft.com→microsoft_teams, meet.jit.si / self-hosted Jitsi→jitsi. Only platforms in `ENABLED_PLATFORMS` (default `jitsi`) are accepted; a detected-but-disabled platform answers 400 `unsupported_platform` naming the platform.
 
-Webhook event: `{"id":"evt_…","type":"meeting.completed","created_at":"…","data":{"meeting_id":"…","metadata":{}}}`.
+Webhook event: `{"id":"evt_…","type":"meeting.completed","created_at":"…","data":{"meeting_id":"…","metadata":{},"transcript_provider":"tinfoil"}}` (`data.fallback_from`/`data.fallback_reason` added when a fallback fired; `data.error` on `meeting.failed`).
 
 ## Persistence (Postgres)
 `meetings(id, project_id, meeting_url, platform, status, bot_name, vexa_native_meeting_id, vexa_bot_id, created_at, started_at, ended_at, completed_at, metadata, error_code, error_message, idempotency_key)`
-`transcripts(meeting_id, language, duration_seconds, segments_json, provider, created_at)`
+`transcripts(meeting_id, language, duration_seconds, segments_json, provider, fallback_from, fallback_reason, created_at)`
 `webhook_deliveries(id, meeting_id, event_type, endpoint, attempt, status, response_code, created_at)`
 `api_keys(id, project_id, key_hash, scopes, created_at)`
 

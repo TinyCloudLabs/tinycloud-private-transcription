@@ -52,6 +52,14 @@ export async function createMeeting(
     }
   }
   const detected = detectPlatform(input.meeting_url, input.platform);
+  // Detection recognizes every platform; deployments only accept the ones in ENABLED_PLATFORMS
+  // (default jitsi — the others are detected but not serviceable yet, see .context/ptx-demo-readiness.md #8).
+  if (!ctx.config.enabledPlatforms.includes(detected.platform)) {
+    throw new ApiError(
+      "unsupported_platform",
+      `The ${detected.platform} platform was detected but is not enabled on this deployment.`,
+    );
+  }
   const [row] = await ctx.db
     .insert(meetings)
     .values({
@@ -128,8 +136,21 @@ export async function failMeeting(ctx: AppContext, meeting: MeetingRow, code: Er
   return transition(ctx, meeting, "failed", { errorCode: code, errorMessage: message });
 }
 
-export async function storeTranscript(ctx: AppContext, meetingId: string, t: NormalizedTranscript, provider: string) {
-  const row = { language: t.language, durationSeconds: t.duration_seconds, segmentsJson: { speakers: t.speakers, segments: t.segments, text: t.text }, provider };
+export async function storeTranscript(
+  ctx: AppContext,
+  meetingId: string,
+  t: NormalizedTranscript,
+  provider: string,
+  fallback: { from: string; reason: string } | null = null,
+) {
+  const row = {
+    language: t.language,
+    durationSeconds: t.duration_seconds,
+    segmentsJson: { speakers: t.speakers, segments: t.segments, text: t.text },
+    provider,
+    fallbackFrom: fallback?.from ?? null,
+    fallbackReason: fallback?.reason ?? null,
+  };
   await ctx.db
     .insert(transcripts)
     .values({ meetingId, ...row })
@@ -199,9 +220,18 @@ export function serializeMeeting(m: MeetingRow, transcript: TranscriptRow | null
     ended_at: m.endedAt?.toISOString() ?? null,
     completed_at: m.completedAt?.toISOString() ?? null,
     metadata: m.metadata ?? {},
+    ...(transcript ? transcriptProviderFields(transcript) : {}),
     ...(status === "failed" && m.errorCode
       ? { error: { type: errorTypeFor(m.errorCode as ErrorCode), code: m.errorCode, message: m.errorMessage ?? "" } }
       : {}),
+  };
+}
+
+/** `transcript_provider` (+ fallback provenance when the configured provider fell back). */
+export function transcriptProviderFields(t: TranscriptRow) {
+  return {
+    transcript_provider: t.provider,
+    ...(t.fallbackFrom ? { fallback_from: t.fallbackFrom, fallback_reason: t.fallbackReason } : {}),
   };
 }
 
@@ -220,6 +250,7 @@ export function serializeTranscript(m: MeetingRow, t: TranscriptRow) {
     language: t.language,
     duration_seconds: t.durationSeconds,
     provider: t.provider,
+    ...(t.fallbackFrom ? { fallback_from: t.fallbackFrom, fallback_reason: t.fallbackReason } : {}),
     speakers: body.speakers,
     segments: body.segments,
     text: body.text,

@@ -15,6 +15,13 @@
       "when": 1787113983322,
       "tag": "0001_transcript_provider",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1787135985152,
+      "tag": "0002_transcript_fallback",
+      "breakpoints": true
     }
   ]
 }

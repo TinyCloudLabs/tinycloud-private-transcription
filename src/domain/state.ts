@@ -33,14 +33,15 @@ export function canTransition(from: MeetingStatus, to: MeetingStatus): boolean {
   return RANK[to] > RANK[from];
 }
 
-/** Vexa MeetingStatus enum: requested, joining, awaiting_admission, active, needs_human_help, stopping, completed, failed. */
+/** Vexa MeetingStatus enum (lifecycle.v1): requested, joining, awaiting_admission, active, needs_help, stopping, completed, failed. */
 export function mapVexaStatus(vexa: string): MeetingStatus {
   switch (vexa) {
     case "requested":
     case "joining":
       return "joining";
     case "awaiting_admission":
-    case "needs_human_help":
+    case "needs_help": // lifecycle.v1 enum (docs/vexa-findings.md)
+    case "needs_human_help": // older alias, kept for compatibility
       return "waiting_for_admission";
     case "active":
       return "in_progress";

@@ -1,6 +1,6 @@
 import { createContext, type AppContext } from "../context.ts";
 import { deliverWebhook } from "../webhooks/dispatcher.ts";
-import { handleMeetingPoll, handleMeetingStart } from "./meeting-job.ts";
+import { handleJoinDeadline, handleMeetingPoll, handleMeetingStart } from "./meeting-job.ts";
 import type { Job } from "./queue.ts";
 
 export async function processJob(ctx: AppContext, job: Job): Promise<void> {
@@ -9,6 +9,8 @@ export async function processJob(ctx: AppContext, job: Job): Promise<void> {
       return handleMeetingStart(ctx, job.meetingId, job.attempt ?? 1);
     case "meeting.poll":
       return handleMeetingPoll(ctx, job.meetingId);
+    case "meeting.join_deadline":
+      return handleJoinDeadline(ctx, job.meetingId);
     case "webhook.deliver":
       return deliverWebhook(ctx, job.deliveryId);
   }

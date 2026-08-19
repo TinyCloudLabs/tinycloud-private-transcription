@@ -95,6 +95,9 @@ then deletes. Green 2/2 on 2026-08-17 (~2 min each; evidence in `tmp/e2e-<room>.
 | `VEXA_BASE_URL` | `http://localhost:18066` | Vexa API gateway (capture rig). Mock: `http://localhost:18056` |
 | `VEXA_API_KEY` | – | sent as `X-API-Key` |
 | `VEXA_POLL_INTERVAL_MS` | `5000` | worker status/transcript poll |
+| `VEXA_MAX_CONCURRENT_BOTS` | `5` | provisioned bot ceiling (matches `max_concurrent_bots` in infra/dstack/app-compose.yaml); reported as `bot_capacity.max` in `/health` |
+| `ENABLED_PLATFORMS` | `jitsi` | comma-separated platforms accepted by `POST /v1/meetings`. Others (zoom, google_meet, microsoft_teams) are still detected but answer 400 `unsupported_platform` |
+| `JOIN_TIMEOUT_SECONDS` | `600` | worker-side join deadline: a meeting still `joining`/`waiting_for_admission` this long after bot dispatch is failed (`meeting_join_failed`/`waiting_room_timeout`), its bot stopped, and `meeting.failed` emitted |
 | `TRANSCRIPTION_PROVIDER` | `vexa` | `vexa` (WhisperLive passthrough) or `tinfoil` |
 | `TINFOIL_BASE_URL` | `https://inference.tinfoil.sh` | OpenAI-compatible `/v1/audio/transcriptions` |
 | `TINFOIL_API_KEY` | – | no live calls are made in tests |
@@ -129,7 +132,7 @@ curl -s -X POST $API/v1/meetings/$ID/stop -H "Authorization: Bearer $KEY"
 # delete → 204 (asks Vexa to delete too; Vexa v0.12 keeps bot-owned rows and answers 409 — logged, see "Known gaps")
 curl -s -X DELETE $API/v1/meetings/$ID -H "Authorization: Bearer $KEY"
 
-curl -s $API/health   # {"status":"ok","checks":{postgres,redis,vexa,bot_capacity,transcription_provider}}
+curl -s $API/health   # {"status":"ok","checks":{postgres,redis,vexa,bot_capacity:{running,max},transcription_provider}}
 ```
 
 With the mock Vexa you drive the lifecycle yourself:
@@ -145,8 +148,9 @@ curl -s -X POST localhost:18056/_mock/meetings/jitsi/TinyCloudDemo -H 'Content-T
 ### Webhooks
 
 `meeting.completed` / `meeting.failed` are POSTed to `webhook_url` as
-`{"id":"evt_…","type":"meeting.completed","created_at":"…","data":{"meeting_id":"…","metadata":{}}}`
-(`data.error` is added on failure). Header `X-Webhook-Signature: sha256=<hex>` is HMAC-SHA256 over the
+`{"id":"evt_…","type":"meeting.completed","created_at":"…","data":{"meeting_id":"…","metadata":{},"transcript_provider":"tinfoil"}}`
+(`data.error` is added on failure; `data.fallback_from`/`data.fallback_reason` are added when the
+configured provider fell back to the Vexa-native transcript). Header `X-Webhook-Signature: sha256=<hex>` is HMAC-SHA256 over the
 raw body with the project's webhook secret (printed by `create-key`). Retries: immediate, 1m, 5m, 30m, 2h,
 persisted in `webhook_deliveries`. Webhook failure never changes meeting status.
 
@@ -211,6 +215,9 @@ has to come from Vexa's speaker timeline. `src/providers/transcription/tinfoil.t
    The worker logs `falling back to vexa-native transcript {reason}` + `transcript finalized
    {provider, fallback_from, fallback_reason, stats}`; the stored transcript and `GET /transcript` carry
    **`provider: "tinfoil" | "vexa"`** (`transcripts.provider`), so callers can tell which path produced it.
+   The fallback is also persisted (`transcripts.fallback_from`/`fallback_reason`) and surfaced to clients:
+   `GET /v1/meetings/{id}` (once completed) and the `meeting.completed` webhook `data` carry
+   `transcript_provider` plus `fallback_from`/`fallback_reason` when a fallback fired.
 
 Limits: turn mode only covers speech Vexa segmented (whole-file mode covers everything but loses speakers);
 Vexa's speaker labels come from Jitsi dominant-speaker events (`"Speaker"` = unknown). ~~Vexa v0.12's

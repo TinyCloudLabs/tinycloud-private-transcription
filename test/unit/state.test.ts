@@ -7,6 +7,8 @@ describe("mapVexaStatus", () => {
     expect(mapVexaStatus("joining")).toBe("joining");
     expect(mapVexaStatus("awaiting_admission")).toBe("waiting_for_admission");
     expect(mapVexaStatus("active")).toBe("in_progress");
+    // Real lifecycle.v1 enum value (docs/vexa-findings.md): needs_help. needs_human_help kept as alias.
+    expect(mapVexaStatus("needs_help")).toBe("waiting_for_admission");
     expect(mapVexaStatus("needs_human_help")).toBe("waiting_for_admission");
     expect(mapVexaStatus("stopping")).toBe("processing");
     expect(mapVexaStatus("completed")).toBe("processing");
