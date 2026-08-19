@@ -213,11 +213,12 @@ has to come from Vexa's speaker timeline. `src/providers/transcription/tinfoil.t
    **`provider: "tinfoil" | "vexa"`** (`transcripts.provider`), so callers can tell which path produced it.
 
 Limits: turn mode only covers speech Vexa segmented (whole-file mode covers everything but loses speakers);
-Vexa's speaker labels come from Jitsi dominant-speaker events (`"Speaker"` = unknown); Vexa v0.12's
-recording tap only mixes the media elements present when it starts, so on Jitsi a participant whose audio
-track is signalled after the bot's tap started is **missing from the recording** even though the live
-transcript hears them (observed with two fake participants; the live mixer is dynamic, the record-chunker is
-not) — a Vexa fix/fork item. Probes: `bun run scripts/tinfoil-check.ts [--two-speakers]` (1–2 live calls),
+Vexa's speaker labels come from Jitsi dominant-speaker events (`"Speaker"` = unknown). ~~Vexa v0.12's
+recording tap only mixes the media elements present when it starts~~ — **fixed in our Vexa fork**
+([TinyCloudLabs/vexa](https://github.com/TinyCloudLabs/vexa) branch `tinycloud`, see "Vexa fork" below): the
+record-chunker's tap is now dynamic (rescans like the live mixer), so a participant who joins after the bot
+IS in the recording; verified live with Bob joining after the bot (`scripts/two-speaker-live.ts`, per-turn
+Tinfoil transcript carries Bob's words, 2/2 runs 2026-08-19). Probes: `bun run scripts/tinfoil-check.ts [--two-speakers]` (1–2 live calls),
 `bun run scripts/two-speaker-live.ts` (Alice + Bob on the rig, per-turn path), `TRANSCRIPTION_PROVIDER=tinfoil
 bun run test:e2e` (asserts `transcript.provider === "tinfoil"`; green 2/2 on 2026-08-19, 2 + 3 calls).
 
@@ -227,15 +228,36 @@ bun run test:e2e` (asserts `transcript.provider === "tinfoil"`; green 2/2 on 202
   meeting the bot lifecycle touched answers `409 "Meeting is no longer planned (bot lifecycle owns it)"`.
   Our DELETE removes our data and logs the 409; purging Vexa's copy needs an upstream route or a direct
   DB/MinIO purge inside the CVM (follow-up).
-- **Silent recording** (1 of 3 rig runs): the bot's recording tap can latch onto a stale element on the very
-  first meeting after a cold stack (also seen when nobody with audio was in the room when the bot joined).
-  The worker detects it (bitrate / RMS) and falls back to the Vexa-native transcript (`provider: "vexa"`).
-- **Recording misses late audio tracks** (Vexa v0.12 record-chunker is static, see "Confidential
-  transcription"): multi-party Jitsi recordings can lack a participant; their turns then transcribe the
-  overlapping audio of others or silence. Needs an upstream fix (dynamic tap like the live mixer).
+- **Silent recording**: fixed in our Vexa fork for the known causes (static tap latching a stale element /
+  nobody with audio present at bot join — the tap now starts over an empty mix and attaches audio as it
+  appears). The worker's bitrate/RMS sanity check + Vexa-native fallback stay as defence in depth.
+- **Recording misses late audio tracks**: **fixed in our Vexa fork** (dynamic record-chunker, see "Vexa
+  fork" below); verified live 2/2 with Bob joining after the bot.
 - **Jitsi live validation** is marked pending upstream; it works against docker-jitsi-meet stable-11146-2
   (bot needs `https://` + hostname + a trusted cert).
 - The capture rig needed a host iptables fix (Docker's FORWARD/NAT chains had been flushed) — see infra/README.md.
+
+## Vexa fork ([TinyCloudLabs/vexa](https://github.com/TinyCloudLabs/vexa))
+
+Our per-turn confidential path transcribes the **persisted recording**, so the recording must hear
+everyone. Upstream Vexa v0.12's record-chunker attached only the media tracks present when the tap
+started: a participant joining after the bot was missing from `master.webm` (the live transcript still
+heard them), and an empty-at-join room produced a silent/absent master. Upstream's live mixer already
+rescans for late tracks; the recording tap did not — so we maintain a fork rather than wait upstream.
+
+- **Branches**: `tinycloud` = upstream base (`e0b356d6`, v0.12.22) + our patches — this is what the rig
+  pins (`infra/vexa/upstream` submodule, `infra/vexa/UPSTREAM_PIN`). `main` tracks upstream untouched.
+- **The patch**: `core/meetings/modules/record-chunker` — `createRecordingTap` now builds a dynamic mix
+  (`DynamicElementMixer`): recorder starts immediately (even with zero audio elements) and a 2 s rescan
+  (live-mixer parity) attaches new elements / detaches ended ones. Pinned by the module's
+  `dynamic-tap.smoke.test.ts`.
+- **Bot image**: `ghcr.io/tinycloudlabs/vexa-bot:tc-<shortsha>` (fork workflow `tinycloud-bot-image`);
+  the rig layers the dev CA on top (`infra/vexa/bot/Dockerfile` → `ptx/vexa-bot:tc-devca`). Control-plane
+  images stay upstream `vexaai/v012-*:v012`.
+- **Syncing upstream** (in the fork repo): `git fetch upstream --tags && git checkout main && git merge
+  --ff-only upstream/main && git push origin main --tags`, then rebase/merge `tinycloud` onto `main`,
+  re-run the record-chunker tests, push, and bump this repo's submodule pin + bot image tag.
+- License unchanged: Apache-2.0, upstream `LICENSE` intact; changes marked per Apache-2.0 §4(b).
 
 ## Deploy (Phala/dstack)
 

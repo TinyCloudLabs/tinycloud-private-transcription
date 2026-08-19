@@ -7,10 +7,10 @@ No GPU, no external accounts. Docker needs `sudo` on this host; the wrappers alr
 ```
 infra/
   certs/gen.sh                 dev CA + leaf cert for jitsi.local            (outputs gitignored)
-  vexa/upstream/               git submodule → Vexa-ai/vexa @ pinned SHA      (see vexa/UPSTREAM_PIN)
+  vexa/upstream/               git submodule → TinyCloudLabs/vexa (OUR FORK) branch `tinycloud` @ pinned SHA (see vexa/UPSTREAM_PIN)
   vexa/vexa.env                compose interpolation env (dev defaults, no real secrets)
   vexa/docker-compose.override.yml  adds CPU faster-whisper on the vexa network
-  vexa/bot/Dockerfile          vexaai/vexa-bot:v012 + our CA in Chromium's NSS store (no source changes)
+  vexa/bot/Dockerfile          ghcr.io/tinycloudlabs/vexa-bot:tc-<sha> (fork bot, dynamic record-chunker) + our CA in Chromium's NSS store
   vexa/compose.sh              wrapper: upstream compose + our env + overlay
   jitsi/docker-compose.yml     docker-jitsi-meet stable-11146-2 compose, copied verbatim (jitsi/UPSTREAM_PIN)
   jitsi/jitsi.env, jitsi/docker-compose.override.yml, jitsi/compose.sh
@@ -23,8 +23,10 @@ infra/
   Jitsi is served as **`https://jitsi.local:8443`** with a cert from our throwaway CA.
 * Vexa's bot launches Chromium **without** `--ignore-certificate-errors` (deliberate upstream choice for
   Google Meet bot-detection). Chromium on Linux trusts user certs from `$HOME/.pki/nssdb`; the bot runs
-  as root, so `infra/vexa/bot/Dockerfile` derives `ptx/vexa-bot:v012-devca` from the published bot image
-  and adds the CA there. `BROWSER_IMAGE` in `vexa.env` points at it. Upstream sources are untouched.
+  as root, so `infra/vexa/bot/Dockerfile` derives `ptx/vexa-bot:tc-devca` from OUR FORK's published bot
+  image (`ghcr.io/tinycloudlabs/vexa-bot:tc-<sha>`, branch `tinycloud` — the record-chunker there is
+  dynamic so late joiners land in master.webm; upstream's was static) and adds the CA there.
+  `BROWSER_IMAGE` in `vexa.env` points at it. The control-plane images stay upstream `vexaai/v012-*`.
 * Bots are spawned by Vexa's `runtime` as containers on the compose network `vexa-v012_vexa`. Jitsi's
   `web` and `jvb` services join that network with the alias **`jitsi.local`**, so the bot resolves the
   URL in-network. On the host, the Playwright fake participant maps `jitsi.local → 127.0.0.1` via
@@ -43,8 +45,8 @@ infra/
 # 0. one-time
 ./infra/certs/gen.sh                                    # dev CA + jitsi.local leaf (per-checkout, throwaway; never committed)
 cp infra/certs/out/ca.crt infra/vexa/bot/ca.crt
-sudo docker build -t ptx/vexa-bot:v012-devca infra/vexa/bot   # derived bot image (pulls vexaai/vexa-bot:v012, ~1.6 GB)
-git submodule update --init infra/vexa/upstream         # pinned Vexa checkout (compose files only are used)
+sudo docker build -t ptx/vexa-bot:tc-devca infra/vexa/bot     # derived bot image (pulls the fork bot from ghcr, ~1.6 GB)
+git submodule update --init infra/vexa/upstream         # pinned FORK checkout (compose files only are used)
 ./scripts/make-fixture.sh                                # fixtures/alice.wav (espeak-ng in a container)
 bun install                                              # playwright for the fake participant
 

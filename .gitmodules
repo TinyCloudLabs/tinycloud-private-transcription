@@ -1,3 +1,4 @@
 [submodule "infra/vexa/upstream"]
 	path = infra/vexa/upstream
-	url = https://github.com/Vexa-ai/vexa.git
+	url = https://github.com/TinyCloudLabs/vexa.git
+	branch = tinycloud
