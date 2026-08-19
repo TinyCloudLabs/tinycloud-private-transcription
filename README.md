@@ -99,6 +99,7 @@ then deletes. Green 2/2 on 2026-08-17 (~2 min each; evidence in `tmp/e2e-<room>.
 | `TINFOIL_BASE_URL` | `https://inference.tinfoil.sh` | OpenAI-compatible `/v1/audio/transcriptions` |
 | `TINFOIL_API_KEY` | – | no live calls are made in tests |
 | `TINFOIL_MODEL` | `voxtral-small-24b` | |
+| `TINFOIL_SEGMENTATION` | `turns` | `turns` (one Tinfoil call per Vexa speaker turn, keeps segmentation) or `whole` (one call, one segment) — see below |
 | `AUTO_MIGRATE` | `true` | API runs migrations at boot |
 | `LOG_LEVEL` | `info` | JSON logs |
 
@@ -183,6 +184,43 @@ Types in `src/providers/vexa/types.ts`; pure mapping in `src/providers/vexa/adap
   (`X-API-Key` required). `src/worker/meeting-job.ts#fetchVexaAudio` applies a content sanity check
   (bytes/second below ~1 kB/s ⇒ treated as the known silent-tap failure and skipped).
 
+## Confidential transcription (Tinfoil)
+
+`TRANSCRIPTION_PROVIDER=tinfoil` transcribes the **persisted meeting recording** on Tinfoil's confidential
+inference (`POST /v1/audio/transcriptions`, OpenAI-compatible, `voxtral-small-24b`) instead of using
+Vexa's WhisperLive words. Verified live: Voxtral on Tinfoil rejects `response_format=verbose_json` (400) and
+`json` returns `{text, usage:{seconds}}` only — **no timestamps, no diarization** — so speaker segmentation
+has to come from Vexa's speaker timeline. `src/providers/transcription/tinfoil.ts`:
+
+1. The worker asks Vexa for `recording_enabled`, and at completion downloads the audio master
+   (`fetchVexaAudio`, with the bitrate sanity check for the known silent-tap capture).
+2. `TINFOIL_SEGMENTATION=turns` (default): the recording is decoded **once** with `ffmpeg` (16 kHz mono PCM,
+   temp files; `apk add ffmpeg` in the Dockerfile), Vexa's speaker-labelled segments (already
+   meeting-relative, same origin as the recording = the bot's `start_time`) are merged into **turns**
+   (adjacent same-speaker segments with a gap ≤ 0.75 s), each turn is cut from the PCM (±0.25 s pad; turns
+   < 0.4 s skipped) into a WAV clip and sent to Tinfoil — ≤ 3 concurrent calls, ≤ 2 retries with backoff on
+   5xx/429/timeouts. Result: one segment per turn with `speaker_id/speaker_name` and `start/end` from Vexa,
+   `text` from Tinfoil; `text` = `Speaker: …` lines; `duration_seconds` = the recording's length. A failed
+   minority of turns keeps Vexa's own words for those turns (logged). Cost: one call of a few seconds per
+   turn (a 30 s two-person exchange ≈ 5–10 calls, ~2–3 s wall time total).
+   `TINFOIL_SEGMENTATION=whole`: one call with the whole recording; one segment attributed to the dominant
+   Vexa speaker (no segmentation) — also what `turns` does when Vexa heard no segments at all.
+3. **Fallback to the Vexa-native transcript** (never a failed meeting when Vexa has words): no usable
+   recording (none persisted / silent tap), recording silent (< −60 dBFS RMS) or undecodable, more than
+   half of the turns failing (4xx), or Tinfoil unavailable after the worker's 3 retries in `processing`.
+   The worker logs `falling back to vexa-native transcript {reason}` + `transcript finalized
+   {provider, fallback_from, fallback_reason, stats}`; the stored transcript and `GET /transcript` carry
+   **`provider: "tinfoil" | "vexa"`** (`transcripts.provider`), so callers can tell which path produced it.
+
+Limits: turn mode only covers speech Vexa segmented (whole-file mode covers everything but loses speakers);
+Vexa's speaker labels come from Jitsi dominant-speaker events (`"Speaker"` = unknown); Vexa v0.12's
+recording tap only mixes the media elements present when it starts, so on Jitsi a participant whose audio
+track is signalled after the bot's tap started is **missing from the recording** even though the live
+transcript hears them (observed with two fake participants; the live mixer is dynamic, the record-chunker is
+not) — a Vexa fix/fork item. Probes: `bun run scripts/tinfoil-check.ts [--two-speakers]` (1–2 live calls),
+`bun run scripts/two-speaker-live.ts` (Alice + Bob on the rig, per-turn path), `TRANSCRIPTION_PROVIDER=tinfoil
+bun run test:e2e` (asserts `transcript.provider === "tinfoil"`; green 2/2 on 2026-08-19, 2 + 3 calls).
+
 ### Known gaps / risks
 
 - **Vexa data retention on DELETE**: Vexa v0.12 only deletes *planned* rows; `DELETE /meetings/{p}/{id}` on a
@@ -190,8 +228,11 @@ Types in `src/providers/vexa/types.ts`; pure mapping in `src/providers/vexa/adap
   Our DELETE removes our data and logs the 409; purging Vexa's copy needs an upstream route or a direct
   DB/MinIO purge inside the CVM (follow-up).
 - **Silent recording** (1 of 3 rig runs): the bot's recording tap can latch onto a stale element on the very
-  first meeting after a cold stack. Batch Tinfoil is "viable with content sanity check"; the fallback is
-  the WhisperLive shim (not built).
+  first meeting after a cold stack (also seen when nobody with audio was in the room when the bot joined).
+  The worker detects it (bitrate / RMS) and falls back to the Vexa-native transcript (`provider: "vexa"`).
+- **Recording misses late audio tracks** (Vexa v0.12 record-chunker is static, see "Confidential
+  transcription"): multi-party Jitsi recordings can lack a participant; their turns then transcribe the
+  overlapping audio of others or silence. Needs an upstream fix (dynamic tap like the live mixer).
 - **Jitsi live validation** is marked pending upstream; it works against docker-jitsi-meet stable-11146-2
   (bot needs `https://` + hostname + a trusted cert).
 - The capture rig needed a host iptables fix (Docker's FORWARD/NAT chains had been flushed) — see infra/README.md.
