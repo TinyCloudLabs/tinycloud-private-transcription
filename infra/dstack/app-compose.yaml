@@ -36,6 +36,11 @@ services:
       TINFOIL_BASE_URL: https://inference.tinfoil.sh
       TINFOIL_API_KEY: ${TINFOIL_API_KEY:-}
       TINFOIL_MODEL: ${TINFOIL_MODEL:-voxtral-small-24b}
+      # Platforms POST /v1/meetings accepts. The code default is jitsi only, which made
+      # tinycloud.chat answer 400 unsupported_platform for every https://meet.google.com/<code>
+      # even though detection and the Vexa bot both handle google_meet. Pinned by
+      # test/unit/deploy-config.test.ts; override per-deployment in infra/dstack/.env.
+      ENABLED_PLATFORMS: ${ENABLED_PLATFORMS:-jitsi,google_meet}
       AUTO_MIGRATE: "true"
       LOG_LEVEL: info
     volumes:
