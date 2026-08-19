@@ -1,0 +1,77 @@
+[
+  {
+    "at": "2026-08-17T17:13:23.565Z",
+    "status": "requested",
+    "bots_status_entry": {
+      "id": 3,
+      "user_id": 1,
+      "platform": "jitsi",
+      "native_meeting_id": "ptx-smoke-msxhsvli@jitsi.local",
+      "constructed_meeting_url": "https://jitsi.local:8443/ptx-smoke-msxhsvli",
+      "status": "requested",
+      "bot_container_id": "mtg-3-f419fc54",
+      "start_time": null,
+      "end_time": null,
+      "completion_reason": null,
+      "failure_stage": null,
+      "shared": false,
+      "created_at": "2026-08-17T17:13:23.194547Z",
+      "updated_at": "2026-08-17T17:13:23.548222Z",
+      "data": {
+        "recording_enabled": true,
+        "transcribe_enabled": true,
+        "constructed_meeting_url": "https://jitsi.local:8443/ptx-smoke-msxhsvli"
+      }
+    }
+  },
+  {
+    "at": "2026-08-17T17:13:28.599Z",
+    "status": "joining",
+    "bots_status_entry": {
+      "id": 3,
+      "user_id": 1,
+      "platform": "jitsi",
+      "native_meeting_id": "ptx-smoke-msxhsvli@jitsi.local",
+      "constructed_meeting_url": "https://jitsi.local:8443/ptx-smoke-msxhsvli",
+      "status": "joining",
+      "bot_container_id": "mtg-3-f419fc54",
+      "start_time": null,
+      "end_time": null,
+      "completion_reason": null,
+      "failure_stage": null,
+      "shared": false,
+      "created_at": "2026-08-17T17:13:23.194547Z",
+      "updated_at": "2026-08-17T17:13:26.193306Z",
+      "data": {
+        "recording_enabled": true,
+        "transcribe_enabled": true,
+        "constructed_meeting_url": "https://jitsi.local:8443/ptx-smoke-msxhsvli"
+      }
+    }
+  },
+  {
+    "at": "2026-08-17T17:13:33.645Z",
+    "status": "active",
+    "bots_status_entry": {
+      "id": 3,
+      "user_id": 1,
+      "platform": "jitsi",
+      "native_meeting_id": "ptx-smoke-msxhsvli@jitsi.local",
+      "constructed_meeting_url": "https://jitsi.local:8443/ptx-smoke-msxhsvli",
+      "status": "active",
+      "bot_container_id": "mtg-3-f419fc54",
+      "start_time": "2026-08-17T17:13:31.012065Z",
+      "end_time": null,
+      "completion_reason": null,
+      "failure_stage": null,
+      "shared": false,
+      "created_at": "2026-08-17T17:13:23.194547Z",
+      "updated_at": "2026-08-17T17:13:31.009947Z",
+      "data": {
+        "recording_enabled": true,
+        "transcribe_enabled": true,
+        "constructed_meeting_url": "https://jitsi.local:8443/ptx-smoke-msxhsvli"
+      }
+    }
+  }
+]

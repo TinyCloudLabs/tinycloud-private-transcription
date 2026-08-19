@@ -1,0 +1,24 @@
+# Overlay for infra/jitsi/docker-compose.yml (upstream docker-jitsi-meet, see UPSTREAM_PIN):
+#  - bind published ports to loopback only (host-side Playwright clients), UDP media stays open
+#  - mount our dev-CA-signed leaf cert so jitsi-web serves TLS the Vexa bot trusts
+#  - join the Vexa compose network under the alias `jitsi.local` so bot containers reach it directly
+services:
+  web:
+    ports: !override
+      - "127.0.0.1:${HTTP_PORT}:8000"
+      - "127.0.0.1:${HTTPS_PORT}:8443"
+    volumes:
+      - ../certs/out/jitsi.crt:/config/keys/cert.crt:ro
+      - ../certs/out/jitsi.key:/config/keys/cert.key:ro
+    networks:
+      meet.jitsi:
+      vexa:
+        aliases: [jitsi.local]
+  jvb:
+    networks:
+      meet.jitsi:
+      vexa:
+networks:
+  vexa:
+    external: true
+    name: ${VEXA_NETWORK:-vexa-v012_vexa}

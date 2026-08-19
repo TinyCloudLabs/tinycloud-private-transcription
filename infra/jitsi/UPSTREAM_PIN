@@ -1,0 +1,5 @@
+repo=https://github.com/jitsi/docker-jitsi-meet
+tag=stable-11146-2
+commit=738058b44bc3029ea289bea180cd3838f702af8e
+file=docker-compose.yml (copied verbatim; overrides live in docker-compose.override.yml)
+license=Apache-2.0

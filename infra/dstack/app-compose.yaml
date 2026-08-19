@@ -1,0 +1,365 @@
+# dstack / Phala CVM app-compose for tinycloud-private-transcription (V1).
+# ONE CVM runs: our api + worker + postgres + redis, and the pinned Vexa v0.12 capture stack
+# (control plane + CPU whisper) that spawns meeting bots. Deploy:
+#   phala deploy -n ptx-dev -c infra/dstack/app-compose.yaml -e infra/dstack/.env -t tdx.large --disk-size 40G
+# Encrypted env (never in this file): POSTGRES_PASSWORD, VEXA_DB_PASSWORD, VEXA_ADMIN_TOKEN,
+# VEXA_INTERNAL_API_SECRET, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD, TINFOIL_API_KEY (optional),
+# TRANSCRIPTION_PROVIDER (vexa|tinfoil), PTX_IMAGE (our api/worker image), VEXA_IMAGE_TAG (v012).
+#
+# Vexa services mirror infra/vexa/upstream/deploy/compose/docker-compose.yml @ e0b356d (+ our
+# docker-compose.override.yml whisper service), minus agent-api/mcp/terminal (not needed for V1).
+#
+# BOT SPAWNING NEEDS THE DOCKER SOCKET: Vexa's `runtime` creates one container per meeting bot
+# (BROWSER_IMAGE = vexaai/vexa-bot:v012, ~3.6 GB, Chromium+Xvfb+PulseAudio) through
+# /var/run/docker.sock, on the compose network named below (DOCKER_NETWORK) so the bot resolves
+# meeting-api:8080, redis and whisper:8000. dstack runs docker inside the CVM, so the socket exists;
+# if a given dstack/Phala policy rejects the bind mount, the fallback plan is Vexa's "process backend"
+# (Vexa Lite: run the bot in-process / as a sibling compose service instead of docker-spawned
+# containers) — see docs/vexa-findings.md and the README "CVM plan" section.
+
+services:
+  # ─── ours ────────────────────────────────────────────────────────────────────────────────────
+  api:
+    image: ${PTX_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:v1}
+    # VEXA_API_KEY is minted at first boot by `vexa-provision` (below) into a shared volume.
+    command: ["sh", "-c", "while [ ! -s /run/vexa/api-key ]; do sleep 2; done; export VEXA_API_KEY=$(cat /run/vexa/api-key); exec bun run src/api/server.ts"]
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      DATABASE_URL: postgres://ptx:${POSTGRES_PASSWORD}@postgres:5432/ptx
+      REDIS_URL: redis://redis:6379
+      VEXA_BASE_URL: http://gateway:8000
+      TRANSCRIPTION_PROVIDER: ${TRANSCRIPTION_PROVIDER:-vexa}
+      TINFOIL_BASE_URL: https://inference.tinfoil.sh
+      TINFOIL_API_KEY: ${TINFOIL_API_KEY:-}
+      TINFOIL_MODEL: ${TINFOIL_MODEL:-voxtral-small-24b}
+      AUTO_MIGRATE: "true"
+      LOG_LEVEL: info
+    volumes:
+      - vexa-provision:/run/vexa:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    networks: [ptx, vexa]
+
+  worker:
+    image: ${PTX_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:v1}
+    command: ["sh", "-c", "while [ ! -s /run/vexa/api-key ]; do sleep 2; done; export VEXA_API_KEY=$(cat /run/vexa/api-key); exec bun run src/worker/index.ts"]
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://ptx:${POSTGRES_PASSWORD}@postgres:5432/ptx
+      REDIS_URL: redis://redis:6379
+      VEXA_BASE_URL: http://gateway:8000
+      VEXA_POLL_INTERVAL_MS: "5000"
+      TRANSCRIPTION_PROVIDER: ${TRANSCRIPTION_PROVIDER:-vexa}
+      TINFOIL_BASE_URL: https://inference.tinfoil.sh
+      TINFOIL_API_KEY: ${TINFOIL_API_KEY:-}
+      TINFOIL_MODEL: ${TINFOIL_MODEL:-voxtral-small-24b}
+      LOG_LEVEL: info
+    volumes:
+      - vexa-provision:/run/vexa:ro
+    depends_on:
+      api:
+        condition: service_started
+    networks: [ptx, vexa]
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ptx
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ptx
+    volumes:
+      - ptx-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ptx"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [ptx]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ptx-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [ptx]
+
+  # ─── Vexa v0.12 capture stack (published images; nothing built) ─────────────────────────────
+  vexa-redis:
+    image: valkey/valkey:8-alpine
+    command: ["valkey-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - vexa-redis:/data
+    networks:
+      vexa:
+        aliases: [redis]   # upstream services + bots hardcode redis://redis:6379/0 on this network
+    restart: unless-stopped
+
+  vexa-postgres:
+    image: postgres:17-alpine
+    command: ["postgres", "-c", "idle_in_transaction_session_timeout=60000"]
+    environment:
+      POSTGRES_DB: vexa
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${VEXA_DB_PASSWORD}
+      TZ: UTC
+      PGTZ: UTC
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d vexa"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - vexa-postgres:/var/lib/postgresql/data
+    networks: [vexa]
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || curl -sf http://localhost:9000/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - minio-data:/data
+    networks: [vexa]
+    restart: unless-stopped
+
+  minio-init:
+    image: minio/mc:latest
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"; do sleep 1; done
+        mc mb -p local/vexa || true
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks: [vexa]
+
+  admin-api:
+    image: vexaai/v012-admin-api:${VEXA_IMAGE_TAG:-v012}
+    environment:
+      DB_HOST: vexa-postgres
+      DB_PORT: "5432"
+      DB_NAME: vexa
+      DB_USER: postgres
+      DB_PASSWORD: ${VEXA_DB_PASSWORD}
+      ADMIN_API_TOKEN: ${VEXA_ADMIN_TOKEN}
+      INTERNAL_API_SECRET: ${VEXA_INTERNAL_API_SECRET}
+      LOG_LEVEL: info
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8001/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    init: true
+    depends_on:
+      vexa-postgres:
+        condition: service_healthy
+    networks: [vexa]
+    restart: unless-stopped
+
+  # Vexa's runtime does `docker create` (no pull) for each bot, so the bot image must already be in the CVM's
+  # docker image store — AND dstack runs `docker image prune -af` after every `compose up`, which deletes any
+  # image no container references. This no-op service makes compose pull vexaai/vexa-bot at boot (~1.6 GB
+  # compressed) and its exited container pins the image so the prune keeps it.
+  bot-image-keeper:
+    image: vexaai/vexa-bot:${VEXA_IMAGE_TAG:-v012}
+    entrypoint: ["/bin/true"]
+    restart: "no"
+    network_mode: none
+
+  runtime:
+    image: vexaai/v012-runtime:${VEXA_IMAGE_TAG:-v012}
+    group_add: ["0"]
+    environment:
+      BROWSER_IMAGE: vexaai/vexa-bot:${VEXA_IMAGE_TAG:-v012}
+      AGENT_IMAGE: vexaai/v012-agent-api:${VEXA_IMAGE_TAG:-v012}
+      AGENT_WORKER_IMAGE: vexaai/v012-agent-worker:${VEXA_IMAGE_TAG:-v012}
+      REDIS_URL: redis://redis:6379/0
+      INTERNAL_API_SECRET: ${VEXA_INTERNAL_API_SECRET}
+      LOG_LEVEL: info
+      # Bots are spawned onto THIS network (fixed name below) so they resolve meeting-api/redis/whisper.
+      DOCKER_NETWORK: ptx-vexa
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock   # bot spawning (see header)
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8090/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      vexa-redis:
+        condition: service_healthy
+      bot-image-keeper:
+        condition: service_completed_successfully
+    networks: [vexa]
+    restart: unless-stopped
+
+  whisper:
+    image: fedirz/faster-whisper-server:latest-cpu
+    environment:
+      WHISPER__MODEL: ${WHISPER_MODEL:-Systran/faster-whisper-small.en}
+      WHISPER__INFERENCE_DEVICE: cpu
+      WHISPER__TTL: "-1"
+    volumes:
+      - whisper-cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    networks: [vexa]
+    restart: unless-stopped
+
+  meeting-api:
+    image: vexaai/v012-meeting-api:${VEXA_IMAGE_TAG:-v012}
+    environment:
+      DB_HOST: vexa-postgres
+      DB_PORT: "5432"
+      DB_NAME: vexa
+      DB_USER: postgres
+      DB_PASSWORD: ${VEXA_DB_PASSWORD}
+      REDIS_URL: redis://redis:6379/0
+      ADMIN_API_URL: http://admin-api:8001
+      ADMIN_TOKEN: ${VEXA_ADMIN_TOKEN}
+      RUNTIME_API_URL: http://runtime:8090
+      INTERNAL_API_SECRET: ${VEXA_INTERNAL_API_SECRET}
+      DEFAULT_BOT_NAME: TinyCloud Notetaker
+      TRANSCRIPTION_SERVICE_URL: http://whisper:8000
+      TRANSCRIPTION_SERVICE_TOKEN: local-stt        # faster-whisper-server ignores auth; non-empty marks STT "configured"
+      TRANSCRIPTION_MODEL: ""
+      TRANSCRIBE_ENABLED: "true"
+      RECORDING_ENABLED: "true"                     # persists meeting audio to MinIO (Tinfoil batch input)
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: vexa
+      MINIO_SECURE: "false"
+      BOT_AUTHENTICATED: "false"
+      LOG_LEVEL: info
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    depends_on:
+      vexa-postgres:
+        condition: service_healthy
+      vexa-redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      runtime:
+        condition: service_healthy
+      whisper:
+        condition: service_healthy
+    networks: [vexa]
+    restart: unless-stopped
+
+  gateway:
+    image: vexaai/v012-gateway:${VEXA_IMAGE_TAG:-v012}
+    environment:
+      ADMIN_API_URL: http://admin-api:8001
+      MEETING_API_URL: http://meeting-api:8080
+      MCP_URL: http://mcp:8010
+      REDIS_URL: redis://redis:6379/0
+      INTERNAL_API_SECRET: ${VEXA_INTERNAL_API_SECRET}
+      GUARD_ENABLED: "false"
+      LOG_LEVEL: info
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      admin-api:
+        condition: service_healthy
+      meeting-api:
+        condition: service_healthy
+      vexa-redis:
+        condition: service_healthy
+    networks: [vexa]
+    restart: unless-stopped
+    # Not published: only our api/worker talk to Vexa. Vexa's gateway is internal to the CVM.
+
+  # One-shot: create the service-owned Vexa user + `bot,tx` API key and hand it to api/worker.
+  vexa-provision:
+    image: curlimages/curl:8.10.1
+    user: root
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        [ -s /run/vexa/api-key ] && { echo "vexa api key already provisioned"; exit 0; }
+        H='X-Admin-API-Key: '"$$VEXA_ADMIN_TOKEN"
+        until curl -sf http://admin-api:8001/health >/dev/null; do sleep 2; done
+        U=$$(curl -sf -H "$$H" http://admin-api:8001/admin/users/email/self-host@vexa.ai || true)
+        [ -n "$$U" ] || U=$$(curl -sf -H "$$H" -H 'Content-Type: application/json' -X POST http://admin-api:8001/admin/users -d '{"email":"self-host@vexa.ai","max_concurrent_bots":5}')
+        ID=$$(echo "$$U" | sed -n 's/.*"id":[ ]*\([0-9]*\).*/\1/p')
+        T=$$(curl -sf -H "$$H" -X POST "http://admin-api:8001/admin/users/$$ID/tokens?scopes=bot,tx")
+        echo "$$T" | sed -n 's/.*"token":[ ]*"\([^"]*\)".*/\1/p' > /run/vexa/api-key
+        [ -s /run/vexa/api-key ] && echo "vexa api key provisioned for user $$ID"
+    environment:
+      VEXA_ADMIN_TOKEN: ${VEXA_ADMIN_TOKEN}
+    volumes:
+      - vexa-provision:/run/vexa
+    depends_on:
+      admin-api:
+        condition: service_healthy
+    networks: [vexa]
+    restart: on-failure
+
+volumes:
+  ptx-postgres:
+  ptx-redis:
+  vexa-postgres:
+  vexa-redis:
+  minio-data:
+  whisper-cache:
+  vexa-provision:
+
+networks:
+  ptx: {}
+  vexa:
+    name: ptx-vexa   # fixed: runtime's DOCKER_NETWORK must equal this (bots are attached here)
+
+# Operational notes
+# - Bootstrap an API key for callers: `phala ssh -- docker exec <api container> bun run src/cli.ts create-key --project demo`.
+# - Sizing (docs/vexa-findings.md): whisper small.en ~1.4 GB RSS + ~10 cores while decoding, one bot
+#   ~470 MB + Chromium launch burst, control plane ~1 GB → tdx.large (4 vCPU / 8 GB) is the smallest
+#   viable dev size; production wants ≥ tdx.xlarge. Disk ≥ 40 GB (bot image 3.6 GB + whisper model + recordings).
+# - Egress: bots join public meetings over the CVM's NAT; only :8080 (our API) is published.
