@@ -1,11 +1,11 @@
 repo=https://github.com/TinyCloudLabs/vexa (OUR FORK of https://github.com/Vexa-ai/vexa)
 branch=tinycloud
-commit=679b1ff623f78e6aa68fac8c43b2b37fe448821e
-version=v0.12.18-30-g679b1ff6 (upstream base e0b356d6 = v0.12.22; +1 TinyCloud commit)
+commit=2db950be784c843adc1e5408e5b2b2080909cd1b
+version=v0.12.18-31-g2db950be (upstream base e0b356d6 = v0.12.22; +2 TinyCloud commits)
 license=Apache-2.0 (unchanged; LICENSE kept intact in the fork)
 pinned_at=2026-08-19
 # Fork rationale: upstream v0.12's record-chunker attached only the media tracks present when the
 # recording tap started — a participant joining after the bot was missing from master.webm (and an
 # empty-at-join room produced no/silent master). The fork's `tinycloud` branch makes the tap dynamic
-# (core/meetings/modules/record-chunker). Fork bot image: ghcr.io/tinycloudlabs/vexa-bot:tc-029610d
+# (core/meetings/modules/record-chunker). Fork bot image: ghcr.io/tinycloudlabs/vexa/bot:tc-2db950b
 # (built by the fork's tinycloud-bot-image workflow). `main` on the fork tracks upstream untouched.
