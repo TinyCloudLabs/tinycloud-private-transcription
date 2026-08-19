@@ -1,7 +1,7 @@
 repo=https://github.com/TinyCloudLabs/vexa (OUR FORK of https://github.com/Vexa-ai/vexa)
 branch=tinycloud
-commit=029610dbd4074d9228414768eec8a2a801b2564c
-version=v0.12.18-30-g029610db (upstream base e0b356d6 = v0.12.22; +1 TinyCloud commit)
+commit=679b1ff623f78e6aa68fac8c43b2b37fe448821e
+version=v0.12.18-30-g679b1ff6 (upstream base e0b356d6 = v0.12.22; +1 TinyCloud commit)
 license=Apache-2.0 (unchanged; LICENSE kept intact in the fork)
 pinned_at=2026-08-19
 # Fork rationale: upstream v0.12's record-chunker attached only the media tracks present when the
