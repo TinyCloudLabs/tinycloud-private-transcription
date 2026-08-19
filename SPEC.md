@@ -31,6 +31,8 @@ Auth: `Authorization: Bearer tc_live_xxx`.
 ```
 States: `queued → joining → waiting_for_admission → in_progress → processing → completed`; terminal failures `failed`, `cancelled`. `in_progress` only once the bot is actually admitted. Map from Vexa statuses (`requested/joining/awaiting_admission/active/needs_help/stopping/completed/failed`; `awaiting_admission`/`needs_help` → `waiting_for_admission`). A meeting still `joining`/`waiting_for_admission` `JOIN_TIMEOUT_SECONDS` (default 600) after bot dispatch is failed by the worker (`meeting_join_failed`/`waiting_room_timeout`), the bot stopped, and `meeting.failed` emitted.
 
+For every dispatched meeting, the worker sends Vexa `automatic_leave.max_time_left_alone` from `VEXA_MAX_TIME_LEFT_ALONE_MS` (default 60000 milliseconds). This per-meeting override releases the bot and continues normal finalization as `completed(left_alone)` after the last human leaves on Jitsi or Google Meet; an operator can increase it for meetings where long silence is expected.
+
 `GET /v1/meetings/{id}` → status, platform, bot{name,joined_at}, transcript{status}, created/started/ended_at, metadata, error{type,code,message} on failure. Once completed also `transcript_provider` (`"tinfoil" | "vexa"`) plus `fallback_from`/`fallback_reason` when the configured provider fell back to the Vexa-native transcript.
 `POST /v1/meetings/{id}/stop` → idempotent, returns `{id,status}`.
 `GET /v1/meetings/{id}/transcript` → 202 `{meeting_id,status}` until complete; then

@@ -21,6 +21,7 @@ interface MockMeeting extends VexaMeetingResponse {
   language?: string;
   meeting_url?: string;
   recording_enabled?: boolean;
+  automatic_leave?: VexaMeetingCreate["automatic_leave"];
   /** Deletable via DELETE /meetings (real Vexa: idle/scheduled rows only). */
   planned?: boolean;
   /** Persisted recording bytes (control: `recording_base64`); served like the real recordings API. */
@@ -82,6 +83,7 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       language: body.language,
       meeting_url: body.meeting_url,
       recording_enabled: body.recording_enabled,
+      automatic_leave: body.automatic_leave,
     };
     meetings.set(k, m);
     return c.json(strip(m), 201);
