@@ -20,6 +20,7 @@ interface MockMeeting extends VexaMeetingResponse {
   bot_name?: string;
   language?: string;
   meeting_url?: string;
+  recording_enabled?: boolean;
   /** Deletable via DELETE /meetings (real Vexa: idle/scheduled rows only). */
   planned?: boolean;
 }
@@ -78,6 +79,7 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       bot_name: body.bot_name,
       language: body.language,
       meeting_url: body.meeting_url,
+      recording_enabled: body.recording_enabled,
     };
     meetings.set(k, m);
     return c.json(strip(m), 201);
