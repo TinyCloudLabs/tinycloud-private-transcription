@@ -21,6 +21,8 @@ export const config = {
     baseUrl: env("TINFOIL_BASE_URL", "https://inference.tinfoil.sh"),
     apiKey: env("TINFOIL_API_KEY", ""),
     model: env("TINFOIL_MODEL", "voxtral-small-24b"),
+    /** `turns` (per speaker turn, keeps segmentation) | `whole` (one call, one segment). */
+    segmentation: env("TINFOIL_SEGMENTATION", "turns") as "turns" | "whole",
   },
   logLevel: env("LOG_LEVEL", "info"),
 };

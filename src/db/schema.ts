@@ -51,6 +51,8 @@ export const transcripts = pgTable("transcripts", {
   language: text("language").notNull(),
   durationSeconds: real("duration_seconds").notNull(),
   segmentsJson: jsonb("segments_json").notNull(),
+  /** Which provider produced the stored transcript: "vexa" (WhisperLive passthrough / fallback) | "tinfoil". */
+  provider: text("provider").notNull().default("vexa"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
