@@ -1,6 +1,19 @@
 node_modules/
-.env
 *.log
-tmp/
-infra/certs/out/
+
+# secrets / local env (examples are committed as *.example)
+.env
+.env.*
+!.env.example
 infra/dstack/.env
+
+# scratch + evidence from local runs
+tmp/
+
+# generated dev PKI (infra/certs/gen.sh) and its copies
+infra/certs/out/
+infra/vexa/bot/ca.crt
+*.key
+*.pem
+*.p12
+*.srl
