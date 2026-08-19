@@ -119,6 +119,7 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
   }
 
   ({ meeting } = await transition(ctx, meeting, "processing"));
+  ctx.log.debug("vexa meeting completed; finalizing", { meetingId: meeting.id, vexaSegments: segments.length, recordings: vexa.recordings?.length ?? 0 });
   await finalize(ctx, meeting, vexa, segments);
 }
 
@@ -133,14 +134,17 @@ async function finalize(ctx: AppContext, meeting: MeetingRow, vexa: VexaTranscri
     language: meeting.language,
     vexaSegments,
     fetchAudio: async () => {
+      ctx.log.debug("fetching vexa recording", { meetingId: meeting.id, vexaMeetingId: vexa.id });
       const audio = await fetchVexaAudio(ctx, vexa);
       if (!audio) audioMissing = true;
+      else ctx.log.debug("vexa recording fetched", { meetingId: meeting.id, bytes: audio.bytes.length, contentType: audio.contentType });
       return audio;
     },
   };
-  // Vexa's live segments are always a valid transcript: a batch provider that cannot run (no/silent
-  // recording, most turns failed, provider outage after our retries) degrades to them instead of failing.
-  const canFallback = () => needsRecording(ctx) && vexaSegments.length > 0;
+  // Vexa's live segments are always a valid transcript (possibly empty: nobody spoke): a batch provider that
+  // cannot run (no/silent recording, most turns failed, provider outage after our retries) degrades to them
+  // instead of failing the meeting.
+  const canFallback = () => needsRecording(ctx);
   const fallback = async (reason: string, error: unknown) => {
     ctx.log.warn("falling back to vexa-native transcript", { meetingId: meeting.id, provider: primary, reason, error: String(error) });
     const transcript = await new VexaNativeProvider().transcribe(input);

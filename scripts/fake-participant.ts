@@ -23,6 +23,8 @@ export interface FakeParticipantOptions {
   name?: string;
   seconds?: number;
   wav?: string;
+  /** Pass false to force JVB from the start (multi-participant recordings; see hash config below). */
+  p2p?: boolean;
   /** host=ip mapping applied via --host-resolver-rules (default jitsi.local=127.0.0.1) */
   resolve?: string;
   headless?: boolean;
@@ -63,6 +65,10 @@ export async function runFakeParticipant(opts: FakeParticipantOptions): Promise<
     "config.startWithAudioMuted=false",
     "config.startWithVideoMuted=true",
     "config.disableDeepLinking=true",
+    // No P2P: with two humans + the bot, Jitsi would start P2P and re-negotiate to the JVB when the bot joins,
+    // recreating the remote <audio> elements — Vexa v0.12's recording tap only mixes the elements present when
+    // it starts, so one participant's audio would be missing from the persisted recording (docs/vexa-findings.md).
+    ...(opts.p2p === false ? ["config.p2p.enabled=false"] : []),
   ].join("&");
   u.hash = hash;
   log(`navigating to ${u.toString()}`);

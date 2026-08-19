@@ -3,6 +3,9 @@
  * ONCE with ffmpeg into 16 kHz mono s16le PCM, then cut turns by sample offset and wrap them as WAV.
  * ffmpeg is only needed for the decode (apt/apk `ffmpeg`; see Dockerfile).
  */
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 export interface Pcm16 {
   samples: Int16Array;
@@ -14,14 +17,25 @@ export const PCM_RATE = 16_000;
 
 export async function decodeToPcm(bytes: Uint8Array, opts: { ffmpegPath?: string; sampleRate?: number } = {}): Promise<Pcm16> {
   const rate = opts.sampleRate ?? PCM_RATE;
-  const proc = Bun.spawn(
-    [opts.ffmpegPath ?? "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0", "-vn", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", String(rate), "pipe:1"],
-    { stdin: bytes as unknown as Uint8Array<ArrayBuffer>, stdout: "pipe", stderr: "pipe" },
-  );
-  const [out, err, code] = await Promise.all([new Response(proc.stdout).arrayBuffer(), new Response(proc.stderr).text(), proc.exited]);
-  if (code !== 0) throw new Error(`ffmpeg decode failed (exit ${code}): ${err.trim().slice(0, 300)}`);
-  const samples = new Int16Array(out.slice(0, out.byteLength - (out.byteLength % 2)));
-  return { samples, sampleRate: rate, durationSec: samples.length / rate };
+  // Files, not pipes: MediaRecorder webm masters have unknown-length clusters and ffmpeg wants to seek;
+  // piping also deadlocked once inside the worker process (Bun stdin writer + Playwright in-process).
+  const dir = await mkdtemp(join(tmpdir(), "ptx-audio-"));
+  const inPath = join(dir, "in.bin");
+  const outPath = join(dir, "out.s16le");
+  try {
+    await Bun.write(inPath, bytes as unknown as Uint8Array<ArrayBuffer>);
+    const proc = Bun.spawn(
+      [opts.ffmpegPath ?? "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", inPath, "-vn", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", String(rate), outPath],
+      { stdin: "ignore", stdout: "ignore", stderr: "pipe" },
+    );
+    const [err, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    if (code !== 0) throw new Error(`ffmpeg decode failed (exit ${code}): ${err.trim().slice(0, 300)}`);
+    const out = await Bun.file(outPath).arrayBuffer();
+    const samples = new Int16Array(out.slice(0, out.byteLength - (out.byteLength % 2)));
+    return { samples, sampleRate: rate, durationSec: samples.length / rate };
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 /** RMS in dBFS over the whole buffer (-Infinity for digital silence). */
