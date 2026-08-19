@@ -105,7 +105,7 @@ async function main() {
     await alice;
   }
   let finalMeeting: any = null;
-  const stopDeadline = Date.now() + 90_000;
+  const stopDeadline = Date.now() + (AUTO_LEAVE_MS === undefined ? 90_000 : AUTO_LEAVE_MS + 90_000);
   while (Date.now() < stopDeadline) {
     const list = await fetch(`${API}/meetings`, { headers: H }).then((x) => x.json()).catch(() => null);
     finalMeeting = list?.meetings?.find((m: any) => m.id === meetingId || m.native_meeting_id === nativeId) ?? null;

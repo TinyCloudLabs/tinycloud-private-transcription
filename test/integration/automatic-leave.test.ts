@@ -18,6 +18,8 @@ describe("automatic leave", () => {
     expect(response.status).toBe(201);
     await h.waitFor(async () => h.vexa.meetings.get(vexaKey) ?? null, { label: `${vexaKey} dispatched` });
     expect(h.vexa.meetings.get(vexaKey)?.automatic_leave).toEqual({ max_time_left_alone: 60_000 });
+    const vexaMeetings = await (await fetch(`${h.vexa.baseUrl}/meetings`, { headers: { "X-API-Key": h.vexa.apiKey } })).json() as { meetings: { native_meeting_id: string }[] };
+    expect(vexaMeetings.meetings.find((meeting: { native_meeting_id: string }) => meeting.native_meeting_id === vexaKey.split("/").at(-1))).not.toHaveProperty("automatic_leave");
     await h.vexa.control(vexaKey.split("/")[0], vexaKey.slice(vexaKey.indexOf("/") + 1), { status: "completed", completion_reason: "stopped" });
   });
 

@@ -213,8 +213,8 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
   return { app, meetings, requests, apiKey };
 }
 
-function strip(m: { segments?: unknown; bot_name?: unknown; language?: unknown; meeting_url?: unknown; planned?: unknown } & VexaMeetingResponse): VexaMeetingResponse {
-  const { segments: _s, bot_name: _b, language: _l, meeting_url: _u, planned: _p, ...rest } = m;
+function strip(m: { segments?: unknown; bot_name?: unknown; language?: unknown; meeting_url?: unknown; automatic_leave?: unknown; planned?: unknown } & VexaMeetingResponse): VexaMeetingResponse {
+  const { segments: _s, bot_name: _b, language: _l, meeting_url: _u, automatic_leave: _a, planned: _p, ...rest } = m;
   return rest;
 }
 
