@@ -83,7 +83,8 @@ bun run cli create-key --project demo
 the capture rig — it brings up nothing itself: follow [infra/README.md](./infra/README.md) first, then
 run it; it mints a Vexa key via admin-api, starts api+worker in-process, creates a meeting in a random
 `https://jitsi.local:8443/<room>`, sends Alice, waits for `completed`, checks transcript + signed webhook,
-then deletes. Green 2/2 on 2026-08-17 (~2 min each; evidence in `tmp/e2e-<room>.json`).
+then deletes. The test uses `E2E_AUTO_LEAVE_MS` (default `60000`) so it does not wait for the five-minute
+production window. Green 2/2 on 2026-08-17 (~2 min each; evidence in `tmp/e2e-<room>.json`).
 
 ### Env vars
 
@@ -95,6 +96,7 @@ then deletes. Green 2/2 on 2026-08-17 (~2 min each; evidence in `tmp/e2e-<room>.
 | `VEXA_BASE_URL` | `http://localhost:18066` | Vexa API gateway (capture rig). Mock: `http://localhost:18056` |
 | `VEXA_API_KEY` | – | sent as `X-API-Key` |
 | `VEXA_POLL_INTERVAL_MS` | `5000` | worker status/transcript poll |
+| `VEXA_MAX_TIME_LEFT_ALONE_MS` | `300000` | per-meeting window without remote participant audio (milliseconds). After five minutes without hearing anyone else, Vexa completes the bot as `left_alone`; applies to Jitsi and Google Meet. |
 | `VEXA_MAX_CONCURRENT_BOTS` | `5` | provisioned bot ceiling (matches `max_concurrent_bots` in infra/dstack/app-compose.yaml); reported as `bot_capacity.max` in `/health` |
 | `ENABLED_PLATFORMS` | `jitsi` | comma-separated platforms accepted by `POST /v1/meetings`. Others (zoom, google_meet, microsoft_teams) are still detected but answer 400 `unsupported_platform` |
 | `JOIN_TIMEOUT_SECONDS` | `600` | worker-side join deadline: a meeting still `joining`/`waiting_for_admission` this long after bot dispatch is failed (`meeting_join_failed`/`waiting_room_timeout`), its bot stopped, and `meeting.failed` emitted |
@@ -231,6 +233,10 @@ bun run test:e2e` (asserts `transcript.provider === "tinfoil"`; green 2/2 on 202
 
 ### Known gaps / risks
 
+- **Quiet meetings can auto-end**: Vexa currently infers an empty room from the absence of remote
+  participant audio, not participant count. Five continuous silent minutes (for example, a break or
+  quiet screen-share) can therefore finalize a meeting even if people remain connected. Use
+  `POST /v1/meetings/{id}/stop` to end immediately; tune `VEXA_MAX_TIME_LEFT_ALONE_MS` for longer silence.
 - **Vexa data retention on DELETE**: Vexa v0.12 only deletes *planned* rows; `DELETE /meetings/{p}/{id}` on a
   meeting the bot lifecycle touched answers `409 "Meeting is no longer planned (bot lifecycle owns it)"`.
   Our DELETE removes our data and logs the 409; purging Vexa's copy needs an upstream route or a direct
@@ -352,4 +358,3 @@ curl -s -X POST $API/v1/meetings -H "Authorization: Bearer $KEY" -H 'Content-Typ
 ```
 
 Debug: `phala logs ptx-dev -f`, `phala logs ptx-dev --serial --tail 200` (image pull / compose errors), `phala ps ptx-dev`.
-

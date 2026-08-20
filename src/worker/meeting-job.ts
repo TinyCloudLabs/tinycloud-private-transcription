@@ -30,6 +30,10 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
       meeting_url: meeting.meetingUrl,
       bot_name: meeting.botName ?? undefined,
       language: meeting.language ?? undefined,
+      // Vexa otherwise applies its ten-minute deployment fallback. Pin every TinyCloud meeting to
+      // our configurable remote-participant audio silence window so both platforms release a bot
+      // after the last human leaves.
+      automatic_leave: { max_time_left_alone: ctx.config.vexa.maxTimeLeftAloneMs },
       // Batch providers (Tinfoil) transcribe the persisted recording: ask for it explicitly (Vexa's
       // default is true, but a deployment can flip RECORDING_ENABLED off).
       ...(needsRecording(ctx) ? { recording_enabled: true } : {}),

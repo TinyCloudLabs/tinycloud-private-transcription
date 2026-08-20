@@ -4,6 +4,12 @@ const env = (name: string, fallback?: string): string => {
   return v;
 };
 
+export const positiveIntegerEnv = (name: string, fallback: string): number => {
+  const value = Number(env(name, fallback));
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`);
+  return value;
+};
+
 export type TranscriptionProviderName = "vexa" | "tinfoil";
 
 export const config = {
@@ -15,6 +21,8 @@ export const config = {
     baseUrl: env("VEXA_BASE_URL", "http://localhost:18066"),
     apiKey: env("VEXA_API_KEY", ""),
     pollIntervalMs: Number(env("VEXA_POLL_INTERVAL_MS", "5000")),
+    /** Per-meeting Vexa remote-participant audio silence window before the bot completes with `left_alone`. */
+    maxTimeLeftAloneMs: positiveIntegerEnv("VEXA_MAX_TIME_LEFT_ALONE_MS", "300000"),
     /** Provisioned bot ceiling (matches `max_concurrent_bots` in infra/dstack/app-compose.yaml). Reported in /health. */
     maxConcurrentBots: Number(env("VEXA_MAX_CONCURRENT_BOTS", "5")),
   },

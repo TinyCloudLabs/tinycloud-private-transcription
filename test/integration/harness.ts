@@ -39,6 +39,7 @@ export async function startHarness(
     log?: Logger;
     enabledPlatforms?: string[];
     joinTimeoutSeconds?: number;
+    maxTimeLeftAloneMs?: number;
   } = {},
 ): Promise<Harness> {
   const vexa = startMockVexa(0);
@@ -48,6 +49,7 @@ export async function startHarness(
     transcriptionProvider: (opts.transcription?.name ?? "vexa") as "vexa" | "tinfoil",
     ...(opts.enabledPlatforms ? { enabledPlatforms: opts.enabledPlatforms } : {}),
     ...(opts.joinTimeoutSeconds !== undefined ? { joinTimeoutSeconds: opts.joinTimeoutSeconds } : {}),
+    ...(opts.maxTimeLeftAloneMs !== undefined ? { vexa: { ...baseConfig.vexa, baseUrl: vexa.baseUrl, apiKey: vexa.apiKey, pollIntervalMs: 50, maxTimeLeftAloneMs: opts.maxTimeLeftAloneMs } } : {}),
   };
   const db = await runMigrations(config.databaseUrl);
   await db.execute(sql`truncate table webhook_deliveries, transcripts, meetings, api_keys, projects cascade`);

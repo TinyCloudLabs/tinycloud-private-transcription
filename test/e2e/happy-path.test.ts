@@ -7,12 +7,14 @@
  *
  * Flow: mint API key → POST /v1/meetings (random Jitsi room, webhook_url → local receiver) → Alice
  * (Playwright fake participant, fixtures/alice.wav: "The quick brown fox jumps over the lazy dog. Hello
- * from Alice.") joins and talks → wait until Vexa has heard "brown fox" → POST /stop → wait for
- * `completed` → assert transcript (speaker Alice, "brown fox", non-empty text) + signed
- * meeting.completed webhook → DELETE → our 404; Vexa row outcome recorded (v0.12 keeps bot-owned rows: 409).
+ * from Alice.") joins and talks → wait until Vexa has heard "brown fox" → Alice leaves with no Stop
+ * call → Vexa completes as `left_alone` → TinyCloud reaches `completed` → assert transcript (speaker
+ * Alice, "brown fox", non-empty text), zero running capacity, and signed meeting.completed webhook →
+ * DELETE → our 404; Vexa row outcome recorded (v0.12 keeps bot-owned rows: 409).
  *
  * Env: VEXA_BASE_URL (http://localhost:18066) VEXA_API_KEY (minted via admin-api if unset)
  *      JITSI_BASE_URL (https://jitsi.local:8443) JITSI_HOST_IP (127.0.0.1) E2E_ALICE_SECONDS (75) E2E_TIMEOUT_S (300)
+ *      E2E_AUTO_LEAVE_MS (60000; explicit short test window, independent of the production default)
  *      TRANSCRIPTION_PROVIDER (vexa|tinfoil, from .env) + TINFOIL_* — with `tinfoil` the worker downloads the Vexa
  *      recording, cuts it per Vexa speaker turn and sends each turn to Tinfoil (TINFOIL_SEGMENTATION=turns, default;
  *      a handful of live calls of a few seconds each; `whole` = ONE call). With `tinfoil` the test REQUIRES
@@ -25,7 +27,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { RedisClient } from "bun";
 import { createApp } from "../../src/api/app.ts";
 import { createApiKey } from "../../src/api/auth.ts";
-import { config as baseConfig } from "../../src/config.ts";
+import { config as baseConfig, positiveIntegerEnv } from "../../src/config.ts";
 import { createContext, type AppContext } from "../../src/context.ts";
 import { runMigrations } from "../../src/db/migrate.ts";
 import { logger, type Logger } from "../../src/log.ts";
@@ -43,6 +45,7 @@ const VEXA_URL = process.env.VEXA_BASE_URL ?? "http://localhost:18066";
 const JITSI = (process.env.JITSI_BASE_URL ?? "https://jitsi.local:8443").replace(/\/$/, "");
 const ALICE_SECONDS = Number(process.env.E2E_ALICE_SECONDS ?? 75);
 const TIMEOUT_S = Number(process.env.E2E_TIMEOUT_S ?? 300);
+const AUTO_LEAVE_MS = positiveIntegerEnv("E2E_AUTO_LEAVE_MS", "60000");
 const ROOM = `ptx-e2e-${Date.now().toString(36)}`;
 const NATIVE_ID = `${ROOM}@${new URL(JITSI).hostname}`;
 
@@ -75,7 +78,7 @@ describe.skipIf(!E2E)("E2E happy path against the real capture rig", () => {
   let meetingId: string;
   let alice: Promise<void> | null = null;
   const aliceLog: string[] = [];
-  const evidence: Record<string, unknown> = { room: ROOM, native_meeting_id: NATIVE_ID, provider: baseConfig.transcriptionProvider, statuses: [] as string[] };
+  const evidence: Record<string, unknown> = { room: ROOM, native_meeting_id: NATIVE_ID, provider: baseConfig.transcriptionProvider, automatic_leave_ms: AUTO_LEAVE_MS, statuses: [] as string[] };
   // Worker log lines about transcription (which provider finalized, fallback, silent recording) → evidence.
   const workerLogs: { level: string; msg: string; data?: Record<string, unknown> }[] = [];
   const tap = (level: keyof Logger) => (msg: string, data?: Record<string, unknown>) => {
@@ -102,7 +105,7 @@ describe.skipIf(!E2E)("E2E happy path against the real capture rig", () => {
     if (!jitsiOk) throw new Error(`Jitsi not reachable (${jitsiProbe}) — see infra/README.md`);
 
     const vexaKey = process.env.VEXA_API_KEY || (await mintVexaApiKey());
-    const config = { ...baseConfig, vexa: { ...baseConfig.vexa, baseUrl: VEXA_URL, apiKey: vexaKey, pollIntervalMs: 3000 } };
+    const config = { ...baseConfig, vexa: { ...baseConfig.vexa, baseUrl: VEXA_URL, apiKey: vexaKey, pollIntervalMs: 3000, maxTimeLeftAloneMs: AUTO_LEAVE_MS } };
     if (config.transcriptionProvider === "tinfoil" && !config.tinfoil.apiKey) throw new Error("TRANSCRIPTION_PROVIDER=tinfoil needs TINFOIL_API_KEY");
     const db = await runMigrations(config.databaseUrl);
     const redis = new RedisClient(config.redisUrl);
@@ -171,27 +174,33 @@ describe.skipIf(!E2E)("E2E happy path against the real capture rig", () => {
     expect(t.status).toBe(202); // not ready while live
   }, TIMEOUT_S * 1000);
 
-  test("Vexa hears 'brown fox' → POST /stop → completed", async () => {
+  test("Vexa hears 'brown fox'; after Alice leaves, automatic_leave completes TinyCloud without POST /stop", async () => {
     await waitFor(async () => {
       const tr = await vexa.getTranscript("jitsi", NATIVE_ID).catch(() => null);
       const segs = tr?.segments ?? [];
       if (segs.length) log(`vexa transcript: ${segs.length} segment(s); latest: ${JSON.stringify(segs.at(-1)).slice(0, 160)}`);
       return segs.some((s) => /brown fox/i.test(s.text) && s.completed !== false) ? tr : null;
     }, "'brown fox' in Vexa transcript", TIMEOUT_S * 1000, 5000);
-    const r = await api(`/v1/meetings/${meetingId}/stop`, { method: "POST" });
-    log(`POST /stop → ${r.status} ${await r.text()}`);
-    expect(r.status).toBe(200);
+    await alice;
+    log("Alice left; waiting for Vexa automatic_leave completion without POST /stop");
     const statuses = evidence.statuses as string[];
     const done = await waitFor(async () => {
       const b = (await (await api(`/v1/meetings/${meetingId}`)).json()) as any;
       if (statuses.at(-1) !== b.status) { statuses.push(b.status); log(`meeting status → ${b.status}`); }
       if (b.status === "failed") throw new Error(`meeting failed: ${JSON.stringify(b.error)}`);
       return b.status === "completed" ? b : null;
-    }, "completed", 120_000);
+    }, "completed", AUTO_LEAVE_MS + 90_000);
     evidence.final_meeting = done;
     expect(done.completed_at).toBeTruthy();
+    const vexaMeeting = await vexa.getTranscript("jitsi", NATIVE_ID);
+    expect(vexaMeeting.status).toBe("completed");
+    expect(vexaMeeting.data?.completion_reason).toBe("left_alone");
+    evidence.vexa_completion = { status: vexaMeeting.status, reason: vexaMeeting.data?.completion_reason };
+    const health = await (await fetch(`${apiUrl}/health`)).json() as any;
+    expect(health.checks.bot_capacity.running).toBe(0);
+    evidence.health_after_completion = health;
     log(`statuses: ${statuses.join(" → ")}`);
-  }, TIMEOUT_S * 1000);
+  }, (TIMEOUT_S + ALICE_SECONDS / 2) * 1000);
 
   test("GET /transcript: Alice, 'brown fox', non-empty text, meeting-relative timing", async () => {
     const r = await api(`/v1/meetings/${meetingId}/transcript`);

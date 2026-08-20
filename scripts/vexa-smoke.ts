@@ -12,7 +12,7 @@
  * Env: VEXA_API_URL (http://localhost:18066)  VEXA_ADMIN_URL (http://localhost:18057)
  *      VEXA_ADMIN_TOKEN (dev-admin-token)      VEXA_API_KEY (minted via admin-api if unset)
  *      JITSI_BASE_URL (https://jitsi.local:8443) SMOKE_ROOM (random)  ALICE_SECONDS (90)
- *      SMOKE_TIMEOUT_S (240)
+ *      SMOKE_TIMEOUT_S (240) AUTO_LEAVE_MS (optional: prove completed(left_alone) after Alice leaves)
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { runFakeParticipant } from "./fake-participant";
@@ -25,6 +25,13 @@ const JITSI = (process.env.JITSI_BASE_URL ?? "https://jitsi.local:8443").replace
 const ROOM = process.env.SMOKE_ROOM ?? `ptx-smoke-${Date.now().toString(36)}`;
 const ALICE_SECONDS = Number(process.env.ALICE_SECONDS ?? 90);
 const TIMEOUT_S = Number(process.env.SMOKE_TIMEOUT_S ?? 240);
+const AUTO_LEAVE_MS = (() => {
+  const raw = process.env.AUTO_LEAVE_MS;
+  if (raw === undefined) return undefined;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error("AUTO_LEAVE_MS must be a positive integer (milliseconds)");
+  return value;
+})();
 const EXPECT = /brown fox/i;
 const OUT = "tmp";
 mkdirSync(OUT, { recursive: true });
@@ -52,7 +59,13 @@ async function main() {
   if (!aliceLog.some((l) => l.startsWith("joined"))) throw new Error("Alice never joined the room");
 
   // 2. Spawn the Vexa bot.
-  const botBody = { platform: "jitsi", meeting_url: meetingUrl, bot_name: "TinyCloud Notetaker", language: "en" };
+  const botBody = {
+    platform: "jitsi",
+    meeting_url: meetingUrl,
+    bot_name: "TinyCloud Notetaker",
+    language: "en",
+    ...(AUTO_LEAVE_MS === undefined ? {} : { automatic_leave: { max_time_left_alone: AUTO_LEAVE_MS } }),
+  };
   save("vexa-post-bots-request.json", botBody);
   let r = await fetch(`${API}/bots`, { method: "POST", headers: H, body: JSON.stringify(botBody) });
   const botResp = await r.json().catch(() => ({}));
@@ -87,13 +100,23 @@ async function main() {
   save("vexa-bots-status-snapshots.json", snapshots);
   if (transcript) save("vexa-transcript.json", transcript);
 
-  // 4. Stop the bot, wait for terminal status, capture the final meeting record.
-  r = await fetch(`${API}/bots/jitsi/${encodeURIComponent(nativeId)}`, { method: "DELETE", headers: H });
-  const delBody = await r.json().catch(() => ({}));
-  save("vexa-delete-bot-response.json", { http_status: r.status, body: delBody });
-  log(`DELETE /bots → ${r.status} ${JSON.stringify(delBody).slice(0, 200)}`);
+  // 4. Either prove the configured empty-room exit, or stop explicitly for the ordinary smoke.
+  let aliceError: unknown;
+  if (AUTO_LEAVE_MS === undefined) {
+    r = await fetch(`${API}/bots/jitsi/${encodeURIComponent(nativeId)}`, { method: "DELETE", headers: H });
+    const delBody = await r.json().catch(() => ({}));
+    save("vexa-delete-bot-response.json", { http_status: r.status, body: delBody });
+    log(`DELETE /bots → ${r.status} ${JSON.stringify(delBody).slice(0, 200)}`);
+  } else {
+    log(`waiting for Alice to leave, then Vexa automatic_leave (${AUTO_LEAVE_MS}ms)`);
+    try {
+      await alice;
+    } catch (error) {
+      aliceError = error;
+    }
+  }
   let finalMeeting: any = null;
-  const stopDeadline = Date.now() + 90_000;
+  const stopDeadline = Date.now() + (AUTO_LEAVE_MS === undefined ? 90_000 : AUTO_LEAVE_MS + 90_000);
   while (Date.now() < stopDeadline) {
     const list = await fetch(`${API}/meetings`, { headers: H }).then((x) => x.json()).catch(() => null);
     finalMeeting = list?.meetings?.find((m: any) => m.id === meetingId || m.native_meeting_id === nativeId) ?? null;
@@ -108,12 +131,19 @@ async function main() {
   await alice.catch(() => {});
 
   const speaker = matched?.speaker;
-  const ok = Boolean(matched) && typeof speaker === "string" && speaker.trim().length > 0;
+  const automaticallyCompleted = AUTO_LEAVE_MS === undefined || (finalMeeting?.status === "completed" && finalMeeting?.completion_reason === "left_alone");
+  const ok = Boolean(matched) && typeof speaker === "string" && speaker.trim().length > 0 && automaticallyCompleted;
   log(`statuses seen: ${statusesSeen.join(" → ")}`);
   log(`match: ${matched ? JSON.stringify(matched) : "none"}`);
   console.log(ok
-    ? `\nPASS  transcript contains "brown fox" attributed to speaker "${speaker}" (${transcript?.segments?.length ?? 0} segments). Raw JSON in ${OUT}/.`
-    : `\nFAIL  ${matched ? "phrase found but no speaker label" : `phrase not found within ${TIMEOUT_S}s`}; statuses: ${statusesSeen.join(" → ")}. See ${OUT}/ and: infra/vexa/compose.sh logs runtime meeting-api; sudo docker ps -a | grep bot`);
+    ? `\nPASS  transcript contains "brown fox" attributed to speaker "${speaker}" (${transcript?.segments?.length ?? 0} segments)${AUTO_LEAVE_MS === undefined ? "" : "; automatic_leave completed(left_alone)"}. Raw JSON in ${OUT}/.`
+    : `\nFAIL  ${!matched ? `phrase not found within ${TIMEOUT_S}s` : typeof speaker !== "string" || speaker.trim().length === 0 ? "phrase found but no speaker label" : "automatic_leave did not complete as completed(left_alone)"}; statuses: ${statusesSeen.join(" → ")}. See ${OUT}/ and: infra/vexa/compose.sh logs runtime meeting-api; sudo docker ps -a | grep bot`);
+  if (AUTO_LEAVE_MS !== undefined && !["completed", "failed"].includes(finalMeeting?.status)) {
+    r = await fetch(`${API}/bots/jitsi/${encodeURIComponent(nativeId)}`, { method: "DELETE", headers: H });
+    save("vexa-delete-bot-response.json", { http_status: r.status, body: await r.json().catch(() => ({})) });
+    log(`cleanup DELETE /bots → ${r.status}`);
+  }
+  if (aliceError) throw aliceError;
   process.exit(ok ? 0 : 1);
 }
 

@@ -33,4 +33,10 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(line).toContain("jitsi");
     expect(line).toContain("google_meet");
   });
+
+  test("the worker gives every Vexa meeting the TinyCloud empty-room window", () => {
+    const env = serviceEnv("worker");
+    const line = env.split("\n").find((l) => l.trim().startsWith("VEXA_MAX_TIME_LEFT_ALONE_MS:"));
+    expect(line).toContain("300000");
+  });
 });
