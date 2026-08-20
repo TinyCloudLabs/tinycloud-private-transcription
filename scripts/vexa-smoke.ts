@@ -25,7 +25,13 @@ const JITSI = (process.env.JITSI_BASE_URL ?? "https://jitsi.local:8443").replace
 const ROOM = process.env.SMOKE_ROOM ?? `ptx-smoke-${Date.now().toString(36)}`;
 const ALICE_SECONDS = Number(process.env.ALICE_SECONDS ?? 90);
 const TIMEOUT_S = Number(process.env.SMOKE_TIMEOUT_S ?? 240);
-const AUTO_LEAVE_MS = process.env.AUTO_LEAVE_MS === undefined ? undefined : Number(process.env.AUTO_LEAVE_MS);
+const AUTO_LEAVE_MS = (() => {
+  const raw = process.env.AUTO_LEAVE_MS;
+  if (raw === undefined) return undefined;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error("AUTO_LEAVE_MS must be a positive integer (milliseconds)");
+  return value;
+})();
 const EXPECT = /brown fox/i;
 const OUT = "tmp";
 mkdirSync(OUT, { recursive: true });
