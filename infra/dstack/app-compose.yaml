@@ -63,8 +63,8 @@ services:
       REDIS_URL: redis://redis:6379
       VEXA_BASE_URL: http://gateway:8000
       VEXA_POLL_INTERVAL_MS: "5000"
-      # Per-meeting Vexa override. Avoid the upstream ten-minute fallback so a bot releases
-      # capacity shortly after the last human leaves on Jitsi or Google Meet.
+      # Per-meeting Vexa remote-participant audio silence window. Avoid the upstream ten-minute
+      # fallback so an empty or silent meeting releases capacity sooner on Jitsi or Google Meet.
       VEXA_MAX_TIME_LEFT_ALONE_MS: ${VEXA_MAX_TIME_LEFT_ALONE_MS:-300000}
       TRANSCRIPTION_PROVIDER: ${TRANSCRIPTION_PROVIDER:-vexa}
       TINFOIL_BASE_URL: https://inference.tinfoil.sh

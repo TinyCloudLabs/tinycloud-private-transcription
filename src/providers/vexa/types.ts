@@ -44,7 +44,7 @@ export interface VexaMeetingCreate {
   task?: "transcribe" | "translate";
   transcribe_enabled?: boolean;
   recording_enabled?: boolean;
-  /** Vexa's per-meeting lifecycle limits. `max_time_left_alone` is milliseconds after everyone else leaves. */
+  /** Vexa's per-meeting lifecycle limits. `max_time_left_alone` is milliseconds without remote participant audio. */
   automatic_leave?: { max_time_left_alone: number };
   passcode?: string;
 }
