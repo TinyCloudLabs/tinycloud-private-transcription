@@ -95,6 +95,7 @@ async function main() {
   if (transcript) save("vexa-transcript.json", transcript);
 
   // 4. Either prove the configured empty-room exit, or stop explicitly for the ordinary smoke.
+  let aliceError: unknown;
   if (AUTO_LEAVE_MS === undefined) {
     r = await fetch(`${API}/bots/jitsi/${encodeURIComponent(nativeId)}`, { method: "DELETE", headers: H });
     const delBody = await r.json().catch(() => ({}));
@@ -102,7 +103,11 @@ async function main() {
     log(`DELETE /bots → ${r.status} ${JSON.stringify(delBody).slice(0, 200)}`);
   } else {
     log(`waiting for Alice to leave, then Vexa automatic_leave (${AUTO_LEAVE_MS}ms)`);
-    await alice;
+    try {
+      await alice;
+    } catch (error) {
+      aliceError = error;
+    }
   }
   let finalMeeting: any = null;
   const stopDeadline = Date.now() + (AUTO_LEAVE_MS === undefined ? 90_000 : AUTO_LEAVE_MS + 90_000);
@@ -126,7 +131,13 @@ async function main() {
   log(`match: ${matched ? JSON.stringify(matched) : "none"}`);
   console.log(ok
     ? `\nPASS  transcript contains "brown fox" attributed to speaker "${speaker}" (${transcript?.segments?.length ?? 0} segments)${AUTO_LEAVE_MS === undefined ? "" : "; automatic_leave completed(left_alone)"}. Raw JSON in ${OUT}/.`
-    : `\nFAIL  ${matched ? "phrase found but completion was not as expected" : `phrase not found within ${TIMEOUT_S}s`}; statuses: ${statusesSeen.join(" → ")}. See ${OUT}/ and: infra/vexa/compose.sh logs runtime meeting-api; sudo docker ps -a | grep bot`);
+    : `\nFAIL  ${!matched ? `phrase not found within ${TIMEOUT_S}s` : typeof speaker !== "string" || speaker.trim().length === 0 ? "phrase found but no speaker label" : "automatic_leave did not complete as completed(left_alone)"}; statuses: ${statusesSeen.join(" → ")}. See ${OUT}/ and: infra/vexa/compose.sh logs runtime meeting-api; sudo docker ps -a | grep bot`);
+  if (AUTO_LEAVE_MS !== undefined && !["completed", "failed"].includes(finalMeeting?.status)) {
+    r = await fetch(`${API}/bots/jitsi/${encodeURIComponent(nativeId)}`, { method: "DELETE", headers: H });
+    save("vexa-delete-bot-response.json", { http_status: r.status, body: await r.json().catch(() => ({})) });
+    log(`cleanup DELETE /bots → ${r.status}`);
+  }
+  if (aliceError) throw aliceError;
   process.exit(ok ? 0 : 1);
 }
 
