@@ -229,6 +229,8 @@ has to come from Vexa's speaker timeline. `src/providers/transcription/tinfoil.t
 Limits: capture-only Tinfoil meetings have no Vexa live speaker timeline, so `turns` safely falls back to
 whole-file transcription and the result has one generic speaker. This deliberately prioritizes preserving
 every spoken word over speaker attribution until capture-side diarization/backpressure is available.
+Long whole-file recordings are split at the quietest 100 ms window before each ten-minute limit; chunk
+failures return to the meeting-level delayed retry instead of blocking the serial worker with inline retries.
 Meetings created before capture-only mode may still have Vexa segments and use speaker-attributed turn mode.
 `POST /v1/meetings/{id}/recover` retries finalization for a failed row when Vexa still retains its recording;
 it is tenant-scoped, concurrent callers safely converge, and a repeated call while `processing` repairs a
