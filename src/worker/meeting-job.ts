@@ -138,7 +138,7 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
   // A terminal bot state describes how capture ended, not whether all captured media was lost. In
   // particular, left_alone/evicted/failed can retain a complete recording. Always salvage that
   // recording before deciding this meeting failed.
-  const segments = adaptVexaSegments(vexa); // deduped by turn, epoch → meeting-relative seconds
+  const segments = adaptVexaSegments(vexa).filter((segment) => segment.text.trim().length > 0); // deduped by turn, epoch → meeting-relative seconds
   const currentMeetingId = meeting.id;
   let cachedAudio: AudioBlob | null | undefined;
   const fetchAudio = async () => {
@@ -151,7 +151,28 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
 
   // With no live segments, a batch provider needs a usable recording to produce anything. This
   // preflight also prevents the old fallback path from storing an empty "completed" transcript.
-  if (segments.length === 0 && (!needsRecording(ctx) || !(await fetchAudio()))) {
+  let usableAudio = true;
+  if (segments.length === 0 && needsRecording(ctx)) {
+    try {
+      usableAudio = !!(await fetchAudio());
+    } catch (error) {
+      const retryable =
+        (error instanceof ApiError && (error.code === "provider_unavailable" || error.code === "provider_timeout")) ||
+        (error instanceof VexaHttpError && (error.status >= 500 || error.notFound));
+      const attempts = meeting.transcriptionAttempts + 1;
+      if (retryable && attempts < MAX_TRANSCRIPTION_ATTEMPTS) {
+        ctx.log.warn("vexa recording unavailable; will retry", { meetingId, attempts, error: String(error) });
+        await ctx.db.update(meetings).set({ transcriptionAttempts: attempts }).where(eq(meetings.id, meeting.id));
+        await ctx.queue.push({ type: "meeting.poll", meetingId }, TRANSCRIPTION_RETRY_BASE_MS * attempts);
+        return;
+      }
+      ctx.log.error("vexa recording could not be fetched", { meetingId, attempts, error: String(error) });
+      const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "The retained meeting audio could not be loaded for transcription.");
+      if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+      return;
+    }
+  }
+  if (segments.length === 0 && (!needsRecording(ctx) || !usableAudio)) {
     const f = reason ? mapVexaFailure(reason) : { code: "capture_failed" as const, message: "No usable audio was captured for this meeting." };
     const { meeting: failed, changed } = await failMeeting(ctx, meeting, f.code, f.message);
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
@@ -254,27 +275,23 @@ const MIN_AUDIO_BYTES_PER_SECOND = 1000;
  * (docs/vexa-findings.md) rather than sent to Tinfoil.
  */
 async function fetchVexaAudio(ctx: AppContext, vexa: VexaTranscriptionResponse): Promise<AudioBlob | null> {
-  try {
-    let recordings: VexaRecording[] = (vexa.recordings ?? []).filter((r) => r.meeting_id === vexa.id);
-    if (recordings.length === 0) {
-      recordings = (await ctx.vexa.listRecordings()).recordings.filter((r) => r.meeting_id === vexa.id);
+  let recordings: VexaRecording[] = (vexa.recordings ?? []).filter((r) => r.meeting_id === vexa.id);
+  if (recordings.length === 0) {
+    recordings = (await ctx.vexa.listRecordings()).recordings.filter((r) => r.meeting_id === vexa.id);
+  }
+  const durationSec =
+    vexa.start_time && vexa.end_time ? (Date.parse(vexa.end_time) - Date.parse(vexa.start_time)) / 1000 : null;
+  for (const rec of recordings) {
+    if (!rec.media_files?.some((f) => f.type === "audio")) continue;
+    const master = await ctx.vexa.recordingMaster(rec.id, "audio");
+    if (!master.raw_url) continue;
+    const { bytes, contentType } = await ctx.vexa.fetchBytes(master.raw_url);
+    if (bytes.length === 0) continue;
+    if (durationSec && durationSec > 5 && bytes.length / durationSec < MIN_AUDIO_BYTES_PER_SECOND) {
+      ctx.log.warn("vexa recording looks silent; skipping", { vexaMeetingId: vexa.id, recordingId: rec.id, bytes: bytes.length, durationSec });
+      continue;
     }
-    const durationSec =
-      vexa.start_time && vexa.end_time ? (Date.parse(vexa.end_time) - Date.parse(vexa.start_time)) / 1000 : null;
-    for (const rec of recordings) {
-      if (!rec.media_files?.some((f) => f.type === "audio")) continue;
-      const master = await ctx.vexa.recordingMaster(rec.id, "audio");
-      if (!master.raw_url) continue;
-      const { bytes, contentType } = await ctx.vexa.fetchBytes(master.raw_url);
-      if (bytes.length === 0) continue;
-      if (durationSec && durationSec > 5 && bytes.length / durationSec < MIN_AUDIO_BYTES_PER_SECOND) {
-        ctx.log.warn("vexa recording looks silent; skipping", { vexaMeetingId: vexa.id, recordingId: rec.id, bytes: bytes.length, durationSec });
-        continue;
-      }
-      return { bytes, filename: "meeting.webm", contentType: contentType.startsWith("audio/") ? contentType : "audio/webm" };
-    }
-  } catch (e) {
-    ctx.log.warn("could not fetch vexa recording", { vexaMeetingId: vexa.id, error: String(e) });
+    return { bytes, filename: "meeting.webm", contentType: contentType.startsWith("audio/") ? contentType : "audio/webm" };
   }
   return null;
 }

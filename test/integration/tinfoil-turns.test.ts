@@ -7,6 +7,9 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { createApiKey } from "../../src/api/auth.ts";
+import { ApiError } from "../../src/domain/errors.ts";
+import { getMeetingById } from "../../src/services/meetings.ts";
+import { handleMeetingPoll } from "../../src/worker/meeting-job.ts";
 import { decodeToPcm, pcmToWav, PCM_RATE } from "../../src/providers/transcription/audio.ts";
 import { TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
 import { startHarness, type Harness } from "./harness.ts";
@@ -189,7 +192,7 @@ describe.skipIf(!ffmpeg || !existsSync("fixtures/bob.wav"))("tinfoil provider wi
       completion_reason: "left_alone",
       recording_base64: silentRecordingB64,
       recording_content_type: "audio/wav",
-      segments: [],
+      segments: [{ start: 0, end: 1, text: "   ", language: "en", speaker: "Alice", completed: true }],
     });
 
     const failed = await h.waitFor(async () => {
@@ -198,6 +201,36 @@ describe.skipIf(!ffmpeg || !existsSync("fixtures/bob.wav"))("tinfoil provider wi
     }, { label: "silent recording failed" });
     expect(failed.error.code).toBe("transcription_failed");
     expect(await (await h.api(`/v1/meetings/${meetingId}/transcript`)).json()).toEqual({ meeting_id: meetingId, status: "failed" });
+  });
+
+  test("a transient retained-recording fetch outage retries instead of failing the meeting", async () => {
+    const nativeId = "RecordingFetchRetry@jitsi.local";
+    const r = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/RecordingFetchRetry", language: "en" } });
+    const { id: meetingId } = await r.json();
+    await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status === "joining" ? true : null));
+
+    const originalMaster = h.ctx.vexa.recordingMaster.bind(h.ctx.vexa);
+    let failOnce = true;
+    h.ctx.vexa.recordingMaster = async (...args) => {
+      if (failOnce) {
+        failOnce = false;
+        throw new ApiError("provider_timeout", "capture provider timeout");
+      }
+      return originalMaster(...args);
+    };
+    await h.vexa.control("jitsi", nativeId, {
+      status: "completed",
+      completion_reason: "left_alone",
+      recording_base64: recordingB64,
+      recording_content_type: "audio/wav",
+      segments: [],
+    });
+    await h.waitFor(async () => ((await getMeetingById(h.ctx, meetingId))?.transcriptionAttempts === 1 ? true : null), { label: "recording fetch retry queued" });
+    expect((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status).not.toBe("failed");
+
+    h.ctx.vexa.recordingMaster = originalMaster;
+    await handleMeetingPoll(h.ctx, meetingId);
+    await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status === "completed" ? true : null), { label: "recording fetch retry completed" });
   });
 
   test("a recovery enqueue failure restores failed state so the caller can retry", async () => {
