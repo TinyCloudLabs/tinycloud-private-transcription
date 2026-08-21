@@ -225,8 +225,8 @@ describe.skipIf(!ffmpeg || !existsSync("fixtures/bob.wav"))("TinfoilTranscriptio
     const p = provider({ segmentation: "whole", wholeChunkSec: 5, concurrency: 2 });
     await expect(p.transcribe(input([]))).rejects.toMatchObject({ code: "transcription_failed" });
     failNames = null;
+    const requestsAtRejection = requests.length;
     await Bun.sleep(100);
-    expect(requests.length).toBeLessThanOrEqual(2);
-    expect(requests.some((request) => request.name === "chunk-3.wav")).toBe(false);
+    expect(requests).toHaveLength(requestsAtRejection);
   });
 });
