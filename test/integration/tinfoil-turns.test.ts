@@ -88,4 +88,25 @@ describe.skipIf(!ffmpeg || !existsSync("fixtures/bob.wav"))("tinfoil provider wi
     expect(logs.find((l) => l.msg === "transcript finalized")).toMatchObject({ data: { provider: "tinfoil", segments: 2, stats: { mode: "turns", turns: 2, transcribed: 2, calls: 2 } } });
     await h.waitFor(async () => h.webhook.received.find((w) => w.body.type === "meeting.completed" && w.body.data.meeting_id === id) ?? null);
   });
+
+  test("completed(left_alone) salvages its retained recording when live segments are empty", async () => {
+    const nativeId = "RetainedRecording@jitsi.local";
+    const r = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/RetainedRecording", language: "en" } });
+    expect(r.status).toBe(201);
+    const { id: meetingId } = await r.json();
+    await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status === "joining" ? true : null));
+
+    await h.vexa.control("jitsi", nativeId, {
+      status: "completed",
+      completion_reason: "left_alone",
+      recording_base64: recordingB64,
+      recording_content_type: "audio/wav",
+      segments: [],
+    });
+
+    await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status === "completed" ? true : null), { label: "retained recording completed" });
+    const transcript = await (await h.api(`/v1/meetings/${meetingId}/transcript`)).json();
+    expect(transcript.provider).toBe("tinfoil");
+    expect(transcript.text).toContain("quick brown fox");
+  });
 });

@@ -140,9 +140,11 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
     return;
   }
 
-  // Bot has left. A "completed" with a failure-ish reason and no audio is a failure for us.
+  // Bot has left. `left_alone` without live segments can still have a persisted recording: this is
+  // the recovery path for meetings Vexa completed after participant audio stopped. Other terminal
+  // failure reasons (for example, eviction) remain failures when there is no captured audio.
   const segments = adaptVexaSegments(vexa); // deduped by turn, epoch → meeting-relative seconds
-  if (segments.length === 0 && reason && reason !== "stopped") {
+  if (segments.length === 0 && reason && reason !== "stopped" && reason !== "left_alone") {
     const f = mapVexaFailure(reason);
     const { meeting: failed } = await failMeeting(ctx, meeting, f.code, f.message);
     await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
