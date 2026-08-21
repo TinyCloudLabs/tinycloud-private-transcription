@@ -115,17 +115,27 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     const bodies: OpenAIVerboseTranscription[] = new Array(chunks.length);
     let calls = 0;
     let next = 0;
+    let stopped = false;
     const workers = Array.from({ length: Math.max(1, Math.min(this.opts.concurrency ?? 3, chunks.length)) }, async () => {
-      while (next < chunks.length) {
+      while (!stopped && next < chunks.length) {
         const i = next++;
         const chunk = chunks[i]!;
         const filename = chunks.length === 1 ? audio.filename.replace(/\.[^.]+$/, ".wav") : `chunk-${i + 1}.wav`;
-        const { body, attempts } = await this.postWithRetry(sliceToWav(pcm, chunk.from, chunk.to), filename, "audio/wav", input.language);
-        calls += attempts;
-        bodies[i] = body;
+        try {
+          const { body, attempts } = await this.postWithRetry(sliceToWav(pcm, chunk.from, chunk.to), filename, "audio/wav", input.language);
+          calls += attempts;
+          bodies[i] = body;
+        } catch (error) {
+          stopped = true;
+          throw error;
+        }
       }
     });
-    await Promise.all(workers);
+    // Wait for sibling requests already in flight, but do not schedule later chunks after the first
+    // failure. This prevents paid work from continuing behind a rejected meeting-level attempt.
+    const settled = await Promise.allSettled(workers);
+    const failure = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failure) throw failure.reason;
 
     const raw: RawSegment[] = bodies.flatMap((body, i) => {
       const chunk = chunks[i]!;

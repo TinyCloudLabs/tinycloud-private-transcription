@@ -217,4 +217,16 @@ describe.skipIf(!ffmpeg || !existsSync("fixtures/bob.wav"))("TinfoilTranscriptio
     expect(t.segments.at(-1)!.end).toBeCloseTo(t.duration_seconds, 2);
     expect(p.lastStats).toMatchObject({ mode: "whole", turns: requests.length, transcribed: requests.length, failed: 0 });
   });
+
+  test("a failed whole-file chunk stops scheduling later paid requests", async () => {
+    requests.length = 0;
+    failNames = /chunk-1/;
+    failStatus = 400;
+    const p = provider({ segmentation: "whole", wholeChunkSec: 5, concurrency: 2 });
+    await expect(p.transcribe(input([]))).rejects.toMatchObject({ code: "transcription_failed" });
+    failNames = null;
+    await Bun.sleep(100);
+    expect(requests.length).toBeLessThanOrEqual(2);
+    expect(requests.some((request) => request.name === "chunk-3.wav")).toBe(false);
+  });
 });
