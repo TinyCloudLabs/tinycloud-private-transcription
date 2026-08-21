@@ -32,12 +32,13 @@ describe("tinfoil provider without a usable recording", () => {
   const nativeId = "TinfoilRoom@jitsi.local";
   let id: string;
 
-  test("bot is requested with recording_enabled", async () => {
+  test("bot is requested in recording-only mode", async () => {
     const r = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/TinfoilRoom", language: "en", webhook_url: h.webhook.url } });
     expect(r.status).toBe(201);
     id = (await r.json()).id;
     await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${id}`)).json()).status === "joining" ? true : null));
     expect(h.vexa.meetings.get(`jitsi/${nativeId}`)?.recording_enabled).toBe(true);
+    expect(h.vexa.meetings.get(`jitsi/${nativeId}`)?.transcribe_enabled).toBe(false);
   });
 
   test("falls back to the vexa-native transcript and logs it", async () => {

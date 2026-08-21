@@ -205,4 +205,16 @@ describe.skipIf(!ffmpeg || !existsSync("fixtures/bob.wav"))("TinfoilTranscriptio
     expect(requests).toHaveLength(1);
     expect(t.segments[0]!.speaker_name).toBe("Unknown");
   });
+
+  test("long whole-file transcription is split into bounded chunks without content holes", async () => {
+    requests.length = 0;
+    const p = provider({ segmentation: "whole", wholeChunkSec: 5, concurrency: 2 });
+    const t = await p.transcribe(input([]));
+    expect(requests.length).toBeGreaterThan(1);
+    expect(requests.every((r) => r.seconds <= 5.01)).toBe(true);
+    expect(t.segments).toHaveLength(requests.length);
+    expect(t.segments[0]!.start).toBe(0);
+    expect(t.segments.at(-1)!.end).toBeCloseTo(t.duration_seconds, 2);
+    expect(p.lastStats).toMatchObject({ mode: "whole", turns: requests.length, transcribed: requests.length, failed: 0 });
+  });
 });

@@ -34,6 +34,8 @@ export interface TinfoilOptions {
   padSec?: number;
   concurrency?: number;
   maxRetries?: number;
+  /** Whole-file mode is split into chunks of at most this many seconds (default 10 minutes). */
+  wholeChunkSec?: number;
   /** Turn-mode: recordings quieter than this (RMS dBFS) are treated as the known silent-tap capture. */
   silenceDbfs?: number;
   ffmpegPath?: string;
@@ -91,23 +93,56 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
   // ---- whole-file mode -------------------------------------------------------------------------
 
   private async transcribeWhole(input: TranscriptionInput, audio: AudioBlob, vexa: VexaTranscriptionSegment[]) {
-    const body = await this.post(audio.bytes, audio.filename, audio.contentType, input.language, 0);
-    // Without word/segment timestamps (voxtral `json`) the whole transcript is one segment spanning the
-    // audio; its speaker is whoever Vexa heard the most. Duration: provider's, else Vexa's last segment end.
-    const vexaEnd = vexa.reduce((m, s) => Math.max(m, s.end), 0);
-    const duration = body.duration ?? body.usage?.seconds ?? vexaEnd;
-    const segs = body.segments?.length ? body.segments : [{ start: 0, end: duration, text: body.text }];
-    const raw: RawSegment[] = segs.map((s) => ({
-      start: s.start,
-      end: s.end,
-      text: s.text,
-      speaker: speakerByOverlap(s.start, s.end, vexa),
-      language: body.language ?? null,
+    let pcm: Pcm16;
+    try {
+      pcm = await decodeToPcm(audio.bytes, { ffmpegPath: this.opts.ffmpegPath });
+    } catch (e) {
+      throw new TranscriptionFallbackError(`Recording could not be decoded: ${String(e)}`, "undecodable");
+    }
+    const level = rmsDbfs(pcm);
+    if (pcm.durationSec < 0.5 || level < (this.opts.silenceDbfs ?? -60)) {
+      throw new TranscriptionFallbackError("Recording is silent", "silent_recording", { audio_seconds: round(pcm.durationSec), rms_dbfs: round(level) });
+    }
+
+    // Long meetings can exceed inference upload limits or the per-request timeout. Decode once and
+    // submit bounded WAV chunks; a failed chunk fails the whole attempt so the worker retries without
+    // ever storing a transcript with a silent hole.
+    const chunkSec = Math.max(1, this.opts.wholeChunkSec ?? 600);
+    const chunks = Array.from({ length: Math.ceil(pcm.durationSec / chunkSec) }, (_, i) => ({
+      from: i * chunkSec,
+      to: Math.min(pcm.durationSec, (i + 1) * chunkSec),
     }));
-    this.calls += 1;
-    this.lastStats = { mode: "whole", audio_seconds: duration, turns: 1, transcribed: 1, skipped_short: 0, failed: 0, calls: 1 };
-    const t = normalizeSegments(raw, input.language ?? body.language ?? null);
-    return { ...t, duration_seconds: Math.max(t.duration_seconds, round(duration)) };
+    const bodies: OpenAIVerboseTranscription[] = new Array(chunks.length);
+    let calls = 0;
+    let next = 0;
+    const workers = Array.from({ length: Math.max(1, Math.min(this.opts.concurrency ?? 3, chunks.length)) }, async () => {
+      while (next < chunks.length) {
+        const i = next++;
+        const chunk = chunks[i]!;
+        const filename = chunks.length === 1 ? audio.filename.replace(/\.[^.]+$/, ".wav") : `chunk-${i + 1}.wav`;
+        const { body, attempts } = await this.postWithRetry(sliceToWav(pcm, chunk.from, chunk.to), filename, "audio/wav", input.language);
+        calls += attempts;
+        bodies[i] = body;
+      }
+    });
+    await Promise.all(workers);
+
+    const raw: RawSegment[] = bodies.flatMap((body, i) => {
+      const chunk = chunks[i]!;
+      const localDuration = body.duration ?? body.usage?.seconds ?? chunk.to - chunk.from;
+      const segs = body.segments?.length ? body.segments : [{ start: 0, end: localDuration, text: body.text }];
+      return segs.map((s) => ({
+        start: chunk.from + s.start,
+        end: Math.min(chunk.to, chunk.from + s.end),
+        text: s.text,
+        speaker: speakerByOverlap(chunk.from + s.start, chunk.from + s.end, vexa),
+        language: body.language ?? null,
+      }));
+    });
+    this.calls += calls;
+    this.lastStats = { mode: "whole", audio_seconds: round(pcm.durationSec), turns: chunks.length, transcribed: chunks.length, skipped_short: 0, failed: 0, calls };
+    const t = normalizeSegments(raw, input.language ?? bodies.find((body) => body.language)?.language ?? null);
+    return { ...t, duration_seconds: Math.max(t.duration_seconds, round(pcm.durationSec)) };
   }
 
   // ---- per-turn mode ---------------------------------------------------------------------------

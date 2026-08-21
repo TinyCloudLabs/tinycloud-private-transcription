@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { VexaNativeProvider } from "../../src/providers/transcription/vexa-native.ts";
 import { TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
 import { createTranscriptionProvider } from "../../src/providers/transcription/index.ts";
+import { pcmToWav, PCM_RATE } from "../../src/providers/transcription/audio.ts";
 import fixture from "../fixtures/tinfoil-verbose.json";
 
 const vexaSegments = [
@@ -57,14 +58,15 @@ describe("TinfoilTranscriptionProvider (mock server)", () => {
 
   const provider = () =>
     new TinfoilTranscriptionProvider({ baseUrl: `http://127.0.0.1:${server.port}`, apiKey: "tk_test", model: "voxtral-small-24b", segmentation: "whole" });
-  const audio = async () => ({ bytes: new Uint8Array([82, 73, 70, 70, 0, 0, 0, 0]), filename: "meeting.wav", contentType: "audio/wav" });
+  const audioBytes = pcmToWav(new Int16Array(PCM_RATE * 12).fill(2000), PCM_RATE);
+  const audio = async () => ({ bytes: audioBytes, filename: "meeting.wav", contentType: "audio/wav" });
 
   test("posts multipart audio (response_format=json by default) and honours segments when returned", async () => {
     mode = "ok";
     const t = await provider().transcribe({ meetingId: "mtg_x", language: "en", vexaSegments, fetchAudio: audio });
-    expect(lastRequest).toEqual({ auth: "Bearer tk_test", model: "voxtral-small-24b", format: "json", fileName: "meeting.wav", fileSize: 8 });
+    expect(lastRequest).toEqual({ auth: "Bearer tk_test", model: "voxtral-small-24b", format: "json", fileName: "meeting.wav", fileSize: audioBytes.length });
     expect(t.language).toBe("en");
-    expect(t.duration_seconds).toBe(6.4);
+    expect(t.duration_seconds).toBe(12);
     expect(t.segments.map((s) => s.speaker_name)).toEqual(["Sam", "Bob"]);
     expect(t.text).toBe("Sam: Hello, this is a test of the private transcription pipeline.\nBob: Sounds good to me.");
   });

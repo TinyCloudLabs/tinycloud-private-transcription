@@ -131,6 +131,9 @@ curl -s -i $API/v1/meetings/$ID/transcript -H "Authorization: Bearer $KEY"
 # stop (idempotent) → {"id","status"}
 curl -s -X POST $API/v1/meetings/$ID/stop -H "Authorization: Bearer $KEY"
 
+# recover a failed meeting from audio still retained by the capture provider (idempotent)
+curl -s -X POST $API/v1/meetings/$ID/recover -H "Authorization: Bearer $KEY"
+
 # delete → 204 (asks Vexa to delete too; Vexa v0.12 keeps bot-owned rows and answers 409 — logged, see "Known gaps")
 curl -s -X DELETE $API/v1/meetings/$ID -H "Authorization: Bearer $KEY"
 
@@ -198,8 +201,10 @@ Vexa's WhisperLive words. Verified live: Voxtral on Tinfoil rejects `response_fo
 `json` returns `{text, usage:{seconds}}` only — **no timestamps, no diarization** — so speaker segmentation
 has to come from Vexa's speaker timeline. `src/providers/transcription/tinfoil.ts`:
 
-1. The worker asks Vexa for `recording_enabled`, and at completion downloads the audio master
-   (`fetchVexaAudio`, with the bitrate sanity check for the known silent-tap capture).
+1. The worker asks Vexa for `recording_enabled:true` and `transcribe_enabled:false`, then downloads the
+   audio master at completion (`fetchVexaAudio`, with the bitrate sanity check for the known silent-tap
+   capture). Capture-only mode prevents Vexa's per-speaker live requests from overwhelming its local
+   Whisper worker; Tinfoil remains the authoritative transcription provider.
 2. `TINFOIL_SEGMENTATION=turns` (default): the recording is decoded **once** with `ffmpeg` (16 kHz mono PCM,
    temp files; `apk add ffmpeg` in the Dockerfile), Vexa's speaker-labelled segments (already
    meeting-relative, same origin as the recording = the bot's `start_time`) are merged into **turns**
@@ -221,7 +226,12 @@ has to come from Vexa's speaker timeline. `src/providers/transcription/tinfoil.t
    `GET /v1/meetings/{id}` (once completed) and the `meeting.completed` webhook `data` carry
    `transcript_provider` plus `fallback_from`/`fallback_reason` when a fallback fired.
 
-Limits: turn mode only covers speech Vexa segmented (whole-file mode covers everything but loses speakers);
+Limits: capture-only Tinfoil meetings have no Vexa live speaker timeline, so `turns` safely falls back to
+whole-file transcription and the result has one generic speaker. This deliberately prioritizes preserving
+every spoken word over speaker attribution until capture-side diarization/backpressure is available.
+Meetings created before capture-only mode may still have Vexa segments and use speaker-attributed turn mode.
+`POST /v1/meetings/{id}/recover` retries finalization for a failed row when Vexa still retains its recording;
+it is tenant-scoped and concurrent/repeated calls enqueue at most one recovery.
 Vexa's speaker labels come from Jitsi dominant-speaker events (`"Speaker"` = unknown). ~~Vexa v0.12's
 recording tap only mixes the media elements present when it starts~~ — **fixed in our Vexa fork**
 ([TinyCloudLabs/vexa](https://github.com/TinyCloudLabs/vexa) branch `tinycloud`, see "Vexa fork" below): the

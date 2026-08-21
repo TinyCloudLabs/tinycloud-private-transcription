@@ -171,6 +171,35 @@ export async function stopMeeting(ctx: AppContext, meeting: MeetingRow): Promise
   return updated;
 }
 
+/**
+ * Re-run finalization for a failed meeting whose capture-provider row/recording is still retained.
+ * The compare-and-set makes concurrent calls idempotent: only the caller that moves failed →
+ * processing enqueues a poll. Completed and already-processing meetings are successful no-ops.
+ */
+export async function recoverMeeting(ctx: AppContext, meeting: MeetingRow): Promise<MeetingRow> {
+  const status = meeting.status as MeetingStatus;
+  if (status === "completed" || status === "processing") return meeting;
+  if (status !== "failed") {
+    throw new ApiError("invalid_request", "Only failed meetings can be recovered.");
+  }
+  if (!meeting.vexaPlatform || !meeting.vexaNativeMeetingId) {
+    throw new ApiError("invalid_request", "This meeting has no retained capture-provider record to recover.");
+  }
+  const [updated] = await ctx.db
+    .update(meetings)
+    .set({
+      status: "processing",
+      errorCode: null,
+      errorMessage: null,
+      transcriptionAttempts: 0,
+    })
+    .where(and(eq(meetings.id, meeting.id), eq(meetings.projectId, meeting.projectId), eq(meetings.status, "failed")))
+    .returning();
+  if (!updated) return (await getMeetingById(ctx, meeting.id)) ?? meeting;
+  await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id });
+  return updated;
+}
+
 async function stopInVexa(ctx: AppContext, meeting: MeetingRow) {
   if (!meeting.vexaPlatform || !meeting.vexaNativeMeetingId) return;
   try {

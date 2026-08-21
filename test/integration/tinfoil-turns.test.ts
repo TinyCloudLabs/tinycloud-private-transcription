@@ -6,6 +6,7 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
+import { createApiKey } from "../../src/api/auth.ts";
 import { decodeToPcm, pcmToWav, PCM_RATE } from "../../src/providers/transcription/audio.ts";
 import { TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
 import { startHarness, type Harness } from "./harness.ts";
@@ -21,6 +22,7 @@ const log = {
   error: (msg: string, data?: Record<string, unknown>) => logs.push({ level: "error", msg, data }),
 };
 let recordingB64 = "";
+let silentRecordingB64 = "";
 let aliceSec = 0;
 const tinfoilCalls: number[] = [];
 
@@ -33,6 +35,7 @@ describe.skipIf(!ffmpeg || !existsSync("fixtures/bob.wav"))("tinfoil provider wi
     joined.set(a.samples, 0);
     joined.set(b.samples, a.samples.length);
     recordingB64 = Buffer.from(pcmToWav(joined, PCM_RATE)).toString("base64");
+    silentRecordingB64 = Buffer.from(pcmToWav(new Int16Array(PCM_RATE * 6), PCM_RATE)).toString("base64");
     tinfoil = Bun.serve({
       port: 0,
       async fetch(req) {
@@ -108,5 +111,92 @@ describe.skipIf(!ffmpeg || !existsSync("fixtures/bob.wav"))("tinfoil provider wi
     const transcript = await (await h.api(`/v1/meetings/${meetingId}/transcript`)).json();
     expect(transcript.provider).toBe("tinfoil");
     expect(transcript.text).toContain("quick brown fox");
+  });
+
+  test("failed(evicted) salvages retained audio instead of discarding it", async () => {
+    const nativeId = "EvictedWithAudio@jitsi.local";
+    const r = await h.api("/v1/meetings", {
+      method: "POST",
+      json: { meeting_url: "https://jitsi.local/EvictedWithAudio", language: "en", webhook_url: h.webhook.url },
+    });
+    expect(r.status).toBe(201);
+    const { id: meetingId } = await r.json();
+    await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status === "joining" ? true : null));
+
+    await h.vexa.control("jitsi", nativeId, {
+      status: "failed",
+      completion_reason: "evicted",
+      recording_base64: recordingB64,
+      recording_content_type: "audio/wav",
+      segments: [],
+    });
+
+    await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status === "completed" ? true : null), { label: "evicted recording completed" });
+    const transcript = await (await h.api(`/v1/meetings/${meetingId}/transcript`)).json();
+    expect(transcript.provider).toBe("tinfoil");
+    expect(transcript.text).toContain("quick brown fox");
+    await h.waitFor(async () => h.webhook.received.find((w) => w.body.type === "meeting.completed" && w.body.data.meeting_id === meetingId) ?? null);
+    expect(h.webhook.received.filter((w) => w.body.type === "meeting.completed" && w.body.data.meeting_id === meetingId)).toHaveLength(1);
+    expect(h.webhook.received.filter((w) => w.body.type === "meeting.failed" && w.body.data.meeting_id === meetingId)).toHaveLength(0);
+  });
+
+  test("failed meeting can be recovered once retained audio becomes available", async () => {
+    const nativeId = "RecoverRecording@jitsi.local";
+    const r = await h.api("/v1/meetings", {
+      method: "POST",
+      json: { meeting_url: "https://jitsi.local/RecoverRecording", language: "en", webhook_url: h.webhook.url },
+    });
+    expect(r.status).toBe(201);
+    const { id: meetingId } = await r.json();
+    await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status === "joining" ? true : null));
+    await h.vexa.control("jitsi", nativeId, { status: "failed", completion_reason: "evicted", segments: [] });
+    await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status === "failed" ? true : null), { label: "failed before recording ready" });
+
+    await h.vexa.control("jitsi", nativeId, {
+      status: "failed",
+      completion_reason: "evicted",
+      recording_base64: recordingB64,
+      recording_content_type: "audio/wav",
+    });
+
+    const { key: otherProjectKey } = await createApiKey(h.ctx, "other-project");
+    expect((await h.api(`/v1/meetings/${meetingId}/recover`, { method: "POST", key: otherProjectKey })).status).toBe(404);
+
+    const [recover1, recover2] = await Promise.all([
+      h.api(`/v1/meetings/${meetingId}/recover`, { method: "POST" }),
+      h.api(`/v1/meetings/${meetingId}/recover`, { method: "POST" }),
+    ]);
+    expect(recover1.status).toBe(200);
+    expect(recover2.status).toBe(200);
+    expect(["processing", "completed"]).toContain((await recover1.json()).status);
+    expect(["processing", "completed"]).toContain((await recover2.json()).status);
+
+    await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status === "completed" ? true : null), { label: "recovered meeting completed" });
+    expect((await (await h.api(`/v1/meetings/${meetingId}/transcript`)).json()).text).toContain("quick brown fox");
+    const completedAgain = await h.api(`/v1/meetings/${meetingId}/recover`, { method: "POST" });
+    expect(await completedAgain.json()).toEqual({ id: meetingId, status: "completed" });
+    await Bun.sleep(100);
+    expect(h.webhook.received.filter((w) => w.body.type === "meeting.completed" && w.body.data.meeting_id === meetingId)).toHaveLength(1);
+  });
+
+  test("zero live segments plus an unusable recording fails instead of storing an empty transcript", async () => {
+    const nativeId = "SilentRecording@jitsi.local";
+    const r = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/SilentRecording", language: "en" } });
+    const { id: meetingId } = await r.json();
+    await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status === "joining" ? true : null));
+    await h.vexa.control("jitsi", nativeId, {
+      status: "completed",
+      completion_reason: "left_alone",
+      recording_base64: silentRecordingB64,
+      recording_content_type: "audio/wav",
+      segments: [],
+    });
+
+    const failed = await h.waitFor(async () => {
+      const body = await (await h.api(`/v1/meetings/${meetingId}`)).json();
+      return body.status === "failed" ? body : null;
+    }, { label: "silent recording failed" });
+    expect(failed.error.code).toBe("transcription_failed");
+    expect(await (await h.api(`/v1/meetings/${meetingId}/transcript`)).json()).toEqual({ meeting_id: meetingId, status: "failed" });
   });
 });
