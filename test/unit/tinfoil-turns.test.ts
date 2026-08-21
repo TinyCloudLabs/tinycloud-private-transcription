@@ -8,7 +8,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { decodeToPcm, pcmToWav, rmsDbfs, sliceToWav, PCM_RATE } from "../../src/providers/transcription/audio.ts";
 import { mergeTurns } from "../../src/providers/transcription/turns.ts";
-import { TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
+import { quietBoundedChunks, TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
 import { TranscriptionFallbackError } from "../../src/providers/transcription/types.ts";
 
 const ffmpeg = Bun.which("ffmpeg");
@@ -48,6 +48,17 @@ describe("audio helpers", () => {
     expect(new DataView(wav.buffer).getUint32(24, true)).toBe(PCM_RATE);
     expect(rmsDbfs({ samples: new Int16Array(100), sampleRate: PCM_RATE, durationSec: 0 })).toBe(-Infinity);
     expect(pcmToWav(new Int16Array(0), PCM_RATE).length).toBe(44);
+  });
+
+  test("whole-file chunk boundaries move to nearby low-energy audio without exceeding the limit", () => {
+    const samples = new Int16Array(PCM_RATE * 12).fill(2000);
+    samples.fill(0, Math.floor(3.9 * PCM_RATE), Math.floor(4.1 * PCM_RATE));
+    const chunks = quietBoundedChunks({ samples, sampleRate: PCM_RATE, durationSec: 12 }, 5);
+    expect(chunks[0]!.to).toBeGreaterThan(3.9);
+    expect(chunks[0]!.to).toBeLessThan(4.1);
+    expect(chunks.every((chunk) => chunk.to - chunk.from <= 5)).toBe(true);
+    expect(chunks[0]!.from).toBe(0);
+    expect(chunks.at(-1)!.to).toBe(12);
   });
 });
 
@@ -204,5 +215,29 @@ describe.skipIf(!ffmpeg || !existsSync("fixtures/bob.wav"))("TinfoilTranscriptio
     const t = await p.transcribe(input([]));
     expect(requests).toHaveLength(1);
     expect(t.segments[0]!.speaker_name).toBe("Unknown");
+  });
+
+  test("long whole-file transcription is split into bounded chunks without content holes", async () => {
+    requests.length = 0;
+    const p = provider({ segmentation: "whole", wholeChunkSec: 5, concurrency: 2 });
+    const t = await p.transcribe(input([]));
+    expect(requests.length).toBeGreaterThan(1);
+    expect(requests.every((r) => r.seconds <= 5.01)).toBe(true);
+    expect(t.segments).toHaveLength(requests.length);
+    expect(t.segments[0]!.start).toBe(0);
+    expect(t.segments.at(-1)!.end).toBeCloseTo(t.duration_seconds, 2);
+    expect(p.lastStats).toMatchObject({ mode: "whole", turns: requests.length, transcribed: requests.length, failed: 0 });
+  });
+
+  test("a failed whole-file chunk stops scheduling later paid requests", async () => {
+    requests.length = 0;
+    failNames = /chunk-1/;
+    failStatus = 400;
+    const p = provider({ segmentation: "whole", wholeChunkSec: 5, concurrency: 2 });
+    await expect(p.transcribe(input([]))).rejects.toMatchObject({ code: "transcription_failed" });
+    failNames = null;
+    const requestsAtRejection = requests.length;
+    await Bun.sleep(100);
+    expect(requests).toHaveLength(requestsAtRejection);
   });
 });

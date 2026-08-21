@@ -17,7 +17,7 @@ Consumers: TinyCloud (`listen` app) and Conclave-shaped clients.
 - Multi-tenancy: one Vexa user/token owned by the service; our API does project scoping. Don't mirror projects into Vexa.
 - Ship order (happy-path-first):
   1. Stock Vexa locally, bot into local Jitsi room, transcript via Vexa's own API.
-  2. API + worker + Postgres: `POST /v1/meetings`, `GET /v1/meetings/{id}`, `POST /v1/meetings/{id}/stop`, `GET /v1/meetings/{id}/transcript`, `DELETE /v1/meetings/{id}` (also deletes in Vexa). Own IDs (`mtg_…`), own error taxonomy, platform detection from URL.
+  2. API + worker + Postgres: `POST /v1/meetings`, `GET /v1/meetings/{id}`, `POST /v1/meetings/{id}/stop`, `POST /v1/meetings/{id}/recover`, `GET /v1/meetings/{id}/transcript`, `DELETE /v1/meetings/{id}` (also deletes in Vexa). Own IDs (`mtg_…`), own error taxonomy, platform detection from URL.
   3. `meeting.completed` + `meeting.failed` webhooks (HMAC-SHA256 `X-Webhook-Signature`, retries immediate/1m/5m/30m/2h; webhook failure never fails the meeting), `Idempotency-Key`.
   4. dstack compose + Phala dev CVM attempt.
   5. Tinfoil provider behind interface (fixture-tested).
@@ -35,6 +35,10 @@ For every dispatched meeting, the worker sends Vexa `automatic_leave.max_time_le
 
 `GET /v1/meetings/{id}` → status, platform, bot{name,joined_at}, transcript{status}, created/started/ended_at, metadata, error{type,code,message} on failure. Once completed also `transcript_provider` (`"tinfoil" | "vexa"`) plus `fallback_from`/`fallback_reason` when the configured provider fell back to the Vexa-native transcript.
 `POST /v1/meetings/{id}/stop` → idempotent, returns `{id,status}`.
+
+`POST /v1/meetings/{id}/recover` → tenant-scoped, idempotently moves a failed meeting with a retained
+capture-provider record back to `processing` and retries finalization. A terminal provider reason never
+discards usable retained audio; zero live segments plus no usable recording remains an explicit failure.
 `GET /v1/meetings/{id}/transcript` → 202 `{meeting_id,status}` until complete; then
 ```json
 {"meeting_id":"…","status":"completed","language":"en","duration_seconds":0,"provider":"tinfoil",

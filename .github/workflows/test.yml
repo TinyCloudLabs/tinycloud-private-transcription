@@ -25,6 +25,11 @@ jobs:
         with:
           bun-version: latest
 
+      - name: Install audio decoder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
       - name: Install dependencies
         run: bun install --frozen-lockfile
 

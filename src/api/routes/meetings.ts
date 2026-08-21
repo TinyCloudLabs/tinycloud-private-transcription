@@ -6,6 +6,7 @@ import {
   deleteMeeting,
   getMeeting,
   getTranscript,
+  recoverMeeting,
   serializeMeeting,
   serializeTranscript,
   stopMeeting,
@@ -76,6 +77,12 @@ export function meetingRoutes(ctx: AppContext) {
   r.post("/:id/stop", async (c) => {
     const meeting = await getMeeting(ctx, c.get("project").id, c.req.param("id"));
     const updated = await stopMeeting(ctx, meeting);
+    return c.json({ id: updated.id, status: updated.status });
+  });
+
+  r.post("/:id/recover", async (c) => {
+    const meeting = await getMeeting(ctx, c.get("project").id, c.req.param("id"));
+    const updated = await recoverMeeting(ctx, meeting);
     return c.json({ id: updated.id, status: updated.status });
   });
 

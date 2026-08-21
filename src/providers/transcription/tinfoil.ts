@@ -34,6 +34,8 @@ export interface TinfoilOptions {
   padSec?: number;
   concurrency?: number;
   maxRetries?: number;
+  /** Whole-file mode is split into chunks of at most this many seconds (default 10 minutes). */
+  wholeChunkSec?: number;
   /** Turn-mode: recordings quieter than this (RMS dBFS) are treated as the known silent-tap capture. */
   silenceDbfs?: number;
   ffmpegPath?: string;
@@ -91,23 +93,62 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
   // ---- whole-file mode -------------------------------------------------------------------------
 
   private async transcribeWhole(input: TranscriptionInput, audio: AudioBlob, vexa: VexaTranscriptionSegment[]) {
-    const body = await this.post(audio.bytes, audio.filename, audio.contentType, input.language, 0);
-    // Without word/segment timestamps (voxtral `json`) the whole transcript is one segment spanning the
-    // audio; its speaker is whoever Vexa heard the most. Duration: provider's, else Vexa's last segment end.
-    const vexaEnd = vexa.reduce((m, s) => Math.max(m, s.end), 0);
-    const duration = body.duration ?? body.usage?.seconds ?? vexaEnd;
-    const segs = body.segments?.length ? body.segments : [{ start: 0, end: duration, text: body.text }];
-    const raw: RawSegment[] = segs.map((s) => ({
-      start: s.start,
-      end: s.end,
-      text: s.text,
-      speaker: speakerByOverlap(s.start, s.end, vexa),
-      language: body.language ?? null,
-    }));
-    this.calls += 1;
-    this.lastStats = { mode: "whole", audio_seconds: duration, turns: 1, transcribed: 1, skipped_short: 0, failed: 0, calls: 1 };
-    const t = normalizeSegments(raw, input.language ?? body.language ?? null);
-    return { ...t, duration_seconds: Math.max(t.duration_seconds, round(duration)) };
+    let pcm: Pcm16;
+    try {
+      pcm = await decodeToPcm(audio.bytes, { ffmpegPath: this.opts.ffmpegPath });
+    } catch (e) {
+      throw new TranscriptionFallbackError(`Recording could not be decoded: ${String(e)}`, "undecodable");
+    }
+    const level = rmsDbfs(pcm);
+    if (pcm.durationSec < 0.5 || level < (this.opts.silenceDbfs ?? -60)) {
+      throw new TranscriptionFallbackError("Recording is silent", "silent_recording", { audio_seconds: round(pcm.durationSec), rms_dbfs: round(level) });
+    }
+
+    // Long meetings can exceed inference upload limits or the per-request timeout. Decode once and
+    // submit bounded WAV chunks; a failed chunk fails the whole attempt so the worker retries without
+    // ever storing a transcript with a silent hole.
+    const chunkSec = Math.max(1, this.opts.wholeChunkSec ?? 600);
+    const chunks = quietBoundedChunks(pcm, chunkSec);
+    const bodies: OpenAIVerboseTranscription[] = new Array(chunks.length);
+    let calls = 0;
+    let next = 0;
+    let stopped = false;
+    const workers = Array.from({ length: Math.max(1, Math.min(this.opts.concurrency ?? 3, chunks.length)) }, async () => {
+      while (!stopped && next < chunks.length) {
+        const i = next++;
+        const chunk = chunks[i]!;
+        const filename = chunks.length === 1 ? audio.filename.replace(/\.[^.]+$/, ".wav") : `chunk-${i + 1}.wav`;
+        try {
+          bodies[i] = await this.post(sliceToWav(pcm, chunk.from, chunk.to), filename, "audio/wav", input.language, 0);
+          calls++;
+        } catch (error) {
+          stopped = true;
+          throw error;
+        }
+      }
+    });
+    // Wait for sibling requests already in flight, but do not schedule later chunks after the first
+    // failure. This prevents paid work from continuing behind a rejected meeting-level attempt.
+    const settled = await Promise.allSettled(workers);
+    const failure = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failure) throw failure.reason;
+
+    const raw: RawSegment[] = bodies.flatMap((body, i) => {
+      const chunk = chunks[i]!;
+      const localDuration = body.duration ?? body.usage?.seconds ?? chunk.to - chunk.from;
+      const segs = body.segments?.length ? body.segments : [{ start: 0, end: localDuration, text: body.text }];
+      return segs.map((s) => ({
+        start: chunk.from + s.start,
+        end: Math.min(chunk.to, chunk.from + s.end),
+        text: s.text,
+        speaker: speakerByOverlap(chunk.from + s.start, chunk.from + s.end, vexa),
+        language: body.language ?? null,
+      }));
+    });
+    this.calls += calls;
+    this.lastStats = { mode: "whole", audio_seconds: round(pcm.durationSec), turns: chunks.length, transcribed: chunks.length, skipped_short: 0, failed: 0, calls };
+    const t = normalizeSegments(raw, input.language ?? bodies.find((body) => body.language)?.language ?? null);
+    return { ...t, duration_seconds: Math.max(t.duration_seconds, round(pcm.durationSec)) };
   }
 
   // ---- per-turn mode ---------------------------------------------------------------------------
@@ -237,6 +278,39 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
 }
 
 const round = (n: number) => Math.round(n * 1000) / 1000;
+
+/**
+ * Split at the lowest-energy 100 ms window in the two seconds before each hard limit. Chunks stay
+ * within the configured bound while avoiding arbitrary cuts through speech whenever nearby quiet
+ * audio exists.
+ */
+export function quietBoundedChunks(pcm: Pcm16, maxSec: number): { from: number; to: number }[] {
+  const chunks: { from: number; to: number }[] = [];
+  let from = 0;
+  while (pcm.durationSec - from > maxSec) {
+    const hardEnd = from + maxSec;
+    const searchStart = Math.max(from + 0.5, hardEnd - 2);
+    const windowSamples = Math.max(1, Math.round(pcm.sampleRate * 0.1));
+    const stepSamples = Math.max(1, Math.floor(windowSamples / 2));
+    const first = Math.max(0, Math.floor(searchStart * pcm.sampleRate));
+    const last = Math.min(pcm.samples.length - windowSamples, Math.floor(hardEnd * pcm.sampleRate) - windowSamples);
+    let bestStart = last;
+    let bestEnergy = Number.POSITIVE_INFINITY;
+    for (let start = first; start <= last; start += stepSamples) {
+      let energy = 0;
+      for (let i = start; i < start + windowSamples; i++) energy += pcm.samples[i]! * pcm.samples[i]!;
+      if (energy < bestEnergy) {
+        bestEnergy = energy;
+        bestStart = start;
+      }
+    }
+    const to = Math.max(from + 0.5, Math.min(hardEnd, (bestStart + Math.floor(windowSamples / 2)) / pcm.sampleRate));
+    chunks.push({ from, to });
+    from = to;
+  }
+  chunks.push({ from, to: pcm.durationSec });
+  return chunks;
+}
 
 export function speakerByOverlap(start: number, end: number, vexa: VexaTranscriptionSegment[]): string | null {
   let best: string | null = null;
