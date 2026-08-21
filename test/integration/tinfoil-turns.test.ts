@@ -199,4 +199,32 @@ describe.skipIf(!ffmpeg || !existsSync("fixtures/bob.wav"))("tinfoil provider wi
     expect(failed.error.code).toBe("transcription_failed");
     expect(await (await h.api(`/v1/meetings/${meetingId}/transcript`)).json()).toEqual({ meeting_id: meetingId, status: "failed" });
   });
+
+  test("a recovery enqueue failure restores failed state so the caller can retry", async () => {
+    const nativeId = "RecoverAfterQueueFailure@jitsi.local";
+    const r = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/RecoverAfterQueueFailure", language: "en" } });
+    const { id: meetingId } = await r.json();
+    await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status === "joining" ? true : null));
+    await h.vexa.control("jitsi", nativeId, { status: "failed", completion_reason: "evicted", segments: [] });
+    await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status === "failed" ? true : null));
+    await h.vexa.control("jitsi", nativeId, {
+      status: "failed",
+      completion_reason: "evicted",
+      recording_base64: recordingB64,
+      recording_content_type: "audio/wav",
+    });
+
+    const originalPush = h.ctx.queue.push.bind(h.ctx.queue);
+    h.ctx.queue.push = async (job, delayMs) => {
+      if (job.type === "meeting.poll" && job.meetingId === meetingId) throw new Error("redis unavailable");
+      return originalPush(job, delayMs);
+    };
+    const unavailable = await h.api(`/v1/meetings/${meetingId}/recover`, { method: "POST" });
+    expect(unavailable.status).toBe(500);
+    expect((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status).toBe("failed");
+    h.ctx.queue.push = originalPush;
+
+    expect((await h.api(`/v1/meetings/${meetingId}/recover`, { method: "POST" })).status).toBe(200);
+    await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status === "completed" ? true : null), { label: "recovery after queue restored" });
+  });
 });

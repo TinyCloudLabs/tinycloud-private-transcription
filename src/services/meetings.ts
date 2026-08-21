@@ -196,7 +196,23 @@ export async function recoverMeeting(ctx: AppContext, meeting: MeetingRow): Prom
     .where(and(eq(meetings.id, meeting.id), eq(meetings.projectId, meeting.projectId), eq(meetings.status, "failed")))
     .returning();
   if (!updated) return (await getMeetingById(ctx, meeting.id)) ?? meeting;
-  await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id });
+  try {
+    await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id });
+  } catch (error) {
+    // Do not strand a meeting in processing when Redis is unavailable. A queue write is atomic; in
+    // the ambiguous response-lost case, a delivered poll sees the restored terminal state and exits,
+    // while the caller can safely retry recovery later.
+    await ctx.db
+      .update(meetings)
+      .set({
+        status: "failed",
+        errorCode: meeting.errorCode,
+        errorMessage: meeting.errorMessage,
+        transcriptionAttempts: meeting.transcriptionAttempts,
+      })
+      .where(and(eq(meetings.id, meeting.id), eq(meetings.projectId, meeting.projectId), eq(meetings.status, "processing")));
+    throw error;
+  }
   return updated;
 }
 
