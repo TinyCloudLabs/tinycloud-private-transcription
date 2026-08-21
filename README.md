@@ -231,7 +231,9 @@ whole-file transcription and the result has one generic speaker. This deliberate
 every spoken word over speaker attribution until capture-side diarization/backpressure is available.
 Meetings created before capture-only mode may still have Vexa segments and use speaker-attributed turn mode.
 `POST /v1/meetings/{id}/recover` retries finalization for a failed row when Vexa still retains its recording;
-it is tenant-scoped and concurrent/repeated calls enqueue at most one recovery.
+it is tenant-scoped, concurrent callers safely converge, and a repeated call while `processing` repairs a
+possible database-to-queue crash window. Duplicate polls remain safe because transcript storage is an upsert
+and only the winning terminal state transition emits a completion webhook.
 Vexa's speaker labels come from Jitsi dominant-speaker events (`"Speaker"` = unknown). ~~Vexa v0.12's
 recording tap only mixes the media elements present when it starts~~ — **fixed in our Vexa fork**
 ([TinyCloudLabs/vexa](https://github.com/TinyCloudLabs/vexa) branch `tinycloud`, see "Vexa fork" below): the

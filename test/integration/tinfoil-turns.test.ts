@@ -6,7 +6,9 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
+import { eq } from "drizzle-orm";
 import { createApiKey } from "../../src/api/auth.ts";
+import { meetings } from "../../src/db/schema.ts";
 import { ApiError } from "../../src/domain/errors.ts";
 import { getMeetingById } from "../../src/services/meetings.ts";
 import { handleMeetingPoll } from "../../src/worker/meeting-job.ts";
@@ -259,5 +261,29 @@ describe.skipIf(!ffmpeg || !existsSync("fixtures/bob.wav"))("tinfoil provider wi
 
     expect((await h.api(`/v1/meetings/${meetingId}/recover`, { method: "POST" })).status).toBe(200);
     await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status === "completed" ? true : null), { label: "recovery after queue restored" });
+  });
+
+  test("recover on a stranded processing row repairs the database-to-queue crash window", async () => {
+    const nativeId = "RecoverStrandedProcessing@jitsi.local";
+    const r = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/RecoverStrandedProcessing", language: "en" } });
+    const { id: meetingId } = await r.json();
+    await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status === "joining" ? true : null));
+    await h.vexa.control("jitsi", nativeId, { status: "failed", completion_reason: "evicted", segments: [] });
+    await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status === "failed" ? true : null));
+    await h.vexa.control("jitsi", nativeId, {
+      status: "failed",
+      completion_reason: "evicted",
+      recording_base64: recordingB64,
+      recording_content_type: "audio/wav",
+    });
+
+    // Simulate a process dying after the database commit but before Redis accepted the poll.
+    const failed = await getMeetingById(h.ctx, meetingId);
+    expect(failed?.status).toBe("failed");
+    await h.ctx.db.update(meetings).set({ status: "processing" }).where(eq(meetings.id, meetingId));
+
+    const repaired = await h.api(`/v1/meetings/${meetingId}/recover`, { method: "POST" });
+    expect(await repaired.json()).toEqual({ id: meetingId, status: "processing" });
+    await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status === "completed" ? true : null), { label: "stranded processing recovery completed" });
   });
 });

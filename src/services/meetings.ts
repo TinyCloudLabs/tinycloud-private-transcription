@@ -178,7 +178,14 @@ export async function stopMeeting(ctx: AppContext, meeting: MeetingRow): Promise
  */
 export async function recoverMeeting(ctx: AppContext, meeting: MeetingRow): Promise<MeetingRow> {
   const status = meeting.status as MeetingStatus;
-  if (status === "completed" || status === "processing") return meeting;
+  if (status === "completed") return meeting;
+  if (status === "processing") {
+    // Repairs the crash window between the failed → processing commit and Redis delivery. A
+    // duplicate poll is safe: transcript storage is an upsert and webhooks require the winning
+    // terminal state transition.
+    await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id });
+    return meeting;
+  }
   if (status !== "failed") {
     throw new ApiError("invalid_request", "Only failed meetings can be recovered.");
   }
