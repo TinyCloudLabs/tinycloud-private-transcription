@@ -138,7 +138,8 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
   // A terminal bot state describes how capture ended, not whether all captured media was lost. In
   // particular, left_alone/evicted/failed can retain a complete recording. Always salvage that
   // recording before deciding this meeting failed.
-  const segments = adaptVexaSegments(vexa).filter((segment) => segment.text.trim().length > 0); // deduped by turn, epoch → meeting-relative seconds
+  const segments = adaptVexaSegments(vexa); // deduped by turn, epoch → meeting-relative seconds
+  const hasLiveWords = segments.some((segment) => segment.text.trim().length > 0);
   const currentMeetingId = meeting.id;
   let cachedAudio: AudioBlob | null | undefined;
   const fetchAudio = async () => {
@@ -152,13 +153,11 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
   // With no live segments, a batch provider needs a usable recording to produce anything. This
   // preflight also prevents the old fallback path from storing an empty "completed" transcript.
   let usableAudio = true;
-  if (segments.length === 0 && needsRecording(ctx)) {
+  if (!hasLiveWords && needsRecording(ctx)) {
     try {
       usableAudio = !!(await fetchAudio());
     } catch (error) {
-      const retryable =
-        (error instanceof ApiError && (error.code === "provider_unavailable" || error.code === "provider_timeout")) ||
-        (error instanceof VexaHttpError && (error.status >= 500 || error.notFound));
+      const retryable = isRetryableRecordingFetchError(error);
       const attempts = meeting.transcriptionAttempts + 1;
       if (retryable && attempts < MAX_TRANSCRIPTION_ATTEMPTS) {
         ctx.log.warn("vexa recording unavailable; will retry", { meetingId, attempts, error: String(error) });
@@ -172,7 +171,7 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
       return;
     }
   }
-  if (segments.length === 0 && (!needsRecording(ctx) || !usableAudio)) {
+  if (!hasLiveWords && (!needsRecording(ctx) || !usableAudio)) {
     const f = reason ? mapVexaFailure(reason) : { code: "capture_failed" as const, message: "No usable audio was captured for this meeting." };
     const { meeting: failed, changed } = await failMeeting(ctx, meeting, f.code, f.message);
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
@@ -187,6 +186,10 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
 /** True for providers that transcribe persisted audio (anything but the WhisperLive passthrough). */
 const needsRecording = (ctx: AppContext) => ctx.transcription.name !== "vexa";
 
+const isRetryableRecordingFetchError = (error: unknown) =>
+  (error instanceof ApiError && (error.code === "provider_unavailable" || error.code === "provider_timeout")) ||
+  (error instanceof VexaHttpError && (error.status >= 500 || error.status === 429 || error.notFound));
+
 async function finalize(
   ctx: AppContext,
   meeting: MeetingRow,
@@ -200,15 +203,24 @@ async function finalize(
     language: meeting.language,
     vexaSegments,
     fetchAudio: async () => {
-      const audio = await fetchAudio();
-      if (!audio) audioMissing = true;
-      return audio;
+      try {
+        const audio = await fetchAudio();
+        if (!audio) audioMissing = true;
+        return audio;
+      } catch (error) {
+        // Vexa's recording endpoints return their own HTTP error type. Normalize transient/eventual
+        // recording failures so the meeting-level delayed retry handles them just like network timeouts.
+        if (error instanceof VexaHttpError && isRetryableRecordingFetchError(error)) {
+          throw new ApiError("provider_unavailable", "Meeting recording is temporarily unavailable");
+        }
+        throw error;
+      }
     },
   };
   // Non-empty Vexa live segments are a valid loss-preserving fallback when the batch provider cannot run.
   // Falling back is loss-preserving only when Vexa actually has words. Never turn an unusable batch
   // recording plus zero live segments into an empty "completed" transcript.
-  const canFallback = () => needsRecording(ctx) && vexaSegments.length > 0;
+  const canFallback = () => needsRecording(ctx) && vexaSegments.some((segment) => segment.text.trim().length > 0);
   let fallbackInfo: { from: string; reason: string } | null = null;
   const fallback = async (reason: string, error: unknown) => {
     ctx.log.warn("falling back to vexa-native transcript", { meetingId: meeting.id, provider: primary, reason, error: String(error) });
@@ -239,6 +251,9 @@ async function finalize(
         throw e;
       }
       provider = "vexa";
+    }
+    if (!transcript.text.trim()) {
+      throw new ApiError("transcription_failed", "Transcription provider returned no words");
     }
     await storeTranscript(ctx, meeting.id, transcript, provider, fallbackInfo);
     const { meeting: done, changed } = await transition(ctx, meeting, "completed");

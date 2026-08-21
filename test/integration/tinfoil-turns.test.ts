@@ -14,6 +14,7 @@ import { getMeetingById } from "../../src/services/meetings.ts";
 import { handleMeetingPoll } from "../../src/worker/meeting-job.ts";
 import { decodeToPcm, pcmToWav, PCM_RATE } from "../../src/providers/transcription/audio.ts";
 import { TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
+import { VexaHttpError } from "../../src/providers/vexa/client.ts";
 import { startHarness, type Harness } from "./harness.ts";
 
 const ffmpeg = Bun.which("ffmpeg");
@@ -95,6 +96,30 @@ describe.skipIf(!ffmpeg || !existsSync("fixtures/bob.wav"))("tinfoil provider wi
     expect(tinfoilCalls).toHaveLength(2);
     expect(logs.find((l) => l.msg === "transcript finalized")).toMatchObject({ data: { provider: "tinfoil", segments: 2, stats: { mode: "turns", turns: 2, transcribed: 2, calls: 2 } } });
     await h.waitFor(async () => h.webhook.received.find((w) => w.body.type === "meeting.completed" && w.body.data.meeting_id === id) ?? null);
+  });
+
+  test("speaker timing is retained even when a live segment has no Whisper words", async () => {
+    const nativeId = "BlankTimelineTurn@jitsi.local";
+    const callsBefore = tinfoilCalls.length;
+    const r = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/BlankTimelineTurn", language: "en" } });
+    const { id: meetingId } = await r.json();
+    await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status === "joining" ? true : null));
+    await h.vexa.control("jitsi", nativeId, {
+      status: "completed",
+      completion_reason: "stopped",
+      recording_base64: recordingB64,
+      recording_content_type: "audio/wav",
+      segments: [
+        { start: 1.5, end: 8.1, text: "Whisper heard Alice.", language: "en", speaker: "Alice", completed: true },
+        { start: aliceSec + 1.5, end: aliceSec + 7.35, text: "   ", language: "en", speaker: "Bob", completed: true },
+      ],
+    });
+
+    await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status === "completed" ? true : null), { label: "blank timeline turn completed" });
+    const transcript = await (await h.api(`/v1/meetings/${meetingId}/transcript`)).json();
+    expect(transcript.speakers.map((speaker: { name: string }) => speaker.name)).toEqual(["Alice", "Bob"]);
+    expect(transcript.segments).toHaveLength(2);
+    expect(tinfoilCalls.length - callsBefore).toBe(2);
   });
 
   test("completed(left_alone) salvages its retained recording when live segments are empty", async () => {
@@ -233,6 +258,31 @@ describe.skipIf(!ffmpeg || !existsSync("fixtures/bob.wav"))("tinfoil provider wi
     h.ctx.vexa.recordingMaster = originalMaster;
     await handleMeetingPoll(h.ctx, meetingId);
     await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status === "completed" ? true : null), { label: "recording fetch retry completed" });
+  });
+
+  test("a transient Vexa recording response also retries when live speaker words exist", async () => {
+    const nativeId = "RecordingHttpRetryWithWords@jitsi.local";
+    const r = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/RecordingHttpRetryWithWords", language: "en" } });
+    const { id: meetingId } = await r.json();
+    await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status === "joining" ? true : null));
+
+    const originalMaster = h.ctx.vexa.recordingMaster.bind(h.ctx.vexa);
+    h.ctx.vexa.recordingMaster = async () => {
+      throw new VexaHttpError(503, "master still assembling", "/recordings/1/master");
+    };
+    await h.vexa.control("jitsi", nativeId, {
+      status: "completed",
+      completion_reason: "left_alone",
+      recording_base64: recordingB64,
+      recording_content_type: "audio/wav",
+      segments: [{ start: 1.5, end: 8.1, text: "Live words remain available.", language: "en", speaker: "Alice", completed: true }],
+    });
+    await h.waitFor(async () => ((await getMeetingById(h.ctx, meetingId))?.transcriptionAttempts === 1 ? true : null), { label: "Vexa HTTP recording retry queued" });
+    expect((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status).toBe("processing");
+
+    h.ctx.vexa.recordingMaster = originalMaster;
+    await handleMeetingPoll(h.ctx, meetingId);
+    await h.waitFor(async () => ((await (await h.api(`/v1/meetings/${meetingId}`)).json()).status === "completed" ? true : null), { label: "Vexa HTTP recording retry completed" });
   });
 
   test("a recovery enqueue failure restores failed state so the caller can retry", async () => {
