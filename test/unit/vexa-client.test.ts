@@ -51,6 +51,8 @@ test("real-shape transcript: epoch timing, turn ids, data.completion_reason", as
   expect(t.segments[0].start).toBeGreaterThan(1e9);
   expect(t.segments[0].segment_id).toBe("turn:0:0");
   expect(t.segments[0].absolute_start_time).toBeTruthy();
+  const meetings = await client.listMeetings();
+  expect(meetings.meetings.some((meeting) => meeting.native_meeting_id === "Shape@jitsi.local")).toBe(true);
   const st = await client.botStatus();
   expect(st).toMatchObject({ count: expect.any(Number), running: expect.any(Array), running_bots: expect.any(Array) });
 });
@@ -58,4 +60,35 @@ test("real-shape transcript: epoch timing, turn ids, data.completion_reason", as
 test("bad api key -> VexaHttpError 401", async () => {
   const bad = new VexaClient({ baseUrl: mock.baseUrl, apiKey: "nope" });
   await expect(bad.botStatus()).rejects.toMatchObject({ status: 401 });
+});
+
+test("non-success provider bodies are discarded at the Vexa adapter boundary", async () => {
+  const body = "PROVIDER_BODY_SENTINEL https://provider.invalid/path sk_SECRET_SENTINEL";
+  const rejectedFetch = (async () => new Response(body, { status: 503 })) as unknown as typeof fetch;
+  const rejected = new VexaClient({
+    baseUrl: "https://adapter.invalid",
+    apiKey: "synthetic",
+    fetch: rejectedFetch,
+  });
+  const error = await rejected.getTranscript("jitsi", "IDENTIFIER_SENTINEL").catch((value) => value);
+  expect(error).toBeInstanceOf(VexaHttpError);
+  expect(error).toMatchObject({ status: 503 });
+  expect(error).not.toHaveProperty("detail");
+  expect(JSON.stringify(error)).not.toContain(body);
+  expect(JSON.stringify(error)).not.toContain("IDENTIFIER_SENTINEL");
+  expect(String(error)).not.toContain("sk_SECRET_SENTINEL");
+  expect(String(error)).not.toContain("IDENTIFIER_SENTINEL");
+});
+
+test("an invalid success response is sanitized at the Vexa adapter boundary", async () => {
+  const invalidFetch = (async () =>
+    new Response('{"provider_body":"PROVIDER_BODY_SENTINEL","secret":"sk_SECRET_SENTINEL"', {
+      status: 200,
+    })) as unknown as typeof fetch;
+  const invalid = new VexaClient({ baseUrl: "https://adapter.invalid", apiKey: "synthetic", fetch: invalidFetch });
+  const error = await invalid.getTranscript("jitsi", "IDENTIFIER_SENTINEL").catch((value) => value);
+  expect(error).toMatchObject({ code: "provider_unavailable" });
+  expect(String(error)).not.toContain("PROVIDER_BODY_SENTINEL");
+  expect(JSON.stringify(error)).not.toContain("sk_SECRET_SENTINEL");
+  expect(JSON.stringify(error)).not.toContain("IDENTIFIER_SENTINEL");
 });

@@ -1,0 +1,2057 @@
+{
+  "id": "629edba1-04f2-4737-a6f8-0daa6eb3ffe4",
+  "prevId": "3a178a9e-20d1-43a7-9dc0-f605fb8e6fe0",
+  "version": "7",
+  "dialect": "postgresql",
+  "tables": {
+    "public.api_keys": {
+      "name": "api_keys",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "project_id": {
+          "name": "project_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "key_hash": {
+          "name": "key_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "scopes": {
+          "name": "scopes",
+          "type": "text[]",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'"
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "api_keys_project_id_projects_id_fk": {
+          "name": "api_keys_project_id_projects_id_fk",
+          "tableFrom": "api_keys",
+          "tableTo": "projects",
+          "columnsFrom": [
+            "project_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "api_keys_key_hash_unique": {
+          "name": "api_keys_key_hash_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "key_hash"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.meetings": {
+      "name": "meetings",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "project_id": {
+          "name": "project_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "meeting_url": {
+          "name": "meeting_url",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "platform": {
+          "name": "platform",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "bot_name": {
+          "name": "bot_name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "language": {
+          "name": "language",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "webhook_url": {
+          "name": "webhook_url",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "vexa_platform": {
+          "name": "vexa_platform",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "vexa_native_meeting_id": {
+          "name": "vexa_native_meeting_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "vexa_bot_id": {
+          "name": "vexa_bot_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "started_at": {
+          "name": "started_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "ended_at": {
+          "name": "ended_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "completed_at": {
+          "name": "completed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "metadata": {
+          "name": "metadata",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'::jsonb"
+        },
+        "error_code": {
+          "name": "error_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "error_message": {
+          "name": "error_message",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "idempotency_key": {
+          "name": "idempotency_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "request_hash": {
+          "name": "request_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "transcription_attempts": {
+          "name": "transcription_attempts",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "budget_provenance": {
+          "name": "budget_provenance",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'tracked'"
+        },
+        "manual_recovery_cycles_consumed": {
+          "name": "manual_recovery_cycles_consumed",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "automatic_recovery_cycles_consumed": {
+          "name": "automatic_recovery_cycles_consumed",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "operator_recovery_cycles_consumed": {
+          "name": "operator_recovery_cycles_consumed",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "consecutive_recoverable_failures": {
+          "name": "consecutive_recoverable_failures",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "next_recovery_eligible_at": {
+          "name": "next_recovery_eligible_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "active_recovery_operation_id": {
+          "name": "active_recovery_operation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_recovery_outcome": {
+          "name": "last_recovery_outcome",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "recovery_phase": {
+          "name": "recovery_phase",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "transcript_revision": {
+          "name": "transcript_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "recovery_capability_version": {
+          "name": "recovery_capability_version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "deleted_at": {
+          "name": "deleted_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "deletion_fence": {
+          "name": "deletion_fence",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "deletion_saga_state": {
+          "name": "deletion_saga_state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "deletion_provider_platform": {
+          "name": "deletion_provider_platform",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "deletion_provider_native_meeting_id": {
+          "name": "deletion_provider_native_meeting_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "meetings_project_idempotency_idx": {
+          "name": "meetings_project_idempotency_idx",
+          "columns": [
+            {
+              "expression": "project_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "idempotency_key",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "meetings_project_status_idx": {
+          "name": "meetings_project_status_idx",
+          "columns": [
+            {
+              "expression": "project_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "meetings_project_id_projects_id_fk": {
+          "name": "meetings_project_id_projects_id_fk",
+          "tableFrom": "meetings",
+          "tableTo": "projects",
+          "columnsFrom": [
+            "project_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "meetings_active_recovery_operation_id_recovery_operations_id_fk": {
+          "name": "meetings_active_recovery_operation_id_recovery_operations_id_fk",
+          "tableFrom": "meetings",
+          "tableTo": "recovery_operations",
+          "columnsFrom": [
+            "active_recovery_operation_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "meetings_budget_provenance_check": {
+          "name": "meetings_budget_provenance_check",
+          "value": "\"meetings\".\"budget_provenance\" in ('tracked', 'legacy_unknown')"
+        },
+        "meetings_recovery_counters_check": {
+          "name": "meetings_recovery_counters_check",
+          "value": "\n      \"meetings\".\"manual_recovery_cycles_consumed\" >= 0 and\n      \"meetings\".\"automatic_recovery_cycles_consumed\" >= 0 and\n      \"meetings\".\"operator_recovery_cycles_consumed\" >= 0 and\n      \"meetings\".\"consecutive_recoverable_failures\" >= 0 and\n      \"meetings\".\"transcript_revision\" >= 0\n    "
+        },
+        "meetings_last_recovery_outcome_check": {
+          "name": "meetings_last_recovery_outcome_check",
+          "value": "\n      \"meetings\".\"last_recovery_outcome\" is null or \"meetings\".\"last_recovery_outcome\" in\n        ('completed', 'failed', 'disabled', 'budget_exhausted', 'cancelled')\n    "
+        },
+        "meetings_recovery_phase_check": {
+          "name": "meetings_recovery_phase_check",
+          "value": "\n      \"meetings\".\"recovery_phase\" is null or \"meetings\".\"recovery_phase\" in\n        ('queued', 'preflighting', 'chunking', 'transcribing', 'delayed', 'publishing', 'completed', 'failed', 'disabled')\n    "
+        },
+        "meetings_create_idempotency_key_check": {
+          "name": "meetings_create_idempotency_key_check",
+          "value": "\n      \"meetings\".\"idempotency_key\" is null or \"meetings\".\"idempotency_key\" ~ '^[!-~]{1,128}$'\n    "
+        },
+        "meetings_deletion_fence_check": {
+          "name": "meetings_deletion_fence_check",
+          "value": "\n      \"meetings\".\"deletion_fence\" between 0 and 9007199254740991 and\n      (\n        (\"meetings\".\"deleted_at\" is null and \"meetings\".\"deletion_saga_state\" is null and\n         \"meetings\".\"deletion_provider_platform\" is null and \"meetings\".\"deletion_provider_native_meeting_id\" is null)\n        or\n        (\"meetings\".\"deleted_at\" is not null and \"meetings\".\"deletion_saga_state\" in ('pending', 'completed') and\n         ((\"meetings\".\"deletion_provider_platform\" is null and \"meetings\".\"deletion_provider_native_meeting_id\" is null)\n          or (\"meetings\".\"deletion_saga_state\" = 'pending' and \"meetings\".\"deletion_provider_platform\" is not null and\n              \"meetings\".\"deletion_provider_native_meeting_id\" is not null)))\n      )\n    "
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.outbox_jobs": {
+      "name": "outbox_jobs",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "project_id": {
+          "name": "project_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "operation_id": {
+          "name": "operation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "chunk_id": {
+          "name": "chunk_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "event_type": {
+          "name": "event_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "dedupe_key_hash": {
+          "name": "dedupe_key_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "state": {
+          "name": "state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'pending'"
+        },
+        "available_at": {
+          "name": "available_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "lease_owner_hash": {
+          "name": "lease_owner_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "lease_expires_at": {
+          "name": "lease_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "lease_fence": {
+          "name": "lease_fence",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "attempt": {
+          "name": "attempt",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "last_error_code": {
+          "name": "last_error_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "outbox_jobs_project_dedupe_idx": {
+          "name": "outbox_jobs_project_dedupe_idx",
+          "columns": [
+            {
+              "expression": "project_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "dedupe_key_hash",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "outbox_jobs_delivery_idx": {
+          "name": "outbox_jobs_delivery_idx",
+          "columns": [
+            {
+              "expression": "state",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "available_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "outbox_jobs_project_id_projects_id_fk": {
+          "name": "outbox_jobs_project_id_projects_id_fk",
+          "tableFrom": "outbox_jobs",
+          "tableTo": "projects",
+          "columnsFrom": [
+            "project_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "outbox_jobs_operation_id_recovery_operations_id_fk": {
+          "name": "outbox_jobs_operation_id_recovery_operations_id_fk",
+          "tableFrom": "outbox_jobs",
+          "tableTo": "recovery_operations",
+          "columnsFrom": [
+            "operation_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "outbox_jobs_chunk_id_transcription_chunks_id_fk": {
+          "name": "outbox_jobs_chunk_id_transcription_chunks_id_fk",
+          "tableFrom": "outbox_jobs",
+          "tableTo": "transcription_chunks",
+          "columnsFrom": [
+            "chunk_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "outbox_jobs_dedupe_hash_check": {
+          "name": "outbox_jobs_dedupe_hash_check",
+          "value": "\"outbox_jobs\".\"dedupe_key_hash\" ~ '^[0-9a-f]{64}$'"
+        },
+        "outbox_jobs_event_type_check": {
+          "name": "outbox_jobs_event_type_check",
+          "value": "\"outbox_jobs\".\"event_type\" in ('operation.accepted', 'operation.resume', 'chunk.retry', 'transcript.publish', 'notification.deliver')"
+        },
+        "outbox_jobs_state_check": {
+          "name": "outbox_jobs_state_check",
+          "value": "\"outbox_jobs\".\"state\" in ('pending', 'leased', 'delivered', 'failed', 'cancelled')"
+        },
+        "outbox_jobs_last_error_code_check": {
+          "name": "outbox_jobs_last_error_code_check",
+          "value": "\n      \"outbox_jobs\".\"last_error_code\" is null or \"outbox_jobs\".\"last_error_code\" in\n        ('lease_expired', 'delivery_failed', 'persistence_failed', 'operation_deadline_exceeded', 'disabled')\n    "
+        },
+        "outbox_jobs_counters_check": {
+          "name": "outbox_jobs_counters_check",
+          "value": "\"outbox_jobs\".\"lease_fence\" between 0 and 9007199254740991 and \"outbox_jobs\".\"attempt\" >= 0"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.project_recovery_buckets": {
+      "name": "project_recovery_buckets",
+      "schema": "",
+      "columns": {
+        "project_id": {
+          "name": "project_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "bucket_minute": {
+          "name": "bucket_minute",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "initial_cycles": {
+          "name": "initial_cycles",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "manual_cycles": {
+          "name": "manual_cycles",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "automatic_cycles": {
+          "name": "automatic_cycles",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "operator_cycles": {
+          "name": "operator_cycles",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "reserved_calls": {
+          "name": "reserved_calls",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "spent_calls": {
+          "name": "spent_calls",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "reserved_audio_ms": {
+          "name": "reserved_audio_ms",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "spent_audio_ms": {
+          "name": "spent_audio_ms",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "reserved_cost_microunits": {
+          "name": "reserved_cost_microunits",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "0"
+        },
+        "spent_cost_microunits": {
+          "name": "spent_cost_microunits",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "0"
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "project_recovery_buckets_project_id_projects_id_fk": {
+          "name": "project_recovery_buckets_project_id_projects_id_fk",
+          "tableFrom": "project_recovery_buckets",
+          "tableTo": "projects",
+          "columnsFrom": [
+            "project_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "project_recovery_buckets_pk": {
+          "name": "project_recovery_buckets_pk",
+          "columns": [
+            "project_id",
+            "bucket_minute"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "project_recovery_buckets_minute_check": {
+          "name": "project_recovery_buckets_minute_check",
+          "value": "\n      \"project_recovery_buckets\".\"bucket_minute\" = date_trunc('minute', \"project_recovery_buckets\".\"bucket_minute\" at time zone 'UTC') at time zone 'UTC'\n    "
+        },
+        "project_recovery_buckets_counters_check": {
+          "name": "project_recovery_buckets_counters_check",
+          "value": "\n      \"project_recovery_buckets\".\"initial_cycles\" >= 0 and \"project_recovery_buckets\".\"manual_cycles\" >= 0 and \"project_recovery_buckets\".\"automatic_cycles\" >= 0 and\n      \"project_recovery_buckets\".\"operator_cycles\" >= 0 and \"project_recovery_buckets\".\"reserved_calls\" >= 0 and \"project_recovery_buckets\".\"spent_calls\" >= 0 and\n      \"project_recovery_buckets\".\"reserved_audio_ms\" between 0 and 9007199254740991 and\n      \"project_recovery_buckets\".\"spent_audio_ms\" between 0 and 9007199254740991 and\n      \"project_recovery_buckets\".\"reserved_cost_microunits\" >= 0 and \"project_recovery_buckets\".\"spent_cost_microunits\" >= 0\n    "
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.project_recovery_guards": {
+      "name": "project_recovery_guards",
+      "schema": "",
+      "columns": {
+        "project_id": {
+          "name": "project_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "lock_version": {
+          "name": "lock_version",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "project_recovery_guards_project_id_projects_id_fk": {
+          "name": "project_recovery_guards_project_id_projects_id_fk",
+          "tableFrom": "project_recovery_guards",
+          "tableTo": "projects",
+          "columnsFrom": [
+            "project_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "project_recovery_guards_lock_version_check": {
+          "name": "project_recovery_guards_lock_version_check",
+          "value": "\"project_recovery_guards\".\"lock_version\" between 0 and 9007199254740991"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.projects": {
+      "name": "projects",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "webhook_secret": {
+          "name": "webhook_secret",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.provider_call_ledger": {
+      "name": "provider_call_ledger",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "project_id": {
+          "name": "project_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "operation_id": {
+          "name": "operation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "chunk_id": {
+          "name": "chunk_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "reservation_key_hash": {
+          "name": "reservation_key_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "submitted_audio_ms": {
+          "name": "submitted_audio_ms",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "submitted_bytes": {
+          "name": "submitted_bytes",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "reserved_cost_microunits": {
+          "name": "reserved_cost_microunits",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "0"
+        },
+        "spent_cost_microunits": {
+          "name": "spent_cost_microunits",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "0"
+        },
+        "attempt": {
+          "name": "attempt",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "dispatch_state": {
+          "name": "dispatch_state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "outcome_code": {
+          "name": "outcome_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "status_class": {
+          "name": "status_class",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "lease_fence": {
+          "name": "lease_fence",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "budget_bucket_minute": {
+          "name": "budget_bucket_minute",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "reserved_at": {
+          "name": "reserved_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "dispatching_at": {
+          "name": "dispatching_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "completed_at": {
+          "name": "completed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "provider_call_ledger_operation_chunk_attempt_idx": {
+          "name": "provider_call_ledger_operation_chunk_attempt_idx",
+          "columns": [
+            {
+              "expression": "operation_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "chunk_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "attempt",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "provider_call_ledger_project_reservation_idx": {
+          "name": "provider_call_ledger_project_reservation_idx",
+          "columns": [
+            {
+              "expression": "project_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "reservation_key_hash",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "provider_call_ledger_operation_state_idx": {
+          "name": "provider_call_ledger_operation_state_idx",
+          "columns": [
+            {
+              "expression": "operation_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "dispatch_state",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "provider_call_ledger_project_id_projects_id_fk": {
+          "name": "provider_call_ledger_project_id_projects_id_fk",
+          "tableFrom": "provider_call_ledger",
+          "tableTo": "projects",
+          "columnsFrom": [
+            "project_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "provider_call_ledger_operation_id_recovery_operations_id_fk": {
+          "name": "provider_call_ledger_operation_id_recovery_operations_id_fk",
+          "tableFrom": "provider_call_ledger",
+          "tableTo": "recovery_operations",
+          "columnsFrom": [
+            "operation_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "provider_call_ledger_chunk_id_transcription_chunks_id_fk": {
+          "name": "provider_call_ledger_chunk_id_transcription_chunks_id_fk",
+          "tableFrom": "provider_call_ledger",
+          "tableTo": "transcription_chunks",
+          "columnsFrom": [
+            "chunk_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "provider_call_ledger_reservation_hash_check": {
+          "name": "provider_call_ledger_reservation_hash_check",
+          "value": "\"provider_call_ledger\".\"reservation_key_hash\" ~ '^[0-9a-f]{64}$'"
+        },
+        "provider_call_ledger_kind_check": {
+          "name": "provider_call_ledger_kind_check",
+          "value": "\"provider_call_ledger\".\"kind\" in ('initial', 'manual', 'automatic', 'operator')"
+        },
+        "provider_call_ledger_dispatch_state_check": {
+          "name": "provider_call_ledger_dispatch_state_check",
+          "value": "\n      \"provider_call_ledger\".\"dispatch_state\" in ('reserved', 'dispatching', 'not_dispatched', 'spent', 'completed')\n    "
+        },
+        "provider_call_ledger_outcome_code_check": {
+          "name": "provider_call_ledger_outcome_code_check",
+          "value": "\n      \"provider_call_ledger\".\"outcome_code\" is null or \"provider_call_ledger\".\"outcome_code\" in\n        ('not_dispatched', 'success', 'timeout', 'transport_error', 'http_408', 'http_429',\n         'http_4xx', 'http_5xx', 'invalid_response', 'attestation_failed', 'provider_rejected', 'unknown')\n    "
+        },
+        "provider_call_ledger_status_class_check": {
+          "name": "provider_call_ledger_status_class_check",
+          "value": "\n      \"provider_call_ledger\".\"status_class\" is null or \"provider_call_ledger\".\"status_class\" in ('none', '2xx', '4xx', '5xx', 'network')\n    "
+        },
+        "provider_call_ledger_counters_check": {
+          "name": "provider_call_ledger_counters_check",
+          "value": "\n      \"provider_call_ledger\".\"submitted_audio_ms\" between 0 and 9007199254740991 and\n      \"provider_call_ledger\".\"submitted_bytes\" between 0 and 9007199254740991 and\n      \"provider_call_ledger\".\"reserved_cost_microunits\" >= 0 and \"provider_call_ledger\".\"spent_cost_microunits\" >= 0 and\n      \"provider_call_ledger\".\"attempt\" > 0 and \"provider_call_ledger\".\"lease_fence\" between 0 and 9007199254740991\n    "
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.recovery_operations": {
+      "name": "recovery_operations",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "project_id": {
+          "name": "project_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "meeting_id": {
+          "name": "meeting_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "idempotency_key_hash": {
+          "name": "idempotency_key_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "state": {
+          "name": "state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "phase": {
+          "name": "phase",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "eligibility_code": {
+          "name": "eligibility_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "ordinal": {
+          "name": "ordinal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "planned_audio_ms": {
+          "name": "planned_audio_ms",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "submitted_audio_ms": {
+          "name": "submitted_audio_ms",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "source_sample_rate_hz": {
+          "name": "source_sample_rate_hz",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "source_sample_count": {
+          "name": "source_sample_count",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "reserved_calls": {
+          "name": "reserved_calls",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "spent_calls": {
+          "name": "spent_calls",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "reserved_cost_microunits": {
+          "name": "reserved_cost_microunits",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "0"
+        },
+        "spent_cost_microunits": {
+          "name": "spent_cost_microunits",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "0"
+        },
+        "cooldown_snapshot_at": {
+          "name": "cooldown_snapshot_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "deadline_at": {
+          "name": "deadline_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "delayed_at": {
+          "name": "delayed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "worker_lease_owner_hash": {
+          "name": "worker_lease_owner_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "worker_lease_expires_at": {
+          "name": "worker_lease_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "worker_lease_fence": {
+          "name": "worker_lease_fence",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "failure_code": {
+          "name": "failure_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "correlation_id": {
+          "name": "correlation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "actor_class": {
+          "name": "actor_class",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "reason_code": {
+          "name": "reason_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "accepted_at": {
+          "name": "accepted_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "started_at": {
+          "name": "started_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "completed_at": {
+          "name": "completed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "recovery_operations_project_meeting_key_idx": {
+          "name": "recovery_operations_project_meeting_key_idx",
+          "columns": [
+            {
+              "expression": "project_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "meeting_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "idempotency_key_hash",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "recovery_operations_one_active_meeting_idx": {
+          "name": "recovery_operations_one_active_meeting_idx",
+          "columns": [
+            {
+              "expression": "project_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "meeting_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"recovery_operations\".\"state\" in ('accepted', 'active', 'delayed')",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "recovery_operations_project_state_idx": {
+          "name": "recovery_operations_project_state_idx",
+          "columns": [
+            {
+              "expression": "project_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "state",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "recovery_operations_project_id_projects_id_fk": {
+          "name": "recovery_operations_project_id_projects_id_fk",
+          "tableFrom": "recovery_operations",
+          "tableTo": "projects",
+          "columnsFrom": [
+            "project_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "recovery_operations_meeting_id_meetings_id_fk": {
+          "name": "recovery_operations_meeting_id_meetings_id_fk",
+          "tableFrom": "recovery_operations",
+          "tableTo": "meetings",
+          "columnsFrom": [
+            "meeting_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "recovery_operations_key_hash_check": {
+          "name": "recovery_operations_key_hash_check",
+          "value": "\"recovery_operations\".\"idempotency_key_hash\" ~ '^[0-9a-f]{64}$'"
+        },
+        "recovery_operations_kind_check": {
+          "name": "recovery_operations_kind_check",
+          "value": "\"recovery_operations\".\"kind\" in ('initial', 'manual', 'automatic', 'operator')"
+        },
+        "recovery_operations_state_check": {
+          "name": "recovery_operations_state_check",
+          "value": "\"recovery_operations\".\"state\" in ('accepted', 'active', 'delayed', 'completed', 'failed', 'cancelled')"
+        },
+        "recovery_operations_phase_check": {
+          "name": "recovery_operations_phase_check",
+          "value": "\n      \"recovery_operations\".\"phase\" in ('queued', 'preflighting', 'chunking', 'transcribing', 'delayed', 'publishing', 'completed', 'failed', 'disabled')\n    "
+        },
+        "recovery_operations_eligibility_code_check": {
+          "name": "recovery_operations_eligibility_code_check",
+          "value": "\n      \"recovery_operations\".\"eligibility_code\" is null or \"recovery_operations\".\"eligibility_code\" in\n        ('eligible', 'legacy_unknown', 'wrong_state', 'cooldown', 'budget_exhausted', 'recording_absent', 'capability_unavailable', 'disabled')\n    "
+        },
+        "recovery_operations_failure_code_check": {
+          "name": "recovery_operations_failure_code_check",
+          "value": "\n      \"recovery_operations\".\"failure_code\" is null or \"recovery_operations\".\"failure_code\" in\n        ('provider_timeout', 'provider_unavailable', 'provider_rejected', 'finalizer_interrupted', 'operation_deadline_exceeded',\n         'recording_fetch_transient', 'recording_absent', 'recording_undecodable', 'recording_silent',\n         'attestation_failed', 'coverage_incomplete', 'budget_exhausted', 'persistence_failed',\n         'cancelled', 'deleted', 'validation_failed', 'authentication_failed')\n    "
+        },
+        "recovery_operations_actor_class_check": {
+          "name": "recovery_operations_actor_class_check",
+          "value": "\"recovery_operations\".\"actor_class\" in ('system', 'user', 'operator')"
+        },
+        "recovery_operations_reason_code_check": {
+          "name": "recovery_operations_reason_code_check",
+          "value": "\n      \"recovery_operations\".\"reason_code\" in ('initial_transcription', 'user_requested', 'automatic_policy', 'operator_override')\n    "
+        },
+        "recovery_operations_correlation_id_check": {
+          "name": "recovery_operations_correlation_id_check",
+          "value": "char_length(\"recovery_operations\".\"correlation_id\") between 1 and 128"
+        },
+        "recovery_operations_counters_check": {
+          "name": "recovery_operations_counters_check",
+          "value": "\n      \"recovery_operations\".\"ordinal\" > 0 and\n      \"recovery_operations\".\"planned_audio_ms\" between 0 and 9007199254740991 and\n      \"recovery_operations\".\"submitted_audio_ms\" between 0 and 9007199254740991 and\n      \"recovery_operations\".\"reserved_calls\" >= 0 and \"recovery_operations\".\"spent_calls\" >= 0 and\n      \"recovery_operations\".\"reserved_cost_microunits\" >= 0 and \"recovery_operations\".\"spent_cost_microunits\" >= 0 and\n      \"recovery_operations\".\"worker_lease_fence\" between 0 and 9007199254740991\n    "
+        },
+        "recovery_operations_source_samples_check": {
+          "name": "recovery_operations_source_samples_check",
+          "value": "\n      (\"recovery_operations\".\"source_sample_rate_hz\" is null and \"recovery_operations\".\"source_sample_count\" is null)\n      or\n      (\"recovery_operations\".\"source_sample_rate_hz\" is not null and \"recovery_operations\".\"source_sample_count\" is not null and\n       \"recovery_operations\".\"source_sample_rate_hz\" > 0 and \"recovery_operations\".\"source_sample_rate_hz\" <= 2147483000 and\n       \"recovery_operations\".\"source_sample_rate_hz\" % 1000 = 0 and\n       \"recovery_operations\".\"source_sample_count\" between 1 and 9007199254740991 and\n       \"recovery_operations\".\"planned_audio_ms\" = (\"recovery_operations\".\"source_sample_count\" + (\"recovery_operations\".\"source_sample_rate_hz\" / 1000) - 1) / (\"recovery_operations\".\"source_sample_rate_hz\" / 1000))\n    "
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.service_capability_leases": {
+      "name": "service_capability_leases",
+      "schema": "",
+      "columns": {
+        "component": {
+          "name": "component",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "lease_owner_hash": {
+          "name": "lease_owner_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "build_revision": {
+          "name": "build_revision",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "contract_version": {
+          "name": "contract_version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "finalizer_version": {
+          "name": "finalizer_version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "schema_version": {
+          "name": "schema_version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "config_version": {
+          "name": "config_version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "lease_expires_at": {
+          "name": "lease_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "heartbeat_at": {
+          "name": "heartbeat_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "lease_fence": {
+          "name": "lease_fence",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "service_capability_leases_component_check": {
+          "name": "service_capability_leases_component_check",
+          "value": "\"service_capability_leases\".\"component\" in ('api', 'worker')"
+        },
+        "service_capability_leases_bounded_fields_check": {
+          "name": "service_capability_leases_bounded_fields_check",
+          "value": "\n      \"service_capability_leases\".\"lease_owner_hash\" ~ '^[0-9a-f]{64}$' and\n      char_length(\"service_capability_leases\".\"build_revision\") between 1 and 128 and\n      char_length(\"service_capability_leases\".\"contract_version\") between 1 and 64 and\n      char_length(\"service_capability_leases\".\"finalizer_version\") between 1 and 64 and\n      char_length(\"service_capability_leases\".\"schema_version\") between 1 and 64 and\n      char_length(\"service_capability_leases\".\"config_version\") between 1 and 128 and\n      \"service_capability_leases\".\"lease_fence\" between 0 and 9007199254740991\n    "
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.transcription_chunks": {
+      "name": "transcription_chunks",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "operation_id": {
+          "name": "operation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "ordinal": {
+          "name": "ordinal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "version": {
+          "name": "version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 1
+        },
+        "start_ms": {
+          "name": "start_ms",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "end_ms": {
+          "name": "end_ms",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "speaker_ref_hash": {
+          "name": "speaker_ref_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "provenance": {
+          "name": "provenance",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "state": {
+          "name": "state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "attempt": {
+          "name": "attempt",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "retry_count": {
+          "name": "retry_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "next_eligible_at": {
+          "name": "next_eligible_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "split_parent_id": {
+          "name": "split_parent_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "provider_call_ledger_id": {
+          "name": "provider_call_ledger_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "checkpoint_ciphertext": {
+          "name": "checkpoint_ciphertext",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "checkpoint_nonce": {
+          "name": "checkpoint_nonce",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "checkpoint_key_version": {
+          "name": "checkpoint_key_version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "checkpoint_content_hash": {
+          "name": "checkpoint_content_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "lease_owner_hash": {
+          "name": "lease_owner_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "lease_expires_at": {
+          "name": "lease_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "lease_fence": {
+          "name": "lease_fence",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "transcription_chunks_operation_ordinal_version_idx": {
+          "name": "transcription_chunks_operation_ordinal_version_idx",
+          "columns": [
+            {
+              "expression": "operation_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "ordinal",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "version",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "transcription_chunks_operation_state_idx": {
+          "name": "transcription_chunks_operation_state_idx",
+          "columns": [
+            {
+              "expression": "operation_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "state",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "transcription_chunks_operation_id_recovery_operations_id_fk": {
+          "name": "transcription_chunks_operation_id_recovery_operations_id_fk",
+          "tableFrom": "transcription_chunks",
+          "tableTo": "recovery_operations",
+          "columnsFrom": [
+            "operation_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "transcription_chunks_split_parent_id_transcription_chunks_id_fk": {
+          "name": "transcription_chunks_split_parent_id_transcription_chunks_id_fk",
+          "tableFrom": "transcription_chunks",
+          "tableTo": "transcription_chunks",
+          "columnsFrom": [
+            "split_parent_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "transcription_chunks_ledger_id_fk": {
+          "name": "transcription_chunks_ledger_id_fk",
+          "tableFrom": "transcription_chunks",
+          "tableTo": "provider_call_ledger",
+          "columnsFrom": [
+            "provider_call_ledger_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "transcription_chunks_bounds_check": {
+          "name": "transcription_chunks_bounds_check",
+          "value": "\n      \"transcription_chunks\".\"ordinal\" >= 0 and \"transcription_chunks\".\"version\" > 0 and\n      \"transcription_chunks\".\"start_ms\" between 0 and 9007199254740991 and\n      \"transcription_chunks\".\"end_ms\" between 1 and 9007199254740991 and \"transcription_chunks\".\"end_ms\" > \"transcription_chunks\".\"start_ms\" and\n      \"transcription_chunks\".\"attempt\" >= 0 and \"transcription_chunks\".\"retry_count\" between 0 and 1 and\n      \"transcription_chunks\".\"lease_fence\" between 0 and 9007199254740991\n    "
+        },
+        "transcription_chunks_provenance_check": {
+          "name": "transcription_chunks_provenance_check",
+          "value": "\"transcription_chunks\".\"provenance\" in ('provider', 'vexa_fallback')"
+        },
+        "transcription_chunks_state_check": {
+          "name": "transcription_chunks_state_check",
+          "value": "\n      \"transcription_chunks\".\"state\" in ('planned', 'reserved', 'dispatching', 'retry_scheduled', 'succeeded', 'split', 'fallback', 'failed')\n    "
+        },
+        "transcription_chunks_checkpoint_shape_check": {
+          "name": "transcription_chunks_checkpoint_shape_check",
+          "value": "\n      (\"transcription_chunks\".\"checkpoint_ciphertext\" is null and \"transcription_chunks\".\"checkpoint_nonce\" is null and\n       \"transcription_chunks\".\"checkpoint_key_version\" is null and \"transcription_chunks\".\"checkpoint_content_hash\" is null)\n      or\n      (\"transcription_chunks\".\"checkpoint_ciphertext\" is not null and \"transcription_chunks\".\"checkpoint_nonce\" is not null and\n       \"transcription_chunks\".\"checkpoint_key_version\" is not null and \"transcription_chunks\".\"checkpoint_content_hash\" is not null and\n       octet_length(\"transcription_chunks\".\"checkpoint_ciphertext\") between 1 and 1048576 and\n       octet_length(\"transcription_chunks\".\"checkpoint_nonce\") between 1 and 256 and\n       char_length(\"transcription_chunks\".\"checkpoint_key_version\") between 1 and 128 and\n       \"transcription_chunks\".\"checkpoint_content_hash\" ~ '^[0-9a-f]{64}$')\n    "
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.transcripts": {
+      "name": "transcripts",
+      "schema": "",
+      "columns": {
+        "meeting_id": {
+          "name": "meeting_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "language": {
+          "name": "language",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "duration_seconds": {
+          "name": "duration_seconds",
+          "type": "real",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "segments_json": {
+          "name": "segments_json",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "provider": {
+          "name": "provider",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'vexa'"
+        },
+        "fallback_from": {
+          "name": "fallback_from",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "fallback_reason": {
+          "name": "fallback_reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "transcripts_meeting_id_meetings_id_fk": {
+          "name": "transcripts_meeting_id_meetings_id_fk",
+          "tableFrom": "transcripts",
+          "tableTo": "meetings",
+          "columnsFrom": [
+            "meeting_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.webhook_deliveries": {
+      "name": "webhook_deliveries",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "meeting_id": {
+          "name": "meeting_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "event_id": {
+          "name": "event_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "event_type": {
+          "name": "event_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "endpoint": {
+          "name": "endpoint",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "payload": {
+          "name": "payload",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "attempt": {
+          "name": "attempt",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "response_code": {
+          "name": "response_code",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "next_attempt_at": {
+          "name": "next_attempt_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "webhook_deliveries_meeting_idx": {
+          "name": "webhook_deliveries_meeting_idx",
+          "columns": [
+            {
+              "expression": "meeting_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    }
+  },
+  "enums": {},
+  "schemas": {},
+  "sequences": {},
+  "roles": {},
+  "policies": {},
+  "views": {},
+  "_meta": {
+    "columns": {},
+    "schemas": {},
+    "tables": {}
+  }
+}

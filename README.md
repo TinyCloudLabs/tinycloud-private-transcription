@@ -2,6 +2,10 @@
 
 **Status: pre-release / V1.**
 
+The complete public surface is checked in as [OpenAPI](./openapi.yaml), with an [API guide](./docs/api.md)
+and a default-dark [recovery runbook](./docs/recovery-runbook.md). Those artifacts do not authorize a
+deployment, canary, recovery, or feature enablement.
+
 A meeting primitive: send a meeting URL in, a bot joins the call, and you get a speaker-attributed,
 structured transcript out — with state you can track (`queued → joining → waiting_for_admission →
 in_progress → processing → completed`) and signed webhooks on completion. The public API (meetings,
@@ -107,6 +111,33 @@ production window. Green 2/2 on 2026-08-17 (~2 min each; evidence in `tmp/e2e-<r
 | `TINFOIL_SEGMENTATION` | `turns` | `turns` (one Tinfoil call per Vexa speaker turn, keeps segmentation) or `whole` (one call, one segment) — see below |
 | `AUTO_MIGRATE` | `true` | API runs migrations at boot |
 | `LOG_LEVEL` | `info` | JSON logs |
+
+Recovery v2 has one typed configuration registry in `src/recovery-config.ts`. All recovery switches
+default off, every non-switch value has no default, and legacy `TRANSCRIPTION_PROVIDER` /
+`TINFOIL_SEGMENTATION` do not activate recovery. Blank values are documentation placeholders only:
+omit them from an actual dark process environment or replace every required value with an approved
+value before construction. A supplied blank or malformed value stops startup.
+
+| recovery group | explicit variables (all default unset unless noted) |
+|---|---|
+| Independent intent | `RECOVERY_V2_ENABLED`, `RECOVERY_PROVIDER_ENABLED`, `RECOVERY_FINALIZER_ENABLED`, `RECOVERY_VEXA_FALLBACK_ENABLED` (all `false`); `RECOVERY_SEGMENTATION_MODE` (`speaker_aware` only) |
+| Acceptance / source | `RECOVERY_MANUAL_CYCLES_PER_MEETING`, `RECOVERY_COOLDOWN_BASE_MS`, `RECOVERY_COOLDOWN_MAX_MS`, `RECOVERY_MAX_SOURCE_DURATION_MS`, `RECOVERY_MAX_SOURCE_PCM_BYTES`, `RECOVERY_MAX_RECORDING_BYTES` |
+| Provider / operation | `RECOVERY_PROVIDER_MAX_CHUNK_DURATION_MS`, `RECOVERY_PROVIDER_MAX_WAV_BYTES`, `RECOVERY_MAX_CHUNK_DURATION_MS`, `RECOVERY_MAX_WAV_BYTES`, `RECOVERY_MAX_CALLS_PER_OPERATION`, `RECOVERY_MAX_SUBMITTED_AUDIO_MS_PER_OPERATION`, `RECOVERY_MAX_COST_MICROUNITS_PER_OPERATION`, `RECOVERY_MAX_CONCURRENT_PROVIDER_CALLS`, `RECOVERY_OPERATION_DEADLINE_MS`, `RECOVERY_DELAYED_THRESHOLD_MS`, `RECOVERY_SPLIT_FLOOR_MS`, `RECOVERY_RETRY_BASE_MS`, `RECOVERY_MAX_RETRY_AFTER_MS` |
+| Rolling project budget | `RECOVERY_PROJECT_MANUAL_CYCLES`, `RECOVERY_PROJECT_AUTOMATIC_CYCLES` (must be exactly `0` in release one), `RECOVERY_PROJECT_MAX_CALLS`, `RECOVERY_PROJECT_MAX_SUBMITTED_AUDIO_MS`, `RECOVERY_PROJECT_MAX_COST_MICROUNITS` |
+| Planner | `RECOVERY_PLAN_MAX_CHUNKS`, `RECOVERY_PLAN_MAX_CANDIDATES`, `RECOVERY_PLAN_QUIET_SEARCH_MS`, `RECOVERY_PLAN_QUIET_WINDOW_MS`, `RECOVERY_PLAN_SILENCE_THRESHOLD_DBFS` |
+| Recording metadata | `RECOVERY_RECORDING_MAX_MEDIA_FILES`, `RECOVERY_RECORDING_MAX_METADATA_STRING_LENGTH`, `RECOVERY_RECORDING_ALLOWED_MEDIA_TYPES`, `RECOVERY_RECORDING_MAX_DURATION_MS`, `RECOVERY_RECORDING_MAX_BYTES` |
+| Durable delivery | `RECOVERY_DELIVERY_LEASE_MS`, `RECOVERY_DELIVERY_MAX_ATTEMPTS`, `RECOVERY_DELIVERY_MAX_AGE_MS`, `RECOVERY_DELIVERY_RETRY_DELAY_MS`, `RECOVERY_DELIVERY_IDLE_MS` |
+| Capability | `RECOVERY_CAPABILITY_LEASE_MS`, `RECOVERY_CAPABILITY_HEARTBEAT_MS` |
+| Approved evidence | `RECOVERY_RETENTION_POLICY_VERSION`, `RECOVERY_PRICE_VERSION`, `RECOVERY_API_BUILD_REVISION`, `RECOVERY_WORKER_BUILD_REVISION`, `RECOVERY_API_CONTRACT_VERSION`, `RECOVERY_WORKER_CONTRACT_VERSION`, `RECOVERY_FINALIZER_VERSION`, `RECOVERY_SCHEMA_VERSION` |
+
+All integer syntax is unsigned base-10 digits (except the non-positive integer dBFS threshold).
+Limits are cross-checked at construction, costs fit PostgreSQL `bigint`, scheduled timings fit the
+runtime timer representation, media types are bounded and unique, and capability heartbeat is
+strictly shorter than its lease. The sanitized effective snapshot encodes bigints as strings and
+derives a `rcfg_...` revision from non-secret values only. It does not include environment objects,
+credentials, provider URLs/bodies, content, or tenant/recording identifiers. Production provider-v2,
+owner-scoped recording preflight, and checkpoint protection are still unavailable, so complete-looking
+configuration cannot advertise or dispatch recovery in this workstream.
 
 ## Curl walkthrough (Definition of Done)
 
@@ -305,13 +336,14 @@ If the docker.sock bind is ever refused by the platform, the alternative is Vexa
 **Workspace.** Deploy from a Phala Cloud workspace you control (`phala switch <profile>` and confirm with
 `phala status` before touching anything); the examples below use a CVM named `ptx-dev`.
 
-**Image.** The api/worker image is `ghcr.io/tinycloudlabs/tinycloud-private-transcription/api` (`:<git sha>`
-immutable, `:v1` moving on feat/v1 + main, `:latest` on main), built for linux/amd64 and pushed by the
+**Image.** The api/worker image is `ghcr.io/tinycloudlabs/tinycloud-private-transcription/api`, built for linux/amd64 and pushed by the
 GitHub Actions workflow `.github/workflows/publish-image.yml` on every push to `feat/v1` / `main` that touches
 the Dockerfile, `src/`, or the lockfile (or `gh workflow run publish-image.yml`). It authenticates with the
 workflow's `GITHUB_TOKEN` (`packages: write`); watch it with `gh run watch` and take the digest from the run
-summary. Pin `PTX_IMAGE=ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:<sha>` (or `:v1`) in
-`infra/dstack/.env`. (The older package `ghcr.io/tinycloudlabs/tinycloud-private-transcription` — no `/api`
+summary. Any recovery-capable rollout must set
+`PTX_IMAGE=ghcr.io/tinycloudlabs/tinycloud-private-transcription/api@sha256:<64 lowercase hex>` in
+`infra/dstack/.env`. Tags, including a Git SHA tag, `:v1`, and `:latest`, are mutable and are not valid
+recovery rollout evidence. Do not deploy until the published manifest digest is known. (The older package `ghcr.io/tinycloudlabs/tinycloud-private-transcription` — no `/api`
 suffix — was created while the repo was private, is stuck private, and is deprecated; nothing pushes to it.)
 
 The CVM must be able to pull that image. dstack's pre-launch script runs `docker image prune -af` on every
@@ -328,21 +360,31 @@ itself has to be reachable. Two options:
    `DSTACK_DOCKER_PASSWORD=<PAT with read:packages only>` to `infra/dstack/.env`; the pre-launch script does
    `docker login ghcr.io` with them before pulling. Do not use a broad-scope OAuth/PAT here.
 
-**Fallback (no registry access, expires in 24 h)** — anonymous ttl.sh push from the dev host:
+Ephemeral or mutable registries/tags are not a recovery rollout path. If the immutable digest cannot be
+resolved and pulled by the CVM, keep every recovery switch off and stop the rollout.
+
+**Legacy recovery-off fallback (no registry access, expires in 24 h).** This mutable `ttl.sh` path is
+preserved only for the pre-recovery deployment with every recovery switch off; it provides no trusted
+provenance and must never be used for a recovery-capable rollout:
 
 ```bash
 git archive HEAD Dockerfile package.json bun.lock src drizzle.config.ts tsconfig.json | tar -x -C /tmp/ptx-build
 sudo docker build --platform linux/amd64 -t ttl.sh/ptx-api-$(git rev-parse --short HEAD):24h /tmp/ptx-build
-sudo docker push ttl.sh/ptx-api-$(git rev-parse --short HEAD):24h      # then set PTX_IMAGE to that tag
+sudo docker push ttl.sh/ptx-api-$(git rev-parse --short HEAD):24h
 ```
-Containers already running keep their image across restarts (compose pull is fail-soft, and referenced images
-are not pruned), but a redeploy after expiry cannot re-pull it.
+
+Set `PTX_IMAGE` to that mutable tag only while every recovery switch is `false`. Containers already
+running keep the image across restarts, but a redeploy after expiry cannot re-pull it.
 
 **Env.** `cp infra/dstack/.env.example infra/dstack/.env` (gitignored) and fill it: random 32-char values for
 `POSTGRES_PASSWORD`, `VEXA_DB_PASSWORD`, `VEXA_ADMIN_TOKEN`, `VEXA_INTERNAL_API_SECRET`, `MINIO_ROOT_PASSWORD`;
-`PTX_IMAGE`; and for private transcription `TRANSCRIPTION_PROVIDER=tinfoil`, `TINFOIL_API_KEY`,
+for a recovery-capable rollout, `PTX_IMAGE` as an immutable digest reference; and for legacy private transcription `TRANSCRIPTION_PROVIDER=tinfoil`, `TINFOIL_API_KEY`,
 `TINFOIL_MODEL` (from the project `.env`). Everything in that file is encrypted client-side and sealed into
-the CVM (`phala deploy -e`); nothing secret lives in `app-compose.yaml`.
+the CVM (`phala deploy -e`); nothing secret lives in `app-compose.yaml`. Recovery values are copied only
+after operator/provider/privacy approval. For a recovery-off deployment, delete or omit every blank
+`RECOVERY_*` entry from the copied dstack example; passing any blank recovery entry as an empty string
+intentionally stops startup. The alternative is to supply every approved value. Blank is never normalized
+to missing.
 
 **Deploy / update.**
 

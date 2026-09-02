@@ -33,10 +33,30 @@ export interface MockVexaOptions {
   apiKey?: string;
 }
 
+type MockVexaOperation =
+  | "create_bot"
+  | "bot_status"
+  | "list_meetings"
+  | "get_transcript"
+  | "stop_bot"
+  | "delete_meeting"
+  | "list_recordings"
+  | "recording_master"
+  | "recording_raw"
+  | "unknown";
+
+type MockVexaMethod = "GET" | "POST" | "DELETE" | "OTHER";
+
+export interface MockVexaRequestCount {
+  operation: MockVexaOperation;
+  method: MockVexaMethod;
+  count: number;
+}
+
 export function createMockVexa(opts: MockVexaOptions = {}) {
   const apiKey = opts.apiKey ?? "vxa_mock";
   const meetings = new Map<string, MockMeeting>();
-  const requests: { method: string; path: string; body?: unknown }[] = [];
+  const requests: MockVexaRequestCount[] = [];
   let nextId = 1;
   const key = (p: string, n: string) => `${p}/${n}`;
   const now = () => new Date().toISOString();
@@ -48,7 +68,7 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
     const k = c.req.header("X-API-Key");
     if (!k) return c.json({ detail: "Missing API key" }, 401);
     if (k !== apiKey) return c.json({ detail: "Invalid API key" }, 401);
-    requests.push({ method: c.req.method, path: c.req.path });
+    recordRequest(requests, c.req.method, c.req.path);
     return next();
   });
 
@@ -168,6 +188,7 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       /** Base64 audio bytes to expose through the recordings API (WAV/webm). */
       recording_base64?: string;
       recording_content_type?: string;
+      duration_seconds?: number;
     };
     if (body.recording_base64 !== undefined) {
       m.recording = { bytes: new Uint8Array(Buffer.from(body.recording_base64, "base64")), contentType: body.recording_content_type ?? "audio/wav" };
@@ -176,6 +197,10 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       m.status = body.status;
       if (["active", "completed"].includes(body.status) && !m.start_time) m.start_time = now();
       if (["completed", "failed"].includes(body.status)) m.end_time = now();
+    }
+    if (typeof body.duration_seconds === "number" && Number.isFinite(body.duration_seconds)
+      && body.duration_seconds > 0 && m.start_time) {
+      m.end_time = new Date(Date.parse(m.start_time) + body.duration_seconds * 1_000).toISOString();
     }
     if (body.segments || body.append_segments) {
       if (!m.start_time) m.start_time = now();
@@ -215,6 +240,30 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
   return { app, meetings, requests, apiKey };
 }
 
+function recordRequest(requests: MockVexaRequestCount[], rawMethod: string, rawPath: string): void {
+  const method: MockVexaMethod = rawMethod === "GET" || rawMethod === "POST" || rawMethod === "DELETE" ? rawMethod : "OTHER";
+  const operation = mockOperation(method, rawPath);
+  const existing = requests.find((entry) => entry.operation === operation && entry.method === method);
+  if (existing) {
+    existing.count = Math.min(Number.MAX_SAFE_INTEGER, existing.count + 1);
+  } else {
+    requests.push({ operation, method, count: 1 });
+  }
+}
+
+function mockOperation(method: MockVexaMethod, path: string): MockVexaOperation {
+  if (method === "POST" && path === "/bots") return "create_bot";
+  if (method === "GET" && path === "/bots/status") return "bot_status";
+  if (method === "GET" && path === "/meetings") return "list_meetings";
+  if (method === "GET" && /^\/transcripts\/[^/]+\/[^/]+$/.test(path)) return "get_transcript";
+  if (method === "DELETE" && /^\/bots\/[^/]+\/[^/]+$/.test(path)) return "stop_bot";
+  if (method === "DELETE" && /^\/meetings\/[^/]+\/[^/]+$/.test(path)) return "delete_meeting";
+  if (method === "GET" && path === "/recordings") return "list_recordings";
+  if (method === "GET" && /^\/recordings\/[^/]+\/master$/.test(path)) return "recording_master";
+  if (method === "GET" && /^\/recordings\/[^/]+\/media\/[^/]+\/raw$/.test(path)) return "recording_raw";
+  return "unknown";
+}
+
 function strip(m: { segments?: unknown; bot_name?: unknown; language?: unknown; meeting_url?: unknown; automatic_leave?: unknown; planned?: unknown } & VexaMeetingResponse): VexaMeetingResponse {
   const { segments: _s, bot_name: _b, language: _l, meeting_url: _u, automatic_leave: _a, planned: _p, ...rest } = m;
   return rest;
@@ -244,6 +293,6 @@ export function startMockVexa(port = 0, opts: MockVexaOptions = {}) {
 
 if (import.meta.main) {
   const port = Number(process.env.MOCK_VEXA_PORT ?? 18056);
-  const m = startMockVexa(port, { apiKey: process.env.VEXA_API_KEY || "vxa_mock" });
-  console.log(`mock vexa listening on ${m.baseUrl} (X-API-Key: ${m.apiKey})`);
+  startMockVexa(port, { apiKey: process.env.VEXA_API_KEY || "vxa_mock" });
+  console.log("mock vexa listening");
 }

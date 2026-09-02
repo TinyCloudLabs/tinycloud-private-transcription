@@ -15,7 +15,7 @@ export interface AuthedProject {
   scopes: string[];
 }
 
-export type AuthEnv = { Variables: { project: AuthedProject } };
+export type AuthEnv = { Variables: { project: AuthedProject; requestId: string } };
 
 export function bearerAuth(ctx: AppContext): MiddlewareHandler<AuthEnv> {
   return async (c, next) => {

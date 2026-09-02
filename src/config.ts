@@ -1,3 +1,5 @@
+import { createRecoveryConfiguration } from "./recovery-config.ts";
+
 const env = (name: string, fallback?: string): string => {
   const v = process.env[name] ?? fallback;
   if (v === undefined) throw new Error(`Missing required env var ${name}`);
@@ -10,7 +12,16 @@ export const positiveIntegerEnv = (name: string, fallback: string): number => {
   return value;
 };
 
+/** Strict boolean env: only the literals `true`/`false` are accepted, so a typo fails loudly instead of silently enabling or disabling a switch. */
+export const booleanEnv = (name: string, fallback: string): boolean => {
+  const value = env(name, fallback);
+  if (value !== "true" && value !== "false") throw new Error(`${name} must be "true" or "false"`);
+  return value === "true";
+};
+
 export type TranscriptionProviderName = "vexa" | "tinfoil";
+
+const recovery = createRecoveryConfiguration(process.env);
 
 export const config = {
   port: Number(env("PORT", "8080")),
@@ -31,6 +42,13 @@ export const config = {
   /** Worker-side join deadline: a meeting still joining/waiting_for_admission this long after bot dispatch is failed and its bot stopped. */
   joinTimeoutSeconds: Number(env("JOIN_TIMEOUT_SECONDS", "600")),
   transcriptionProvider: env("TRANSCRIPTION_PROVIDER", "vexa") as TranscriptionProviderName,
+  /**
+   * Intent switch for recovery v2. Off by default and never sufficient on its own: A0/A1 refuse
+   * every failed-row restart until A2-A4 install compatible transactional/capability authority.
+   */
+  recoveryV2Enabled: recovery.switches.acceptance,
+  /** One parsed, typed, sanitized source for every recovery policy and readiness seam. */
+  recovery,
   tinfoil: {
     baseUrl: env("TINFOIL_BASE_URL", "https://inference.tinfoil.sh"),
     apiKey: env("TINFOIL_API_KEY", ""),

@@ -29,7 +29,7 @@ describe("VexaNativeProvider", () => {
 describe("TinfoilTranscriptionProvider (mock server)", () => {
   let server: ReturnType<typeof Bun.serve>;
   let lastRequest: { auth: string | null; model: string | null; fileName: string | null; fileSize: number; format: string | null } | null = null;
-  let mode: "ok" | "json" | "500" | "401" = "ok";
+  let mode: "ok" | "json" | "500" | "401" | "400-sentinel" | "invalid-json-sentinel" = "ok";
 
   beforeAll(() => {
     server = Bun.serve({
@@ -48,6 +48,8 @@ describe("TinfoilTranscriptionProvider (mock server)", () => {
         };
         if (mode === "500") return new Response("boom", { status: 500 });
         if (mode === "401") return new Response("{}", { status: 401 });
+        if (mode === "400-sentinel") return new Response("PROVIDER_BODY_SENTINEL sk_SECRET_SENTINEL", { status: 400 });
+        if (mode === "invalid-json-sentinel") return new Response('{"text":"PROVIDER_BODY_SENTINEL","secret":"sk_SECRET_SENTINEL"', { status: 200 });
         // Real Tinfoil `json` shape for voxtral-small-24b (observed live 2026-08-18): text + billed duration, no segments.
         if (mode === "json") return Response.json({ text: "The quick brown fox jumps over the lazy dog. Hello from Alice.", usage: { type: "duration", seconds: 12 } });
         return Response.json(fixture);
@@ -81,17 +83,39 @@ describe("TinfoilTranscriptionProvider (mock server)", () => {
     mode = "ok";
   });
 
-  test("no audio -> transcription_failed", async () => {
+  test("no retained audio -> recording_absent", async () => {
     await expect(
       provider().transcribe({ meetingId: "mtg_x", language: null, vexaSegments, fetchAudio: async () => null }),
-    ).rejects.toMatchObject({ code: "transcription_failed" });
+    ).rejects.toMatchObject({ code: "recording_absent" });
   });
 
-  test("5xx -> provider_unavailable (retryable), 4xx -> transcription_failed", async () => {
+  test("5xx -> provider_unavailable (retryable), 4xx -> provider_rejected", async () => {
     mode = "500";
     await expect(provider().transcribe({ meetingId: "m", language: null, vexaSegments, fetchAudio: audio })).rejects.toMatchObject({ code: "provider_unavailable" });
     mode = "401";
-    await expect(provider().transcribe({ meetingId: "m", language: null, vexaSegments, fetchAudio: audio })).rejects.toMatchObject({ code: "transcription_failed" });
+    await expect(provider().transcribe({ meetingId: "m", language: null, vexaSegments, fetchAudio: audio })).rejects.toMatchObject({ code: "provider_rejected" });
+  });
+
+  test("a rejected provider body is discarded at the adapter boundary", async () => {
+    mode = "400-sentinel";
+    const error = await provider()
+      .transcribe({ meetingId: "m", language: null, vexaSegments, fetchAudio: audio })
+      .catch((value) => value);
+    expect(error).toMatchObject({ code: "provider_rejected" });
+    expect(JSON.stringify(error)).not.toContain("PROVIDER_BODY_SENTINEL");
+    expect(String(error)).not.toContain("sk_SECRET_SENTINEL");
+    mode = "ok";
+  });
+
+  test("an invalid success response is sanitized inside the adapter", async () => {
+    mode = "invalid-json-sentinel";
+    const error = await provider()
+      .transcribe({ meetingId: "m", language: null, vexaSegments, fetchAudio: audio })
+      .catch((value) => value);
+    expect(error).toMatchObject({ code: "provider_rejected" });
+    expect(String(error)).not.toContain("PROVIDER_BODY_SENTINEL");
+    expect(JSON.stringify(error)).not.toContain("sk_SECRET_SENTINEL");
+    mode = "ok";
   });
 });
 

@@ -1,13 +1,29 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { AppContext } from "../context.ts";
-import { meetings, transcripts, type MeetingRow, type TranscriptRow } from "../db/schema.ts";
-import { ApiError, type ErrorCode, errorTypeFor } from "../domain/errors.ts";
+import {
+  meetings,
+  outboxJobs,
+  recoveryOperations,
+  transcriptionChunks,
+  transcripts,
+  webhookDeliveries,
+  type MeetingRow,
+  type TranscriptRow,
+} from "../db/schema.ts";
+import { ApiError, type ErrorCode, safeStoredError } from "../domain/errors.ts";
 import { newMeetingId } from "../domain/ids.ts";
 import { detectPlatform, type Platform } from "../domain/platform.ts";
 import { canTransition, isTerminal, type MeetingStatus } from "../domain/state.ts";
+import { classifyRecovery } from "../domain/recovery.ts";
 import type { NormalizedTranscript } from "../domain/transcript.ts";
+import { meetingLogFields } from "../log.ts";
 import { VexaHttpError } from "../providers/vexa/client.ts";
+import {
+  safeTranscriptRevision,
+  serializeMeetingRecovery,
+} from "../api/recovery-contract.ts";
+import { reconcileTerminalProviderReservations } from "../worker/outbox.ts";
 
 export interface CreateMeetingInput {
   meeting_url: string;
@@ -90,14 +106,17 @@ export async function getMeeting(ctx: AppContext, projectId: string, id: string)
   const [row] = await ctx.db
     .select()
     .from(meetings)
-    .where(and(eq(meetings.id, id), eq(meetings.projectId, projectId)))
+    .where(and(eq(meetings.id, id), eq(meetings.projectId, projectId), isNull(meetings.deletedAt)))
     .limit(1);
-  if (!row) throw new ApiError("meeting_not_found", `No meeting with id ${id}`);
+  // The requested id is deliberately not echoed. A meeting belonging to another project and one
+  // that never existed must answer identically, and the caller already knows what it asked for.
+  if (!row) throw new ApiError("meeting_not_found", "No such meeting.");
   return row;
 }
 
 export async function getMeetingById(ctx: AppContext, id: string): Promise<MeetingRow | null> {
-  const [row] = await ctx.db.select().from(meetings).where(eq(meetings.id, id)).limit(1);
+  const [row] = await ctx.db.select().from(meetings)
+    .where(and(eq(meetings.id, id), isNull(meetings.deletedAt))).limit(1);
   return row ?? null;
 }
 
@@ -151,10 +170,18 @@ export async function storeTranscript(
     fallbackFrom: fallback?.from ?? null,
     fallbackReason: fallback?.reason ?? null,
   };
-  await ctx.db
-    .insert(transcripts)
-    .values({ meetingId, ...row })
-    .onConflictDoUpdate({ target: transcripts.meetingId, set: row });
+  return ctx.db.transaction(async (tx) => {
+    const [liveMeeting] = await tx.select({ id: meetings.id }).from(meetings).where(and(
+      eq(meetings.id, meetingId),
+      eq(meetings.status, "processing"),
+      isNull(meetings.deletedAt),
+    )).for("update");
+    if (!liveMeeting) return false;
+    await tx.insert(transcripts)
+      .values({ meetingId, ...row })
+      .onConflictDoUpdate({ target: transcripts.meetingId, set: row });
+    return true;
+  });
 }
 
 /** Idempotent stop: cancels before admission, otherwise asks Vexa to leave and moves to processing. */
@@ -171,65 +198,46 @@ export async function stopMeeting(ctx: AppContext, meeting: MeetingRow): Promise
   return updated;
 }
 
+export type RecoverDisposition = "already_completed" | "already_active";
+
+export interface RecoverResult {
+  meeting: MeetingRow;
+  /** Every A0/A1 success is a read-only no-op. A started disposition requires A2-A4 authority. */
+  disposition: RecoverDisposition;
+}
+
 /**
- * Re-run finalization for a failed meeting whose capture-provider row/recording is still retained.
- * The compare-and-set makes concurrent calls idempotent: only the caller that moves failed →
- * processing enqueues a poll. Completed and already-processing meetings are successful no-ops.
+ * A0/A1 containment only. Completed and already-processing meetings are successful read-only
+ * no-ops. Every failed row remains disabled even when the deployment switch is true: the switch
+ * is necessary but cannot substitute for the A2-A4 transactional operation, budget, capability,
+ * and durable-delivery authority. Other states fail closed.
  */
-export async function recoverMeeting(ctx: AppContext, meeting: MeetingRow): Promise<MeetingRow> {
-  const status = meeting.status as MeetingStatus;
-  if (status === "completed") return meeting;
-  if (status === "processing") {
-    // Repairs the crash window between the failed → processing commit and Redis delivery. A
-    // duplicate poll is safe: transcript storage is an upsert and webhooks require the winning
-    // terminal state transition.
-    await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id });
-    return meeting;
+export async function recoverMeeting(_ctx: AppContext, meeting: MeetingRow): Promise<RecoverResult> {
+  const classification = classifyRecovery(meeting.status, meeting.errorCode);
+  if (classification === "already_completed") return { meeting, disposition: "already_completed" };
+  if (classification === "already_active") {
+    // A meeting already being worked on is reported, never re-driven: an extra poll per call is an
+    // unbounded duplicate-work amplifier under client retries. Repairing the commit-to-Redis crash
+    // window belongs to recovery v2, not to a caller retry.
+    return { meeting, disposition: "already_active" };
   }
-  if (status !== "failed") {
-    throw new ApiError("invalid_request", "Only failed meetings can be recovered.");
+  if (meeting.status === "failed") {
+    throw new ApiError("recovery_disabled", "Meeting recovery is not available on this deployment.");
   }
-  if (!meeting.vexaPlatform || !meeting.vexaNativeMeetingId) {
-    throw new ApiError("invalid_request", "This meeting has no retained capture-provider record to recover.");
-  }
-  const [updated] = await ctx.db
-    .update(meetings)
-    .set({
-      status: "processing",
-      errorCode: null,
-      errorMessage: null,
-      transcriptionAttempts: 0,
-    })
-    .where(and(eq(meetings.id, meeting.id), eq(meetings.projectId, meeting.projectId), eq(meetings.status, "failed")))
-    .returning();
-  if (!updated) return (await getMeetingById(ctx, meeting.id)) ?? meeting;
-  try {
-    await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id });
-  } catch (error) {
-    // Do not strand a meeting in processing when Redis is unavailable. A queue write is atomic; in
-    // the ambiguous response-lost case, a delivered poll sees the restored terminal state and exits,
-    // while the caller can safely retry recovery later.
-    await ctx.db
-      .update(meetings)
-      .set({
-        status: "failed",
-        errorCode: meeting.errorCode,
-        errorMessage: meeting.errorMessage,
-        transcriptionAttempts: meeting.transcriptionAttempts,
-      })
-      .where(and(eq(meetings.id, meeting.id), eq(meetings.projectId, meeting.projectId), eq(meetings.status, "processing")));
-    throw error;
-  }
-  return updated;
+  throw new ApiError("recovery_ineligible", "This meeting is not eligible for recovery.");
 }
 
 async function stopInVexa(ctx: AppContext, meeting: MeetingRow) {
   if (!meeting.vexaPlatform || !meeting.vexaNativeMeetingId) return;
   try {
     await ctx.vexa.stopBot(meeting.vexaPlatform, meeting.vexaNativeMeetingId);
-  } catch (e) {
-    if (e instanceof VexaHttpError && e.notFound) return;
-    ctx.log.warn("vexa stopBot failed", { meetingId: meeting.id, error: String(e) });
+  } catch (error) {
+    if (error instanceof VexaHttpError && error.notFound) return;
+    ctx.log.warn("capture_stop_failed", {
+      ...meetingLogFields(meeting.id),
+      errorClass: "capture_provider_failure",
+      ...(error instanceof VexaHttpError ? { statusClass: `${Math.floor(error.status / 100)}xx` } : {}),
+    });
   }
 }
 
@@ -238,26 +246,186 @@ async function stopInVexa(ctx: AppContext, meeting: MeetingRow) {
  * deletes PLANNED rows and answers 409 for anything the bot lifecycle touched — we log that ("retained
  * by capture provider") and still remove our data; purging Vexa's copy is a documented gap.
  */
-export async function deleteMeeting(ctx: AppContext, meeting: MeetingRow): Promise<void> {
-  if (meeting.vexaPlatform && meeting.vexaNativeMeetingId) {
-    if (!isTerminal(meeting.status as MeetingStatus)) await stopInVexa(ctx, meeting);
+interface DeletionTarget {
+  platform: string;
+  nativeMeetingId: string;
+}
+
+async function fenceMeetingDeletion(
+  ctx: AppContext,
+  projectId: string,
+  meetingId: string,
+): Promise<DeletionTarget | null> {
+  return ctx.db.transaction(async (tx) => {
+    const [meeting] = await tx.select().from(meetings).where(and(
+      eq(meetings.id, meetingId),
+      eq(meetings.projectId, projectId),
+    )).for("update");
+    if (!meeting) throw new ApiError("meeting_not_found", "No such meeting.");
+    if (meeting.deletedAt) {
+      return meeting.deletionSagaState === "pending"
+        && meeting.deletionProviderPlatform && meeting.deletionProviderNativeMeetingId
+        ? { platform: meeting.deletionProviderPlatform, nativeMeetingId: meeting.deletionProviderNativeMeetingId }
+        : null;
+    }
+
+    const target = meeting.vexaPlatform && meeting.vexaNativeMeetingId
+      ? { platform: meeting.vexaPlatform, nativeMeetingId: meeting.vexaNativeMeetingId }
+      : null;
+    // Recovery transactions use one lock order everywhere: meeting -> operation -> outbox ->
+    // chunks -> provider ledger -> project guard/bucket. Lock every operation (including terminal
+    // audit rows) in stable order before changing any dependent recovery row.
+    const lockedOperations = await tx.select().from(recoveryOperations)
+      .where(eq(recoveryOperations.meetingId, meetingId))
+      .orderBy(recoveryOperations.id)
+      .for("update");
+    const cancellableOperationIds = lockedOperations
+      .filter((operation) => ["accepted", "active", "delayed"].includes(operation.state))
+      .map((operation) => operation.id);
+    const cancelledOperations = cancellableOperationIds.length > 0
+      ? await tx.update(recoveryOperations).set({
+      state: "cancelled",
+      phase: "failed",
+      failureCode: "deleted",
+      workerLeaseOwnerHash: null,
+      workerLeaseExpiresAt: null,
+      workerLeaseFence: sql`${recoveryOperations.workerLeaseFence} + 1`,
+      completedAt: sql`coalesce(${recoveryOperations.completedAt}, clock_timestamp())`,
+      updatedAt: sql`clock_timestamp()`,
+    }).where(inArray(recoveryOperations.id, cancellableOperationIds)).returning({ id: recoveryOperations.id })
+      : [];
+    await tx.update(outboxJobs).set({
+      state: "cancelled",
+      leaseOwnerHash: null,
+      leaseExpiresAt: null,
+      leaseFence: sql`${outboxJobs.leaseFence} + 1`,
+      updatedAt: sql`clock_timestamp()`,
+    }).where(and(
+      sql`${outboxJobs.operationId} in (select id from recovery_operations where meeting_id = ${meetingId})`,
+      inArray(outboxJobs.state, ["pending", "leased", "failed"]),
+    ));
+    await tx.update(transcriptionChunks).set({
+      leaseOwnerHash: null,
+      leaseExpiresAt: null,
+      leaseFence: sql`${transcriptionChunks.leaseFence} + 1`,
+      updatedAt: sql`clock_timestamp()`,
+    }).where(sql`${transcriptionChunks.operationId} in (select id from recovery_operations where meeting_id = ${meetingId})`);
+    for (const operation of cancelledOperations.sort((left, right) => left.id.localeCompare(right.id))) {
+      await reconcileTerminalProviderReservations(tx, operation.id);
+    }
+    await tx.update(webhookDeliveries).set({
+      status: "cancelled",
+      nextAttemptAt: null,
+      updatedAt: sql`clock_timestamp()`,
+    }).where(and(
+      eq(webhookDeliveries.meetingId, meetingId),
+      inArray(webhookDeliveries.status, ["pending", "dispatching"]),
+    ));
+    await tx.delete(transcripts).where(eq(transcripts.meetingId, meetingId));
+    await tx.update(meetings).set({
+      meetingUrl: "",
+      botName: null,
+      language: null,
+      webhookUrl: null,
+      vexaPlatform: null,
+      vexaNativeMeetingId: null,
+      vexaBotId: null,
+      metadata: {},
+      errorCode: "deleted",
+      errorMessage: null,
+      idempotencyKey: null,
+      requestHash: null,
+      status: "cancelled",
+      activeRecoveryOperationId: null,
+      nextRecoveryEligibleAt: null,
+      recoveryPhase: "failed",
+      lastRecoveryOutcome: "cancelled",
+      deletedAt: sql`clock_timestamp()`,
+      deletionFence: sql`${meetings.deletionFence} + 1`,
+      deletionSagaState: target ? "pending" : "completed",
+      deletionProviderPlatform: target?.platform ?? null,
+      deletionProviderNativeMeetingId: target?.nativeMeetingId ?? null,
+    }).where(and(eq(meetings.id, meetingId), isNull(meetings.deletedAt)));
+    return target;
+  });
+}
+
+async function completeDeletionSaga(ctx: AppContext, projectId: string, meetingId: string): Promise<void> {
+  await ctx.db.update(meetings).set({
+    deletionSagaState: "completed",
+    deletionProviderPlatform: null,
+    deletionProviderNativeMeetingId: null,
+  }).where(and(
+    eq(meetings.id, meetingId),
+    eq(meetings.projectId, projectId),
+    sql`${meetings.deletedAt} is not null`,
+    eq(meetings.deletionSagaState, "pending"),
+  ));
+}
+
+async function finishCaptureDeletion(
+  ctx: AppContext,
+  projectId: string,
+  meetingId: string,
+  target: DeletionTarget | null,
+): Promise<void> {
+  if (target) {
+    await stopInVexa(ctx, {
+      id: meetingId,
+      status: "cancelled",
+      vexaPlatform: target.platform,
+      vexaNativeMeetingId: target.nativeMeetingId,
+    } as MeetingRow);
     try {
-      await ctx.vexa.deleteMeeting(meeting.vexaPlatform, meeting.vexaNativeMeetingId);
-    } catch (e) {
-      if (e instanceof VexaHttpError && e.conflict) {
-        ctx.log.warn("vexa retains meeting row (409: bot lifecycle owns it)", { meetingId: meeting.id, vexaNativeMeetingId: meeting.vexaNativeMeetingId });
-      } else if (!(e instanceof VexaHttpError && e.notFound)) {
-        ctx.log.warn("vexa deleteMeeting failed", { meetingId: meeting.id, error: String(e) });
+      await ctx.vexa.deleteMeeting(target.platform, target.nativeMeetingId);
+    } catch (error) {
+      if (error instanceof VexaHttpError && error.conflict) {
+        ctx.log.warn("capture_delete_retained", {
+          ...meetingLogFields(meetingId),
+          errorClass: "capture_provider_conflict",
+          statusClass: "4xx",
+        });
+      } else if (!(error instanceof VexaHttpError && error.notFound)) {
+        ctx.log.warn("capture_delete_failed", {
+          ...meetingLogFields(meetingId),
+          errorClass: "capture_provider_failure",
+          ...(error instanceof VexaHttpError ? { statusClass: `${Math.floor(error.status / 100)}xx` } : {}),
+        });
         throw new ApiError("provider_unavailable", "Could not delete the meeting from the capture provider");
       }
     }
   }
-  await ctx.db.delete(meetings).where(eq(meetings.id, meeting.id));
+  await completeDeletionSaga(ctx, projectId, meetingId);
+}
+
+/** Tombstone/fence first; the capture-provider delete is a retryable idempotent saga step. */
+export async function deleteMeetingById(ctx: AppContext, projectId: string, meetingId: string): Promise<void> {
+  const target = await fenceMeetingDeletion(ctx, projectId, meetingId);
+  await finishCaptureDeletion(ctx, projectId, meetingId, target);
+}
+
+/** Backward-compatible service entry point for callers that already loaded the owner-scoped row. */
+export async function deleteMeeting(ctx: AppContext, meeting: MeetingRow): Promise<void> {
+  await deleteMeetingById(ctx, meeting.projectId, meeting.id);
 }
 
 // ---- serialization ----
 
-export function serializeMeeting(m: MeetingRow, transcript: TranscriptRow | null | undefined) {
+export interface MeetingRecoverySerializationContext {
+  manualMeetingCycles: number | null;
+  eligible: boolean;
+}
+
+const DARK_RECOVERY_SERIALIZATION: MeetingRecoverySerializationContext = Object.freeze({
+  manualMeetingCycles: null,
+  eligible: false,
+});
+
+export function serializeMeeting(
+  m: MeetingRow,
+  transcript: TranscriptRow | null | undefined,
+  recoveryContext: MeetingRecoverySerializationContext = DARK_RECOVERY_SERIALIZATION,
+) {
   const status = m.status as MeetingStatus;
   return {
     id: m.id,
@@ -273,9 +441,18 @@ export function serializeMeeting(m: MeetingRow, transcript: TranscriptRow | null
     completed_at: m.completedAt?.toISOString() ?? null,
     metadata: m.metadata ?? {},
     ...(transcript ? transcriptProviderFields(transcript) : {}),
-    ...(status === "failed" && m.errorCode
-      ? { error: { type: errorTypeFor(m.errorCode as ErrorCode), code: m.errorCode, message: m.errorMessage ?? "" } }
-      : {}),
+    recovery: serializeMeetingRecovery({
+      status,
+      errorCode: m.errorCode,
+      phase: m.recoveryPhase,
+      nextEligibleAt: m.nextRecoveryEligibleAt,
+      budgetProvenance: m.budgetProvenance,
+      manualCyclesConsumed: m.manualRecoveryCyclesConsumed,
+      manualMeetingCycles: recoveryContext.manualMeetingCycles,
+      eligible: recoveryContext.eligible,
+    }),
+    transcript_revision: safeTranscriptRevision(m.transcriptRevision),
+    ...(status === "failed" ? { error: safeStoredError(m.errorCode) } : {}),
   };
 }
 
@@ -307,5 +484,6 @@ export function serializeTranscript(m: MeetingRow, t: TranscriptRow) {
     segments: body.segments,
     text: body.text,
     created_at: t.createdAt.toISOString(),
+    transcript_revision: safeTranscriptRevision(m.transcriptRevision),
   };
 }

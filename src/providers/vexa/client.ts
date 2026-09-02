@@ -4,6 +4,7 @@ import type {
   VexaMeetingResponse,
   VexaTranscriptionResponse,
   VexaBotStatusResponse,
+  VexaMeetingListResponse,
   VexaRecordingsResponse,
   VexaRecordingMasterResponse,
   VexaStopBotResponse,
@@ -17,14 +18,10 @@ export interface VexaClientOptions {
   fetch?: typeof fetch;
 }
 
-/** Thrown for any non-2xx from Vexa; carries status + raw detail for logs only (never surfaced to clients). */
+/** Thrown for any non-2xx from Vexa; carries only bounded classification fields. */
 export class VexaHttpError extends Error {
-  constructor(
-    readonly status: number,
-    readonly detail: string,
-    readonly path: string,
-  ) {
-    super(`Vexa ${path} -> ${status}`);
+  constructor(readonly status: number) {
+    super(`Capture provider request failed (HTTP ${status})`);
   }
   get notFound() {
     return this.status === 404;
@@ -68,8 +65,9 @@ export class VexaClient {
       );
     }
     if (!res.ok) {
-      const detail = await res.text().catch(() => "");
-      throw new VexaHttpError(res.status, detail, path);
+      // Provider bodies and paths are untrusted and may contain identifiers, URLs, or secrets.
+      // Discard both; the bounded status is sufficient for internal classification.
+      throw new VexaHttpError(res.status);
     }
     return res;
   }
@@ -77,7 +75,16 @@ export class VexaClient {
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
     const res = await this.raw(method, path, body);
     if (res.status === 204) return undefined as T;
-    return (await res.json()) as T;
+    let value: unknown;
+    try {
+      value = await res.json();
+    } catch {
+      throw new ApiError("provider_unavailable", "Meeting capture provider returned an invalid response");
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new ApiError("provider_unavailable", "Meeting capture provider returned an invalid response");
+    }
+    return value as T;
   }
 
   createBot(body: VexaMeetingCreate) {
@@ -112,6 +119,11 @@ export class VexaClient {
 
   botStatus() {
     return this.request<VexaBotStatusResponse>("GET", "/bots/status");
+  }
+
+  /** GET /meetings — owner-scoped meeting metadata; contains no transcript or recording bytes. */
+  listMeetings() {
+    return this.request<VexaMeetingListResponse>("GET", "/meetings");
   }
 
   /** GET /recordings — all of the key's recordings; filter by `meeting_id` client-side. */

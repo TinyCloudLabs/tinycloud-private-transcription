@@ -29,3 +29,12 @@ test("normalizeSegments builds stable speaker ids, text, duration", () => {
   });
   expect(t.text).toBe("Sam: Hello there.\nBob: Second.\nUnknown: Unknown voice");
 });
+
+test("normalizeSegments preserves explicit recovery provenance without adding it to legacy segments", () => {
+  const explicit = normalizeSegments([
+    { start: 0, end: 1, text: "provider", speaker: "A", provenance: "provider" },
+    { start: 1, end: 2, text: "fallback", speaker: "A", provenance: "vexa_fallback" },
+  ]);
+  expect(explicit.segments.map((segment) => segment.provenance)).toEqual(["provider", "vexa_fallback"]);
+  expect(normalizeSegments([{ start: 0, end: 1, text: "legacy" }]).segments[0]).not.toHaveProperty("provenance");
+});

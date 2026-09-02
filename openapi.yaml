@@ -1,0 +1,567 @@
+openapi: 3.1.0
+info:
+  title: Private Transcription API
+  version: placeholder-contract
+  description: Public transcription contract. Recovery is dark unless authenticated capability negotiation says otherwise.
+servers:
+  - url: https://api.example.invalid
+    description: Placeholder only
+security:
+  - bearerAuth: []
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      security: []
+      responses:
+        "200":
+          description: Core dependencies are healthy.
+          content: { application/json: { schema: { $ref: "#/components/schemas/Health" } } }
+        "503":
+          description: A core dependency is unavailable.
+          content: { application/json: { schema: { $ref: "#/components/schemas/Health" } } }
+        "500": { $ref: "#/components/responses/Internal" }
+  /v1/capabilities:
+    get:
+      operationId: getCapabilities
+      responses:
+        "200":
+          description: Authenticated, current public capabilities.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CapabilitiesResponse" }
+              example:
+                recovery:
+                  contract_version: null
+                  manual_available: false
+                  automatic_available: false
+                  supported_error_codes: [provider_timeout, provider_unavailable, finalizer_interrupted, recording_fetch_transient]
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
+  /v1/meetings:
+    post:
+      operationId: createMeeting
+      parameters:
+        - $ref: "#/components/parameters/OptionalIdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateMeetingRequest" }
+            example:
+              meeting_url: https://example.invalid/meeting-placeholder
+              bot_name: Placeholder Notetaker
+              language: en
+      responses:
+        "200": { $ref: "#/components/responses/Meeting" }
+        "201": { $ref: "#/components/responses/MeetingCreated" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "500": { $ref: "#/components/responses/Internal" }
+  /v1/meetings/{id}:
+    parameters:
+      - $ref: "#/components/parameters/MeetingId"
+    get:
+      operationId: getMeeting
+      responses:
+        "200": { $ref: "#/components/responses/Meeting" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/Internal" }
+    delete:
+      operationId: deleteMeeting
+      responses:
+        "204": { description: Meeting data was removed; the response has no body. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "500": { $ref: "#/components/responses/Internal" }
+  /v1/meetings/{id}/stop:
+    parameters:
+      - $ref: "#/components/parameters/MeetingId"
+    post:
+      operationId: stopMeeting
+      responses:
+        "200":
+          description: Current meeting status after the idempotent stop request.
+          content: { application/json: { schema: { $ref: "#/components/schemas/MeetingStatusResponse" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/Internal" }
+  /v1/meetings/{id}/recover:
+    parameters:
+      - $ref: "#/components/parameters/MeetingId"
+    post:
+      operationId: recoverMeeting
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 128, pattern: "^[!-~]{1,128}$" }
+          example: placeholder-action-key
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RecoverMeetingRequest" }
+            example: { kind: manual }
+      responses:
+        "200":
+          description: Same-key replay or read-only active/completed convergence.
+          content: { application/json: { schema: { $ref: "#/components/schemas/RecoverMeetingResponse" } } }
+        "202":
+          description: One new manual recovery operation was transactionally accepted.
+          content: { application/json: { schema: { $ref: "#/components/schemas/RecoverMeetingResponse" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "410": { $ref: "#/components/responses/Gone" }
+        "429":
+          description: Durable cooldown or budget/rate admission rejection. Retry-After is present only when database state proves it.
+          headers:
+            Retry-After:
+              schema: { type: integer, minimum: 1, maximum: 86400 }
+              description: Bounded whole seconds derived from database-authoritative state.
+          content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "500": { $ref: "#/components/responses/Internal" }
+  /v1/meetings/{id}/transcript:
+    parameters:
+      - $ref: "#/components/parameters/MeetingId"
+    get:
+      operationId: getTranscript
+      responses:
+        "200":
+          description: Complete transcript or a safe terminal transcript status.
+          content: { application/json: { schema: { $ref: "#/components/schemas/TranscriptResponse" } } }
+        "202":
+          description: Transcript is not complete.
+          content: { application/json: { schema: { $ref: "#/components/schemas/TranscriptStatus" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/Internal" }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque-api-key
+  parameters:
+    MeetingId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^mtg_[0-9A-HJKMNP-TV-Z]{26}$" }
+      example: mtg_0000000000000000000000000A
+    OptionalIdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string, minLength: 1, maxLength: 128, pattern: "^[!-~]{1,128}$" }
+      example: placeholder-create-key
+  responses:
+    Meeting:
+      description: Meeting representation.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Meeting" } } }
+    MeetingCreated:
+      description: New meeting created.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Meeting" } } }
+    BadRequest:
+      description: Malformed identifier or body.
+      content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+    Unauthorized:
+      description: Authentication is missing or invalid.
+      content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+    Forbidden:
+      description: The authenticated key lacks the required scope.
+      content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+    NotFound:
+      description: Absent, deleted, or wrong-owner meeting.
+      content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+    Conflict:
+      description: Wrong state/version or permanent ineligibility.
+      content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+    Gone:
+      description: Owner-scoped recording absence is authoritative.
+      content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+    Unavailable:
+      description: Admission disabled or a transient/persistence dependency is unavailable.
+      content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+    Internal:
+      description: Sanitized internal failure.
+      content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
+  schemas:
+    MeetingStatus:
+      type: string
+      enum: [queued, joining, waiting_for_admission, in_progress, processing, completed, failed, cancelled]
+    RecoveryDisposition:
+      type: string
+      enum: [started, already_active, already_completed]
+    RecoverMeetingStatus:
+      type: string
+      enum: [processing, completed, failed, cancelled]
+    RecoveryPhase:
+      type: string
+      enum: [queued, preflighting, chunking, transcribing, delayed, publishing, completed, failed, disabled]
+    RecoverySupportedErrorCode:
+      type: string
+      enum: [provider_timeout, provider_unavailable, finalizer_interrupted, recording_fetch_transient]
+    RecoverySafeErrorCode:
+      type: string
+      enum:
+        - provider_timeout
+        - provider_unavailable
+        - finalizer_interrupted
+        - recording_fetch_transient
+        - operation_deadline_exceeded
+        - recording_absent
+        - recording_undecodable
+        - recording_silent
+        - provider_rejected
+        - attestation_failed
+        - coverage_incomplete
+        - budget_exhausted
+        - persistence_failed
+        - cancelled
+        - deleted
+        - validation_failed
+        - authentication_failed
+    ErrorCode:
+      type: string
+      enum:
+        - invalid_meeting_url
+        - unsupported_platform
+        - meeting_not_found
+        - meeting_join_failed
+        - waiting_room_timeout
+        - bot_removed
+        - meeting_ended
+        - capture_failed
+        - transcription_failed
+        - provider_timeout
+        - provider_unavailable
+        - provider_rejected
+        - finalizer_interrupted
+        - operation_deadline_exceeded
+        - recording_fetch_transient
+        - recording_absent
+        - recording_undecodable
+        - recording_silent
+        - attestation_failed
+        - coverage_incomplete
+        - budget_exhausted
+        - persistence_failed
+        - cancelled
+        - deleted
+        - validation_failed
+        - authentication_failed
+        - unauthorized
+        - insufficient_scope
+        - invalid_request
+        - idempotency_conflict
+        - recovery_disabled
+        - recovery_ineligible
+        - recovery_cooldown
+        - internal_error
+        - not_found
+    Error:
+      type: object
+      additionalProperties: false
+      required: [type, code, message, retryable]
+      properties:
+        type:
+          type: string
+          enum: [invalid_request_error, authentication_error, permission_error, not_found_error, meeting_join_failed, capture_error, transcription_error, provider_error, internal_error]
+        code: { $ref: "#/components/schemas/ErrorCode" }
+        message: { type: string, minLength: 1, maxLength: 256 }
+        retryable: { type: boolean }
+    ErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required: [error, request_id]
+      properties:
+        error: { $ref: "#/components/schemas/Error" }
+        request_id: { type: string, pattern: "^req_[0-9A-HJKMNP-TV-Z]{26}$" }
+    RecoveryCapabilities:
+      type: object
+      additionalProperties: false
+      required: [contract_version, manual_available, automatic_available, supported_error_codes]
+      properties:
+        contract_version: { type: [string, "null"], minLength: 1, maxLength: 64, pattern: "^[A-Za-z0-9._:-]+$" }
+        manual_available: { type: boolean }
+        automatic_available: { type: boolean, const: false }
+        supported_error_codes:
+          type: array
+          minItems: 4
+          maxItems: 4
+          uniqueItems: true
+          prefixItems:
+            - { const: provider_timeout }
+            - { const: provider_unavailable }
+            - { const: finalizer_interrupted }
+            - { const: recording_fetch_transient }
+          items: false
+    CapabilitiesResponse:
+      type: object
+      additionalProperties: false
+      required: [recovery]
+      properties:
+        recovery: { $ref: "#/components/schemas/RecoveryCapabilities" }
+    MeetingRecoveryMetadata:
+      type: object
+      additionalProperties: false
+      required: [eligible, code, phase, next_eligible_at, manual_remaining, automatic_enabled]
+      properties:
+        eligible: { type: boolean }
+        code:
+          oneOf:
+            - { $ref: "#/components/schemas/RecoverySafeErrorCode" }
+            - { type: "null" }
+        phase:
+          oneOf:
+            - { $ref: "#/components/schemas/RecoveryPhase" }
+            - { type: "null" }
+        next_eligible_at: { type: [string, "null"], format: date-time }
+        manual_remaining: { type: [integer, "null"], minimum: 0 }
+        automatic_enabled: { type: boolean, const: false }
+    RecoverMeetingRequest:
+      type: object
+      additionalProperties: false
+      required: [kind]
+      properties:
+        kind: { type: string, const: manual }
+    RecoverMetadata:
+      type: object
+      additionalProperties: false
+      required: [operation_id, disposition, kind, phase, attempt, max_attempts, next_eligible_at]
+      properties:
+        operation_id: { type: [string, "null"], pattern: "^rcv_[0-9A-HJKMNP-TV-Z]{26}$" }
+        disposition: { $ref: "#/components/schemas/RecoveryDisposition" }
+        kind: { type: string, const: manual }
+        phase:
+          oneOf:
+            - { $ref: "#/components/schemas/RecoveryPhase" }
+            - { type: "null" }
+        attempt: { type: [integer, "null"], minimum: 1 }
+        max_attempts: { type: [integer, "null"], minimum: 1 }
+        next_eligible_at: { type: [string, "null"], format: date-time }
+    RecoverMeetingResponse:
+      type: object
+      additionalProperties: false
+      required: [id, status, recovery]
+      properties:
+        id: { type: string, pattern: "^mtg_[0-9A-HJKMNP-TV-Z]{26}$" }
+        status: { $ref: "#/components/schemas/RecoverMeetingStatus" }
+        recovery: { $ref: "#/components/schemas/RecoverMetadata" }
+    CreateMeetingRequest:
+      type: object
+      additionalProperties: false
+      required: [meeting_url]
+      properties:
+        meeting_url: { type: string, format: uri, pattern: "^https?://", minLength: 1, maxLength: 2048 }
+        bot_name: { type: [string, "null"], maxLength: 256 }
+        language: { type: [string, "null"], maxLength: 64 }
+        webhook_url: { type: [string, "null"], format: uri, pattern: "^https?://", minLength: 1, maxLength: 2048 }
+        platform:
+          oneOf:
+            - { type: string, enum: [google_meet, zoom, microsoft_teams, jitsi] }
+            - { type: "null" }
+        metadata:
+          type: object
+          maxProperties: 64
+          propertyNames: { type: string, maxLength: 128 }
+          additionalProperties: { $ref: "#/components/schemas/MetadataValue" }
+    MetadataValue:
+      $ref: "#/components/schemas/MetadataValue1"
+    MetadataValue1:
+      oneOf:
+        - { type: "null" }
+        - { type: boolean }
+        - { type: number }
+        - { type: string, maxLength: 2048 }
+        - { type: array, maxItems: 64, items: { $ref: "#/components/schemas/MetadataValue2" } }
+        - type: object
+          maxProperties: 64
+          propertyNames: { type: string, maxLength: 128 }
+          additionalProperties: { $ref: "#/components/schemas/MetadataValue2" }
+    MetadataValue2:
+      oneOf:
+        - { type: "null" }
+        - { type: boolean }
+        - { type: number }
+        - { type: string, maxLength: 2048 }
+        - { type: array, maxItems: 64, items: { $ref: "#/components/schemas/MetadataValue3" } }
+        - { type: object, maxProperties: 64, propertyNames: { type: string, maxLength: 128 }, additionalProperties: { $ref: "#/components/schemas/MetadataValue3" } }
+    MetadataValue3:
+      oneOf:
+        - { type: "null" }
+        - { type: boolean }
+        - { type: number }
+        - { type: string, maxLength: 2048 }
+        - { type: array, maxItems: 64, items: { $ref: "#/components/schemas/MetadataValue4" } }
+        - { type: object, maxProperties: 64, propertyNames: { type: string, maxLength: 128 }, additionalProperties: { $ref: "#/components/schemas/MetadataValue4" } }
+    MetadataValue4:
+      oneOf:
+        - { type: "null" }
+        - { type: boolean }
+        - { type: number }
+        - { type: string, maxLength: 2048 }
+        - { type: array, maxItems: 64, items: { $ref: "#/components/schemas/MetadataValue5" } }
+        - { type: object, maxProperties: 64, propertyNames: { type: string, maxLength: 128 }, additionalProperties: { $ref: "#/components/schemas/MetadataValue5" } }
+    MetadataValue5:
+      oneOf:
+        - { type: "null" }
+        - { type: boolean }
+        - { type: number }
+        - { type: string, maxLength: 2048 }
+        - { type: array, maxItems: 64, items: { $ref: "#/components/schemas/MetadataValue6" } }
+        - { type: object, maxProperties: 64, propertyNames: { type: string, maxLength: 128 }, additionalProperties: { $ref: "#/components/schemas/MetadataValue6" } }
+    MetadataValue6:
+      oneOf:
+        - { type: "null" }
+        - { type: boolean }
+        - { type: number }
+        - { type: string, maxLength: 2048 }
+        - { type: array, maxItems: 64, items: { $ref: "#/components/schemas/MetadataValue7" } }
+        - { type: object, maxProperties: 64, propertyNames: { type: string, maxLength: 128 }, additionalProperties: { $ref: "#/components/schemas/MetadataValue7" } }
+    MetadataValue7:
+      oneOf:
+        - { type: "null" }
+        - { type: boolean }
+        - { type: number }
+        - { type: string, maxLength: 2048 }
+        - { type: array, maxItems: 64, items: { $ref: "#/components/schemas/MetadataValue8" } }
+        - { type: object, maxProperties: 64, propertyNames: { type: string, maxLength: 128 }, additionalProperties: { $ref: "#/components/schemas/MetadataValue8" } }
+    MetadataValue8:
+      oneOf:
+        - { type: "null" }
+        - { type: boolean }
+        - { type: number }
+        - { type: string, maxLength: 2048 }
+    Meeting:
+      type: object
+      additionalProperties: false
+      required: [id, object, status, platform, meeting_url, bot, transcript, created_at, started_at, ended_at, completed_at, metadata, recovery, transcript_revision]
+      properties:
+        id: { type: string, pattern: "^mtg_[0-9A-HJKMNP-TV-Z]{26}$" }
+        object: { type: string, const: meeting }
+        status: { $ref: "#/components/schemas/MeetingStatus" }
+        platform: { type: string, enum: [google_meet, zoom, microsoft_teams, jitsi] }
+        meeting_url: { type: string, format: uri, pattern: "^https?://", minLength: 1, maxLength: 2048 }
+        bot:
+          type: object
+          additionalProperties: false
+          required: [name, joined_at]
+          properties:
+            name: { type: [string, "null"], maxLength: 256 }
+            joined_at: { type: [string, "null"], format: date-time }
+        transcript:
+          type: object
+          additionalProperties: false
+          required: [status]
+          properties:
+            status: { type: string, enum: [pending, processing, completed, unavailable] }
+        created_at: { type: string, format: date-time }
+        started_at: { type: [string, "null"], format: date-time }
+        ended_at: { type: [string, "null"], format: date-time }
+        completed_at: { type: [string, "null"], format: date-time }
+        metadata:
+          type: object
+          maxProperties: 64
+          propertyNames: { type: string, maxLength: 128 }
+          additionalProperties: { $ref: "#/components/schemas/MetadataValue" }
+        transcript_provider: { type: string, maxLength: 64 }
+        fallback_from: { type: string, maxLength: 64 }
+        fallback_reason: { type: [string, "null"], maxLength: 128 }
+        recovery: { $ref: "#/components/schemas/MeetingRecoveryMetadata" }
+        transcript_revision: { type: [integer, "null"], minimum: 0 }
+        error:
+          type: object
+          additionalProperties: false
+          required: [type, code, message]
+          properties:
+            type: { type: string }
+            code: { type: string }
+            message: { type: string }
+    MeetingStatusResponse:
+      type: object
+      additionalProperties: false
+      required: [id, status]
+      properties:
+        id: { type: string, pattern: "^mtg_[0-9A-HJKMNP-TV-Z]{26}$" }
+        status: { $ref: "#/components/schemas/MeetingStatus" }
+    TranscriptStatus:
+      type: object
+      additionalProperties: false
+      required: [meeting_id, status, transcript_revision]
+      properties:
+        meeting_id: { type: string, pattern: "^mtg_[0-9A-HJKMNP-TV-Z]{26}$" }
+        status: { $ref: "#/components/schemas/MeetingStatus" }
+        transcript_revision: { type: [integer, "null"], minimum: 0 }
+    Speaker:
+      type: object
+      required: [id, name]
+      properties: { id: { type: string }, name: { type: string } }
+    Segment:
+      type: object
+      required: [id, speaker_id, speaker_name, start, end, text]
+      properties:
+        id: { type: string }
+        speaker_id: { type: string }
+        speaker_name: { type: string }
+        start: { type: number, minimum: 0 }
+        end: { type: number, minimum: 0 }
+        text: { type: string }
+        provenance: { type: string, enum: [provider, vexa_fallback] }
+    Transcript:
+      type: object
+      additionalProperties: false
+      required: [meeting_id, status, language, duration_seconds, provider, speakers, segments, text, created_at, transcript_revision]
+      properties:
+        meeting_id: { type: string, pattern: "^mtg_[0-9A-HJKMNP-TV-Z]{26}$" }
+        status: { type: string, const: completed }
+        language: { type: string }
+        duration_seconds: { type: number, minimum: 0 }
+        provider: { type: string }
+        fallback_from: { type: string }
+        fallback_reason: { type: [string, "null"] }
+        speakers: { type: array, items: { $ref: "#/components/schemas/Speaker" } }
+        segments: { type: array, items: { $ref: "#/components/schemas/Segment" } }
+        text: { type: string }
+        created_at: { type: string, format: date-time }
+        transcript_revision: { type: [integer, "null"], minimum: 0 }
+    TranscriptResponse:
+      oneOf:
+        - { $ref: "#/components/schemas/Transcript" }
+        - { $ref: "#/components/schemas/TranscriptStatus" }
+    Health:
+      type: object
+      required: [status, checks]
+      properties:
+        status: { type: string, enum: [ok, degraded, error] }
+        checks:
+          type: object
+          required: [postgres, redis, vexa, bot_capacity, transcription_provider]
+          properties:
+            postgres: { type: boolean }
+            redis: { type: boolean }
+            vexa: { type: boolean }
+            bot_capacity:
+              type: object
+              required: [running, max]
+              properties:
+                running: { type: [integer, "null"], minimum: 0 }
+                max: { type: integer, minimum: 0 }
+            transcription_provider: { type: string }

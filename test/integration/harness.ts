@@ -12,6 +12,9 @@ import { VexaNativeProvider } from "../../src/providers/transcription/vexa-nativ
 import type { TranscriptionProvider } from "../../src/providers/transcription/types.ts";
 import { Queue } from "../../src/worker/queue.ts";
 import { startWorker, type WorkerHandle } from "../../src/worker/index.ts";
+import type { RecoveryConfiguration } from "../../src/recovery-config.ts";
+import type { RecoveryApiRuntime } from "../../src/api/recovery-runtime.ts";
+import { createIsolatedDatabase } from "./a2-db.ts";
 
 export type ApiResponse = Omit<Response, "json"> & { json(): Promise<any> };
 
@@ -40,15 +43,26 @@ export async function startHarness(
     enabledPlatforms?: string[];
     joinTimeoutSeconds?: number;
     maxTimeLeftAloneMs?: number;
+    recoveryV2Enabled?: boolean;
+    recoveryConfiguration?: RecoveryConfiguration;
+    recoveryApiRuntime?: RecoveryApiRuntime;
+    databaseUrl?: string;
   } = {},
 ): Promise<Harness> {
   const vexa = startMockVexa(0);
+  const isolated = opts.databaseUrl ? null : await createIsolatedDatabase("ptx_harness");
   const config = {
     ...baseConfig,
+    databaseUrl: opts.databaseUrl ?? isolated!.url,
     vexa: { ...baseConfig.vexa, baseUrl: vexa.baseUrl, apiKey: vexa.apiKey, pollIntervalMs: 50 },
     transcriptionProvider: (opts.transcription?.name ?? "vexa") as "vexa" | "tinfoil",
     ...(opts.enabledPlatforms ? { enabledPlatforms: opts.enabledPlatforms } : {}),
     ...(opts.joinTimeoutSeconds !== undefined ? { joinTimeoutSeconds: opts.joinTimeoutSeconds } : {}),
+    ...(opts.recoveryV2Enabled !== undefined ? { recoveryV2Enabled: opts.recoveryV2Enabled } : {}),
+    ...(opts.recoveryConfiguration ? {
+      recovery: opts.recoveryConfiguration,
+      recoveryV2Enabled: opts.recoveryConfiguration.switches.acceptance,
+    } : {}),
     ...(opts.maxTimeLeftAloneMs !== undefined ? { vexa: { ...baseConfig.vexa, baseUrl: vexa.baseUrl, apiKey: vexa.apiKey, pollIntervalMs: 50, maxTimeLeftAloneMs: opts.maxTimeLeftAloneMs } } : {}),
   };
   const db = await runMigrations(config.databaseUrl);
@@ -66,7 +80,7 @@ export async function startHarness(
     webhookRetryDelaysMs: opts.webhookRetryDelaysMs ?? [0, 100, 200],
   });
   const { key, webhookSecret } = await createApiKey(ctx, "demo");
-  const app = createApp(ctx);
+  const app = createApp(ctx, { recoveryApiRuntime: opts.recoveryApiRuntime });
 
   const webhook: Harness["webhook"] = { url: "", received: [], failNext: 0 };
   const receiver = Bun.serve({
@@ -118,6 +132,10 @@ export async function startHarness(
       receiver.stop(true);
       vexa.stop();
       redis.close();
+      if (isolated) {
+        await ctx.db.$client.close();
+        await isolated.drop();
+      }
     },
   };
 }

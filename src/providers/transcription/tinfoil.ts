@@ -1,7 +1,8 @@
 import { ApiError } from "../../domain/errors.ts";
 import { normalizeSegments, type NormalizedTranscript, type RawSegment } from "../../domain/transcript.ts";
-import type { Logger } from "../../log.ts";
+import { meetingLogFields, type Logger } from "../../log.ts";
 import type { VexaTranscriptionSegment } from "../vexa/types.ts";
+import { validateVexaTurnFallbackCoverage } from "../vexa/fallback-coverage.ts";
 import { decodeToPcm, rmsDbfs, sliceToWav, type Pcm16 } from "./audio.ts";
 import { mergeTurns, type Turn } from "./turns.ts";
 import { TranscriptionFallbackError, type AudioBlob, type TranscriptionInput, type TranscriptionProvider } from "./types.ts";
@@ -54,11 +55,21 @@ export interface OpenAIVerboseTranscription {
 export interface TinfoilTurnStats {
   mode: TinfoilSegmentation;
   audio_seconds: number;
+  audio_duration_ms: number;
   turns: number;
   transcribed: number;
   skipped_short: number;
   failed: number;
   calls: number;
+}
+
+export function exactVexaTurnFallbackText(turn: Turn, segments: readonly VexaTranscriptionSegment[]): {
+  readonly text: string;
+  readonly provenance: "vexa_fallback";
+} | null {
+  const coverage = validateVexaTurnFallbackCoverage(turn, segments);
+  if (coverage.kind !== "accepted" || coverage.leaves.length !== 1) return null;
+  return { text: coverage.leaves[0]!.text, provenance: "vexa_fallback" };
 }
 
 /**
@@ -80,9 +91,10 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
   }
 
   async transcribe(input: TranscriptionInput): Promise<NormalizedTranscript> {
+    this.lastStats = null;
     const audio = await input.fetchAudio();
     if (!audio) {
-      throw new ApiError("transcription_failed", "No recorded audio available for transcription");
+      throw new ApiError("recording_absent", "No recorded audio is available for transcription");
     }
     const mode = this.opts.segmentation ?? "turns";
     const vexa = input.vexaSegments.filter((s) => s.completed !== false);
@@ -96,12 +108,14 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     let pcm: Pcm16;
     try {
       pcm = await decodeToPcm(audio.bytes, { ffmpegPath: this.opts.ffmpegPath });
-    } catch (e) {
-      throw new TranscriptionFallbackError(`Recording could not be decoded: ${String(e)}`, "undecodable");
+    } catch {
+      throw new TranscriptionFallbackError("Recording could not be decoded", "undecodable");
     }
+    const audioDurationMs = exactPcmDurationMs(pcm);
     const level = rmsDbfs(pcm);
+    this.lastStats = { mode: "whole", audio_seconds: round(pcm.durationSec), audio_duration_ms: audioDurationMs, turns: 0, transcribed: 0, skipped_short: 0, failed: 0, calls: 0 };
     if (pcm.durationSec < 0.5 || level < (this.opts.silenceDbfs ?? -60)) {
-      throw new TranscriptionFallbackError("Recording is silent", "silent_recording", { audio_seconds: round(pcm.durationSec), rms_dbfs: round(level) });
+      throw new TranscriptionFallbackError("Recording is silent", "silent_recording", { audio_seconds: round(pcm.durationSec), audio_duration_ms: audioDurationMs, rms_dbfs: round(level) });
     }
 
     // Long meetings can exceed inference upload limits or the per-request timeout. Decode once and
@@ -109,6 +123,7 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     // ever storing a transcript with a silent hole.
     const chunkSec = Math.max(1, this.opts.wholeChunkSec ?? 600);
     const chunks = quietBoundedChunks(pcm, chunkSec);
+    this.lastStats = { ...this.lastStats, turns: chunks.length };
     const bodies: OpenAIVerboseTranscription[] = new Array(chunks.length);
     let calls = 0;
     let next = 0;
@@ -143,12 +158,13 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
         text: s.text,
         speaker: speakerByOverlap(chunk.from + s.start, chunk.from + s.end, vexa),
         language: body.language ?? null,
+        provenance: "provider" as const,
       }));
     });
     this.calls += calls;
-    this.lastStats = { mode: "whole", audio_seconds: round(pcm.durationSec), turns: chunks.length, transcribed: chunks.length, skipped_short: 0, failed: 0, calls };
+    this.lastStats = { mode: "whole", audio_seconds: round(pcm.durationSec), audio_duration_ms: audioDurationMs, turns: chunks.length, transcribed: chunks.length, skipped_short: 0, failed: 0, calls };
     const t = normalizeSegments(raw, input.language ?? bodies.find((body) => body.language)?.language ?? null);
-    return { ...t, duration_seconds: Math.max(t.duration_seconds, round(pcm.durationSec)) };
+    return { ...t, duration_seconds: Math.max(t.duration_seconds, audioDurationMs / 1_000) };
   }
 
   // ---- per-turn mode ---------------------------------------------------------------------------
@@ -158,13 +174,21 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     let pcm: Pcm16;
     try {
       pcm = await decodeToPcm(audio.bytes, { ffmpegPath: this.opts.ffmpegPath });
-    } catch (e) {
-      throw new TranscriptionFallbackError(`Recording could not be decoded: ${String(e)}`, "undecodable");
+    } catch {
+      throw new TranscriptionFallbackError("Recording could not be decoded", "undecodable");
     }
+    const audioDurationMs = exactPcmDurationMs(pcm);
     const level = rmsDbfs(pcm);
-    log?.debug("tinfoil: recording decoded", { meetingId: input.meetingId, audio_seconds: round(pcm.durationSec), rms_dbfs: round(level), vexa_segments: vexa.length });
+    this.lastStats = { mode: "turns", audio_seconds: round(pcm.durationSec), audio_duration_ms: audioDurationMs, turns: 0, transcribed: 0, skipped_short: 0, failed: 0, calls: 0 };
+    log?.debug("transcription_recording_decoded", {
+      ...meetingLogFields(input.meetingId),
+      audio_seconds: round(pcm.durationSec),
+      audio_duration_ms: audioDurationMs,
+      rms_dbfs: round(level),
+      vexa_segments: vexa.length,
+    });
     if (pcm.durationSec < 0.5 || level < (this.opts.silenceDbfs ?? -60)) {
-      throw new TranscriptionFallbackError("Recording is silent", "silent_recording", { audio_seconds: round(pcm.durationSec), rms_dbfs: round(level) });
+      throw new TranscriptionFallbackError("Recording is silent", "silent_recording", { audio_seconds: round(pcm.durationSec), audio_duration_ms: audioDurationMs, rms_dbfs: round(level) });
     }
 
     const minTurn = this.opts.minTurnSec ?? 0.4;
@@ -179,6 +203,8 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     const results: ({ text: string; language: string | null } | null)[] = new Array(eligible.length).fill(null);
     let failed = 0;
     let unavailable = 0; // failures that were 5xx/429/timeout/network even after retries (provider outage)
+    let timeouts = 0;
+    let permanent = 0;
     let calls = 0;
     let next = 0;
     const workers = Array.from({ length: Math.max(1, Math.min(this.opts.concurrency ?? 3, eligible.length)) }, async () => {
@@ -190,22 +216,47 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
           const { body, attempts } = await this.postWithRetry(wav, `turn-${i + 1}.wav`, "audio/wav", input.language);
           calls += attempts;
           results[i] = { text: body.text ?? "", language: body.language ?? null };
-          log?.debug("tinfoil: turn transcribed", { meetingId: input.meetingId, turn: i + 1, of: eligible.length, speaker: c.turn.speaker, start: c.turn.start, end: c.turn.end, attempts, chars: results[i]!.text.length });
+          log?.debug("transcription_turn_completed", {
+            ...meetingLogFields(input.meetingId),
+            turn: i + 1,
+            of: eligible.length,
+            start: c.turn.start,
+            end: c.turn.end,
+            attempts,
+            chars: results[i]!.text.length,
+          });
         } catch (e) {
           calls += (e as { attempts?: number }).attempts ?? 1;
           failed++;
-          if (e instanceof ApiError && (e.code === "provider_unavailable" || e.code === "provider_timeout")) unavailable++;
-          log?.warn("tinfoil turn failed", { meetingId: input.meetingId, turn: i + 1, speaker: c.turn.speaker, start: c.from, end: c.to, error: String(e) });
+          if (e instanceof ApiError && (e.code === "provider_unavailable" || e.code === "provider_timeout")) {
+            unavailable++;
+            if (e.code === "provider_timeout") timeouts++;
+          } else {
+            permanent++;
+          }
+          log?.warn("transcription_turn_failed", {
+            ...meetingLogFields(input.meetingId),
+            turn: i + 1,
+            start: c.from,
+            end: c.to,
+            errorClass: e instanceof ApiError ? e.code : "provider_failure",
+          });
         }
       }
     });
     await Promise.all(workers);
     this.calls += calls;
-    this.lastStats = { mode: "turns", audio_seconds: round(pcm.durationSec), turns: cuts.length, transcribed: eligible.length - failed, skipped_short: skipped, failed, calls };
+    this.lastStats = { mode: "turns", audio_seconds: round(pcm.durationSec), audio_duration_ms: audioDurationMs, turns: cuts.length, transcribed: eligible.length - failed, skipped_short: skipped, failed, calls };
 
+    if (permanent > 0) {
+      throw new ApiError("provider_rejected", "Transcription provider rejected one or more speaker turns");
+    }
     if (eligible.length > 0 && unavailable === eligible.length) {
       // Every turn hit an outage: let the worker retry later (SPEC: a Tinfoil outage must not fail the meeting).
-      throw new ApiError("provider_unavailable", "Transcription provider is unavailable");
+      throw new ApiError(
+        timeouts === eligible.length ? "provider_timeout" : "provider_unavailable",
+        timeouts === eligible.length ? "Transcription provider timed out" : "Transcription provider is unavailable",
+      );
     }
     if (eligible.length > 0 && failed * 2 > eligible.length) {
       throw new TranscriptionFallbackError(`Most speaker turns failed to transcribe (${failed}/${eligible.length})`, "turns_failed", { ...this.lastStats });
@@ -216,11 +267,21 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
 
     const raw: RawSegment[] = eligible.map((c, i) => {
       const r = results[i];
-      // A turn that failed (< 50 % of them) keeps Vexa's own words rather than a hole in the transcript.
-      return { start: c.turn.start, end: c.turn.end, text: r ? r.text : c.turn.vexaText, speaker: c.turn.speaker, language: r?.language ?? c.turn.language };
+      const fallback = r ? null : exactVexaTurnFallbackText(c.turn, vexa);
+      if (!r && !fallback) {
+        throw new TranscriptionFallbackError("A failed speaker turn lacks exact fallback coverage", "coverage_incomplete", { ...this.lastStats });
+      }
+      return {
+        start: c.turn.start,
+        end: c.turn.end,
+        text: r?.text ?? fallback!.text,
+        speaker: c.turn.speaker,
+        language: r?.language ?? c.turn.language,
+        provenance: r ? "provider" as const : fallback!.provenance,
+      };
     });
     const t = normalizeSegments(raw, input.language ?? null);
-    return { ...t, duration_seconds: Math.max(t.duration_seconds, round(pcm.durationSec)) };
+    return { ...t, duration_seconds: Math.max(t.duration_seconds, audioDurationMs / 1_000) };
   }
 
   // ---- HTTP -----------------------------------------------------------------------------------
@@ -270,14 +331,56 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
       throw new ApiError("provider_unavailable", "Transcription provider is unavailable");
     }
     if (!res.ok) {
-      const detail = (await res.text().catch(() => "")).slice(0, 300);
-      throw new ApiError("transcription_failed", `Transcription provider rejected the request (HTTP ${res.status}${detail ? `: ${detail}` : ""})`);
+      // Provider response bodies are untrusted and may contain identifiers, request material, or
+      // secret-like values. Discard them at the adapter boundary; retain only the bounded status.
+      throw new ApiError("provider_rejected", `Transcription provider rejected the request (HTTP ${res.status})`);
     }
-    return (await res.json()) as OpenAIVerboseTranscription;
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch {
+      throw new ApiError("provider_rejected", "Transcription provider returned an invalid response");
+    }
+    if (!isTranscriptionResponse(body)) {
+      throw new ApiError("provider_rejected", "Transcription provider returned an invalid response");
+    }
+    return body;
   }
 }
 
+const isFiniteNumber = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+
+function isTranscriptionResponse(value: unknown): value is OpenAIVerboseTranscription {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const body = value as Record<string, unknown>;
+  if (typeof body.text !== "string" || !body.text.trim()) return false;
+  if (body.language !== undefined && typeof body.language !== "string") return false;
+  if (body.duration !== undefined && !isFiniteNumber(body.duration)) return false;
+  if (body.usage !== undefined) {
+    if (!body.usage || typeof body.usage !== "object" || Array.isArray(body.usage)) return false;
+    const usage = body.usage as Record<string, unknown>;
+    if (usage.type !== undefined && typeof usage.type !== "string") return false;
+    if (usage.seconds !== undefined && !isFiniteNumber(usage.seconds)) return false;
+  }
+  if (body.segments !== undefined) {
+    if (!Array.isArray(body.segments)) return false;
+    if (!body.segments.every((segment) => {
+      if (!segment || typeof segment !== "object" || Array.isArray(segment)) return false;
+      const item = segment as Record<string, unknown>;
+      return isFiniteNumber(item.start) && isFiniteNumber(item.end) && typeof item.text === "string";
+    })) return false;
+  }
+  return true;
+}
+
 const round = (n: number) => Math.round(n * 1000) / 1000;
+
+function exactPcmDurationMs(pcm: Pick<Pcm16, "samples" | "sampleRate">): number {
+  if (!Number.isSafeInteger(pcm.sampleRate) || pcm.sampleRate <= 0) throw new TypeError("invalid PCM sample rate");
+  const durationMs = Number((BigInt(pcm.samples.length) * 1_000n + BigInt(pcm.sampleRate) - 1n) / BigInt(pcm.sampleRate));
+  if (!Number.isSafeInteger(durationMs) || durationMs <= 0) throw new TypeError("invalid PCM duration");
+  return durationMs;
+}
 
 /**
  * Split at the lowest-energy 100 ms window in the two seconds before each hard limit. Chunks stay

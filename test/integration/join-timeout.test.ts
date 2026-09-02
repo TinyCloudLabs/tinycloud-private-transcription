@@ -25,6 +25,9 @@ const waitFailed = (id: string) =>
     return b.status === "failed" ? b : null;
   }, { timeoutMs: 8000, label: `meeting ${id} -> failed` });
 
+const vexaOperationCount = (operation: string) =>
+  h.vexa.requests.find((request) => request.operation === operation)?.count ?? 0;
+
 describe("join deadline", () => {
   test("stuck in joining -> failed meeting_join_failed, bot stopped, webhook delivered", async () => {
     const nativeId = "JoinTimeoutA@jitsi.local";
@@ -36,10 +39,11 @@ describe("join deadline", () => {
     const id = (await r.json()).id;
     // Mock stays "requested" (mapped to joining) — never admitted.
     await h.waitFor(async () => ((await meetingOf(id)).status === "joining" ? true : null), { label: "joining" });
+    const stopCallsBefore = vexaOperationCount("stop_bot");
 
     const failed = await waitFailed(id);
     expect(failed.error).toMatchObject({ type: "meeting_join_failed", code: "meeting_join_failed" });
-    expect(h.vexa.requests.some((q) => q.method === "DELETE" && q.path === `/bots/jitsi/${encodeURIComponent(nativeId)}`)).toBe(true);
+    expect(vexaOperationCount("stop_bot")).toBe(stopCallsBefore + 1);
     const hook = await h.waitFor(
       async () => h.webhook.received.find((w) => w.body.type === "meeting.failed" && w.body.data.meeting_id === id) ?? null,
       { label: "meeting.failed webhook" },
@@ -57,10 +61,11 @@ describe("join deadline", () => {
     await h.waitFor(async () => ((await meetingOf(id)).status === "joining" ? true : null), { label: "joining" });
     await h.vexa.control("jitsi", nativeId, { status: "awaiting_admission" });
     await h.waitFor(async () => ((await meetingOf(id)).status === "waiting_for_admission" ? true : null), { label: "waiting_for_admission" });
+    const stopCallsBefore = vexaOperationCount("stop_bot");
 
     const failed = await waitFailed(id);
     expect(failed.error).toMatchObject({ type: "meeting_join_failed", code: "waiting_room_timeout" });
-    expect(h.vexa.requests.some((q) => q.method === "DELETE" && q.path === `/bots/jitsi/${encodeURIComponent(nativeId)}`)).toBe(true);
+    expect(vexaOperationCount("stop_bot")).toBe(stopCallsBefore + 1);
     const hook = await h.waitFor(
       async () => h.webhook.received.find((w) => w.body.type === "meeting.failed" && w.body.data.meeting_id === id) ?? null,
       { label: "meeting.failed webhook" },

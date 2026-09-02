@@ -8,7 +8,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { decodeToPcm, pcmToWav, rmsDbfs, sliceToWav, PCM_RATE } from "../../src/providers/transcription/audio.ts";
 import { mergeTurns } from "../../src/providers/transcription/turns.ts";
-import { quietBoundedChunks, TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
+import { exactVexaTurnFallbackText, quietBoundedChunks, TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
 import { TranscriptionFallbackError } from "../../src/providers/transcription/types.ts";
 
 const ffmpeg = Bun.which("ffmpeg");
@@ -36,6 +36,29 @@ describe("mergeTurns", () => {
       { start: 2.1, end: 3, text: "c", language: null, speaker: "Sam" },
     ]);
     expect(turns.map((t) => [t.speaker, t.start, t.end])).toEqual([[null, 0, 2], ["Sam", 2.1, 3]]);
+  });
+});
+
+describe("B4 legacy turn fallback coverage", () => {
+  const turn = { speaker: "A", start: 0, end: 2, vexaText: "unsafe aggregate", language: "en" };
+
+  test("a failed turn accepts only exact, ordered, nonblank Vexa coverage and keeps it explicit", () => {
+    expect(exactVexaTurnFallbackText(turn, [
+      { start: 0, end: 1, text: "exact one", language: "en", speaker: "A", completed: true },
+      { start: 1, end: 2, text: "exact two", language: "en", speaker: "A", completed: true },
+    ])).toEqual({ text: "exact one exact two", provenance: "vexa_fallback" });
+  });
+
+  test("a blank, partial, gapped, or speaker-mismatched failed turn cannot silently disappear", () => {
+    for (const segments of [
+      [{ start: 0, end: 2, text: " \t", language: "en", speaker: "A", completed: true }],
+      [{ start: 0, end: 1, text: "partial", language: "en", speaker: "A", completed: true }],
+      [
+        { start: 0, end: 1, text: "left", language: "en", speaker: "A", completed: true },
+        { start: 1.001, end: 2, text: "right", language: "en", speaker: "A", completed: true },
+      ],
+      [{ start: 0, end: 2, text: "wrong", language: "en", speaker: "B", completed: true }],
+    ]) expect(exactVexaTurnFallbackText(turn, segments)).toBeNull();
   });
 });
 
@@ -69,6 +92,7 @@ describe.skipIf(!ffmpeg || !existsSync("fixtures/bob.wav"))("TinfoilTranscriptio
   const requests: { name: string; seconds: number; dbfs: number; language: string | null }[] = [];
   let failNames: RegExp | null = null; // requests whose file name matches fail with 500
   let failStatus = 500;
+  let blankNames: RegExp | null = null;
   let flakyOnce = new Set<string>(); // first attempt for these names → 500, then ok
 
   const ALICE_TEXT = "The quick brown fox jumps over the lazy dog. Hello from Alice.";
@@ -98,6 +122,7 @@ describe.skipIf(!ffmpeg || !existsSync("fixtures/bob.wav"))("TinfoilTranscriptio
         requests.push({ name, seconds: Math.round(pcm.durationSec * 100) / 100, dbfs: Math.round(rmsDbfs(pcm)), language: form.get("language") as string | null });
         if (flakyOnce.has(name)) { flakyOnce.delete(name); return new Response("flake", { status: 500 }); }
         if (failNames?.test(name)) return new Response("boom", { status: failStatus });
+        if (blankNames?.test(name)) return Response.json({ text: " \t\n", usage: { type: "duration", seconds: pcm.durationSec } });
         return Response.json({ text: `clip ${pcm.durationSec.toFixed(2)}s`, usage: { type: "duration", seconds: pcm.durationSec } });
       },
     });
@@ -145,30 +170,94 @@ describe.skipIf(!ffmpeg || !existsSync("fixtures/bob.wav"))("TinfoilTranscriptio
     expect(p.lastStats).toMatchObject({ transcribed: 2, failed: 0, calls: 3 });
   });
 
-  test("a minority of failed turns keeps Vexa's words for those turns (4xx is not retried)", async () => {
+  test("a minority failed turn with incomplete Vexa coverage fails the whole attempt", async () => {
     requests.length = 0;
     failNames = /turn-2/;
-    failStatus = 400;
-    const p = provider();
-    const t = await p.transcribe(input());
+    failStatus = 503;
+    const p = provider({ maxRetries: 0 });
+    await expect(p.transcribe(input())).rejects.toMatchObject({ reason: "coverage_incomplete" });
     failNames = null;
     expect(requests).toHaveLength(2);
     expect(p.lastStats).toMatchObject({ transcribed: 1, failed: 1, calls: 2 });
-    expect(t.segments.map((s) => s.text)).toEqual(["clip 7.10s", "Good morning everyone, this is Bob. The meeting starts now."]);
   });
 
-  test("more than half of the turns failing → TranscriptionFallbackError (worker stores the Vexa transcript)", async () => {
+  test("a blank provider success beside a nonblank sibling is an invalid response, never a partial transcript", async () => {
+    requests.length = 0;
+    blankNames = /turn-2/;
+    const p = provider({ maxRetries: 0 });
+    await expect(p.transcribe(input())).rejects.toMatchObject({ code: "provider_rejected" });
+    blankNames = null;
+    expect(requests).toHaveLength(2);
+  });
+
+  test("two ordinary HTTP 400 turn failures preserve provider_rejected instead of becoming turns_failed fallback", async () => {
+    requests.length = 0;
+    const segments = vexaSegments(aliceSec);
+    segments[4] = { ...segments[4]!, end: segments[4]!.start + 1 };
+    failNames = /turn-(2|3)/;
+    failStatus = 400;
+    const p = provider({ maxRetries: 0 });
+    await expect(p.transcribe(input(segments))).rejects.toMatchObject({ code: "provider_rejected" });
+    failNames = null;
+    expect(requests).toHaveLength(3);
+  });
+
+  test("a minority failed turn keeps only genuinely exact nonblank fallback with explicit provenance", async () => {
+    requests.length = 0;
+    failNames = /turn-2/;
+    failStatus = 503;
+    const segments = vexaSegments(aliceSec).map((segment) => ({
+      ...segment,
+      start: Math.round(segment.start * 1_000) / 1_000,
+      end: Math.round(segment.end * 1_000) / 1_000,
+    }));
+    segments[3] = { ...segments[3]!, start: segments[2]!.end };
+    const p = provider({ maxRetries: 0 });
+    const t = await p.transcribe(input(segments));
+    failNames = null;
+    expect(requests).toHaveLength(2);
+    expect(t.segments.map((segment) => segment.provenance)).toEqual(["provider", "vexa_fallback"]);
+    expect(t.segments[1]).toMatchObject({
+      start: segments[2]!.start,
+      end: segments[3]!.end,
+      text: "Good morning everyone, this is Bob. The meeting starts now.",
+      provenance: "vexa_fallback",
+    });
+  });
+
+  test("more than half of the turns permanently rejected preserves provider_rejected", async () => {
     // Three turns: Alice, Bob, and Alice again (make the trailing "uh" a real 1 s turn); Bob + trailing fail.
     const segs = vexaSegments(aliceSec);
     segs[4] = { ...segs[4]!, end: segs[4]!.start + 1 };
     failNames = /turn-(2|3)/;
     failStatus = 400;
-    const p = provider();
+    const p = provider({ maxRetries: 0 });
     const err = await p.transcribe(input(segs)).catch((e) => e);
     failNames = null;
-    expect(err).toBeInstanceOf(TranscriptionFallbackError);
-    expect(err.reason).toBe("turns_failed");
+    expect(err).toMatchObject({ code: "provider_rejected" });
     expect(p.lastStats).toMatchObject({ turns: 3, transcribed: 1, failed: 2 });
+  });
+
+  test("provider logs omit raw meeting and provider identifiers", async () => {
+    const entries: Array<{ msg: string; data?: Record<string, unknown> }> = [];
+    const log = {
+      debug: (msg: string, data?: Record<string, unknown>) => entries.push({ msg, data }),
+      info: (msg: string, data?: Record<string, unknown>) => entries.push({ msg, data }),
+      warn: (msg: string, data?: Record<string, unknown>) => entries.push({ msg, data }),
+      error: (msg: string, data?: Record<string, unknown>) => entries.push({ msg, data }),
+    };
+    const segments = vexaSegments(aliceSec).map((segment, index) =>
+      index === 0 ? { ...segment, speaker: "PROVIDER_IDENTIFIER_SENTINEL" } : segment,
+    );
+    failNames = /./;
+    failStatus = 400;
+    const p = provider({ log, maxRetries: 0 });
+    await p.transcribe({ ...input(segments), meetingId: "mtg_MEETING_IDENTIFIER_SENTINEL" }).catch(() => undefined);
+    failNames = null;
+
+    const serialized = JSON.stringify(entries);
+    expect(serialized).not.toContain("MEETING_IDENTIFIER_SENTINEL");
+    expect(serialized).not.toContain("PROVIDER_IDENTIFIER_SENTINEL");
   });
 
   test("every turn hitting an outage (5xx after retries) → provider_unavailable (worker retries later)", async () => {
@@ -178,6 +267,18 @@ describe.skipIf(!ffmpeg || !existsSync("fixtures/bob.wav"))("TinfoilTranscriptio
     await expect(p.transcribe(input())).rejects.toMatchObject({ code: "provider_unavailable" });
     failNames = null;
     expect(p.lastStats).toMatchObject({ failed: 2, calls: 4 });
+  });
+
+  test("every turn timing out preserves provider_timeout", async () => {
+    const timeout = new Error("synthetic timeout");
+    timeout.name = "TimeoutError";
+    const p = provider({
+      maxRetries: 0,
+      fetch: (async () => {
+        throw timeout;
+      }) as unknown as typeof fetch,
+    });
+    await expect(p.transcribe(input())).rejects.toMatchObject({ code: "provider_timeout" });
   });
 
   test("silent recording → TranscriptionFallbackError(silent_recording), no Tinfoil call", async () => {
@@ -234,7 +335,7 @@ describe.skipIf(!ffmpeg || !existsSync("fixtures/bob.wav"))("TinfoilTranscriptio
     failNames = /chunk-1/;
     failStatus = 400;
     const p = provider({ segmentation: "whole", wholeChunkSec: 5, concurrency: 2 });
-    await expect(p.transcribe(input([]))).rejects.toMatchObject({ code: "transcription_failed" });
+    await expect(p.transcribe(input([]))).rejects.toMatchObject({ code: "provider_rejected" });
     failNames = null;
     const requestsAtRejection = requests.length;
     await Bun.sleep(100);

@@ -4,6 +4,7 @@ export interface RawSegment {
   text: string;
   speaker?: string | null;
   language?: string | null;
+  provenance?: "provider" | "vexa_fallback";
 }
 
 export interface Speaker {
@@ -17,6 +18,7 @@ export interface Segment {
   start: number;
   end: number;
   text: string;
+  provenance?: "provider" | "vexa_fallback";
 }
 export interface NormalizedTranscript {
   language: string;
@@ -50,6 +52,7 @@ export function normalizeSegments(raw: RawSegment[], languageHint?: string | nul
       start: s.start,
       end: s.end,
       text: s.text.trim(),
+      ...(s.provenance ? { provenance: s.provenance } : {}),
     };
   });
   const language = languageHint || sorted.find((s) => s.language)?.language || "en";

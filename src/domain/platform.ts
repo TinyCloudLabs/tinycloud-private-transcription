@@ -54,5 +54,5 @@ export function detectPlatform(meetingUrl: string, override?: string): DetectedP
   if (override && (PLATFORMS as string[]).includes(override)) {
     return { platform: override as Platform, nativeMeetingId: null };
   }
-  throw new ApiError("unsupported_platform", `Could not determine a supported meeting platform from ${host}`);
+  throw new ApiError("unsupported_platform", "Could not determine a supported meeting platform from this URL.");
 }

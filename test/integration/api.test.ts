@@ -1,6 +1,9 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { webhookDeliveries } from "../../src/db/schema.ts";
+import { meetings, webhookDeliveries } from "../../src/db/schema.ts";
+import { newMeetingId } from "../../src/domain/ids.ts";
+import { getMeetingById } from "../../src/services/meetings.ts";
+import { enqueueMeetingWebhook } from "../../src/webhooks/dispatcher.ts";
 import { verifyWebhookSignature } from "../../src/webhooks/signature.ts";
 import { startHarness, type Harness } from "./harness.ts";
 
@@ -23,6 +26,9 @@ async function statusOf(id: string) {
   return { res: r, body: b, status: b.status as string };
 }
 
+const vexaOperationCount = (operation: string) =>
+  h.vexa.requests.find((request) => request.operation === operation)?.count ?? 0;
+
 const waitStatus = (id: string, wanted: string) =>
   h.waitFor(async () => {
     const { status, body } = await statusOf(id);
@@ -33,7 +39,10 @@ describe("auth", () => {
   test("missing / bad key -> 401 with our error shape", async () => {
     const r1 = await h.api("/v1/meetings/mtg_x", { key: null });
     expect(r1.status).toBe(401);
-    expect(await r1.json()).toEqual({ error: { type: "authentication_error", code: "unauthorized", message: expect.any(String) } });
+    expect(await r1.json()).toEqual({
+      error: { type: "authentication_error", code: "unauthorized", message: expect.any(String), retryable: false },
+      request_id: expect.any(String),
+    });
     const r2 = await h.api("/v1/meetings/mtg_x", { key: "tc_live_nope" });
     expect(r2.status).toBe(401);
   });
@@ -70,7 +79,7 @@ describe("validation", () => {
     expect((await r.json()).error.message).toContain("google_meet");
     r = await h.api("/v1/meetings", { method: "POST", body: "{", headers: { "Content-Type": "application/json" } });
     expect(r.status).toBe(400);
-    r = await h.api("/v1/meetings/mtg_doesnotexist");
+    r = await h.api(`/v1/meetings/${newMeetingId()}`);
     expect(r.status).toBe(404);
     expect((await r.json()).error.code).toBe("meeting_not_found");
   });
@@ -118,7 +127,7 @@ describe("happy path: create -> joined -> completed -> transcript + webhook", ()
     await waitStatus(id, "waiting_for_admission");
     const t = await h.api(`/v1/meetings/${id}/transcript`);
     expect(t.status).toBe(202);
-    expect(await t.json()).toEqual({ meeting_id: id, status: "waiting_for_admission" });
+    expect(await t.json()).toEqual({ meeting_id: id, status: "waiting_for_admission", transcript_revision: 0 });
   });
 
   test("active -> in_progress with started_at; live segments do not complete it", async () => {
@@ -191,10 +200,11 @@ describe("happy path: create -> joined -> completed -> transcript + webhook", ()
   });
 
   test("DELETE removes our record and asks Vexa to delete (v0.12 answers 409 for bot-owned rows: tolerated)", async () => {
+    const deleteCallsBefore = vexaOperationCount("delete_meeting");
     const r = await h.api(`/v1/meetings/${id}`, { method: "DELETE" });
     expect(r.status).toBe(204);
     expect((await h.api(`/v1/meetings/${id}`)).status).toBe(404);
-    expect(h.vexa.requests.some((q) => q.method === "DELETE" && q.path === `/meetings/jitsi/${encodeURIComponent(nativeId)}`)).toBe(true);
+    expect(vexaOperationCount("delete_meeting")).toBe(deleteCallsBefore + 1);
     // The mock mirrors real Vexa: the completed row is retained (409). A planned row is actually removed:
     await h.vexa.control("jitsi", nativeId, { planned: true });
     await h.ctx.vexa.deleteMeeting("jitsi", nativeId);
@@ -216,7 +226,7 @@ describe("failure path", () => {
     expect(body.error.message).not.toMatch(/awaiting_admission/);
     const t = await h.api(`/v1/meetings/${id}/transcript`);
     expect(t.status).toBe(200);
-    expect(await t.json()).toEqual({ meeting_id: id, status: "failed" });
+    expect(await t.json()).toEqual({ meeting_id: id, status: "failed", transcript_revision: 0 });
     const hook = await h.waitFor(async () => h.webhook.received.find((w) => w.body.data.meeting_id === id) ?? null);
     expect(hook.body.type).toBe("meeting.failed");
     expect(hook.body.data.error.code).toBe("waiting_room_timeout");
@@ -230,6 +240,41 @@ describe("failure path", () => {
     await h.vexa.control("jitsi", "EvictRoom", { status: "completed", completion_reason: "evicted" });
     const body = await waitStatus(id, "failed");
     expect(body.error.code).toBe("bot_removed");
+  });
+
+  test("failed webhook serializes only an allowlisted authored stored error", async () => {
+    const rawCode = "UNKNOWN_WEBHOOK_CODE_SENTINEL";
+    const hostileMessage = [
+      "https://private.invalid/meeting/WEBHOOK_URL_SENTINEL",
+      "provider-recording-WEBHOOK_RAW_ID_SENTINEL",
+      '{"detail":"WEBHOOK_PROVIDER_BODY_SENTINEL"}',
+      "sk-test-WEBHOOK_SECRET_SENTINEL",
+      "Error: WEBHOOK_EXCEPTION_SENTINEL",
+      "at privateFrame (/srv/private.ts:9:1) WEBHOOK_STACK_SENTINEL",
+    ].join(" ");
+    const created = await h.api("/v1/meetings", {
+      method: "POST",
+      json: { meeting_url: "https://meet.jit.si/SafeFailedWebhook", webhook_url: h.webhook.url },
+    });
+    const { id } = await created.json();
+    await waitStatus(id, "joining");
+    await h.ctx.db
+      .update(meetings)
+      .set({ status: "failed", errorCode: rawCode, errorMessage: hostileMessage })
+      .where(eq(meetings.id, id));
+    const stored = await getMeetingById(h.ctx, id);
+    expect(stored).not.toBeNull();
+    await enqueueMeetingWebhook(h.ctx, stored!, "meeting.failed");
+
+    const hook = await h.waitFor(
+      async () => h.webhook.received.find((w) => w.body.type === "meeting.failed" && w.body.data.meeting_id === id) ?? null,
+      { label: "safe failed webhook" },
+    );
+    expect(hook.body.data.error).toEqual({ code: "transcription_failed", message: "Transcription failed." });
+    const serializedError = JSON.stringify(hook.body.data.error);
+    for (const sentinel of [rawCode, "WEBHOOK_URL_SENTINEL", "WEBHOOK_RAW_ID_SENTINEL", "WEBHOOK_PROVIDER_BODY_SENTINEL", "WEBHOOK_SECRET_SENTINEL", "WEBHOOK_EXCEPTION_SENTINEL", "WEBHOOK_STACK_SENTINEL"]) {
+      expect(serializedError).not.toContain(sentinel);
+    }
   });
 });
 
