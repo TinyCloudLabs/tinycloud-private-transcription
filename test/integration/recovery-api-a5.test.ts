@@ -126,6 +126,32 @@ const recover = (id: string, key: string) => h.api(`/v1/meetings/${id}/recover`,
   json: { kind: "manual" },
 });
 
+const RACE_WAIT_MS = 1_000;
+
+async function within<T>(promise: Promise<T>, label: string, maxMs = RACE_WAIT_MS): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} exceeded ${maxMs}ms`)), maxMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function deferred() {
+  let resolve!: () => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function pauseAfterSelectingTableOnce<T extends object>(
   database: T,
   table: object,
@@ -185,6 +211,40 @@ function pauseAfterSelectingTableOnce<T extends object>(
     },
   });
   return { database: wrapped, entered, release };
+}
+
+function pauseTransactionAfterInvocation<T extends object>(
+  database: T,
+  invoked: () => boolean,
+): { database: T; entered: Promise<void>; release(): void } {
+  const entered = deferred();
+  const released = deferred();
+  let paused = false;
+  const wrapped = new Proxy(database, {
+    get(target, property) {
+      const value = Reflect.get(target, property, target);
+      if (property !== "transaction" || typeof value !== "function") {
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+      return async (callback: (transaction: unknown) => unknown, ...args: unknown[]) => {
+        try {
+          return await value.call(target, async (transaction: unknown) => {
+            const result = await callback(transaction);
+            if (!paused && invoked()) {
+              paused = true;
+              entered.resolve();
+              await released.promise;
+            }
+            return result;
+          }, ...args);
+        } catch (error) {
+          if (!paused) entered.reject(error);
+          throw error;
+        }
+      };
+    },
+  });
+  return { database: wrapped, entered: entered.promise, release: released.resolve };
 }
 
 async function waitForMeetingLockWait(maxMs = 250): Promise<boolean> {
@@ -589,6 +649,116 @@ describe("A5 authenticated capability and public recovery routes", () => {
       expect(providerCalls).toBe(2);
     } finally {
       h.ctx.vexa.deleteMeeting = originalDelete;
+    }
+  });
+
+  test("ordinary stop route deletion-first suppresses stopBot and keeps saga authority separate", async () => {
+    const id = await seed("in_progress");
+    const staleRead = pauseAfterSelectingTableOnce(h.ctx.db, meetings);
+    let ordinaryStopCalls = 0;
+    let sagaStopCalls = 0;
+    let sagaDeleteCalls = 0;
+    let queueCalls = 0;
+    const stopContext = {
+      ...h.ctx,
+      db: staleRead.database,
+      queue: { push: async () => { queueCalls += 1; } },
+      vexa: {
+        stopBot: async () => { ordinaryStopCalls += 1; return { status: "stopping" }; },
+      },
+    } as unknown as AppContext;
+    const deletionContext = {
+      ...h.ctx,
+      vexa: {
+        stopBot: async () => { sagaStopCalls += 1; return { status: "stopping" }; },
+        deleteMeeting: async () => { sagaDeleteCalls += 1; return { status: "deleted" }; },
+      },
+    } as unknown as AppContext;
+    const app = createApp(stopContext, { recoveryApiRuntime });
+    let stopping: Promise<Response> | null = null;
+    try {
+      stopping = Promise.resolve(app.request(`/v1/meetings/${id}/stop`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${h.apiKey}` },
+      }));
+      await within(staleRead.entered, "ordinary stop stale owner-scoped read");
+      await within(deleteMeetingById(deletionContext, "demo", id), "ordinary stop deletion-first commit");
+      staleRead.release();
+      const response = await within(stopping, "ordinary stop deletion-first response");
+
+      expect(ordinaryStopCalls).toBe(0);
+      expect(sagaStopCalls).toBe(1);
+      expect(sagaDeleteCalls).toBe(1);
+      expect(queueCalls).toBe(0);
+      expect(response.status).toBe(404);
+      const [tombstone] = await h.ctx.db.select().from(meetings).where(eq(meetings.id, id));
+      expect(tombstone).toMatchObject({ status: "cancelled", deletedAt: expect.any(Date) });
+    } finally {
+      staleRead.release();
+      if (stopping) await within(Promise.allSettled([stopping]), "ordinary stop deletion-first cleanup");
+    }
+  });
+
+  test("ordinary stop route invocation-first holds deletion only through handoff and never revives", async () => {
+    const id = await seed("in_progress");
+    const providerResponse = deferred();
+    const providerStarted = deferred();
+    let providerSettled = false;
+    let ordinaryStopCalls = 0;
+    let sagaStopCalls = 0;
+    let sagaDeleteCalls = 0;
+    let queueCalls = 0;
+    const handoff = pauseTransactionAfterInvocation(h.ctx.db, () => ordinaryStopCalls === 1);
+    const stopContext = {
+      ...h.ctx,
+      db: handoff.database,
+      queue: { push: async () => { queueCalls += 1; } },
+      vexa: {
+        stopBot: async () => {
+          ordinaryStopCalls += 1;
+          providerStarted.resolve();
+          await providerResponse.promise;
+          providerSettled = true;
+          return { status: "stopping" };
+        },
+      },
+    } as unknown as AppContext;
+    const deletionContext = {
+      ...h.ctx,
+      vexa: {
+        stopBot: async () => { sagaStopCalls += 1; return { status: "stopping" }; },
+        deleteMeeting: async () => { sagaDeleteCalls += 1; return { status: "deleted" }; },
+      },
+    } as unknown as AppContext;
+    const app = createApp(stopContext, { recoveryApiRuntime });
+    let stopping: Promise<Response> | null = null;
+    let deleting: Promise<void> | null = null;
+    try {
+      stopping = Promise.resolve(app.request(`/v1/meetings/${id}/stop`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${h.apiKey}` },
+      }));
+      await within(providerStarted.promise, "ordinary stop provider invocation");
+      deleting = deleteMeetingById(deletionContext, "demo", id);
+      expect(await waitForMeetingLockWait()).toBe(true);
+      handoff.release();
+      await within(deleting, "ordinary stop post-handoff deletion");
+      expect(providerSettled).toBe(false);
+      expect(ordinaryStopCalls).toBe(1);
+      expect(sagaStopCalls).toBe(1);
+      expect(sagaDeleteCalls).toBe(1);
+      providerResponse.resolve();
+      await within(stopping, "ordinary stop invocation-first response");
+      expect(queueCalls).toBe(0);
+      const [tombstone] = await h.ctx.db.select().from(meetings).where(eq(meetings.id, id));
+      expect(tombstone).toMatchObject({ status: "cancelled", deletedAt: expect.any(Date) });
+    } finally {
+      handoff.release();
+      providerResponse.resolve();
+      const cleanup: Promise<unknown>[] = [];
+      if (stopping) cleanup.push(stopping);
+      if (deleting) cleanup.push(deleting);
+      await within(Promise.allSettled(cleanup), "ordinary stop invocation-first cleanup");
     }
   });
 

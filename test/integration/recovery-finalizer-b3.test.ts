@@ -11,6 +11,7 @@ import {
   recoveryOperations,
   transcriptionChunks,
   transcripts,
+  webhookDeliveries,
 } from "../../src/db/schema.ts";
 import type { ProviderV2Outcome } from "../../src/providers/transcription/provider-v2.ts";
 import {
@@ -525,6 +526,59 @@ function pauseTransactionAfterInvocation<T extends object>(
   return { database: wrapped, entered: entered.promise, release: released.resolve };
 }
 
+function failTransactionBeforeInvocation<T extends object>(
+  database: T,
+  ordinal: number,
+): { database: T; invocationBegan: () => boolean } {
+  let transactions = 0;
+  let invocationBegan = false;
+  const wrapped = new Proxy(database, {
+    get(target, property) {
+      const value = Reflect.get(target, property, target);
+      if (property !== "transaction" || typeof value !== "function") {
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+      return (...args: unknown[]) => {
+        transactions += 1;
+        if (transactions === ordinal) {
+          invocationBegan = false;
+          throw new Error("synthetic pre-invocation transaction failure");
+        }
+        return value.apply(target, args);
+      };
+    },
+  });
+  return { database: wrapped, invocationBegan: () => invocationBegan };
+}
+
+function loseCommitAcknowledgementAfterInvocation<T extends object>(
+  database: T,
+  invoked: () => boolean,
+): { database: T; acknowledgementLost: Promise<void>; invocationBegan: () => boolean } {
+  const acknowledgementLost = deferred();
+  let failed = false;
+  let invocationBegan = false;
+  const wrapped = new Proxy(database, {
+    get(target, property) {
+      const value = Reflect.get(target, property, target);
+      if (property !== "transaction" || typeof value !== "function") {
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+      return async (...args: unknown[]) => {
+        const result = await value.apply(target, args);
+        if (!failed && invoked()) {
+          failed = true;
+          invocationBegan = true;
+          acknowledgementLost.resolve();
+          throw new Error("synthetic lost transaction commit acknowledgement");
+        }
+        return result;
+      };
+    },
+  });
+  return { database: wrapped, acknowledgementLost: acknowledgementLost.promise, invocationBegan: () => invocationBegan };
+}
+
 async function waitForMutualDatabaseBlocking(maxMs = 200): Promise<boolean> {
   const deadline = performance.now() + maxMs;
   do {
@@ -780,6 +834,78 @@ describe("B3 durable chunk finalizer", () => {
       reservedCostMicrounits: 0n, spentCostMicrounits: 250n,
     });
     expect(chunk).toMatchObject({ leaseOwnerHash: null, leaseExpiresAt: null, leaseFence: 3, state: "failed" });
+  });
+
+  test("provider-v2 records a pre-invocation call-start failure as not started and not spent", async () => {
+    const fixture = await seedOperation(250);
+    const boundaries = fixtureBoundaries(fixture, [success("must not dispatch")]);
+    expect((await oneStep(fixture, boundaries))?.result).toBe("continued");
+    expect((await oneStep(fixture, boundaries))?.result).toBe("continued");
+    // The fourth transaction commits the durable dispatching marker; the fifth is call start.
+    const failedStart = failTransactionBeforeInvocation(db, 5);
+
+    await within(oneStep(fixture, boundaries, { database: failedStart.database }), "pre-invocation finalizer settlement");
+
+    expect(failedStart.invocationBegan()).toBe(false);
+    expect(boundaries.dispatches).toHaveLength(0);
+    const [operation] = await db.select().from(recoveryOperations).where(eq(recoveryOperations.id, fixture.operationId));
+    const [ledger] = await db.select().from(providerCallLedger).where(eq(providerCallLedger.operationId, fixture.operationId));
+    const [bucket] = await db.select().from(projectRecoveryBuckets).where(eq(projectRecoveryBuckets.projectId, fixture.projectId));
+    expect(operation).toMatchObject({ reservedCalls: 0, spentCalls: 0, submittedAudioMs: 0, spentCostMicrounits: 0n });
+    expect(ledger).toMatchObject({ dispatchState: "not_dispatched", outcomeCode: "not_dispatched", statusClass: "none", spentCostMicrounits: 0n });
+    expect(bucket).toMatchObject({ reservedCalls: 0, spentCalls: 0, reservedAudioMs: 0, spentAudioMs: 0, spentCostMicrounits: 0n });
+  });
+
+  test("provider-v2 lost commit acknowledgement after invocation is spent unknown exactly once and never redispatched", async () => {
+    const fixture = await seedOperation(250);
+    const boundaries = fixtureBoundaries(fixture, []);
+    const lateResponse = deferred();
+    const invoked = deferred();
+    boundaries.provider.dispatch = async (input) => {
+      boundaries.dispatches.push({ attempt: input.attempt, audioMs: input.submittedAudioMs, bytes: input.audio.byteLength });
+      if (boundaries.dispatches.length === 1) {
+        invoked.resolve();
+        await lateResponse.promise;
+        return success("late ambiguous response must not publish");
+      }
+      return success("redispatch must not occur");
+    };
+    expect((await oneStep(fixture, boundaries))?.result).toBe("continued");
+    expect((await oneStep(fixture, boundaries))?.result).toBe("continued");
+    const lostAck = loseCommitAcknowledgementAfterInvocation(db, () => boundaries.dispatches.length === 1);
+    let finalizing: ReturnType<typeof oneStep> | null = null;
+    try {
+      finalizing = oneStep(fixture, boundaries, { database: lostAck.database });
+      await within(invoked.promise, "provider-v2 ambiguous invocation");
+      await within(lostAck.acknowledgementLost, "provider-v2 lost commit acknowledgement");
+      expect(lostAck.invocationBegan()).toBe(true);
+      lateResponse.resolve();
+      await within(finalizing, "provider-v2 ambiguous settlement");
+      await isolated.sql`
+        update outbox_jobs set available_at = clock_timestamp()
+        where operation_id = ${fixture.operationId} and state = 'pending'
+      `;
+      await isolated.sql`
+        update transcription_chunks set next_eligible_at = clock_timestamp()
+        where operation_id = ${fixture.operationId} and state = 'retry_scheduled'
+      `;
+      await within(drive(fixture, boundaries), "provider-v2 ambiguous successor drive", 5_000);
+    } finally {
+      lateResponse.resolve();
+      if (finalizing) await within(Promise.allSettled([finalizing]), "provider-v2 lost-ack cleanup");
+    }
+
+    expect(boundaries.dispatches).toHaveLength(1);
+    expect(await db.select().from(transcripts).where(eq(transcripts.meetingId, fixture.meetingId))).toHaveLength(0);
+    expect(await db.select().from(webhookDeliveries).where(eq(webhookDeliveries.meetingId, fixture.meetingId))).toHaveLength(0);
+    const [meeting] = await db.select().from(meetings).where(eq(meetings.id, fixture.meetingId));
+    const [operation] = await db.select().from(recoveryOperations).where(eq(recoveryOperations.id, fixture.operationId));
+    const [ledger] = await db.select().from(providerCallLedger).where(eq(providerCallLedger.operationId, fixture.operationId));
+    const [bucket] = await db.select().from(projectRecoveryBuckets).where(eq(projectRecoveryBuckets.projectId, fixture.projectId));
+    expect(meeting).toMatchObject({ transcriptRevision: 0 });
+    expect(operation).toMatchObject({ reservedCalls: 0, spentCalls: 1, submittedAudioMs: 250, reservedCostMicrounits: 0n, spentCostMicrounits: 250n });
+    expect(ledger).toMatchObject({ dispatchState: "spent", outcomeCode: "unknown", statusClass: "none", spentCostMicrounits: 250n });
+    expect(bucket).toMatchObject({ reservedCalls: 0, spentCalls: 1, reservedAudioMs: 0, spentAudioMs: 250, reservedCostMicrounits: 0n, spentCostMicrounits: 250n });
   });
 
   test("provider-v2 recording preparation is suppressed when deletion commits after the stale pre-read", async () => {

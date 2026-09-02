@@ -3,9 +3,10 @@ import { eq } from "drizzle-orm";
 import type { AppContext } from "../../src/context.ts";
 import { createDb } from "../../src/db/client.ts";
 import { runMigrations } from "../../src/db/migrate.ts";
-import { meetings, transcripts } from "../../src/db/schema.ts";
+import { meetings, transcripts, webhookDeliveries } from "../../src/db/schema.ts";
 import { normalizeSegments } from "../../src/domain/transcript.ts";
 import { silentLogger } from "../../src/log.ts";
+import { TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
 import { TranscriptionFallbackError } from "../../src/providers/transcription/types.ts";
 import { VexaNativeProvider } from "../../src/providers/transcription/vexa-native.ts";
 import type { VexaTranscriptionResponse } from "../../src/providers/vexa/types.ts";
@@ -39,6 +40,28 @@ function deferred() {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+function pauseNextTinfoilBackoff() {
+  const entered = deferred();
+  const released = deferred();
+  const original = globalThis.setTimeout;
+  let intercepted = false;
+  globalThis.setTimeout = ((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
+    if (!intercepted && delay === 250) {
+      intercepted = true;
+      return original(() => {
+        entered.resolve();
+        void released.promise.then(() => callback(...args));
+      }, 0);
+    }
+    return original(callback, delay, ...args);
+  }) as typeof setTimeout;
+  return {
+    entered: entered.promise,
+    release: released.resolve,
+    restore() { globalThis.setTimeout = original; },
+  };
 }
 
 let isolated: IsolatedDatabase;
@@ -222,6 +245,50 @@ function pauseTransactionAfterInvocation<T extends object>(
   return { database: wrapped, entered: entered.promise, release: released.resolve };
 }
 
+function pauseObservedTransactionAfterInvocation<T extends object>(
+  database: T,
+  invoked: () => boolean,
+): { database: T; enable(): void; entries(): number; entered: Promise<void>; release(): void } {
+  const entered = deferred();
+  const released = deferred();
+  let enabled = false;
+  let entries = 0;
+  let paused = false;
+  const wrapped = new Proxy(database, {
+    get(target, property) {
+      const value = Reflect.get(target, property, target);
+      if (property !== "transaction" || typeof value !== "function") {
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+      return async (callback: (transaction: unknown) => unknown, ...args: unknown[]) => {
+        const observed = enabled;
+        if (observed) entries += 1;
+        try {
+          return await value.call(target, async (transaction: unknown) => {
+            const result = await callback(transaction);
+            if (observed && !paused && invoked()) {
+              paused = true;
+              entered.resolve();
+              await released.promise;
+            }
+            return result;
+          }, ...args);
+        } catch (error) {
+          if (observed && !paused) entered.reject(error);
+          throw error;
+        }
+      };
+    },
+  });
+  return {
+    database: wrapped,
+    enable() { enabled = true; },
+    entries: () => entries,
+    entered: entered.promise,
+    release: released.resolve,
+  };
+}
+
 async function waitForDeletionLock(maxMs = 250): Promise<boolean> {
   const deadline = performance.now() + maxMs;
   do {
@@ -239,8 +306,180 @@ async function waitForDeletionLock(maxMs = 250): Promise<boolean> {
   return false;
 }
 
+async function waitForMeetingLockWaiters(expected: number, maxMs = 2_000): Promise<number> {
+  const deadline = performance.now() + maxMs;
+  let count = 0;
+  do {
+    const [blocked] = await isolated.sql<{ count: number }[]>`
+      select count(*)::int as count
+      from pg_stat_activity
+      where datname = current_database()
+        and wait_event_type = 'Lock'
+        and cardinality(pg_blocking_pids(pid)) > 0
+        and query ilike '%meetings%for update%'
+    `;
+    count = blocked?.count ?? 0;
+    if (count >= expected) return count;
+    await Bun.sleep(2);
+  } while (performance.now() < deadline);
+  return count;
+}
+
+async function beforePollingSettles<T>(signal: Promise<T>, polling: Promise<void>, label: string): Promise<T> {
+  return Promise.race([
+    signal,
+    polling.then(
+      () => Promise.reject(new Error(`${label}: polling settled before the barrier`)),
+      (error) => Promise.reject(error),
+    ),
+  ]);
+}
+
 async function expectNoTranscript(meetingId: string) {
   expect(await db.select().from(transcripts).where(eq(transcripts.meetingId, meetingId))).toHaveLength(0);
+}
+
+async function syntheticAudioFixture(): Promise<Uint8Array> {
+  return new Uint8Array(await Bun.file("fixtures/alice.wav").arrayBuffer());
+}
+
+function retainedRecording() {
+  return {
+    id: 7,
+    source: "bot",
+    status: "completed",
+    meeting_id: sequence,
+    media_files: [{ id: 8, type: "audio", format: "wav", is_final: true }],
+  };
+}
+
+async function runTinfoilSiblingDeletionRace(mode: "whole" | "turns") {
+  const fixture = await seedMeeting("in_progress");
+  const audio = await syntheticAudioFixture();
+  const firstResponse = deferred();
+  let tinfoilFetchCalls = 0;
+  let settledResponses = 0;
+  let entriesAtFirstTransport = 0;
+  let queueCalls = 0;
+  let fallbackCalls = 0;
+  const handoff = pauseObservedTransactionAfterInvocation(db, () => tinfoilFetchCalls > 0);
+  const provider = new TinfoilTranscriptionProvider({
+    baseUrl: "https://synthetic.invalid",
+    apiKey: "synthetic",
+    model: "synthetic",
+    segmentation: mode,
+    wholeChunkSec: 1,
+    concurrency: 3,
+    maxRetries: 0,
+    fetch: (async () => {
+      const call = ++tinfoilFetchCalls;
+      if (call === 1) entriesAtFirstTransport = handoff.entries();
+      await firstResponse.promise;
+      settledResponses += 1;
+      return Response.json({ text: `synthetic ${mode} ${call}`, language: "en" });
+    }) as unknown as typeof fetch,
+  });
+  const recording = retainedRecording();
+  const startEpoch = 1_767_225_600;
+  const segments = mode === "turns" ? [
+    { start: startEpoch + 0.5, end: startEpoch + 1.2, text: "first", language: "en", speaker: "One", completed: true },
+    { start: startEpoch + 2.1, end: startEpoch + 2.9, text: "second", language: "en", speaker: "Two", completed: true },
+    { start: startEpoch + 3.8, end: startEpoch + 4.7, text: "third", language: "en", speaker: "Three", completed: true },
+  ] : undefined;
+  const originalFallback = VexaNativeProvider.prototype.transcribe;
+  VexaNativeProvider.prototype.transcribe = async function (input) {
+    fallbackCalls += 1;
+    return originalFallback.call(this, input);
+  };
+  const ctx = fakeContext({
+    db: handoff.database,
+    queue: { push: async () => { queueCalls += 1; } },
+    vexa: {
+      getTranscript: async () => completedTranscript({
+        end_time: "2026-01-01T00:00:06.000Z",
+        recordings: [recording],
+        ...(segments ? { segments } : {}),
+      }),
+      recordingMaster: async () => ({ raw_url: "/synthetic.wav" }),
+      fetchBytes: async () => {
+        handoff.enable();
+        return { bytes: audio, contentType: "audio/wav" };
+      },
+    },
+  });
+  ctx.transcription = provider;
+  let polling: Promise<void> | null = null;
+  let deleting: Promise<void> | null = null;
+  try {
+    polling = handleMeetingPoll(ctx, fixture.meetingId);
+    await within(
+      beforePollingSettles(handoff.entered, polling, `${mode} first Tinfoil handoff`),
+      `${mode} first Tinfoil handoff`,
+      5_000,
+    );
+
+    let siblingWaiters = 0;
+    if (entriesAtFirstTransport > 1) {
+      siblingWaiters = await within(
+        beforePollingSettles(
+          waitForMeetingLockWaiters(entriesAtFirstTransport - 1),
+          polling,
+          `${mode} sibling lock waiters`,
+        ),
+        `${mode} sibling lock waiters`,
+        5_000,
+      );
+      expect(siblingWaiters).toBeGreaterThanOrEqual(entriesAtFirstTransport - 1);
+    }
+
+    deleting = deleteMeetingById(deletionContext(), fixture.projectId, fixture.meetingId);
+    const deletionWaiters = await within(
+      beforePollingSettles(
+        waitForMeetingLockWaiters(entriesAtFirstTransport),
+        polling,
+        `${mode} deletion lock waiter`,
+      ),
+      `${mode} deletion lock waiter`,
+      5_000,
+    );
+    expect(deletionWaiters).toBeGreaterThanOrEqual(entriesAtFirstTransport);
+
+    handoff.release();
+    await within(deleting, `${mode} deletion after first Tinfoil handoff`, 5_000);
+    console.info("A5 protected Tinfoil sibling race", {
+      mode,
+      entriesAtFirstTransport,
+      siblingWaiters,
+      deletionWaiters,
+      tinfoilFetchCalls,
+      settledResponses,
+    });
+    expect(settledResponses).toBe(0);
+    expect(tinfoilFetchCalls).toBe(1);
+    expect(entriesAtFirstTransport).toBe(1);
+
+    firstResponse.resolve();
+    await within(polling, `${mode} Tinfoil response settlement`, 5_000);
+    expect(tinfoilFetchCalls).toBe(1);
+    expect(settledResponses).toBe(1);
+    expect(handoff.entries()).toBeGreaterThan(entriesAtFirstTransport);
+    expect(queueCalls).toBe(0);
+    expect(fallbackCalls).toBe(0);
+    await expectNoTranscript(fixture.meetingId);
+    expect(await db.select().from(webhookDeliveries).where(eq(webhookDeliveries.meetingId, fixture.meetingId))).toHaveLength(0);
+    const [deleted] = await db.select().from(meetings).where(eq(meetings.id, fixture.meetingId));
+    expect(deleted?.deletedAt).toBeInstanceOf(Date);
+    expect(deleted?.status).toBe("cancelled");
+    expect(deleted?.transcriptionAttempts).toBe(0);
+  } finally {
+    handoff.release();
+    firstResponse.resolve();
+    VexaNativeProvider.prototype.transcribe = originalFallback;
+    const cleanup: Promise<unknown>[] = [];
+    if (polling) cleanup.push(polling);
+    if (deleting) cleanup.push(deleting);
+    await within(Promise.allSettled(cleanup), `${mode} Tinfoil sibling-race cleanup`, 5_000);
+  }
 }
 
 describe("A5 legacy meeting-job external call fences", () => {
@@ -364,7 +603,7 @@ describe("A5 legacy meeting-job external call fences", () => {
       starting = handleMeetingStart(ctx, fixture.meetingId);
       await db.update(meetings).set({ status: "cancelled" }).where(eq(meetings.id, fixture.meetingId));
       createResponse.resolve();
-      await within(secondRead.entered, "cleanup stop cancelled-row read");
+      await within(secondRead.entered, "cleanup stop cancelled-row read", 2_000);
       await within(deleteMeetingById(deletionContext(), fixture.projectId, fixture.meetingId), "cleanup stop deletion commit");
       secondRead.release();
       await within(starting, "cleanup stop settlement");
@@ -499,6 +738,153 @@ describe("A5 legacy meeting-job external call fences", () => {
     } finally {
       response.resolve();
       if (polling) await within(Promise.allSettled([polling]), "primary transcription cleanup");
+    }
+  });
+
+  test("concrete Tinfoil delayed audio cannot begin its first HTTP attempt after deletion commits", async () => {
+    const fixture = await seedMeeting("in_progress");
+    const audio = await syntheticAudioFixture();
+    const captureEntered = deferred();
+    const captureResponse = deferred();
+    let tinfoilFetchCalls = 0;
+    const provider = new TinfoilTranscriptionProvider({
+      baseUrl: "https://synthetic.invalid",
+      apiKey: "synthetic",
+      model: "synthetic",
+      segmentation: "whole",
+      fetch: (async () => {
+        tinfoilFetchCalls += 1;
+        return Response.json({ text: "must not dispatch" });
+      }) as unknown as typeof fetch,
+    });
+    const recording = retainedRecording();
+    const ctx = fakeContext({
+      vexa: {
+        getTranscript: async () => completedTranscript({ recordings: [recording] }),
+        recordingMaster: async () => ({ raw_url: "/synthetic.wav" }),
+        fetchBytes: async () => {
+          captureEntered.resolve();
+          await captureResponse.promise;
+          return { bytes: audio, contentType: "audio/wav" };
+        },
+      },
+    });
+    ctx.transcription = provider;
+    let polling: Promise<void> | null = null;
+    try {
+      polling = handleMeetingPoll(ctx, fixture.meetingId);
+      await within(captureEntered.promise, "Tinfoil delayed audio readiness");
+      await within(deleteMeetingById(deletionContext(), fixture.projectId, fixture.meetingId), "Tinfoil delayed audio deletion commit");
+      captureResponse.resolve();
+      await within(polling, "Tinfoil delayed audio settlement", 5_000);
+      expect(tinfoilFetchCalls).toBe(0);
+      await expectNoTranscript(fixture.meetingId);
+    } finally {
+      captureResponse.resolve();
+      if (polling) await within(Promise.allSettled([polling]), "Tinfoil delayed audio cleanup", 5_000);
+    }
+  });
+
+  test("concrete Tinfoil whole-file workers do not start later chunks after deletion", async () => {
+    const fixture = await seedMeeting("in_progress");
+    const audio = await syntheticAudioFixture();
+    const firstTransport = deferred();
+    const firstResponse = deferred();
+    let tinfoilFetchCalls = 0;
+    const provider = new TinfoilTranscriptionProvider({
+      baseUrl: "https://synthetic.invalid",
+      apiKey: "synthetic",
+      model: "synthetic",
+      segmentation: "whole",
+      wholeChunkSec: 5,
+      concurrency: 1,
+      fetch: (async () => {
+        tinfoilFetchCalls += 1;
+        if (tinfoilFetchCalls === 1) {
+          firstTransport.resolve();
+          await firstResponse.promise;
+        }
+        return Response.json({ text: `synthetic chunk ${tinfoilFetchCalls}` });
+      }) as unknown as typeof fetch,
+    });
+    const recording = retainedRecording();
+    const ctx = fakeContext({
+      vexa: {
+        getTranscript: async () => completedTranscript({ recordings: [recording] }),
+        recordingMaster: async () => ({ raw_url: "/synthetic.wav" }),
+        fetchBytes: async () => ({ bytes: audio, contentType: "audio/wav" }),
+      },
+    });
+    ctx.transcription = provider;
+    let polling: Promise<void> | null = null;
+    try {
+      polling = handleMeetingPoll(ctx, fixture.meetingId);
+      await within(firstTransport.promise, "Tinfoil first whole-chunk transport", 5_000);
+      await within(deleteMeetingById(deletionContext(), fixture.projectId, fixture.meetingId), "Tinfoil whole-chunk deletion while response pending");
+      expect(tinfoilFetchCalls).toBe(1);
+      firstResponse.resolve();
+      await within(polling, "Tinfoil whole-chunk settlement", 5_000);
+      expect(tinfoilFetchCalls).toBe(1);
+      await expectNoTranscript(fixture.meetingId);
+    } finally {
+      firstResponse.resolve();
+      if (polling) await within(Promise.allSettled([polling]), "Tinfoil whole-chunk cleanup", 5_000);
+    }
+  });
+
+  test("concrete Tinfoil whole-file concurrency 3 serializes protected sibling handoffs across deletion", async () => {
+    await runTinfoilSiblingDeletionRace("whole");
+  });
+
+  test("concrete Tinfoil turn concurrency 3 serializes protected sibling handoffs across deletion", async () => {
+    await runTinfoilSiblingDeletionRace("turns");
+  });
+
+  test("concrete Tinfoil turn retry revalidates after controlled backoff and deletion", async () => {
+    const fixture = await seedMeeting("in_progress");
+    const audio = await syntheticAudioFixture();
+    const backoff = pauseNextTinfoilBackoff();
+    let tinfoilFetchCalls = 0;
+    let queueCalls = 0;
+    const provider = new TinfoilTranscriptionProvider({
+      baseUrl: "https://synthetic.invalid",
+      apiKey: "synthetic",
+      model: "synthetic",
+      segmentation: "turns",
+      concurrency: 1,
+      maxRetries: 1,
+      fetch: (async () => {
+        tinfoilFetchCalls += 1;
+        return tinfoilFetchCalls === 1
+          ? new Response("retry", { status: 503 })
+          : Response.json({ text: "retry must not dispatch" });
+      }) as unknown as typeof fetch,
+    });
+    const recording = retainedRecording();
+    const ctx = fakeContext({
+      queue: { push: async () => { queueCalls += 1; } },
+      vexa: {
+        getTranscript: async () => completedTranscript({ recordings: [recording] }),
+        recordingMaster: async () => ({ raw_url: "/synthetic.wav" }),
+        fetchBytes: async () => ({ bytes: audio, contentType: "audio/wav" }),
+      },
+    });
+    ctx.transcription = provider;
+    let polling: Promise<void> | null = null;
+    try {
+      polling = handleMeetingPoll(ctx, fixture.meetingId);
+      await within(backoff.entered, "Tinfoil controlled retry backoff", 5_000);
+      expect(tinfoilFetchCalls).toBe(1);
+      await within(deleteMeetingById(deletionContext(), fixture.projectId, fixture.meetingId), "Tinfoil retry deletion commit");
+      backoff.release();
+      await within(polling, "Tinfoil retry settlement", 5_000);
+      expect(tinfoilFetchCalls).toBe(1);
+      expect(queueCalls).toBe(0);
+      await expectNoTranscript(fixture.meetingId);
+    } finally {
+      backoff.release();
+      backoff.restore();
+      if (polling) await within(Promise.allSettled([polling]), "Tinfoil retry cleanup", 5_000);
     }
   });
 

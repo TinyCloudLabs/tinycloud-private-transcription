@@ -169,7 +169,7 @@ export function meetingRoutes(ctx: AppContext, recoveryRuntime: RecoveryApiRunti
   r.post("/:id/stop", requireMeetingScope("meetings:write"), async (c) => {
     requireMeetingId(c.req.param("id"));
     const meeting = await getMeeting(ctx, c.get("project").id, c.req.param("id"));
-    const updated = await stopMeeting(ctx, meeting);
+    const updated = await stopMeeting(ctx, c.get("project").id, meeting.id);
     return c.json({ id: updated.id, status: updated.status });
   });
 

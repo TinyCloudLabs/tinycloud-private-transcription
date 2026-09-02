@@ -8,7 +8,11 @@ import { adaptVexaSegments, completionReasonOf } from "../providers/vexa/adapter
 import { validateLegacyVexaTranscriptCoverage } from "../providers/vexa/fallback-coverage.ts";
 import type { VexaRecording, VexaTranscriptionResponse } from "../providers/vexa/types.ts";
 import { toVexaPlatform } from "../providers/vexa/platform-map.ts";
-import { TranscriptionFallbackError, type AudioBlob } from "../providers/transcription/types.ts";
+import {
+  TranscriptionFallbackError,
+  TranscriptionTransportFenceLost,
+  type AudioBlob,
+} from "../providers/transcription/types.ts";
 import { VexaNativeProvider } from "../providers/transcription/vexa-native.ts";
 import { failMeeting, getMeetingById, storeTranscript, transition } from "../services/meetings.ts";
 import { enqueueMeetingWebhook } from "../webhooks/dispatcher.ts";
@@ -35,7 +39,7 @@ async function startLegacyMeetingCall<T>(
     async (_tx, meeting) => meeting.activeRecoveryOperationId === null ? true : null,
     invoke,
   );
-  if (started.kind === "stale") throw new LegacyMeetingCallFenceLost();
+  if (started.kind !== "started") throw new LegacyMeetingCallFenceLost();
   return started.response;
 }
 
@@ -371,6 +375,16 @@ async function finalize(
         throw new ApiError(failure.code, failure.message);
       }
     },
+    startTransportAttempt: async <T>(invoke: () => Promise<T>) => {
+      const started = await startMeetingFencedCall(
+        ctx.db,
+        meeting.id,
+        async (_tx, live) => live.activeRecoveryOperationId === null ? true : null,
+        invoke,
+      );
+      if (started.kind !== "started") throw new TranscriptionTransportFenceLost();
+      return { response: started.response };
+    },
   };
   const ownPositiveNumber = (value: unknown, key: string): number | null => {
     if (!value || typeof value !== "object") return null;
@@ -438,6 +452,9 @@ async function finalize(
     let transcript;
     let provider = primary;
     try {
+      // Preserve the legacy orchestration handoff for provider-neutral ordering. Concrete batch
+      // transports still reacquire the authoritative fence through input.startTransportAttempt at
+      // every paid/network attempt; this wrapper cannot authorize later chunks or retries.
       transcript = await startLegacyMeetingCall(ctx, meeting.id, () => ctx.transcription.transcribe(input));
       const stats = safeProviderStats((ctx.transcription as { lastStats?: Record<string, unknown> }).lastStats);
       ctx.log.info("transcript finalized", {
@@ -475,7 +492,7 @@ async function finalize(
     const { meeting: done, changed } = await transition(ctx, meeting, "completed");
     if (changed) await enqueueMeetingWebhook(ctx, done, "meeting.completed");
   } catch (e) {
-    if (e instanceof LegacyMeetingCallFenceLost) return;
+    if (e instanceof LegacyMeetingCallFenceLost || e instanceof TranscriptionTransportFenceLost) return;
     const retryable = isRetryableTranscriptionError(e);
     const attempts = meeting.transcriptionAttempts + 1;
     if (retryable && attempts < MAX_TRANSCRIPTION_ATTEMPTS) {

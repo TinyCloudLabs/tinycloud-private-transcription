@@ -5,7 +5,14 @@ import type { VexaTranscriptionSegment } from "../vexa/types.ts";
 import { validateVexaTurnFallbackCoverage } from "../vexa/fallback-coverage.ts";
 import { decodeToPcm, rmsDbfs, sliceToWav, type Pcm16 } from "./audio.ts";
 import { mergeTurns, type Turn } from "./turns.ts";
-import { TranscriptionFallbackError, type AudioBlob, type TranscriptionInput, type TranscriptionProvider } from "./types.ts";
+import {
+  TranscriptionFallbackError,
+  TranscriptionTransportFenceLost,
+  type AudioBlob,
+  type StartTranscriptionTransportAttempt,
+  type TranscriptionInput,
+  type TranscriptionProvider,
+} from "./types.ts";
 
 export type TinfoilSegmentation = "turns" | "whole";
 
@@ -40,6 +47,11 @@ export interface TinfoilOptions {
   /** Turn-mode: recordings quieter than this (RMS dBFS) are treated as the known silent-tap capture. */
   silenceDbfs?: number;
   ffmpegPath?: string;
+}
+
+function effectiveWorkerCount(configured: number | undefined, workItems: number, protectedTransport: boolean): number {
+  const concurrency = protectedTransport ? 1 : configured ?? 3;
+  return Math.max(1, Math.min(concurrency, workItems));
 }
 
 /** OpenAI-compatible response from POST /v1/audio/transcriptions (`json` or `verbose_json`). */
@@ -128,13 +140,22 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     let calls = 0;
     let next = 0;
     let stopped = false;
-    const workers = Array.from({ length: Math.max(1, Math.min(this.opts.concurrency ?? 3, chunks.length)) }, async () => {
+    const workers = Array.from({
+      length: effectiveWorkerCount(this.opts.concurrency, chunks.length, input.startTransportAttempt !== undefined),
+    }, async () => {
       while (!stopped && next < chunks.length) {
         const i = next++;
         const chunk = chunks[i]!;
         const filename = chunks.length === 1 ? audio.filename.replace(/\.[^.]+$/, ".wav") : `chunk-${i + 1}.wav`;
         try {
-          bodies[i] = await this.post(sliceToWav(pcm, chunk.from, chunk.to), filename, "audio/wav", input.language, 0);
+          bodies[i] = await this.post(
+            sliceToWav(pcm, chunk.from, chunk.to),
+            filename,
+            "audio/wav",
+            input.language,
+            0,
+            input.startTransportAttempt,
+          );
           calls++;
         } catch (error) {
           stopped = true;
@@ -207,13 +228,22 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     let permanent = 0;
     let calls = 0;
     let next = 0;
-    const workers = Array.from({ length: Math.max(1, Math.min(this.opts.concurrency ?? 3, eligible.length)) }, async () => {
-      while (next < eligible.length) {
+    let stopped = false;
+    const workers = Array.from({
+      length: effectiveWorkerCount(this.opts.concurrency, eligible.length, input.startTransportAttempt !== undefined),
+    }, async () => {
+      while (!stopped && next < eligible.length) {
         const i = next++;
         const c = eligible[i]!;
         const wav = sliceToWav(pcm, c.from, c.to);
         try {
-          const { body, attempts } = await this.postWithRetry(wav, `turn-${i + 1}.wav`, "audio/wav", input.language);
+          const { body, attempts } = await this.postWithRetry(
+            wav,
+            `turn-${i + 1}.wav`,
+            "audio/wav",
+            input.language,
+            input.startTransportAttempt,
+          );
           calls += attempts;
           results[i] = { text: body.text ?? "", language: body.language ?? null };
           log?.debug("transcription_turn_completed", {
@@ -226,6 +256,10 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
             chars: results[i]!.text.length,
           });
         } catch (e) {
+          if (e instanceof TranscriptionTransportFenceLost) {
+            stopped = true;
+            throw e;
+          }
           calls += (e as { attempts?: number }).attempts ?? 1;
           failed++;
           if (e instanceof ApiError && (e.code === "provider_unavailable" || e.code === "provider_timeout")) {
@@ -244,7 +278,10 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
         }
       }
     });
-    await Promise.all(workers);
+    const settled = await Promise.allSettled(workers);
+    const fenceLoss = settled.find((result): result is PromiseRejectedResult =>
+      result.status === "rejected" && result.reason instanceof TranscriptionTransportFenceLost);
+    if (fenceLoss) throw fenceLoss.reason;
     this.calls += calls;
     this.lastStats = { mode: "turns", audio_seconds: round(pcm.durationSec), audio_duration_ms: audioDurationMs, turns: cuts.length, transcribed: eligible.length - failed, skipped_short: skipped, failed, calls };
 
@@ -286,13 +323,19 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
 
   // ---- HTTP -----------------------------------------------------------------------------------
 
-  private async postWithRetry(bytes: Uint8Array, filename: string, contentType: string, language: string | null) {
+  private async postWithRetry(
+    bytes: Uint8Array,
+    filename: string,
+    contentType: string,
+    language: string | null,
+    startTransportAttempt?: StartTranscriptionTransportAttempt,
+  ) {
     const maxRetries = this.opts.maxRetries ?? 2;
     let attempt = 0;
     for (;;) {
       attempt++;
       try {
-        const body = await this.post(bytes, filename, contentType, language, attempt - 1);
+        const body = await this.post(bytes, filename, contentType, language, attempt - 1, startTransportAttempt);
         return { body, attempts: attempt };
       } catch (e) {
         const retryable = e instanceof ApiError && (e.code === "provider_unavailable" || e.code === "provider_timeout");
@@ -305,7 +348,14 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     }
   }
 
-  private async post(bytes: Uint8Array, filename: string, contentType: string, language: string | null, _attempt: number): Promise<OpenAIVerboseTranscription> {
+  private async post(
+    bytes: Uint8Array,
+    filename: string,
+    contentType: string,
+    language: string | null,
+    _attempt: number,
+    startTransportAttempt?: StartTranscriptionTransportAttempt,
+  ): Promise<OpenAIVerboseTranscription> {
     const form = new FormData();
     form.set("model", this.opts.model);
     form.set("response_format", this.opts.responseFormat ?? "json");
@@ -314,13 +364,18 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
 
     let res: Response;
     try {
-      res = await this.fetchImpl(`${this.opts.baseUrl.replace(/\/$/, "")}/v1/audio/transcriptions`, {
+      const invoke = () => this.fetchImpl(`${this.opts.baseUrl.replace(/\/$/, "")}/v1/audio/transcriptions`, {
         method: "POST",
         headers: { Authorization: `Bearer ${this.opts.apiKey}` },
         body: form,
         signal: AbortSignal.timeout(this.opts.timeoutMs ?? 120_000),
       });
+      const response = startTransportAttempt
+        ? (await startTransportAttempt(invoke)).response
+        : Promise.resolve(invoke());
+      res = await response;
     } catch (e) {
+      if (e instanceof TranscriptionTransportFenceLost) throw e;
       const timeout = e instanceof Error && e.name === "TimeoutError";
       throw new ApiError(
         timeout ? "provider_timeout" : "provider_unavailable",

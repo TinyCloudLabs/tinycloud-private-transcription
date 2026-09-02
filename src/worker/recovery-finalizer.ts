@@ -512,6 +512,7 @@ async function planStep(
       (authority) => input.recording.prepare(authority),
     );
     if (started.kind === "stale") return "stale";
+    if (started.kind !== "started") throw new Error("recording preparation call-start acknowledgement failed");
     prepared = await started.response;
   } catch {
     return terminal(input, "recording_undecodable");
@@ -1191,6 +1192,7 @@ async function dispatchStep(
       (authority) => input.recording.encode(authority),
     );
     if (started.kind === "stale") return "stale";
+    if (started.kind !== "started") throw new Error("recording encoding call-start acknowledgement failed");
     encoded = await started.response;
   } catch {
     encoded = { audio: new Uint8Array(), contentType: "" };
@@ -1273,6 +1275,7 @@ async function dispatchStep(
   input.fault?.("after_dispatch_marked");
 
   let providerResult: DurableProviderAttemptResult;
+  let callStartUnknown = false;
   try {
     const started = await startMeetingFencedCall(
       input.db,
@@ -1294,8 +1297,42 @@ async function dispatchStep(
       (authority) => input.provider.dispatch(authority),
     );
     if (started.kind === "stale") return "stale";
-    const injected = await started.response;
-    providerResult = canonicalProviderAttemptResult(injected) ?? { outcome: spentPersistenceUnknown() };
+    if (started.kind === "not_started") {
+      return input.db.transaction(async (tx) => {
+        const context = await lockContext(tx, input);
+        if (!context) return "stale";
+        const locked = await lockChunkBeforeLedger(tx, context.operation.id, ledgerId, "dispatching");
+        if (!locked?.chunk) return "stale";
+        await finishUnspentReservation(tx, locked.ledger, false);
+        const [reset] = await tx.update(transcriptionChunks).set({
+          state: "planned",
+          providerCallLedgerId: null,
+          nextEligibleAt: null,
+          updatedAt: sql`clock_timestamp()`,
+        }).where(and(
+          eq(transcriptionChunks.id, locked.chunk.id),
+          eq(transcriptionChunks.state, "dispatching"),
+          eq(transcriptionChunks.providerCallLedgerId, locked.ledger.id),
+        )).returning({ id: transcriptionChunks.id });
+        if (!reset) throw new Error("durable provider not-started chunk reset mismatch");
+        await schedule(
+          tx,
+          ids,
+          context,
+          `not-started:${locked.chunk.id}:${locked.ledger.attempt}`,
+          context.databaseNow,
+          locked.chunk.id,
+        );
+        return "continued";
+      });
+    }
+    if (started.kind === "ambiguous") {
+      callStartUnknown = true;
+      providerResult = { outcome: spentPersistenceUnknown() };
+    } else {
+      const injected = await started.response;
+      providerResult = canonicalProviderAttemptResult(injected) ?? { outcome: spentPersistenceUnknown() };
+    }
   } catch {
     providerResult = { outcome: thrownTransport() };
   }
@@ -1331,6 +1368,7 @@ async function dispatchStep(
       outcome: providerResult.outcome,
       retryAfterMs: providerResult.retryAfterMs,
       checkpoint,
+      unknown: callStartUnknown,
     });
   });
   if (checkpoint && settled === "continued") input.fault?.("after_checkpoint");
@@ -1478,6 +1516,7 @@ async function fallbackStep(
       (authority) => input.fallback!.coverage(authority),
     );
     if (started.kind === "stale") return "stale";
+    if (started.kind !== "started") throw new Error("fallback coverage call-start acknowledgement failed");
     rawCoverage = await started.response;
   } catch {
     return terminal(input, "persistence_failed");

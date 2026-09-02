@@ -24,6 +24,7 @@ import {
   serializeMeetingRecovery,
 } from "../api/recovery-contract.ts";
 import { reconcileTerminalProviderReservations } from "../worker/outbox.ts";
+import { startMeetingFencedCall } from "../worker/meeting-call-fence.ts";
 
 export interface CreateMeetingInput {
   meeting_url: string;
@@ -184,18 +185,60 @@ export async function storeTranscript(
   });
 }
 
-/** Idempotent stop: cancels before admission, otherwise asks Vexa to leave and moves to processing. */
-export async function stopMeeting(ctx: AppContext, meeting: MeetingRow): Promise<MeetingRow> {
-  const status = meeting.status as MeetingStatus;
-  if (isTerminal(status) || status === "processing") return meeting;
-  await stopInVexa(ctx, meeting);
-  if (status === "in_progress") {
-    const { meeting: updated } = await transition(ctx, meeting, "processing");
-    await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id });
-    return updated;
+/** Idempotent owner-scoped stop. The provider handoff and every post-I/O effect revalidate liveness. */
+export async function stopMeeting(ctx: AppContext, projectId: string, meetingId: string): Promise<MeetingRow> {
+  const started = await startMeetingFencedCall(
+    ctx.db,
+    meetingId,
+    async (_tx, meeting) => meeting.projectId === projectId
+      ? {
+          meeting,
+          shouldStop: !isTerminal(meeting.status as MeetingStatus) && meeting.status !== "processing",
+        }
+      : null,
+    async (authority) => {
+      if (authority.shouldStop) await stopInVexa(ctx, authority.meeting);
+      return authority.meeting;
+    },
+  );
+  if (started.kind === "stale" || started.kind === "not_started") {
+    throw new ApiError("meeting_not_found", "No such meeting.");
   }
-  const { meeting: updated } = await transition(ctx, meeting, "cancelled");
-  return updated;
+  if (started.kind === "ambiguous") {
+    throw new ApiError("provider_unavailable", "Could not confirm the capture provider stop handoff.");
+  }
+  // Only a positively acknowledged commit may use the response. The transaction below then locks
+  // the owner-scoped live row again before status or queue publication.
+  await started.response;
+
+  return ctx.db.transaction(async (tx) => {
+    const [meeting] = await tx.select().from(meetings).where(and(
+      eq(meetings.id, meetingId),
+      eq(meetings.projectId, projectId),
+      isNull(meetings.deletedAt),
+    )).for("update");
+    if (!meeting) throw new ApiError("meeting_not_found", "No such meeting.");
+    const status = meeting.status as MeetingStatus;
+    if (isTerminal(status) || status === "processing") return meeting;
+
+    const nextStatus: MeetingStatus = status === "in_progress" ? "processing" : "cancelled";
+    if (!canTransition(status, nextStatus)) return meeting;
+    const now = new Date();
+    const [updated] = await tx.update(meetings).set({
+      status: nextStatus,
+      ...(!meeting.endedAt ? { endedAt: now } : {}),
+    }).where(and(
+      eq(meetings.id, meeting.id),
+      eq(meetings.projectId, projectId),
+      eq(meetings.status, meeting.status),
+      isNull(meetings.deletedAt),
+    )).returning();
+    if (!updated) throw new ApiError("meeting_not_found", "No such meeting.");
+    if (nextStatus === "processing") {
+      await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id });
+    }
+    return updated;
+  });
 }
 
 export type RecoverDisposition = "already_completed" | "already_active";
@@ -370,6 +413,8 @@ async function finishCaptureDeletion(
   target: DeletionTarget | null,
 ): Promise<void> {
   if (target) {
+    // Explicit deletion-saga authority: the row is already tombstoned, so this cleanup must not use
+    // the live-meeting fence that protects ordinary stop calls.
     await stopInVexa(ctx, {
       id: meetingId,
       status: "cancelled",

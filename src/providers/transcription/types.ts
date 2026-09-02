@@ -7,6 +7,21 @@ export interface AudioBlob {
   contentType: string;
 }
 
+export class TranscriptionTransportFenceLost extends Error {
+  constructor() {
+    super("Transcription transport authority was lost before handoff");
+    this.name = "TranscriptionTransportFenceLost";
+  }
+}
+
+export interface TranscriptionTransportAttempt<T> {
+  readonly response: Promise<T>;
+}
+
+export type StartTranscriptionTransportAttempt = <T>(
+  invoke: () => Promise<T>,
+) => Promise<TranscriptionTransportAttempt<T>>;
+
 export interface TranscriptionInput {
   meetingId: string;
   /** Language requested at meeting creation, if any. */
@@ -15,6 +30,8 @@ export interface TranscriptionInput {
   vexaSegments: VexaTranscriptionSegment[];
   /** Lazily fetches persisted meeting audio, or null when none exists. */
   fetchAudio: () => Promise<AudioBlob | null>;
+  /** Revalidates this meeting immediately around each concrete paid/network transport handoff. */
+  startTransportAttempt?: StartTranscriptionTransportAttempt;
 }
 
 export interface TranscriptionProvider {
