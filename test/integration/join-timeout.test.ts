@@ -45,6 +45,7 @@ describe("join deadline", () => {
       { label: "meeting.failed webhook" },
     );
     expect(hook.body.data.error.code).toBe("meeting_join_failed");
+    expect(hook.body.data.capture.stop_requested_by).toBe("join_deadline");
   });
 
   test("stuck in waiting_for_admission -> failed waiting_room_timeout", async () => {

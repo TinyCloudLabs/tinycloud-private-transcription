@@ -89,10 +89,10 @@ export function meetingRoutes(ctx: AppContext) {
   r.get("/:id/transcript", async (c) => {
     const meeting = await getMeeting(ctx, c.get("project").id, c.req.param("id"));
     if (meeting.status === "failed" || meeting.status === "cancelled") {
-      return c.json({ meeting_id: meeting.id, status: meeting.status }, 200);
+      return c.json({ meeting_id: meeting.id, status: meeting.status, ...(meeting.captureDiagnostics ? { capture: meeting.captureDiagnostics } : {}) }, 200);
     }
     const transcript = meeting.status === "completed" ? await getTranscript(ctx, meeting.id) : null;
-    if (!transcript) return c.json({ meeting_id: meeting.id, status: meeting.status }, 202);
+    if (!transcript) return c.json({ meeting_id: meeting.id, status: meeting.status, ...(meeting.captureDiagnostics ? { capture: meeting.captureDiagnostics } : {}) }, 202);
     return c.json(serializeTranscript(meeting, transcript));
   });
 

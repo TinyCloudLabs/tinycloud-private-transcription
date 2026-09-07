@@ -11,6 +11,7 @@ import { TranscriptionFallbackError, type AudioBlob } from "../providers/transcr
 import { VexaNativeProvider } from "../providers/transcription/vexa-native.ts";
 import { failMeeting, getMeetingById, storeTranscript, transition } from "../services/meetings.ts";
 import { enqueueMeetingWebhook } from "../webhooks/dispatcher.ts";
+import { observeCapture, recordCapture } from "../services/capture.ts";
 import { eq } from "drizzle-orm";
 import { meetings } from "../db/schema.ts";
 
@@ -31,8 +32,8 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
       bot_name: meeting.botName ?? undefined,
       language: meeting.language ?? undefined,
       // Vexa otherwise applies its ten-minute deployment fallback. Pin every TinyCloud meeting to
-      // our configurable remote-participant audio silence window so both platforms release a bot
-      // after the last human leaves.
+      // our configurable audio-silence window. This can expire with humans still connected;
+      // participant presence does not veto Vexa's silence verdict.
       automatic_leave: { max_time_left_alone: ctx.config.vexa.maxTimeLeftAloneMs },
       // Batch providers (Tinfoil) transcribe the persisted recording: ask for it explicitly (Vexa's
       // default is true, but a deployment can flip RECORDING_ENABLED off). Do not also run Vexa's
@@ -41,12 +42,18 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
       ...(needsRecording(ctx) ? { recording_enabled: true, transcribe_enabled: false } : {}),
     });
     const vexaNativeMeetingId = created.native_meeting_id ?? meeting.vexaNativeMeetingId;
-    const { meeting: updated, changed } = await transition(ctx, meeting, "joining", {
+    const dispatched = await recordCapture(ctx, meeting, {
+      silence_timeout_ms: ctx.config.vexa.maxTimeLeftAloneMs,
+      ...(needsRecording(ctx) ? { recording_requested: true } : {}),
+      live_transcription_requested: !needsRecording(ctx),
+    });
+    const { meeting: updated, changed } = await transition(ctx, dispatched, "joining", {
       vexaPlatform: created.platform ?? vexaPlatform,
       vexaNativeMeetingId,
       vexaBotId: created.bot_container_id ?? String(created.id),
     });
     if (changed) {
+      ctx.log.info("bot dispatched", { meetingId, botId: updated.vexaBotId, vexaMeetingId: created.id, platform: meeting.platform, provider: ctx.transcription.name, ...updated.captureDiagnostics });
       await ctx.queue.push({ type: "meeting.poll", meetingId }, ctx.config.vexa.pollIntervalMs);
       // Worker-side join deadline: Vexa's own awaiting_admission timeout is opaque; without this a
       // never-admitted bot leaves the meeting in joining/waiting_for_admission forever.
@@ -86,10 +93,11 @@ async function handleStartError(ctx: AppContext, meeting: MeetingRow, e: unknown
  * meeting_join_failed otherwise), its Vexa bot is stopped, and meeting.failed is emitted.
  */
 export async function handleJoinDeadline(ctx: AppContext, meetingId: string): Promise<void> {
-  const meeting = await getMeetingById(ctx, meetingId);
+  let meeting = await getMeetingById(ctx, meetingId);
   if (!meeting) return;
   const status = meeting.status as MeetingStatus;
   if (status !== "joining" && status !== "waiting_for_admission") return;
+  meeting = await recordCapture(ctx, meeting, { stop_requested_at: new Date().toISOString(), stop_requested_by: "join_deadline" });
   ctx.log.warn("join deadline exceeded; failing meeting", { meetingId, status, joinTimeoutSeconds: ctx.config.joinTimeoutSeconds });
   if (meeting.vexaPlatform && meeting.vexaNativeMeetingId) {
     await ctx.vexa.stopBot(meeting.vexaPlatform, meeting.vexaNativeMeetingId).catch((e) => {
@@ -115,6 +123,8 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
     vexa = await ctx.vexa.getTranscript(meeting.vexaPlatform, meeting.vexaNativeMeetingId);
   } catch (e) {
     if (e instanceof VexaHttpError && e.notFound) {
+      meeting = await recordCapture(ctx, meeting, { provider_record_missing_at: new Date().toISOString() });
+      ctx.log.warn("capture provider record missing", { meetingId, botId: meeting.vexaBotId });
       const { meeting: failed } = await failMeeting(ctx, meeting, "capture_failed", "The capture provider lost track of this meeting.");
       await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
       return;
@@ -123,6 +133,8 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
     await ctx.queue.push({ type: "meeting.poll", meetingId }, ctx.config.vexa.pollIntervalMs);
     return;
   }
+
+  meeting = await observeCapture(ctx, meeting, vexa);
 
   // completion_reason lives under `data` on transcript rows (top-level only on MeetingResponse rows).
   const reason = completionReasonOf(vexa);

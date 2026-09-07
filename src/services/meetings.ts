@@ -7,6 +7,7 @@ import { newMeetingId } from "../domain/ids.ts";
 import { detectPlatform, type Platform } from "../domain/platform.ts";
 import { canTransition, isTerminal, type MeetingStatus } from "../domain/state.ts";
 import type { NormalizedTranscript } from "../domain/transcript.ts";
+import { recordCapture } from "./capture.ts";
 import { VexaHttpError } from "../providers/vexa/client.ts";
 
 export interface CreateMeetingInput {
@@ -129,6 +130,7 @@ export async function transition(
     .returning();
   // If another writer moved it first, re-read and report unchanged.
   if (!row) return { meeting: (await getMeetingById(ctx, meeting.id)) ?? meeting, changed: false };
+  ctx.log.info("meeting status changed", { meetingId: row.id, from: meeting.status, to, completionReason: row.captureDiagnostics?.completion_reason ?? null });
   return { meeting: row, changed: true };
 }
 
@@ -161,6 +163,8 @@ export async function storeTranscript(
 export async function stopMeeting(ctx: AppContext, meeting: MeetingRow): Promise<MeetingRow> {
   const status = meeting.status as MeetingStatus;
   if (isTerminal(status) || status === "processing") return meeting;
+  meeting = await recordCapture(ctx, meeting, { stop_requested_at: new Date().toISOString(), stop_requested_by: "user" });
+  ctx.log.info("bot stop requested", { meetingId: meeting.id, status, botId: meeting.vexaBotId });
   await stopInVexa(ctx, meeting);
   if (status === "in_progress") {
     const { meeting: updated } = await transition(ctx, meeting, "processing");
@@ -272,6 +276,7 @@ export function serializeMeeting(m: MeetingRow, transcript: TranscriptRow | null
     ended_at: m.endedAt?.toISOString() ?? null,
     completed_at: m.completedAt?.toISOString() ?? null,
     metadata: m.metadata ?? {},
+    ...(m.captureDiagnostics ? { capture: m.captureDiagnostics } : {}),
     ...(transcript ? transcriptProviderFields(transcript) : {}),
     ...(status === "failed" && m.errorCode
       ? { error: { type: errorTypeFor(m.errorCode as ErrorCode), code: m.errorCode, message: m.errorMessage ?? "" } }
@@ -302,6 +307,7 @@ export function serializeTranscript(m: MeetingRow, t: TranscriptRow) {
     language: t.language,
     duration_seconds: t.durationSeconds,
     provider: t.provider,
+    ...(m.captureDiagnostics ? { capture: m.captureDiagnostics } : {}),
     ...(t.fallbackFrom ? { fallback_from: t.fallbackFrom, fallback_reason: t.fallbackReason } : {}),
     speakers: body.speakers,
     segments: body.segments,

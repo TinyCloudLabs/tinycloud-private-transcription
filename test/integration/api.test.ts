@@ -118,7 +118,7 @@ describe("happy path: create -> joined -> completed -> transcript + webhook", ()
     await waitStatus(id, "waiting_for_admission");
     const t = await h.api(`/v1/meetings/${id}/transcript`);
     expect(t.status).toBe(202);
-    expect(await t.json()).toEqual({ meeting_id: id, status: "waiting_for_admission" });
+    expect(await t.json()).toMatchObject({ meeting_id: id, status: "waiting_for_admission", capture: { provider_status: "awaiting_admission" } });
   });
 
   test("active -> in_progress with started_at; live segments do not complete it", async () => {
@@ -216,7 +216,7 @@ describe("failure path", () => {
     expect(body.error.message).not.toMatch(/awaiting_admission/);
     const t = await h.api(`/v1/meetings/${id}/transcript`);
     expect(t.status).toBe(200);
-    expect(await t.json()).toEqual({ meeting_id: id, status: "failed" });
+    expect(await t.json()).toMatchObject({ meeting_id: id, status: "failed", capture: { completion_reason: "awaiting_admission_timeout" } });
     const hook = await h.waitFor(async () => h.webhook.received.find((w) => w.body.data.meeting_id === id) ?? null);
     expect(hook.body.type).toBe("meeting.failed");
     expect(hook.body.data.error.code).toBe("waiting_room_timeout");
