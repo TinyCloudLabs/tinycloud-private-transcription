@@ -399,7 +399,8 @@ removal indicators. Also, its audio-ready flag is cleared only during capture te
 capture can remain marked ready. These are code-level failure mechanisms, not a diagnosis of
 any particular meeting without its matching logs.
 
-Deploy migration `0003_capture_diagnostics` before starting the updated worker/API. The API's
-`AUTO_MIGRATE` path applies it, but a worker started concurrently can race migration completion;
-run `bun run db:migrate` first for a coordinated rollout. No bot timeout behavior changes with
+The CVM compose file waits for the API's healthcheck before starting the worker. The API's
+`AUTO_MIGRATE` path applies migration `0003_capture_diagnostics` before listening, so this gate
+prevents the worker from querying the new column before migration completes. For workers started
+outside this compose file, run `bun run db:migrate` first. No bot timeout behavior changes with
 this diagnostics update. It does not reconstruct missing historical evidence or add diarization.

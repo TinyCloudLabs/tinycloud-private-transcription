@@ -27,6 +27,13 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
+    # The API listens only after migrations finish; gate worker startup on readiness.
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
     environment:
       PORT: "8080"
       DATABASE_URL: postgres://ptx:${POSTGRES_PASSWORD}@postgres:5432/ptx
@@ -75,7 +82,7 @@ services:
       - vexa-provision:/run/vexa:ro
     depends_on:
       api:
-        condition: service_started
+        condition: service_healthy
     networks: [ptx, vexa]
 
   postgres:
