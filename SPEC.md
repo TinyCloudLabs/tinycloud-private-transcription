@@ -55,8 +55,32 @@ Platform detection: meet.google.com→google_meet, zoom.us→zoom, teams.microso
 
 Webhook event: `{"id":"evt_…","type":"meeting.completed","created_at":"…","data":{"meeting_id":"…","metadata":{},"transcript_provider":"tinfoil"}}` (`data.fallback_from`/`data.fallback_reason` added when a fallback fired; `data.error` on `meeting.failed`).
 
+## Capture diagnostics
+
+Meeting reads and transcript responses include an optional `capture` object. Completed/failed
+webhooks include the same evidence. It is service-owned, stored in `meetings.capture_diagnostics`,
+and separate from caller-supplied `metadata`. Existing rows without evidence omit it.
+
+`capture` contains the dispatched `silence_timeout_ms`, recording/live-transcription request flags,
+provider meeting ID and status, `completion_reason`, `failure_stage`, `exit_code` when reported,
+provider start/end timestamps, observation timestamp, recording/segment counts, and up to 20
+sanitized status transitions. `stop_requested_at`/`stop_requested_by` record our stop intent
+(`user` or `join_deadline`); they do not replace the provider's actual departure reason.
+`provider_record_missing_at` records a provider 404.
+
+These fields describe capture independently of transcript success: `status: "completed"` can
+coexist with `capture.completion_reason: "evicted"` or `"left_alone"` after successful salvage.
+Missing reasons/exit codes remain null. Unrecognized provider enums become `unknown`.
+`audio_activity: "not_reported"` explicitly means the upstream API does not report PCM arrival
+or AudioContext health; zero transcript segments are not evidence of silence.
+
+Only operational fields are retained. Provider logs, error text, recording URLs, participant names,
+and conversation content are excluded. Access uses the existing project/meeting authorization.
+Capture observations are persisted/logged on provider status/reason/exit-code changes and at most
+once per minute otherwise while polling. Terminal evidence survives transcription retries.
+
 ## Persistence (Postgres)
-`meetings(id, project_id, meeting_url, platform, status, bot_name, vexa_native_meeting_id, vexa_bot_id, created_at, started_at, ended_at, completed_at, metadata, error_code, error_message, idempotency_key)`
+`meetings(id, project_id, meeting_url, platform, status, bot_name, vexa_native_meeting_id, vexa_bot_id, created_at, started_at, ended_at, completed_at, metadata, capture_diagnostics, error_code, error_message, idempotency_key)`
 `transcripts(meeting_id, language, duration_seconds, segments_json, provider, fallback_from, fallback_reason, created_at)`
 `webhook_deliveries(id, meeting_id, event_type, endpoint, attempt, status, response_code, created_at)`
 `api_keys(id, project_id, key_hash, scopes, created_at)`

@@ -372,3 +372,34 @@ curl -s -X POST $API/v1/meetings -H "Authorization: Bearer $KEY" -H 'Content-Typ
 ```
 
 Debug: `phala logs ptx-dev -f`, `phala logs ptx-dev --serial --tail 200` (image pull / compose errors), `phala ps ptx-dev`.
+
+
+### Diagnosing an unexpected bot departure
+
+Read `capture` from `GET /v1/meetings/{id}`. Keep it alongside transcript status: a completed
+transcript can be a salvaged recording from an interrupted call. `left_alone` is a detector verdict,
+not proof that participants stopped speaking. `evicted` is a removal-detector verdict, not proof
+that a person removed the bot. `stopped` can include a runtime termination signal; compare it
+with `stop_requested_by` rather than assuming the user pressed Stop. Exit 137 alone does not
+prove an out-of-memory kill; confirm runtime events.
+
+Search structured worker logs by `meetingId`: `bot dispatched` ties it to the bot/container and
+provider meeting IDs and captures the timeout/mode; `capture status observed` carries lifecycle
+evidence; `capture heartbeat` shows continued successful polling; `meeting status changed`
+connects capture with transcript finalization. Capture health is explicitly `not_reported` by this
+API. For continuous-speech incidents, correlate provider bot logs for:
+
+- `aloneness: silence verdict` (last detected audio time and silence window)
+- `Google Meet removal detected` (which selector matched)
+- `termination signal` and runtime/container exit events
+- `[PerSpeaker]` frame-flow/worklet/context logs
+
+The pinned Google Meet detector currently accepts generic alert dialogs and `Reconnecting` as
+removal indicators. Also, its audio-ready flag is cleared only during capture teardown; stalled
+capture can remain marked ready. These are code-level failure mechanisms, not a diagnosis of
+any particular meeting without its matching logs.
+
+Deploy migration `0003_capture_diagnostics` before starting the updated worker/API. The API's
+`AUTO_MIGRATE` path applies it, but a worker started concurrently can race migration completion;
+run `bun run db:migrate` first for a coordinated rollout. No bot timeout behavior changes with
+this diagnostics update. It does not reconstruct missing historical evidence or add diarization.

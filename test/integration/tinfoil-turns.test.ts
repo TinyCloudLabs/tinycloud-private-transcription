@@ -141,6 +141,7 @@ describe.skipIf(!ffmpeg || !existsSync("fixtures/bob.wav"))("tinfoil provider wi
     const transcript = await (await h.api(`/v1/meetings/${meetingId}/transcript`)).json();
     expect(transcript.provider).toBe("tinfoil");
     expect(transcript.text).toContain("quick brown fox");
+    expect(transcript.capture).toMatchObject({ completion_reason: "left_alone", transcript_segment_count: 0, recording_count: 1 });
   });
 
   test("failed(evicted) salvages retained audio instead of discarding it", async () => {
@@ -165,6 +166,7 @@ describe.skipIf(!ffmpeg || !existsSync("fixtures/bob.wav"))("tinfoil provider wi
     const transcript = await (await h.api(`/v1/meetings/${meetingId}/transcript`)).json();
     expect(transcript.provider).toBe("tinfoil");
     expect(transcript.text).toContain("quick brown fox");
+    expect(transcript.capture).toMatchObject({ completion_reason: "evicted", provider_status: "failed" });
     await h.waitFor(async () => h.webhook.received.find((w) => w.body.type === "meeting.completed" && w.body.data.meeting_id === meetingId) ?? null);
     expect(h.webhook.received.filter((w) => w.body.type === "meeting.completed" && w.body.data.meeting_id === meetingId)).toHaveLength(1);
     expect(h.webhook.received.filter((w) => w.body.type === "meeting.failed" && w.body.data.meeting_id === meetingId)).toHaveLength(0);
@@ -227,7 +229,7 @@ describe.skipIf(!ffmpeg || !existsSync("fixtures/bob.wav"))("tinfoil provider wi
       return body.status === "failed" ? body : null;
     }, { label: "silent recording failed" });
     expect(failed.error.code).toBe("transcription_failed");
-    expect(await (await h.api(`/v1/meetings/${meetingId}/transcript`)).json()).toEqual({ meeting_id: meetingId, status: "failed" });
+    expect(await (await h.api(`/v1/meetings/${meetingId}/transcript`)).json()).toMatchObject({ meeting_id: meetingId, status: "failed", capture: { completion_reason: "left_alone" } });
   });
 
   test("a transient retained-recording fetch outage retries instead of failing the meeting", async () => {

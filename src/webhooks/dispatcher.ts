@@ -19,6 +19,7 @@ export async function enqueueMeetingWebhook(ctx: AppContext, meeting: MeetingRow
       meeting_id: meeting.id,
       status: meeting.status,
       metadata: meeting.metadata ?? {},
+      ...(meeting.captureDiagnostics ? { capture: meeting.captureDiagnostics } : {}),
       ...(transcript ? transcriptProviderFields(transcript) : {}),
       ...(type === "meeting.failed" && meeting.errorCode
         ? { error: { code: meeting.errorCode, message: meeting.errorMessage ?? "" } }

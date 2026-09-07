@@ -1,3 +1,4 @@
+import type { CaptureDiagnostics } from "../domain/capture.ts";
 import { pgTable, text, timestamp, integer, jsonb, real, index, uniqueIndex } from "drizzle-orm/pg-core";
 
 export const projects = pgTable("projects", {
@@ -34,6 +35,7 @@ export const meetings = pgTable(
     endedAt: timestamp("ended_at", { withTimezone: true }),
     completedAt: timestamp("completed_at", { withTimezone: true }),
     metadata: jsonb("metadata").notNull().default({}),
+    captureDiagnostics: jsonb("capture_diagnostics").$type<CaptureDiagnostics>(),
     errorCode: text("error_code"),
     errorMessage: text("error_message"),
     idempotencyKey: text("idempotency_key"),
