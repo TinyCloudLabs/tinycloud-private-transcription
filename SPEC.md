@@ -68,6 +68,11 @@ sanitized status transitions. `stop_requested_at`/`stop_requested_by` record our
 (`user` or `join_deadline`); they do not replace the provider's actual departure reason.
 `provider_record_missing_at` records a provider 404.
 
+`failure_reason` is optional and currently allowlists `browser_crashed` and `browser_closed`.
+It is retained only when a failed provider reports that discriminator, without copying the raw
+error text. It can coexist with a completed, salvaged transcript and remains available if a later
+provider response omits it. An exit code alone does not infer a browser crash or an OOM kill.
+
 These fields describe capture independently of transcript success: `status: "completed"` can
 coexist with `capture.completion_reason: "evicted"` or `"left_alone"` after successful salvage.
 Missing reasons/exit codes remain null. Unrecognized provider enums become `unknown`.

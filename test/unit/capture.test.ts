@@ -3,6 +3,23 @@ import { captureObservation } from "../../src/domain/capture.ts";
 import type { VexaTranscriptionResponse } from "../../src/providers/vexa/types.ts";
 
 describe("capture diagnostics", () => {
+  test.each(["browser_crashed", "browser_closed"])("retains %s without exposing free-form error text", (reason) => {
+    const capture = captureObservation({
+      id: 1, status: "failed", segments: [],
+      data: { failure_stage: "active", last_error: { reason: `${reason}: private provider output`, exit_code: 1 } },
+    } as unknown as VexaTranscriptionResponse);
+    expect(capture.failure_reason).toBe(reason);
+    expect(capture.completion_reason).toBeNull();
+    expect(JSON.stringify(capture)).not.toContain("private provider output");
+  });
+
+  test("does not infer a browser crash from arbitrary error text or an exit code", () => {
+    const capture = captureObservation({
+      id: 1, status: "failed", segments: [],
+      data: { last_error: { reason: "someone mentioned browser_crashed: in private output", exit_code: 137 } },
+    } as unknown as VexaTranscriptionResponse);
+    expect(capture.failure_reason).toBeUndefined();
+  });
   test("retains operational evidence without copying private provider payloads", () => {
     const response = {
       id: 42, status: "failed", start_time: "2026-09-07T10:00:00Z", end_time: "2026-09-07T10:14:14Z",

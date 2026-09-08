@@ -23,6 +23,22 @@ async function status(id: string, wanted: string) {
 }
 
 describe("capture evidence survives transcript finalization", () => {
+  test("browser crash survives persistence and later responses that omit its reason", async () => {
+    const { id, nativeId } = await create("BrowserCrashEvidence");
+    await h.vexa.control("jitsi", nativeId, { status: "active" });
+    await status(id, "in_progress");
+    const raw = h.vexa.meetings.get(`jitsi/${nativeId}`)!;
+    raw.data = { last_error: { reason: "browser_crashed: PRIVATE PROVIDER OUTPUT", exit_code: 1 } };
+    await h.vexa.control("jitsi", nativeId, { status: "failed", failure_stage: "active" });
+    const m = await status(id, "failed");
+    expect(m.capture).toMatchObject({ failure_reason: "browser_crashed", exit_code: 1, completion_reason: null });
+    expect(JSON.stringify(m)).not.toContain("PRIVATE PROVIDER OUTPUT");
+    const previous = (await getMeetingById(h.ctx, id))!;
+    const response = await h.ctx.vexa.getTranscript("jitsi", nativeId);
+    response.data = {};
+    const after = await observeCapture(h.ctx, previous, response);
+    expect(after.captureDiagnostics?.failure_reason).toBe("browser_crashed");
+  });
   test.each(["left_alone", "evicted"] as const)("completed transcript retains %s in meeting, transcript, webhook and logs", async (reason) => {
     const { id, nativeId, metadata } = await create(`Evidence-${reason}`);
     await h.vexa.control("jitsi", nativeId, { status: "active" });
