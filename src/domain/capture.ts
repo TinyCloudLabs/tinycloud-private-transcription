@@ -13,6 +13,7 @@ export interface CaptureDiagnostics {
   provider_status?: string;
   completion_reason?: string | null;
   failure_stage?: string | null;
+  failure_reason?: "browser_crashed" | "browser_closed";
   exit_code?: number | null;
   observed_at?: string;
   started_at?: string | null;
@@ -34,11 +35,15 @@ const iso = (value: unknown): string | null => typeof value === "string" && Numb
 /** Allowlist the wire fields: data.last_error/error_details may contain private provider output. */
 export function captureObservation(vexa: VexaTranscriptionResponse, now = new Date()): CaptureDiagnostics {
   const code = vexa.data?.last_error?.exit_code;
+  // Read the producer's discriminator only; the text after it is private provider output.
+  const rawReason = vexa.data?.last_error?.reason;
+  const failure = typeof rawReason === "string" ? /^(browser_crashed|browser_closed):/.exec(rawReason)?.[1] : undefined;
   return {
     provider_meeting_id: vexa.id,
     provider_status: safeEnum(vexa.status, statuses),
     completion_reason: reasonOf(completionReasonOf(vexa)),
     failure_stage: vexa.data?.failure_stage == null ? null : safeEnum(vexa.data.failure_stage, statuses),
+    ...(failure && vexa.status === "failed" ? { failure_reason: failure as "browser_crashed" | "browser_closed" } : {}),
     exit_code: typeof code === "number" && Number.isSafeInteger(code) ? code : null,
     observed_at: now.toISOString(),
     started_at: iso(vexa.start_time),

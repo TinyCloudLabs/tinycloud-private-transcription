@@ -27,6 +27,7 @@ export async function observeCapture(ctx: AppContext, meeting: MeetingRow, vexa:
     if (!next.transitions?.length) delete next.transitions;
   }
   const changed = previous?.provider_status !== next.provider_status
+    || (next.failure_reason != null && previous?.failure_reason !== next.failure_reason)
     || (next.completion_reason != null && previous?.completion_reason !== next.completion_reason)
     || (next.exit_code != null && previous?.exit_code !== next.exit_code);
   const heartbeatDue = !previous?.observed_at || Date.now() - Date.parse(previous.observed_at) >= 60_000;

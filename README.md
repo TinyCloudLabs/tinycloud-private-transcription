@@ -383,6 +383,10 @@ that a person removed the bot. `stopped` can include a runtime termination signa
 with `stop_requested_by` rather than assuming the user pressed Stop. Exit 137 alone does not
 prove an out-of-memory kill; confirm runtime events.
 
+`capture.failure_reason` preserves explicit `browser_crashed` or `browser_closed` evidence from
+a failed provider, including after transcript salvage. It contains only that discriminator;
+private provider error text is not exposed. Older provider builds may omit it.
+
 Search structured worker logs by `meetingId`: `bot dispatched` ties it to the bot/container and
 provider meeting IDs and captures the timeout/mode; `capture status observed` carries lifecycle
 evidence; `capture heartbeat` shows continued successful polling; `meeting status changed`
