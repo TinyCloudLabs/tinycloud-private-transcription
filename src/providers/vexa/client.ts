@@ -124,8 +124,21 @@ export class VexaClient {
     return this.request<VexaRecordingMasterResponse>("GET", `/recordings/${recordingId}/master?type=${type}`);
   }
 
-  recordingSpeakerTimeline(recordingId: number) {
-    return this.request<unknown>("GET", `/recordings/${recordingId}/speaker-timeline`);
+  async recordingSpeakerTimeline(recordingId: number) {
+    // Audio finality can become visible just before its metadata object is durable. Give
+    // that upload a bounded chance to finish before the caller commits an unknown transcript.
+    const delays = [0, 250, 750];
+    for (let attempt = 0; ; attempt++) {
+      if (delays[attempt]) await Bun.sleep(delays[attempt]!);
+      try {
+        return await this.request<unknown>("GET", `/recordings/${recordingId}/speaker-timeline`);
+      } catch (error) {
+        const retryable = error instanceof VexaHttpError
+          ? [404, 422, 429].includes(error.status) || error.status >= 500
+          : error instanceof ApiError && ["provider_timeout", "provider_unavailable"].includes(error.code);
+        if (!retryable || attempt === delays.length - 1) throw error;
+      }
+    }
   }
 
   /** Fetch bytes from a gateway-relative path such as `raw_url` (needs X-API-Key). */

@@ -59,3 +59,34 @@ test("bad api key -> VexaHttpError 401", async () => {
   const bad = new VexaClient({ baseUrl: mock.baseUrl, apiKey: "nope" });
   await expect(bad.botStatus()).rejects.toMatchObject({ status: 401 });
 });
+
+test("recording timeline waits for metadata that becomes available after audio finality", async () => {
+  const timeline = { version: 1, recording_id: 77, intervals: [] };
+  let requests = 0;
+  const late = new VexaClient({ baseUrl: "http://capture.invalid", apiKey: "fixture", fetch: (async (url) => {
+    expect(String(url)).toBe("http://capture.invalid/recordings/77/speaker-timeline");
+    requests++;
+    if (requests === 1) return Response.json({ detail: "not available" }, { status: 404 });
+    if (requests === 2) return Response.json({ detail: "incomplete" }, { status: 422 });
+    return Response.json(timeline);
+  }) as typeof fetch });
+  expect(await late.recordingSpeakerTimeline(77)).toEqual(timeline);
+});
+
+test("missing metadata has a bounded retry budget and authorization errors are not retried", async () => {
+  let requests = 0;
+  const unavailable = new VexaClient({ baseUrl: "http://capture.invalid", apiKey: "fixture", fetch: (async (_url) => {
+    requests++;
+    return Response.json({ detail: "not available" }, { status: 404 });
+  }) as typeof fetch });
+  await expect(unavailable.recordingSpeakerTimeline(77)).rejects.toMatchObject({ status: 404, notFound: true });
+  expect(requests).toBe(3);
+
+  requests = 0;
+  const unauthorized = new VexaClient({ baseUrl: "http://capture.invalid", apiKey: "fixture", fetch: (async (_url) => {
+    requests++;
+    return Response.json({ detail: "denied" }, { status: 403 });
+  }) as typeof fetch });
+  await expect(unauthorized.recordingSpeakerTimeline(77)).rejects.toMatchObject({ status: 403 });
+  expect(requests).toBe(1);
+});

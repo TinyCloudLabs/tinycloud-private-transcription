@@ -234,6 +234,12 @@ IDs distinguish equal display names. Transcript segments optionally expose `attr
 `identified`, `unknown` or `overlap`. Unknown/overlap windows never inherit the dominant name.
 The normal concurrency and request-duration bounds apply. Failed inference windows reject the
 result for meeting-level retry, rather than finalizing a transcript with missing sections.
+Timeline fetches retry transient or incomplete uploads at most three times, with 250 ms and 750 ms
+delays, because the final audio receipt can precede its metadata. Authorization failures are not retried.
+PCM decoding preserves encoded timestamp gaps with FFmpeg's
+[`aresample` timestamp compensation](https://ffmpeg.org/ffmpeg-resampler.html#Resampler-Options), so later
+audio does not shift under an earlier speaker label. Inserted silence represents absent encoded audio;
+it does not recover speech that was never captured. Original recording bytes remain unchanged.
 
 Limits: when the recording timeline is absent (including older capture deployments), capture-only
 Tinfoil meetings still fall back to whole-file transcription with a generic speaker. Invalid metadata

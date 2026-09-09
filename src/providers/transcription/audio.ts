@@ -24,8 +24,12 @@ export async function decodeToPcm(bytes: Uint8Array, opts: { ffmpegPath?: string
   const outPath = join(dir, "out.s16le");
   try {
     await Bun.write(inPath, bytes as unknown as Uint8Array<ArrayBuffer>);
+    // Raw PCM has no timestamps. Fill encoded timestamp gaps before discarding the container,
+    // otherwise every later sample moves earlier than its recorded speaker evidence. Keep ffmpeg's
+    // default input-origin normalization (no -copyts); absolute container epochs must not turn into
+    // years of padding. async=1 fills/trims discontinuities without stretching speech.
     const proc = Bun.spawn(
-      [opts.ffmpegPath ?? "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", inPath, "-vn", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", String(rate), outPath],
+      [opts.ffmpegPath ?? "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", inPath, "-vn", "-af", "aresample=async=1:first_pts=0", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", String(rate), outPath],
       { stdin: "ignore", stdout: "ignore", stderr: "pipe" },
     );
     const [err, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
