@@ -27,6 +27,7 @@ interface MockMeeting extends VexaMeetingResponse {
   planned?: boolean;
   /** Persisted recording bytes (control: `recording_base64`); served like the real recordings API. */
   recording?: { bytes: Uint8Array; contentType: string };
+  speakerTimeline?: unknown;
 }
 
 export interface MockVexaOptions {
@@ -144,6 +145,11 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       ? [{ id: m.id * 1000, source: "bot", status: "completed", meeting_id: m.id, media_files: [{ id: m.id * 1000 + 1, type: "audio", format: "webm", is_final: true, file_size_bytes: m.recording.bytes.length }] }]
       : [];
   app.get("/recordings", (c) => c.json({ recordings: [...meetings.values()].flatMap(recordingsOf) }));
+  app.get("/recordings/:id/speaker-timeline", (c) => {
+    const m = [...meetings.values()].find((x) => x.id * 1000 === Number(c.req.param("id")));
+    if (!m?.recording || m.speakerTimeline === undefined) return c.json({ detail: "Speaker timeline not found" }, 404);
+    return c.json(m.speakerTimeline);
+  });
   app.get("/recordings/:id/master", (c) => {
     const m = [...meetings.values()].find((x) => x.id * 1000 === Number(c.req.param("id")));
     if (!m?.recording) return c.json({ detail: "Recording not found" }, 404);
@@ -168,10 +174,12 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       /** Base64 audio bytes to expose through the recordings API (WAV/webm). */
       recording_base64?: string;
       recording_content_type?: string;
+      speaker_timeline?: unknown;
     };
     if (body.recording_base64 !== undefined) {
       m.recording = { bytes: new Uint8Array(Buffer.from(body.recording_base64, "base64")), contentType: body.recording_content_type ?? "audio/wav" };
     }
+    if (body.speaker_timeline !== undefined) m.speakerTimeline = body.speaker_timeline;
     if (body.status) {
       m.status = body.status;
       if (["active", "completed"].includes(body.status) && !m.start_time) m.start_time = now();

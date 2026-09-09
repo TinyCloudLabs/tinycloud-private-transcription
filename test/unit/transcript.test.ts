@@ -29,3 +29,15 @@ test("normalizeSegments builds stable speaker ids, text, duration", () => {
   });
   expect(t.text).toBe("Sam: Hello there.\nBob: Second.\nUnknown: Unknown voice");
 });
+
+test("capture identities survive duplicate display names and name changes; uncertainty is retained", () => {
+  const t = normalizeSegments([
+    { start: 0, end: 1, text: "First", speaker: "Sam", speakerKey: "a", attribution: "identified" },
+    { start: 1, end: 2, text: "Second", speaker: "Sam", speakerKey: "b", attribution: "identified" },
+    { start: 2, end: 3, text: "Renamed", speaker: "Samuel", speakerKey: "a", attribution: "identified" },
+    { start: 3, end: 4, text: "Both", speaker: null, attribution: "overlap" },
+  ]);
+  expect(t.segments.map(s => s.speaker_id)).toEqual(["speaker_0", "speaker_1", "speaker_0", "speaker_2"]);
+  expect(t.segments[2]?.speaker_name).toBe("Samuel");
+  expect(t.segments[3]).toMatchObject({ speaker_name: "Unknown", attribution: "overlap" });
+});

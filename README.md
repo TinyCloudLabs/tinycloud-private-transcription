@@ -226,9 +226,18 @@ has to come from Vexa's speaker timeline. `src/providers/transcription/tinfoil.t
    `GET /v1/meetings/{id}` (once completed) and the `meeting.completed` webhook `data` carry
    `transcript_provider` plus `fallback_from`/`fallback_reason` when a fallback fired.
 
-Limits: capture-only Tinfoil meetings have no Vexa live speaker timeline, so `turns` safely falls back to
-whole-file transcription and the result has one generic speaker. This deliberately prioritizes preserving
-every spoken word over speaker attribution until capture-side diarization/backpressure is available.
+Recording-only Google Meet speaker attribution uses `GET /recordings/{id}/speaker-timeline` when
+provided by the capture stack. The adapter validates the exact recording identity and keeps offsets
+on the recorder's clock. Batch processing covers the entire recording, including short turns,
+unidentified windows and overlap; no audio is omitted because its speaker is unknown. Participant
+IDs distinguish equal display names. Transcript segments optionally expose `attribution` as
+`identified`, `unknown` or `overlap`. Unknown/overlap windows never inherit the dominant name.
+The normal concurrency and request-duration bounds apply. Failed inference windows reject the
+result for meeting-level retry, rather than finalizing a transcript with missing sections.
+
+Limits: when the recording timeline is absent (including older capture deployments), capture-only
+Tinfoil meetings still fall back to whole-file transcription with a generic speaker. Invalid metadata
+is logged and processed as unknown; recorded audio remains available.
 Long whole-file recordings are split at the quietest 100 ms window before each ten-minute limit; chunk
 failures return to the meeting-level delayed retry instead of blocking the serial worker with inline retries.
 Meetings created before capture-only mode may still have Vexa segments and use speaker-attributed turn mode.

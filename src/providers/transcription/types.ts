@@ -1,10 +1,13 @@
 import type { NormalizedTranscript } from "../../domain/transcript.ts";
 import type { VexaTranscriptionSegment } from "../vexa/types.ts";
+import type { SpeakerInterval } from "./speaker-timeline.ts";
 
 export interface AudioBlob {
   bytes: Uint8Array;
   filename: string;
   contentType: string;
+  /** Speaker evidence for THIS recording, normalized to its audio clock by the capture adapter. */
+  speakerTimeline?: readonly SpeakerInterval[];
 }
 
 export interface TranscriptionInput {

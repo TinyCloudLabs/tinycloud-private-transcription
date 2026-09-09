@@ -124,6 +124,10 @@ export class VexaClient {
     return this.request<VexaRecordingMasterResponse>("GET", `/recordings/${recordingId}/master?type=${type}`);
   }
 
+  recordingSpeakerTimeline(recordingId: number) {
+    return this.request<unknown>("GET", `/recordings/${recordingId}/speaker-timeline`);
+  }
+
   /** Fetch bytes from a gateway-relative path such as `raw_url` (needs X-API-Key). */
   async fetchBytes(gatewayPath: string, timeoutMs = 60_000): Promise<{ bytes: Uint8Array; contentType: string }> {
     const res = await this.raw("GET", gatewayPath, undefined, timeoutMs);

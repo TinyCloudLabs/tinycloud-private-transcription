@@ -2,7 +2,8 @@ import { ApiError } from "../../domain/errors.ts";
 import { normalizeSegments, type NormalizedTranscript, type RawSegment } from "../../domain/transcript.ts";
 import type { Logger } from "../../log.ts";
 import type { VexaTranscriptionSegment } from "../vexa/types.ts";
-import { decodeToPcm, rmsDbfs, sliceToWav, type Pcm16 } from "./audio.ts";
+import { decodeToPcm, pcmToWav, rmsDbfs, sliceToWav, type Pcm16 } from "./audio.ts";
+import { partitionSpeakerTimeline, type SpeakerInterval } from "./speaker-timeline.ts";
 import { mergeTurns, type Turn } from "./turns.ts";
 import { TranscriptionFallbackError, type AudioBlob, type TranscriptionInput, type TranscriptionProvider } from "./types.ts";
 
@@ -52,7 +53,7 @@ export interface OpenAIVerboseTranscription {
 }
 
 export interface TinfoilTurnStats {
-  mode: TinfoilSegmentation;
+  mode: TinfoilSegmentation | "timeline";
   audio_seconds: number;
   turns: number;
   transcribed: number;
@@ -86,13 +87,14 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     }
     const mode = this.opts.segmentation ?? "turns";
     const vexa = input.vexaSegments.filter((s) => s.completed !== false);
+    if (mode !== "whole" && audio.speakerTimeline !== undefined) return this.transcribeWhole(input, audio, vexa, true);
     if (mode === "whole" || vexa.length === 0) return this.transcribeWhole(input, audio, vexa);
     return this.transcribeTurns(input, audio, vexa);
   }
 
   // ---- whole-file mode -------------------------------------------------------------------------
 
-  private async transcribeWhole(input: TranscriptionInput, audio: AudioBlob, vexa: VexaTranscriptionSegment[]) {
+  private async transcribeWhole(input: TranscriptionInput, audio: AudioBlob, vexa: VexaTranscriptionSegment[], useTimeline = false) {
     let pcm: Pcm16;
     try {
       pcm = await decodeToPcm(audio.bytes, { ffmpegPath: this.opts.ffmpegPath });
@@ -108,7 +110,14 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     // submit bounded WAV chunks; a failed chunk fails the whole attempt so the worker retries without
     // ever storing a transcript with a silent hole.
     const chunkSec = Math.max(1, this.opts.wholeChunkSec ?? 600);
-    const chunks = quietBoundedChunks(pcm, chunkSec);
+    let chunks: AudioWindow[];
+    try {
+      chunks = useTimeline ? timelineAudioWindows(pcm, audio.speakerTimeline!, chunkSec) : quietBoundedChunks(pcm, chunkSec);
+    } catch (error) {
+      // Metadata is optional evidence. Its failure must not prevent transcribing the full audio.
+      this.opts.log?.warn("speaker timeline rejected; transcribing without attribution", { meetingId: input.meetingId, error: String(error) });
+      chunks = quietBoundedChunks(pcm, chunkSec).map(c => ({ ...c, attribution: "unknown", name: null, participantId: null }));
+    }
     const bodies: OpenAIVerboseTranscription[] = new Array(chunks.length);
     let calls = 0;
     let next = 0;
@@ -119,7 +128,10 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
         const chunk = chunks[i]!;
         const filename = chunks.length === 1 ? audio.filename.replace(/\.[^.]+$/, ".wav") : `chunk-${i + 1}.wav`;
         try {
-          bodies[i] = await this.post(sliceToWav(pcm, chunk.from, chunk.to), filename, "audio/wav", input.language, 0);
+          const wav = chunk.fromSample !== undefined && chunk.toSample !== undefined
+            ? pcmToWav(pcm.samples.subarray(chunk.fromSample, chunk.toSample), pcm.sampleRate)
+            : sliceToWav(pcm, chunk.from, chunk.to);
+          bodies[i] = await this.post(wav, filename, "audio/wav", input.language, 0);
           calls++;
         } catch (error) {
           stopped = true;
@@ -135,18 +147,19 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
 
     const raw: RawSegment[] = bodies.flatMap((body, i) => {
       const chunk = chunks[i]!;
-      const localDuration = body.duration ?? body.usage?.seconds ?? chunk.to - chunk.from;
+      const localDuration = useTimeline ? chunk.to - chunk.from : body.duration ?? body.usage?.seconds ?? chunk.to - chunk.from;
       const segs = body.segments?.length ? body.segments : [{ start: 0, end: localDuration, text: body.text }];
       return segs.map((s) => ({
         start: chunk.from + s.start,
         end: Math.min(chunk.to, chunk.from + s.end),
         text: s.text,
-        speaker: speakerByOverlap(chunk.from + s.start, chunk.from + s.end, vexa),
+        speaker: chunk.attribution ? chunk.name : speakerByOverlap(chunk.from + s.start, chunk.from + s.end, vexa),
+        ...(chunk.attribution ? { speakerKey: chunk.participantId, attribution: chunk.attribution } : {}),
         language: body.language ?? null,
       }));
     });
     this.calls += calls;
-    this.lastStats = { mode: "whole", audio_seconds: round(pcm.durationSec), turns: chunks.length, transcribed: chunks.length, skipped_short: 0, failed: 0, calls };
+    this.lastStats = { mode: useTimeline ? "timeline" : "whole", audio_seconds: round(pcm.durationSec), turns: chunks.length, transcribed: chunks.length, skipped_short: 0, failed: 0, calls };
     const t = normalizeSegments(raw, input.language ?? bodies.find((body) => body.language)?.language ?? null);
     return { ...t, duration_seconds: Math.max(t.duration_seconds, round(pcm.durationSec)) };
   }
@@ -278,6 +291,36 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
 }
 
 const round = (n: number) => Math.round(n * 1000) / 1000;
+
+interface AudioWindow {
+  from: number;
+  to: number;
+  fromSample?: number;
+  toSample?: number;
+  participantId?: string | null;
+  name?: string | null;
+  attribution?: SpeakerInterval["attribution"];
+}
+
+/** Partition the complete recording, then apply the existing request-duration bound to each
+ * interval. Adjacent cuts share integer sample boundaries: no padding duplicates or short-turn
+ * skips. Subarrays are views onto the one decoded PCM buffer, never additional audio copies.
+ */
+function timelineAudioWindows(pcm: Pcm16, timeline: readonly SpeakerInterval[], maxSec: number): AudioWindow[] {
+  return partitionSpeakerTimeline(pcm.durationSec, timeline).flatMap(interval => {
+    const startSample = Math.round(interval.start * pcm.sampleRate);
+    const endSample = Math.round(interval.end * pcm.sampleRate);
+    if (endSample <= startSample) return [];
+    const view: Pcm16 = { samples: pcm.samples.subarray(startSample, endSample), sampleRate: pcm.sampleRate,
+      durationSec: (endSample - startSample) / pcm.sampleRate };
+    return quietBoundedChunks(view, maxSec).map(c => {
+      const fromSample = startSample + Math.round(c.from * pcm.sampleRate);
+      const toSample = startSample + Math.round(c.to * pcm.sampleRate);
+      return { from: fromSample / pcm.sampleRate, to: toSample / pcm.sampleRate, fromSample, toSample,
+        participantId: interval.participantId, name: interval.name, attribution: interval.attribution };
+    });
+  });
+}
 
 /**
  * Split at the lowest-energy 100 ms window in the two seconds before each hard limit. Chunks stay

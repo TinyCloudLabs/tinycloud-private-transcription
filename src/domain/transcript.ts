@@ -1,8 +1,13 @@
+export type SpeakerAttribution = "identified" | "unknown" | "overlap";
+
 export interface RawSegment {
   start: number;
   end: number;
   text: string;
   speaker?: string | null;
+  /** Stable capture identity; display names alone cannot distinguish participants. */
+  speakerKey?: string | null;
+  attribution?: SpeakerAttribution;
   language?: string | null;
 }
 
@@ -17,6 +22,7 @@ export interface Segment {
   start: number;
   end: number;
   text: string;
+  attribution?: SpeakerAttribution;
 }
 export interface NormalizedTranscript {
   language: string;
@@ -37,10 +43,11 @@ export function normalizeSegments(raw: RawSegment[], languageHint?: string | nul
   const speakers: Speaker[] = [];
   const segments: Segment[] = sorted.map((s, i) => {
     const name = s.speaker && s.speaker.trim() ? s.speaker.trim() : UNKNOWN;
-    let id = speakerIds.get(name);
+    const key = s.speakerKey ? `participant:${s.speakerKey}` : `name:${name}`;
+    let id = speakerIds.get(key);
     if (!id) {
       id = `speaker_${speakers.length}`;
-      speakerIds.set(name, id);
+      speakerIds.set(key, id);
       speakers.push({ id, name });
     }
     return {
@@ -50,6 +57,7 @@ export function normalizeSegments(raw: RawSegment[], languageHint?: string | nul
       start: s.start,
       end: s.end,
       text: s.text.trim(),
+      ...(s.attribution ? { attribution: s.attribution } : {}),
     };
   });
   const language = languageHint || sorted.find((s) => s.language)?.language || "en";

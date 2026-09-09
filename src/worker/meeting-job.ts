@@ -4,6 +4,7 @@ import { ApiError } from "../domain/errors.ts";
 import type { Platform } from "../domain/platform.ts";
 import { isTerminal, mapVexaFailure, mapVexaStatus, type MeetingStatus } from "../domain/state.ts";
 import { VexaHttpError } from "../providers/vexa/client.ts";
+import { adaptSpeakerTimeline } from "../providers/vexa/speaker-timeline.ts";
 import { adaptVexaSegments, completionReasonOf } from "../providers/vexa/adapter.ts";
 import type { VexaRecording, VexaTranscriptionResponse } from "../providers/vexa/types.ts";
 import { toVexaPlatform } from "../providers/vexa/platform-map.ts";
@@ -318,7 +319,19 @@ async function fetchVexaAudio(ctx: AppContext, vexa: VexaTranscriptionResponse):
       ctx.log.warn("vexa recording looks silent; skipping", { vexaMeetingId: vexa.id, recordingId: rec.id, bytes: bytes.length, durationSec });
       continue;
     }
-    return { bytes, filename: "meeting.webm", contentType: contentType.startsWith("audio/") ? contentType : "audio/webm" };
+    let speakerTimeline: AudioBlob["speakerTimeline"];
+    if (vexa.platform === "google_meet") {
+      try {
+        speakerTimeline = adaptSpeakerTimeline(await ctx.vexa.recordingSpeakerTimeline(rec.id), rec.id);
+      } catch (error) {
+        if (!(error instanceof VexaHttpError && error.notFound)) {
+          speakerTimeline = [];
+          ctx.log.warn("recording speaker timeline unavailable; preserving unattributed audio", { recordingId: rec.id, error: String(error) });
+        }
+      }
+    }
+    return { bytes, filename: "meeting.webm", contentType: contentType.startsWith("audio/") ? contentType : "audio/webm",
+      ...(speakerTimeline === undefined ? {} : { speakerTimeline }) };
   }
   return null;
 }
