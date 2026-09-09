@@ -286,7 +286,19 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
       const detail = (await res.text().catch(() => "")).slice(0, 300);
       throw new ApiError("transcription_failed", `Transcription provider rejected the request (HTTP ${res.status}${detail ? `: ${detail}` : ""})`);
     }
-    return (await res.json()) as OpenAIVerboseTranscription;
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch {
+      throw new ApiError("transcription_failed", "Transcription provider returned invalid JSON");
+    }
+    // A successful HTTP status is not a successful transcription. In particular, undefined text
+    // is filtered out by normalization and used to silently erase a window from the saved result.
+    // Empty text is different: it is a valid response for an interval with no recognized speech.
+    if (!body || typeof body !== "object" || typeof (body as Record<string, unknown>).text !== "string") {
+      throw new ApiError("transcription_failed", "Transcription provider returned no transcription text");
+    }
+    return body as OpenAIVerboseTranscription;
   }
 }
 

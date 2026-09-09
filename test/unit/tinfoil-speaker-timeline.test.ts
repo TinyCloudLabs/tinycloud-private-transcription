@@ -3,7 +3,7 @@ import { pcmToWav, PCM_RATE } from "../../src/providers/transcription/audio.ts";
 import { TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
 import type { SpeakerInterval } from "../../src/providers/transcription/speaker-timeline.ts";
 
-function fixture(timeline: SpeakerInterval[], failAt = -1) {
+function fixture(timeline: SpeakerInterval[], failAt = -1, responseAtFailure?: unknown) {
   const samples = Int16Array.from({ length: PCM_RATE * 3 }, (_, i) => (i % 8000) - 4000);
   const uploaded: Int16Array[] = [];
   const provider = new TinfoilTranscriptionProvider({
@@ -12,7 +12,8 @@ function fixture(timeline: SpeakerInterval[], failAt = -1) {
       const file = (opts!.body as FormData).get("file") as File;
       const bytes = await file.arrayBuffer();
       uploaded.push(new Int16Array(bytes.slice(44)));
-      if (uploaded.length === failAt) return new Response("unavailable", { status: 503 });
+      if (uploaded.length === failAt) return responseAtFailure === undefined
+        ? new Response("unavailable", { status: 503 }) : Response.json(responseAtFailure);
       return Response.json({ text: `words ${uploaded.length}`, usage: { seconds: (bytes.byteLength - 44) / 2 / PCM_RATE } });
     }) as typeof fetch,
   });
@@ -55,4 +56,25 @@ test("a failed timeline window cannot finalize an incomplete transcript or conti
   await expect(f.provider.transcribe(f.input)).rejects.toMatchObject({ code: "provider_unavailable" });
   expect(f.uploaded).toHaveLength(2);
   expect(f.provider.lastStats).toBeNull();
+});
+
+test("HTTP success with missing transcription text cannot silently remove a speaker's words", async () => {
+  const f = fixture([
+    { start: 0, end: 1, participantId: "a", name: "Alice", attribution: "identified" },
+    { start: 1, end: 2, participantId: "b", name: "Bob", attribution: "identified" },
+  ], 2, { error: "synthetic malformed provider response" });
+  await expect(f.provider.transcribe(f.input)).rejects.toMatchObject({ code: "transcription_failed" });
+  expect(f.uploaded).toHaveLength(2);
+  expect(f.provider.lastStats).toBeNull();
+});
+
+test("an explicit empty transcription remains valid for a window with no recognized speech", async () => {
+  const f = fixture([
+    { start: 0, end: 1, participantId: "a", name: "Alice", attribution: "identified" },
+    { start: 1, end: 2, participantId: "b", name: "Bob", attribution: "identified" },
+  ], 2, { text: "", usage: { seconds: 1 } });
+  const result = await f.provider.transcribe(f.input);
+  expect(f.uploaded).toHaveLength(3);
+  expect(result.segments.map(s => s.text)).toEqual(["words 1", "words 3"]);
+  expect(result.duration_seconds).toBe(3);
 });
