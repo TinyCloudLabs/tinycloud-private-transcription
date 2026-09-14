@@ -17,9 +17,3 @@ infra/vexa/bot/ca.crt
 *.pem
 *.p12
 *.srl
-
-# smithers orchestration artifacts (local run state)
-.smithers/
-smithers.db
-smithers.db-shm
-smithers.db-wal
