@@ -1,0 +1,10 @@
+{
+  "_comment": "Replay timeline for scripts/signal-smoke.ts on rigs without Signal Desktop/PulseAudio. It captures no audio and is never evidence of live Signal capture.",
+  "admittedAfterMs": 500,
+  "activeAfterMs": 1500,
+  "endsAfterMs": 600000,
+  "segments": [
+    { "start": 0.0, "end": 2.4, "text": "Thanks for joining the call, the quick brown fox jumps over the lazy dog." },
+    { "start": 2.6, "end": 5.1, "text": "Agreed, let us ship the Signal capture boundary this week." }
+  ]
+}
