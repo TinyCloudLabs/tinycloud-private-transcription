@@ -40,7 +40,6 @@ export const meetings = pgTable(
     errorMessage: text("error_message"),
     idempotencyKey: text("idempotency_key"),
     requestHash: text("request_hash"),
-    transcriptionAttempts: integer("transcription_attempts").notNull().default(0),
   },
   (t) => [
     uniqueIndex("meetings_project_idempotency_idx").on(t.projectId, t.idempotencyKey),

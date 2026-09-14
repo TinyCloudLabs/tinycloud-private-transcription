@@ -112,7 +112,14 @@ describe("happy path: create -> joined -> completed -> transcript + webhook", ()
     expect(m!.meeting_url).toBe("https://jitsi.local/DemoRoom");
     expect(m!.language).toBe("en");
     expect(m!.transcribe_enabled).toBe(true);
-    expect("recording_enabled" in m!).toBe(false);
+    const createRequest = h.vexa.requests.find((request) => request.method === "POST" && request.path === "/bots");
+    expect(createRequest?.body).toMatchObject({
+      platform: "jitsi",
+      native_meeting_id: nativeId,
+      meeting_url: "https://jitsi.local/DemoRoom",
+      transcribe_enabled: true,
+    });
+    expect(createRequest?.body).not.toHaveProperty("recording_enabled");
   });
 
   test("awaiting_admission -> waiting_for_admission; transcript is 202", async () => {

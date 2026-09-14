@@ -33,7 +33,13 @@ describe("Vexa-native transcript ingestion", () => {
     const { id, native } = await dispatch("IngestNoSecondPass");
     const bot = h.vexa.meetings.get(`jitsi/${native}`)!;
     expect(bot.transcribe_enabled).toBe(true);
-    expect("recording_enabled" in bot).toBe(false);
+    const createRequest = h.vexa.requests.find((request) => request.method === "POST" && request.path === "/bots");
+    expect(createRequest?.body).toMatchObject({
+      platform: "jitsi",
+      native_meeting_id: native,
+      transcribe_enabled: true,
+    });
+    expect(createRequest?.body).not.toHaveProperty("recording_enabled");
 
     const before = h.vexa.requests.length;
     await h.vexa.control("jitsi", native, {

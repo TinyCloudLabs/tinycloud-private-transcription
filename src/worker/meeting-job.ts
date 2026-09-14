@@ -9,12 +9,8 @@ import { toVexaPlatform } from "../providers/vexa/platform-map.ts";
 import { failMeeting, getMeetingById, storeTranscript, transition } from "../services/meetings.ts";
 import { enqueueMeetingWebhook } from "../webhooks/dispatcher.ts";
 import { observeCapture, recordCapture } from "../services/capture.ts";
-import { eq } from "drizzle-orm";
-import { meetings } from "../db/schema.ts";
 
 const MAX_START_ATTEMPTS = 3;
-const MAX_TRANSCRIPTION_ATTEMPTS = 3;
-const TRANSCRIPTION_RETRY_BASE_MS = 30_000;
 
 /** Job: meeting.start — ask Vexa to send a bot. */
 export async function handleMeetingStart(ctx: AppContext, meetingId: string, attempt = 1): Promise<void> {
@@ -187,19 +183,11 @@ async function finalize(
     const { meeting: done, changed } = await transition(ctx, meeting, "completed");
     if (changed) await enqueueMeetingWebhook(ctx, done, "meeting.completed");
   } catch (e) {
-    const retryable = e instanceof ApiError && (e.code === "provider_unavailable" || e.code === "provider_timeout");
-    const attempts = meeting.transcriptionAttempts + 1;
-    if (retryable && attempts < MAX_TRANSCRIPTION_ATTEMPTS) {
-      ctx.log.warn("transcription provider unavailable; staying in processing", { meetingId: meeting.id, attempts });
-      await ctx.db.update(meetings).set({ transcriptionAttempts: attempts }).where(eq(meetings.id, meeting.id));
-      await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id }, TRANSCRIPTION_RETRY_BASE_MS * attempts);
-      return;
-    }
     ctx.log.error("transcription failed", { meetingId: meeting.id, error: String(e) });
     const { meeting: failed, changed } = await failMeeting(
       ctx,
       meeting,
-      retryable ? "transcription_failed" : e instanceof ApiError ? e.code : "transcription_failed",
+      e instanceof ApiError ? e.code : "transcription_failed",
       "Transcription could not be completed for this meeting.",
     );
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");

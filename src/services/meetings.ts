@@ -199,7 +199,6 @@ export async function recoverMeeting(ctx: AppContext, meeting: MeetingRow): Prom
       status: "processing",
       errorCode: null,
       errorMessage: null,
-      transcriptionAttempts: 0,
     })
     .where(and(eq(meetings.id, meeting.id), eq(meetings.projectId, meeting.projectId), eq(meetings.status, "failed")))
     .returning();
@@ -216,7 +215,6 @@ export async function recoverMeeting(ctx: AppContext, meeting: MeetingRow): Prom
         status: "failed",
         errorCode: meeting.errorCode,
         errorMessage: meeting.errorMessage,
-        transcriptionAttempts: meeting.transcriptionAttempts,
       })
       .where(and(eq(meetings.id, meeting.id), eq(meetings.projectId, meeting.projectId), eq(meetings.status, "processing")));
     throw error;

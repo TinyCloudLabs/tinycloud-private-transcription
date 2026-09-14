@@ -202,13 +202,6 @@
           "type": "text",
           "primaryKey": false,
           "notNull": false
-        },
-        "transcription_attempts": {
-          "name": "transcription_attempts",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "default": 0
         }
       },
       "indexes": {

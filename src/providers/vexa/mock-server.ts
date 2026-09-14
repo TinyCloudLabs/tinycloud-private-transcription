@@ -45,12 +45,15 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
     const k = c.req.header("X-API-Key");
     if (!k) return c.json({ detail: "Missing API key" }, 401);
     if (k !== apiKey) return c.json({ detail: "Invalid API key" }, 401);
-    requests.push({ method: c.req.method, path: c.req.path });
+    // POST /bots is recorded by its handler after parsing so tests can assert the exact create
+    // payload rather than inferring it from the mock's derived meeting state.
+    if (c.req.method !== "POST" || c.req.path !== "/bots") requests.push({ method: c.req.method, path: c.req.path });
     return next();
   });
 
   app.post("/bots", async (c) => {
     const body = (await c.req.json()) as VexaMeetingCreate;
+    requests.push({ method: c.req.method, path: c.req.path, body });
     if (!body.platform) return c.json({ detail: "platform required" }, 422);
     // Vexa parses meeting_url when native_meeting_id is missing; emulate for teams.
     const nativeId =

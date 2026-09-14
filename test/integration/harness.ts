@@ -9,7 +9,7 @@ import { runMigrations } from "../../src/db/migrate.ts";
 import { silentLogger, type Logger } from "../../src/log.ts";
 import { VexaClient } from "../../src/providers/vexa/client.ts";
 import { startMockVexa } from "../../src/providers/vexa/mock-server.ts";
-import { VexaNativeProvider } from "../../src/providers/transcription/vexa-native.ts";
+import { createTranscriptionProvider } from "../../src/providers/transcription/index.ts";
 import type { TranscriptionProvider } from "../../src/providers/transcription/types.ts";
 import { Queue } from "../../src/worker/queue.ts";
 import { startWorker, type WorkerHandle } from "../../src/worker/index.ts";
@@ -63,7 +63,7 @@ export async function startHarness(
     redis,
     queue,
     vexa: new VexaClient({ baseUrl: vexa.baseUrl, apiKey: vexa.apiKey }),
-    transcription: opts.transcription ?? new VexaNativeProvider(),
+    transcription: opts.transcription ?? createTranscriptionProvider(config),
     log: opts.log ?? silentLogger,
     webhookRetryDelaysMs: opts.webhookRetryDelaysMs ?? [0, 100, 200],
   });

@@ -202,6 +202,9 @@ Vexa transcript row; transcript storage is an upsert and only the winning termin
   DB/MinIO purge inside the CVM (follow-up).
 - **Jitsi live validation** is marked pending upstream; it works against docker-jitsi-meet stable-11146-2
   (bot needs `https://` + hostname + a trusted cert).
+- **Tinfoil contract probe and late-joiner validation are deferred pre-merge**: the real Tinfoil
+  deployment contract has not yet been probed, and the two-speaker/late-joiner fixture validation is
+  intentionally reserved for the later gate. `fixtures/bob.wav` remains in the repository for that work.
 - The capture rig needed a host iptables fix (Docker's FORWARD/NAT chains had been flushed) — see infra/README.md.
 
 ## Vexa fork ([TinyCloudLabs/vexa](https://github.com/TinyCloudLabs/vexa))
