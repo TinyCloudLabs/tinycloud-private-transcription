@@ -9,6 +9,7 @@ import { canTransition, isTerminal, type MeetingStatus } from "../domain/state.t
 import type { NormalizedTranscript } from "../domain/transcript.ts";
 import { recordCapture } from "./capture.ts";
 import { VexaHttpError } from "../providers/vexa/client.ts";
+import { sealSignalCapability } from "../providers/signal/capability.ts";
 
 export interface CreateMeetingInput {
   meeting_url: string;
@@ -38,7 +39,13 @@ export async function createMeeting(
   input: CreateMeetingInput,
   idempotencyKey: string | null,
 ): Promise<{ meeting: MeetingRow; created: boolean }> {
-  const requestHash = hashCreateRequest(input);
+  const detected = detectPlatform(input.meeting_url, input.platform);
+  const signalUrl = detected.platform === "signal" ? new URL(input.meeting_url) : null;
+  const signalCapability = signalUrl?.hash.slice(1) ?? null;
+  // Never retain a raw Signal fragment in an idempotency hash, URL column, API object, webhook, or log.
+  if (signalUrl) signalUrl.hash = "";
+  const storedMeetingUrl = signalUrl?.toString() ?? input.meeting_url;
+  const requestHash = hashCreateRequest({ ...input, meeting_url: storedMeetingUrl });
   if (idempotencyKey) {
     const [existing] = await ctx.db
       .select()
@@ -52,7 +59,6 @@ export async function createMeeting(
       return { meeting: existing, created: false };
     }
   }
-  const detected = detectPlatform(input.meeting_url, input.platform);
   // Detection recognizes every platform; deployments only accept the ones in ENABLED_PLATFORMS
   // (default jitsi — the others are detected but not serviceable yet, see .context/ptx-demo-readiness.md #8).
   if (!ctx.config.enabledPlatforms.includes(detected.platform)) {
@@ -66,7 +72,7 @@ export async function createMeeting(
     .values({
       id: newMeetingId(),
       projectId,
-      meetingUrl: input.meeting_url,
+      meetingUrl: storedMeetingUrl,
       platform: detected.platform,
       status: "queued",
       botName: input.bot_name ?? null,
@@ -76,6 +82,7 @@ export async function createMeeting(
       metadata: input.metadata ?? {},
       idempotencyKey,
       requestHash,
+      ...(signalCapability ? { signalCapability: sealSignalCapability(signalCapability, ctx.config.signal.capabilityKey) } : {}),
     })
     .onConflictDoNothing()
     .returning();
@@ -123,6 +130,8 @@ export async function transition(
   if (to === "in_progress" && !meeting.startedAt) patch.startedAt = now;
   if ((to === "processing" || isTerminal(to)) && !meeting.endedAt) patch.endedAt = now;
   if (to === "completed") patch.completedAt = now;
+  // The Signal fragment is only needed until a terminal worker result. It must not outlive capture.
+  if (isTerminal(to) && meeting.platform === "signal") patch.signalCapability = null;
   const [row] = await ctx.db
     .update(meetings)
     .set(patch)
@@ -165,7 +174,8 @@ export async function stopMeeting(ctx: AppContext, meeting: MeetingRow): Promise
   if (isTerminal(status) || status === "processing") return meeting;
   meeting = await recordCapture(ctx, meeting, { stop_requested_at: new Date().toISOString(), stop_requested_by: "user" });
   ctx.log.info("bot stop requested", { meetingId: meeting.id, status, botId: meeting.vexaBotId });
-  await stopInVexa(ctx, meeting);
+  if (meeting.platform === "signal") await stopInSignal(ctx, meeting);
+  else await stopInVexa(ctx, meeting);
   if (status === "in_progress") {
     const { meeting: updated } = await transition(ctx, meeting, "processing");
     await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id });
@@ -193,7 +203,8 @@ export async function recoverMeeting(ctx: AppContext, meeting: MeetingRow): Prom
   if (status !== "failed") {
     throw new ApiError("invalid_request", "Only failed meetings can be recovered.");
   }
-  if (!meeting.vexaPlatform || !meeting.vexaNativeMeetingId) {
+  const hasRetainedCapture = meeting.platform === "signal" ? !!meeting.signalSessionId : !!meeting.vexaPlatform && !!meeting.vexaNativeMeetingId;
+  if (!hasRetainedCapture) {
     throw new ApiError("invalid_request", "This meeting has no retained capture-provider record to recover.");
   }
   const [updated] = await ctx.db
@@ -237,12 +248,24 @@ async function stopInVexa(ctx: AppContext, meeting: MeetingRow) {
   }
 }
 
+async function stopInSignal(ctx: AppContext, meeting: MeetingRow) {
+  if (!meeting.signalSessionId) return;
+  try { await ctx.signal.leave(meeting.signalSessionId); }
+  catch (e) { ctx.log.warn("signal leave failed", { meetingId: meeting.id, error: String(e) }); }
+}
+
 /**
  * Removes our record + transcript and asks Vexa to delete its meeting (404-tolerant). Vexa v0.12 only
  * deletes PLANNED rows and answers 409 for anything the bot lifecycle touched — we log that ("retained
  * by capture provider") and still remove our data; purging Vexa's copy is a documented gap.
  */
 export async function deleteMeeting(ctx: AppContext, meeting: MeetingRow): Promise<void> {
+  if (meeting.platform === "signal") {
+    if (!isTerminal(meeting.status as MeetingStatus)) await stopInSignal(ctx, meeting);
+    if (meeting.signalSessionId) await ctx.signal.remove(meeting.signalSessionId).catch(() => {});
+    await ctx.db.delete(meetings).where(eq(meetings.id, meeting.id));
+    return;
+  }
   if (meeting.vexaPlatform && meeting.vexaNativeMeetingId) {
     if (!isTerminal(meeting.status as MeetingStatus)) await stopInVexa(ctx, meeting);
     try {

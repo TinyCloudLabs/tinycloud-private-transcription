@@ -99,6 +99,9 @@ production window. Green 2/2 on 2026-08-17 (~2 min each; evidence in `tmp/e2e-<r
 | `VEXA_MAX_TIME_LEFT_ALONE_MS` | `300000` | per-meeting window without remote participant audio (milliseconds). After five minutes without hearing anyone else, Vexa completes the bot as `left_alone`; applies to Jitsi and Google Meet. |
 | `VEXA_MAX_CONCURRENT_BOTS` | `5` | provisioned bot ceiling (matches `max_concurrent_bots` in infra/dstack/app-compose.yaml); reported as `bot_capacity.max` in `/health` |
 | `ENABLED_PLATFORMS` | `jitsi` | comma-separated platforms accepted by `POST /v1/meetings`. Others (zoom, google_meet, microsoft_teams) are still detected but answer 400 `unsupported_platform` |
+| `SIGNAL_CAPTURE_URL` | `http://127.0.0.1:18076` | loopback-only Signal capture-worker endpoint; it owns Signal Desktop CDP and PulseAudio |
+| `SIGNAL_CAPABILITY_KEY` | none | required 32-byte base64 (or 64-hex-character) key used to encrypt Signal call URL fragments at rest |
+| `SIGNAL_MAX_CONCURRENT_CALLS` | `1` | provisioned Signal Desktop seat count |
 | `JOIN_TIMEOUT_SECONDS` | `600` | worker-side join deadline: a meeting still `joining`/`waiting_for_admission` this long after bot dispatch is failed (`meeting_join_failed`/`waiting_room_timeout`), its bot stopped, and `meeting.failed` emitted |
 | `TRANSCRIPTION_PROVIDER` | `vexa` | `vexa` (WhisperLive passthrough) or `tinfoil` |
 | `TINFOIL_BASE_URL` | `https://inference.tinfoil.sh` | OpenAI-compatible `/v1/audio/transcriptions` |

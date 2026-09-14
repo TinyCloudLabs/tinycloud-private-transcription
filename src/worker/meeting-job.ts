@@ -13,8 +13,10 @@ import { VexaNativeProvider } from "../providers/transcription/vexa-native.ts";
 import { failMeeting, getMeetingById, storeTranscript, transition } from "../services/meetings.ts";
 import { enqueueMeetingWebhook } from "../webhooks/dispatcher.ts";
 import { observeCapture, recordCapture } from "../services/capture.ts";
-import { eq } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 import { meetings } from "../db/schema.ts";
+import { normalizeSegments } from "../domain/transcript.ts";
+import { openSignalCapability } from "../providers/signal/capability.ts";
 
 const MAX_START_ATTEMPTS = 3;
 const MAX_TRANSCRIPTION_ATTEMPTS = 3;
@@ -24,7 +26,8 @@ const TRANSCRIPTION_RETRY_BASE_MS = 30_000;
 export async function handleMeetingStart(ctx: AppContext, meetingId: string, attempt = 1): Promise<void> {
   const meeting = await getMeetingById(ctx, meetingId);
   if (!meeting || meeting.status !== "queued") return;
-  const vexaPlatform = toVexaPlatform(meeting.platform as Platform);
+  if (meeting.platform === "signal") return handleSignalStart(ctx, meeting, attempt);
+  const vexaPlatform = toVexaPlatform(meeting.platform as Exclude<Platform, "signal">);
   try {
     const created = await ctx.vexa.createBot({
       platform: vexaPlatform,
@@ -100,7 +103,9 @@ export async function handleJoinDeadline(ctx: AppContext, meetingId: string): Pr
   if (status !== "joining" && status !== "waiting_for_admission") return;
   meeting = await recordCapture(ctx, meeting, { stop_requested_at: new Date().toISOString(), stop_requested_by: "join_deadline" });
   ctx.log.warn("join deadline exceeded; failing meeting", { meetingId, status, joinTimeoutSeconds: ctx.config.joinTimeoutSeconds });
-  if (meeting.vexaPlatform && meeting.vexaNativeMeetingId) {
+  if (meeting.platform === "signal" && meeting.signalSessionId) {
+    await ctx.signal.leave(meeting.signalSessionId).catch(() => {});
+  } else if (meeting.vexaPlatform && meeting.vexaNativeMeetingId) {
     await ctx.vexa.stopBot(meeting.vexaPlatform, meeting.vexaNativeMeetingId).catch((e) => {
       if (!(e instanceof VexaHttpError && e.notFound)) ctx.log.warn("vexa stopBot failed at join deadline", { meetingId, error: String(e) });
     });
@@ -117,6 +122,7 @@ export async function handleJoinDeadline(ctx: AppContext, meetingId: string): Pr
 export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Promise<void> {
   let meeting = await getMeetingById(ctx, meetingId);
   if (!meeting || isTerminal(meeting.status as MeetingStatus)) return;
+  if (meeting.platform === "signal") return handleSignalPoll(ctx, meeting);
   if (!meeting.vexaPlatform || !meeting.vexaNativeMeetingId) return;
 
   let vexa;
@@ -194,6 +200,116 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
   ({ meeting } = await transition(ctx, meeting, "processing"));
   ctx.log.debug("vexa meeting completed; finalizing", { meetingId: meeting.id, vexaSegments: segments.length, recordings: vexa.recordings?.length ?? 0 });
   await finalize(ctx, meeting, segments, fetchAudio);
+}
+
+async function handleSignalStart(ctx: AppContext, meeting: MeetingRow, attempt: number) {
+  try {
+    if (!meeting.signalCapability) throw new ApiError("capture_failed", "Signal call capability is unavailable.");
+    const capability = meeting.signalCapability;
+    const reserved = await reserveSignalSeat(ctx, meeting.id);
+    // A full rig is a queue, not a failure: wait for a seat until the join deadline would elapse.
+    if (!reserved) return await requeueForSignalSeat(ctx, meeting, attempt, "capacity");
+    meeting = reserved;
+    // Reconstruct at the last possible boundary; never emit this URL in a log or persisted field.
+    const callUrl = `${meeting.meetingUrl}#${openSignalCapability(capability, ctx.config.signal.capabilityKey)}`;
+    let created;
+    try {
+      created = await ctx.signal.start({ meetingId: meeting.id, callUrl, botName: meeting.botName ?? undefined, language: meeting.language ?? undefined });
+    } catch (error) {
+      // The worker is the authority on its own seats and provisioning. When it says "busy" or "not
+      // ready", give the PTX seat back rather than holding it against a capture that never started.
+      if (error instanceof ApiError && (error.code === "provider_unavailable" || error.code === "provider_timeout") && (await releaseSignalSeat(ctx, meeting.id))) {
+        return await requeueForSignalSeat(ctx, meeting, attempt, error.code);
+      }
+      throw error;
+    }
+    const [updated] = await ctx.db.update(meetings).set({ signalSessionId: created.sessionId }).where(and(eq(meetings.id, meeting.id), eq(meetings.status, "joining"))).returning();
+    if (!updated) {
+      // Stopped or deleted while we were dispatching: don't leave the seat held in the worker.
+      await ctx.signal.leave(created.sessionId).catch(() => {});
+      await ctx.signal.remove(created.sessionId).catch(() => {});
+      return;
+    }
+    ctx.log.info("signal capture dispatched", { meetingId: meeting.id, sessionId: created.sessionId, platform: "signal" });
+    await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id }, ctx.config.vexa.pollIntervalMs);
+    await ctx.queue.push({ type: "meeting.join_deadline", meetingId: meeting.id }, ctx.config.joinTimeoutSeconds * 1000);
+  } catch (error) {
+    const { meeting: failed, changed } = await failMeeting(ctx, meeting, error instanceof ApiError ? error.code : "provider_unavailable", "Signal capture could not be started.");
+    if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+  }
+}
+
+/**
+ * Bounded wait for a Signal seat. Attempts are spaced by the poll interval and stop once they would
+ * exceed JOIN_TIMEOUT_SECONDS, at which point the meeting fails as provider_unavailable — the same
+ * deadline a dispatched meeting gets for admission.
+ */
+async function requeueForSignalSeat(ctx: AppContext, meeting: MeetingRow, attempt: number, reason: string) {
+  const delayMs = Math.max(ctx.config.vexa.pollIntervalMs, 1_000);
+  if (attempt * delayMs < ctx.config.joinTimeoutSeconds * 1000) {
+    ctx.log.info("waiting for a signal capture seat", { meetingId: meeting.id, attempt, reason });
+    await ctx.queue.push({ type: "meeting.start", meetingId: meeting.id, attempt: attempt + 1 }, delayMs);
+    return;
+  }
+  const fresh = (await getMeetingById(ctx, meeting.id)) ?? meeting;
+  const { meeting: failed, changed } = await failMeeting(ctx, fresh, "provider_unavailable", "No Signal capture seat became available in time.");
+  if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+}
+
+/** Hands a reserved-but-unused seat back to the queue. Only safe while no worker session exists. */
+async function releaseSignalSeat(ctx: AppContext, meetingId: string): Promise<boolean> {
+  const released = await ctx.db
+    .update(meetings)
+    .set({ status: "queued" })
+    .where(and(eq(meetings.id, meetingId), eq(meetings.status, "joining"), isNull(meetings.signalSessionId)))
+    .returning();
+  return released.length > 0;
+}
+
+/** Serializes check-and-reserve so concurrent queued jobs cannot oversubscribe Signal Desktop seats. */
+async function reserveSignalSeat(ctx: AppContext, meetingId: string): Promise<MeetingRow | null> {
+  return ctx.db.transaction(async (tx) => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext('ptx-signal-capture-capacity'))`);
+    const capacity = await tx.execute<{ running: string }>(sql`
+      select count(*)::text as running from ${meetings}
+      where ${meetings.platform} = 'signal'
+        and ${meetings.status} in ('joining', 'waiting_for_admission', 'in_progress', 'processing')
+    `);
+    if (Number(capacity[0]?.running ?? 0) >= ctx.config.signal.maxConcurrentCalls) return null;
+    const [reserved] = await tx.update(meetings).set({ status: "joining" }).where(and(eq(meetings.id, meetingId), eq(meetings.status, "queued"))).returning();
+    return reserved ?? null;
+  });
+}
+
+async function handleSignalPoll(ctx: AppContext, meeting: MeetingRow) {
+  if (!meeting.signalSessionId) return;
+  try {
+    const snapshot = await ctx.signal.status(meeting.signalSessionId);
+    if (snapshot.status === "joining" || snapshot.status === "waiting_for_admission" || snapshot.status === "in_progress") {
+      const { meeting: updated } = await transition(ctx, meeting, snapshot.status);
+      await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id }, ctx.config.vexa.pollIntervalMs);
+      return;
+    }
+    if (snapshot.status === "failed") {
+      const { meeting: failed, changed } = await failMeeting(ctx, meeting, snapshot.errorCode ?? "capture_failed", "Signal capture ended before transcription completed.");
+      if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+      return;
+    }
+    const transcript = normalizeSegments((snapshot.segments ?? []).map((segment) => ({ ...segment, speaker: "Unknown", speakerKey: "unknown", attribution: "unknown" })), meeting.language);
+    if (!transcript.text.trim()) throw new ApiError("transcription_failed", "Signal capture returned no words.");
+    // A poll can observe only a terminal worker snapshot; preserve PTX's ordered lifecycle even
+    // when Signal Desktop joined and left between polls.
+    if (meeting.status === "joining" || meeting.status === "waiting_for_admission") ({ meeting } = await transition(ctx, meeting, "in_progress"));
+    ({ meeting } = await transition(ctx, meeting, "processing"));
+    await storeTranscript(ctx, meeting.id, transcript, "signal");
+    const { meeting: done, changed } = await transition(ctx, meeting, "completed", { signalCapability: null });
+    if (changed) await enqueueMeetingWebhook(ctx, done, "meeting.completed");
+  } catch (error) {
+    // Do not stringify worker errors here: a malformed local-worker error can include the call URL.
+    ctx.log.warn("signal capture finalization failed", { meetingId: meeting.id });
+    const { meeting: failed, changed } = await failMeeting(ctx, meeting, error instanceof ApiError ? error.code : "capture_failed", "Signal capture could not be completed.");
+    if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+  }
 }
 
 /** True for providers that transcribe persisted audio (anything but the WhisperLive passthrough). */
