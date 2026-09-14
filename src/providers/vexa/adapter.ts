@@ -3,6 +3,7 @@
  * Typed against docs/vexa-samples/vexa-transcript.json.
  */
 import type { VexaTranscriptionResponse, VexaTranscriptionSegment } from "./types.ts";
+import { ApiError } from "../../domain/errors.ts";
 
 const TURN_ID = /^turn:(\d+):(p?)(\d+)$/;
 
@@ -33,6 +34,27 @@ export function dedupeVexaSegments(segments: VexaTranscriptionSegment[]): VexaTr
 }
 
 /**
+ * Validate the transcript supplied by Vexa before it reaches normalization/storage. This is the
+ * live Vexa boundary (including Vexa deployments backed by Tinfoil), rather than a removed
+ * recording-based downstream provider.
+ */
+function validateVexaSegments(segments: VexaTranscriptionSegment[]): VexaTranscriptionSegment[] {
+  for (const segment of segments) {
+    if (
+      !Number.isFinite(segment.start) ||
+      !Number.isFinite(segment.end) ||
+      segment.end < segment.start ||
+      typeof segment.text !== "string" ||
+      (segment.language !== undefined && segment.language !== null && typeof segment.language !== "string") ||
+      (segment.speaker !== undefined && segment.speaker !== null && typeof segment.speaker !== "string")
+    ) {
+      throw new ApiError("transcription_failed", "Vexa returned an invalid transcript segment");
+    }
+  }
+  return segments;
+}
+
+/**
  * Vexa `start`/`end` are epoch seconds. Rebase to meeting-relative seconds: origin is the bot's
  * `start_time` (joined/active) when it precedes the first segment, else the first segment start.
  * Values already meeting-relative (small numbers, no start_time) pass through unchanged.
@@ -55,7 +77,7 @@ export function toMeetingRelative(
 
 /** Segments ready for our transcript: deduped, speaker from `speaker`, meeting-relative timing. */
 export function adaptVexaSegments(vexa: Pick<VexaTranscriptionResponse, "segments" | "start_time">): VexaTranscriptionSegment[] {
-  return toMeetingRelative(dedupeVexaSegments(vexa.segments ?? []), vexa.start_time);
+  return toMeetingRelative(validateVexaSegments(dedupeVexaSegments(vexa.segments ?? [])), vexa.start_time);
 }
 
 /** Where Vexa reports the completion reason for a transcript/meeting row (data.* is authoritative). */

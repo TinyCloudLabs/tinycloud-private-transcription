@@ -40,7 +40,6 @@ export const meetings = pgTable(
     errorMessage: text("error_message"),
     idempotencyKey: text("idempotency_key"),
     requestHash: text("request_hash"),
-    transcriptionAttempts: integer("transcription_attempts").notNull().default(0),
   },
   (t) => [
     uniqueIndex("meetings_project_idempotency_idx").on(t.projectId, t.idempotencyKey),
@@ -53,12 +52,8 @@ export const transcripts = pgTable("transcripts", {
   language: text("language").notNull(),
   durationSeconds: real("duration_seconds").notNull(),
   segmentsJson: jsonb("segments_json").notNull(),
-  /** Which provider produced the stored transcript: "vexa" (WhisperLive passthrough / fallback) | "tinfoil". */
+  /** Vexa owns attribution and transcription; its configured backend may be Tinfoil. */
   provider: text("provider").notNull().default("vexa"),
-  /** Set when the configured provider fell back to vexa-native: the provider we fell back FROM (e.g. "tinfoil"). */
-  fallbackFrom: text("fallback_from"),
-  /** Why the fallback fired (e.g. "no_usable_recording", "provider_unavailable_after_retries"). */
-  fallbackReason: text("fallback_reason"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 

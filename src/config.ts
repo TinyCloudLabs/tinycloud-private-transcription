@@ -10,6 +10,10 @@ export const positiveIntegerEnv = (name: string, fallback: string): number => {
   return value;
 };
 
+/**
+ * The Vexa deployment may select its own transcription backend. TinyCloud always consumes the
+ * resulting Vexa segments and never performs a second, recording-based transcription pass.
+ */
 export type TranscriptionProviderName = "vexa" | "tinfoil";
 
 export const config = {
@@ -31,13 +35,6 @@ export const config = {
   /** Worker-side join deadline: a meeting still joining/waiting_for_admission this long after bot dispatch is failed and its bot stopped. */
   joinTimeoutSeconds: Number(env("JOIN_TIMEOUT_SECONDS", "600")),
   transcriptionProvider: env("TRANSCRIPTION_PROVIDER", "vexa") as TranscriptionProviderName,
-  tinfoil: {
-    baseUrl: env("TINFOIL_BASE_URL", "https://inference.tinfoil.sh"),
-    apiKey: env("TINFOIL_API_KEY", ""),
-    model: env("TINFOIL_MODEL", "voxtral-small-24b"),
-    /** `turns` (per speaker turn, keeps segmentation) | `whole` (one call, one segment). */
-    segmentation: env("TINFOIL_SEGMENTATION", "turns") as "turns" | "whole",
-  },
   logLevel: env("LOG_LEVEL", "info"),
 };
 

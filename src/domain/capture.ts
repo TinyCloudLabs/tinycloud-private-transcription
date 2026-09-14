@@ -4,7 +4,6 @@ import type { VexaTranscriptionResponse } from "../providers/vexa/types.ts";
 /** Operational evidence only. Never persist provider logs, URLs, names, or transcript text here. */
 export interface CaptureDiagnostics {
   silence_timeout_ms?: number;
-  recording_requested?: boolean;
   live_transcription_requested?: boolean;
   stop_requested_at?: string;
   stop_requested_by?: "user" | "join_deadline";
@@ -19,7 +18,6 @@ export interface CaptureDiagnostics {
   started_at?: string | null;
   ended_at?: string | null;
   transcript_segment_count?: number;
-  recording_count?: number;
   /** Vexa's transcript API does not expose PCM arrival or audio-context health. */
   audio_activity?: "not_reported";
   transitions?: { from: string | null; to: string; at: string | null; source: string; completion_reason: string | null }[];
@@ -49,7 +47,6 @@ export function captureObservation(vexa: VexaTranscriptionResponse, now = new Da
     started_at: iso(vexa.start_time),
     ended_at: iso(vexa.end_time),
     transcript_segment_count: vexa.segments?.length ?? 0,
-    recording_count: vexa.recordings?.filter((r) => r.meeting_id === vexa.id).length ?? 0,
     audio_activity: "not_reported",
     transitions: (vexa.data?.status_transition ?? []).slice(-20).map((t) => ({
       from: t.from == null ? null : safeEnum(t.from, statuses),

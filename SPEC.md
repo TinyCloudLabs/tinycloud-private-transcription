@@ -9,8 +9,7 @@ Consumers: TinyCloud (`listen` app) and Conclave-shaped clients.
 
 ## Decisions (2026-08-17)
 - Stack: **Bun + TypeScript** (Hono API + worker), Postgres, Redis queue. Vexa runs as a pinned upstream Docker Compose dependency (Apache-2.0, `Vexa-ai/vexa` main). Do not fork Vexa unless Jitsi live-join is broken; if forking is required, raise it before doing so.
-- V1 transcript source: Vexa native transcription (WhisperLive, CPU mode — no GPU on dev host). `TranscriptionProvider` interface from day one; `TinfoilTranscriptionProvider` implemented behind it, tested with a recorded fixture + mock. **No live Tinfoil calls** (no key yet). Confidential inference (Tinfoil + dstack) is required for the product but sequenced last.
-- Vexa `POST /bots` exposes `recording_enabled`; verify whether it persists audio — if yes, that's the batch path for Tinfoil. If not, the Tinfoil path is a WhisperLive-compatible shim proxying to Tinfoil realtime (`voxtral-mini-4b-realtime`). Document which is viable.
+- V1 transcript source: Vexa native transcription (WhisperLive, CPU mode — no GPU on dev host). TinyCloud validates, normalizes, and stores Vexa-produced segments; it does not download recordings or perform a second transcription pass.
 - E2E test: local `docker-jitsi-meet` + Playwright fake participant that joins the room and plays a known TTS/WAV clip; assert transcript contains expected phrases with a speaker label. Public meet.jit.si needs an authenticated moderator → not used for automated tests.
 - dstack/Phala: write the dstack app-compose; **attempt** a dev CVM deploy with the authenticated `phala` CLI in a dedicated workspace; never touch unrelated production CVMs. Small spend OK; stop and report on anything larger.
 - Auth: static project API keys (`tc_live_…`, hashed in Postgres), seeded via CLI; single project for demo. Leave room for scopes.
@@ -20,7 +19,6 @@ Consumers: TinyCloud (`listen` app) and Conclave-shaped clients.
   2. API + worker + Postgres: `POST /v1/meetings`, `GET /v1/meetings/{id}`, `POST /v1/meetings/{id}/stop`, `POST /v1/meetings/{id}/recover`, `GET /v1/meetings/{id}/transcript`, `DELETE /v1/meetings/{id}` (also deletes in Vexa). Own IDs (`mtg_…`), own error taxonomy, platform detection from URL.
   3. `meeting.completed` + `meeting.failed` webhooks (HMAC-SHA256 `X-Webhook-Signature`, retries immediate/1m/5m/30m/2h; webhook failure never fails the meeting), `Idempotency-Key`.
   4. dstack compose + Phala dev CVM attempt.
-  5. Tinfoil provider behind interface (fixture-tested).
 
 ## API
 Auth: `Authorization: Bearer tc_live_xxx`.
@@ -33,27 +31,26 @@ States: `queued → joining → waiting_for_admission → in_progress → proces
 
 For every dispatched meeting, the worker sends Vexa `automatic_leave.max_time_left_alone` from `VEXA_MAX_TIME_LEFT_ALONE_MS` (default 300000 milliseconds). Vexa currently infers aloneness from the absence of remote participant audio, so five continuous silent minutes release the bot and continue normal finalization as `completed(left_alone)` on Jitsi or Google Meet; operators can tune the window when needed.
 
-`GET /v1/meetings/{id}` → status, platform, bot{name,joined_at}, transcript{status}, created/started/ended_at, metadata, error{type,code,message} on failure. Once completed also `transcript_provider` (`"tinfoil" | "vexa"`) plus `fallback_from`/`fallback_reason` when the configured provider fell back to the Vexa-native transcript.
+`GET /v1/meetings/{id}` → status, platform, bot{name,joined_at}, transcript{status}, created/started/ended_at, metadata, error{type,code,message} on failure. Once completed it includes `transcript_provider: "vexa"`.
 `POST /v1/meetings/{id}/stop` → idempotent, returns `{id,status}`.
 
 `POST /v1/meetings/{id}/recover` → tenant-scoped, idempotently moves a failed meeting with a retained
-capture-provider record back to `processing` and retries finalization. A terminal provider reason never
-discards usable retained audio; zero live segments plus no usable recording remains an explicit failure.
+capture-provider record back to `processing` and retries Vexa-segment finalization.
 `GET /v1/meetings/{id}/transcript` → 202 `{meeting_id,status}` until complete; then
 ```json
-{"meeting_id":"…","status":"completed","language":"en","duration_seconds":0,"provider":"tinfoil",
+{"meeting_id":"…","status":"completed","language":"en","duration_seconds":0,"provider":"vexa",
  "speakers":[{"id":"speaker_0","name":"Alice"}],
  "segments":[{"id":"seg_001","speaker_id":"speaker_0","speaker_name":"Alice","start":0.0,"end":3.2,"text":"…"}],
  "text":"Alice: …","created_at":"…"}
 ```
-`speaker_id` is stable within a meeting only. `provider` is which engine produced the words: `"tinfoil"` (confidential batch path, per speaker turn) or `"vexa"` (WhisperLive passthrough, or the fallback when the recording is unusable); on fallback the transcript also carries `fallback_from`/`fallback_reason`. `DELETE /v1/meetings/{id}` removes our record + transcript and the Vexa meeting.
-`GET /health` → `{status:"ok","checks":{postgres,redis,vexa,bot_capacity:{running,max},transcription_provider}}` (`bot_capacity.max` from `VEXA_MAX_CONCURRENT_BOTS`; Tinfoil outage must not block recording — retry in `processing`).
+`speaker_id` is stable within a meeting only. `provider` is `"vexa"`: Vexa owns the transcript and speaker attribution, while TinyCloud normalizes the completed segments. `DELETE /v1/meetings/{id}` removes our record + transcript and the Vexa meeting.
+`GET /health` → `{status:"ok","checks":{postgres,redis,vexa,bot_capacity:{running,max},transcription_provider}}` (`bot_capacity.max` from `VEXA_MAX_CONCURRENT_BOTS`).
 
 Errors: `{"error":{"type":"meeting_join_failed","code":"waiting_room_timeout","message":"…"}}`. Codes: invalid_meeting_url, unsupported_platform, meeting_not_found, meeting_join_failed, waiting_room_timeout, bot_removed, meeting_ended, capture_failed, transcription_failed, provider_timeout, provider_unavailable, internal_error. Never leak Vexa errors raw.
 
 Platform detection: meet.google.com→google_meet, zoom.us→zoom, teams.microsoft.com→microsoft_teams, meet.jit.si / self-hosted Jitsi→jitsi. Only platforms in `ENABLED_PLATFORMS` (default `jitsi`) are accepted; a detected-but-disabled platform answers 400 `unsupported_platform` naming the platform.
 
-Webhook event: `{"id":"evt_…","type":"meeting.completed","created_at":"…","data":{"meeting_id":"…","metadata":{},"transcript_provider":"tinfoil"}}` (`data.fallback_from`/`data.fallback_reason` added when a fallback fired; `data.error` on `meeting.failed`).
+Webhook event: `{"id":"evt_…","type":"meeting.completed","created_at":"…","data":{"meeting_id":"…","metadata":{},"transcript_provider":"vexa"}}` (`data.error` on `meeting.failed`).
 
 ## Capture diagnostics
 
@@ -61,9 +58,9 @@ Meeting reads and transcript responses include an optional `capture` object. Com
 webhooks include the same evidence. It is service-owned, stored in `meetings.capture_diagnostics`,
 and separate from caller-supplied `metadata`. Existing rows without evidence omit it.
 
-`capture` contains the dispatched `silence_timeout_ms`, recording/live-transcription request flags,
+`capture` contains the dispatched `silence_timeout_ms`, live-transcription request flag,
 provider meeting ID and status, `completion_reason`, `failure_stage`, `exit_code` when reported,
-provider start/end timestamps, observation timestamp, recording/segment counts, and up to 20
+provider start/end timestamps, observation timestamp, segment counts, and up to 20
 sanitized status transitions. `stop_requested_at`/`stop_requested_by` record our stop intent
 (`user` or `join_deadline`); they do not replace the provider's actual departure reason.
 `provider_record_missing_at` records a provider 404.
@@ -86,12 +83,12 @@ once per minute otherwise while polling. Terminal evidence survives transcriptio
 
 ## Persistence (Postgres)
 `meetings(id, project_id, meeting_url, platform, status, bot_name, vexa_native_meeting_id, vexa_bot_id, created_at, started_at, ended_at, completed_at, metadata, capture_diagnostics, error_code, error_message, idempotency_key)`
-`transcripts(meeting_id, language, duration_seconds, segments_json, provider, fallback_from, fallback_reason, created_at)`
+`transcripts(meeting_id, language, duration_seconds, segments_json, provider, created_at)`
 `webhook_deliveries(id, meeting_id, event_type, endpoint, attempt, status, response_code, created_at)`
 `api_keys(id, project_id, key_hash, scopes, created_at)`
 
 ## Deployment
-Single dstack CVM: api, worker, vexa services, redis, postgres. Tinfoil external.
+Single dstack CVM: api, worker, Vexa services, redis, postgres.
 
 ## Non-goals (V1)
 Summaries, chat/RAG, agents, calendar UI, user accounts, team workspaces, transcript approval/versioning, voice fingerprints, dashboards, realtime WS events (V2: `WS /v1/meetings/{id}/events`), replacing the Vexa UI.
