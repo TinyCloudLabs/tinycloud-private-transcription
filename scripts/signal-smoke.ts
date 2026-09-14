@@ -19,7 +19,9 @@
  * live Signal capture.
  *
  * Env: DATABASE_URL, REDIS_URL (docker-compose.dev.yml defaults), SIGNAL_REPLAY_SCRIPT,
- *      SMOKE_TIMEOUT_S (120).
+ *      SMOKE_TIMEOUT_S (120). On a dev rig shared with `bun test` (which truncates tables and
+ *      clears the queue) point SMOKE_DATABASE_URL / SMOKE_REDIS_URL at a scratch database and a
+ *      spare Redis index so a concurrent suite cannot eat this run's jobs.
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
@@ -50,13 +52,15 @@ async function waitForHttp(url: string, timeoutMs = 30_000) {
 }
 
 async function main() {
+  const databaseUrl = process.env.SMOKE_DATABASE_URL ?? config.databaseUrl;
+  const redisUrl = process.env.SMOKE_REDIS_URL ?? config.redisUrl;
   const capabilityKey = randomBytes(32).toString("base64");
   const capturePort = freePort();
   const apiPort = freePort();
   const shared = {
     ...process.env,
-    DATABASE_URL: config.databaseUrl,
-    REDIS_URL: config.redisUrl,
+    DATABASE_URL: databaseUrl,
+    REDIS_URL: redisUrl,
     ENABLED_PLATFORMS: "signal",
     SIGNAL_CAPABILITY_KEY: capabilityKey,
     SIGNAL_CAPTURE_URL: `http://127.0.0.1:${capturePort}`,
@@ -87,8 +91,8 @@ async function main() {
   }
 
   // 2. Real API + queue worker processes, real Postgres/Redis, real API key.
-  await runMigrations(config.databaseUrl);
-  const ctx = createContext({ config: { ...config, signal: { ...config.signal, capabilityKey } } });
+  await runMigrations(databaseUrl);
+  const ctx = createContext({ config: { ...config, databaseUrl, redisUrl, signal: { ...config.signal, capabilityKey } } });
   const { key: apiKey, webhookSecret } = await createApiKey(ctx, `signal-smoke-${Date.now().toString(36)}`);
   const received: { headers: Record<string, string>; rawBody: string; body: any }[] = [];
   const sink = Bun.serve({ port: 0, hostname: "127.0.0.1", async fetch(req) { received.push({ headers: Object.fromEntries(req.headers), rawBody: await req.text(), body: null }); return new Response("ok"); } });

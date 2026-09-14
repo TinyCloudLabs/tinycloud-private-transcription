@@ -43,6 +43,7 @@ export async function startHarness(
     maxTimeLeftAloneMs?: number;
     signal?: SignalCaptureAdapter;
     signalCapabilityKey?: string;
+    signalMaxConcurrentCalls?: number;
   } = {},
 ): Promise<Harness> {
   const vexa = startMockVexa(0);
@@ -53,7 +54,9 @@ export async function startHarness(
     ...(opts.enabledPlatforms ? { enabledPlatforms: opts.enabledPlatforms } : {}),
     ...(opts.joinTimeoutSeconds !== undefined ? { joinTimeoutSeconds: opts.joinTimeoutSeconds } : {}),
     ...(opts.maxTimeLeftAloneMs !== undefined ? { vexa: { ...baseConfig.vexa, baseUrl: vexa.baseUrl, apiKey: vexa.apiKey, pollIntervalMs: 50, maxTimeLeftAloneMs: opts.maxTimeLeftAloneMs } } : {}),
-    ...(opts.signalCapabilityKey ? { signal: { ...baseConfig.signal, capabilityKey: opts.signalCapabilityKey } } : {}),
+    ...(opts.signalCapabilityKey || opts.signalMaxConcurrentCalls !== undefined
+      ? { signal: { ...baseConfig.signal, ...(opts.signalCapabilityKey ? { capabilityKey: opts.signalCapabilityKey } : {}), ...(opts.signalMaxConcurrentCalls !== undefined ? { maxConcurrentCalls: opts.signalMaxConcurrentCalls } : {}) } }
+      : {}),
   };
   const db = await runMigrations(config.databaseUrl);
   await db.execute(sql`truncate table webhook_deliveries, transcripts, meetings, api_keys, projects cascade`);
