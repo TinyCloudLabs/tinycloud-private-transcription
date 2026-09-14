@@ -143,7 +143,18 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
 
   // Vexa owns the STT windows and speaker attribution. Private transcription only normalizes and
   // persists Vexa's completed segments; it must never re-fetch or re-transcribe recordings.
-  const segments = adaptVexaSegments(vexa); // deduped by turn, epoch → meeting-relative seconds
+  let segments: ReturnType<typeof adaptVexaSegments>;
+  try {
+    segments = adaptVexaSegments(vexa); // deduped by turn, epoch → meeting-relative seconds
+  } catch (e) {
+    // A malformed Vexa transcript has to end the meeting here. The worker loop logs and drops a
+    // thrown job without re-queueing it, so letting this escape would strand the meeting in a
+    // non-terminal state with no webhook, forever.
+    ctx.log.error("vexa returned an invalid transcript", { meetingId, error: String(e) });
+    const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "The capture provider returned an invalid transcript.");
+    if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+    return;
+  }
   const hasLiveWords = segments.some((segment) => segment.text.trim().length > 0);
   if (!hasLiveWords) {
     const f = reason ? mapVexaFailure(reason) : { code: "capture_failed" as const, message: "No usable audio was captured for this meeting." };

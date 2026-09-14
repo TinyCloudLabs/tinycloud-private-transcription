@@ -65,7 +65,9 @@ export async function runFakeParticipant(opts: FakeParticipantOptions): Promise<
     "config.startWithAudioMuted=false",
     "config.startWithVideoMuted=true",
     "config.disableDeepLinking=true",
-    // No P2P: with two humans + the bot, Jitsi would start P2P and re-negotiate to the JVB when the bot joins,
+    // No P2P: with two humans + the bot, Jitsi would start P2P and re-negotiate to the JVB when the
+    // bot joins, recreating the remote <audio> elements mid-call. Forcing JVB from the start keeps
+    // one stable set of remote tracks for the whole run.
     ...(opts.p2p === false ? ["config.p2p.enabled=false"] : []),
   ].join("&");
   u.hash = hash;

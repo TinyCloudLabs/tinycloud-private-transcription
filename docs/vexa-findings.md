@@ -3,7 +3,7 @@
 Upstream: `Vexa-ai/vexa` @ `e0b356d6de3f8322db45d3cb9d66282ae108bebf` (main, "v0.12.22" release notes;
 `git describe` = v0.12.18-29). Control-plane images `vexaai/v012-*:v012`. Apache-2.0.
 **Since 2026-08-19 the BOT comes from our fork** `TinyCloudLabs/vexa` branch `tinycloud`
-(`2db950be`, image `ghcr.io/tinycloudlabs/vexa/bot:tc-2db950b`).
+(`2db950be`, image `ghcr.io/tinycloudlabs/vexa/bot:tc-2db950b`). See README "Vexa fork".
 Stack under `infra/vexa`, local Jitsi under `infra/jitsi`, gate `scripts/vexa-smoke.ts` (**green, 3/3 runs**).
 Raw payloads: `docs/vexa-samples/*.json` (verbatim from the running stack).
 

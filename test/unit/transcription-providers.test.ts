@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { VexaNativeProvider } from "../../src/providers/transcription/vexa-native.ts";
+import { createTranscriptionProvider } from "../../src/providers/transcription/index.ts";
+import type { TranscriptionProviderName } from "../../src/config.ts";
 
 const vexaSegments = [
   { start: 0, end: 4, text: "Hello this is a test of the private transcription pipeline", language: "en", speaker: "Sam", completed: true },
@@ -18,5 +20,21 @@ describe("VexaNativeProvider", () => {
     expect(t.speakers.map((s) => s.name)).toEqual(["Sam", "Bob"]);
     expect(t.language).toBe("en");
     expect(t.text).toContain("Sam: Hello");
+  });
+});
+
+describe("createTranscriptionProvider", () => {
+  // The no-second-transcription invariant at the construction boundary: whichever backend the Vexa
+  // deployment selects, TinyCloud only ever builds the passthrough that normalizes Vexa's segments.
+  test.each(["vexa", "tinfoil"] as const)("%s selects the Vexa-native passthrough", (transcriptionProvider) => {
+    const provider = createTranscriptionProvider({ transcriptionProvider });
+    expect(provider).toBeInstanceOf(VexaNativeProvider);
+    expect(provider.name).toBe("vexa");
+  });
+
+  test("an unknown TRANSCRIPTION_PROVIDER fails at boot instead of silently defaulting", () => {
+    expect(() => createTranscriptionProvider({ transcriptionProvider: "whisper" as TranscriptionProviderName })).toThrow(
+      "Unknown TRANSCRIPTION_PROVIDER: whisper",
+    );
   });
 });

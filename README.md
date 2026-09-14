@@ -204,6 +204,31 @@ Vexa transcript row; transcript storage is an upsert and only the winning termin
   (bot needs `https://` + hostname + a trusted cert).
 - The capture rig needed a host iptables fix (Docker's FORWARD/NAT chains had been flushed) — see infra/README.md.
 
+## Vexa fork ([TinyCloudLabs/vexa](https://github.com/TinyCloudLabs/vexa))
+
+The rig and the CVM run our fork of the Vexa bot, not upstream. Upstream v0.12's record-chunker
+attached only the media tracks present when its recording tap started, so a participant who joined
+after the bot was missing from the capture mix (and an empty-at-join room produced a silent one).
+Upstream's live mixer already rescanned for late tracks; the recording tap did not. TinyCloud no
+longer transcribes recordings, but the fork stays pinned because it is what the bot image is built
+from.
+
+- **Branches**: `tinycloud` = upstream base (`e0b356d6`, v0.12.22) + our patches — this is what the rig
+  pins (`infra/vexa/upstream` submodule, `infra/vexa/UPSTREAM_PIN`). `main` tracks upstream untouched.
+- **The patch**: `core/meetings/modules/record-chunker` — `createRecordingTap` builds a dynamic mix
+  (`DynamicElementMixer`): the recorder starts immediately (even with zero audio elements) and a 2 s
+  rescan (live-mixer parity) attaches new elements / detaches ended ones. Pinned by the module's
+  `dynamic-tap.smoke.test.ts`.
+- **Bot image**: `ghcr.io/tinycloudlabs/vexa/bot:tc-<shortsha>` (fork workflow `tinycloud-bot-image`; the older
+  `ghcr.io/tinycloudlabs/vexa-bot` package was created while the fork was private, is stuck private,
+  and is deprecated — nothing pushes to it);
+  the rig layers the dev CA on top (`infra/vexa/bot/Dockerfile` → `ptx/vexa-bot:tc-devca`). Control-plane
+  images stay upstream `vexaai/v012-*:v012`.
+- **Syncing upstream** (in the fork repo): `git fetch upstream --tags && git checkout main && git merge
+  --ff-only upstream/main && git push origin main --tags`, then rebase/merge `tinycloud` onto `main`,
+  re-run the record-chunker tests, push, and bump this repo's submodule pin + bot image tag.
+- License unchanged: Apache-2.0, upstream `LICENSE` intact; changes marked per Apache-2.0 §4(b).
+
 ## Deploy (Phala/dstack)
 
 `infra/dstack/app-compose.yaml` runs api + worker + postgres + redis and the pinned Vexa v0.12 stack

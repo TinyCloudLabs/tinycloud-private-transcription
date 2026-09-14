@@ -39,7 +39,7 @@ export function dedupeVexaSegments(segments: VexaTranscriptionSegment[]): VexaTr
  * recording-based downstream provider.
  */
 function validateVexaSegments(segments: VexaTranscriptionSegment[]): VexaTranscriptionSegment[] {
-  return segments.map((segment) => {
+  for (const segment of segments) {
     if (
       !Number.isFinite(segment.start) ||
       !Number.isFinite(segment.end) ||
@@ -50,8 +50,8 @@ function validateVexaSegments(segments: VexaTranscriptionSegment[]): VexaTranscr
     ) {
       throw new ApiError("transcription_failed", "Vexa returned an invalid transcript segment");
     }
-    return segment;
-  });
+  }
+  return segments;
 }
 
 /**
