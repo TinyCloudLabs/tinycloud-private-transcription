@@ -6,10 +6,14 @@ const capability = "signal-call-capability-that-must-never-escape";
 
 class FakeSignalCapture implements SignalCaptureAdapter {
   receivedUrl = "";
+  leaves = 0;
   snapshot: SignalCaptureSnapshot = { status: "joining" };
   async start(input: { callUrl: string }) { this.receivedUrl = input.callUrl; return { sessionId: "signal-session-1" }; }
   async status() { return this.snapshot; }
-  async leave() {}
+  async leave() {
+    this.leaves++;
+    this.snapshot = { status: "completed", segments: [{ start: 0, end: 0.5, text: "stopped signal call" }] };
+  }
   async remove() {}
 }
 
@@ -52,5 +56,30 @@ describe("Signal call transcription", () => {
     expect(JSON.stringify(await finished.json())).not.toContain(capability);
     await h.waitFor(async () => h.webhook.received[0] ?? null);
     expect(h.webhook.received[0].rawBody).not.toContain(capability);
+  });
+
+  test("stop is idempotent and finalizes an in-progress Signal capture", async () => {
+    signal.snapshot = { status: "joining" };
+    const created = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: `https://signal.link/call/#${capability}-stop` } });
+    const meeting = await created.json();
+    await h.waitFor(async () => {
+      const body = await (await h.api(`/v1/meetings/${meeting.id}`)).json();
+      return body.status === "joining" ? body : null;
+    });
+    signal.snapshot = { status: "in_progress" };
+    await h.waitFor(async () => {
+      const body = await (await h.api(`/v1/meetings/${meeting.id}`)).json();
+      return body.status === "in_progress" ? body : null;
+    });
+    const before = signal.leaves;
+    expect((await h.api(`/v1/meetings/${meeting.id}/stop`, { method: "POST" })).status).toBe(200);
+    const transcript = await h.waitFor(async () => {
+      const body = await (await h.api(`/v1/meetings/${meeting.id}/transcript`)).json();
+      return body.status === "completed" ? body : null;
+    });
+    expect(transcript.segments[0]).toMatchObject({ speaker_name: "Unknown", attribution: "unknown" });
+    expect(signal.leaves).toBe(before + 1);
+    expect((await h.api(`/v1/meetings/${meeting.id}/stop`, { method: "POST" })).status).toBe(200);
+    expect(signal.leaves).toBe(before + 1);
   });
 });

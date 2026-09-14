@@ -31,6 +31,21 @@ export const config = {
     baseUrl: env("SIGNAL_CAPTURE_URL", "http://127.0.0.1:18076"),
     capabilityKey: env("SIGNAL_CAPABILITY_KEY", ""),
     maxConcurrentCalls: positiveIntegerEnv("SIGNAL_MAX_CONCURRENT_CALLS", "1"),
+    /** Capture-worker process settings. Bind and CDP endpoint are rejected unless loopback. */
+    capture: {
+      bind: env("SIGNAL_CAPTURE_BIND", "127.0.0.1"),
+      port: positiveIntegerEnv("SIGNAL_CAPTURE_PORT", "18076"),
+      cdpUrl: env("SIGNAL_CDP_URL", "http://127.0.0.1:9222"),
+      pulseSource: env("SIGNAL_PULSE_SOURCE", ""),
+      /** argv prefix; the worker appends a temporary wav path and reads JSON RawSegment[] on stdout. */
+      transcriber: env("SIGNAL_TRANSCRIBER", "").split(" ").filter(Boolean),
+      /** Replay timeline used only by the rig smoke; it captures no audio and proves no live call. */
+      replayScript: env("SIGNAL_REPLAY_SCRIPT", ""),
+      /** Hard ceiling on one captured call, so a forgotten seat cannot hold Signal Desktop forever. */
+      maxCallSeconds: positiveIntegerEnv("SIGNAL_MAX_CALL_SECONDS", "7200"),
+      /** How long a terminal snapshot stays readable so PTX's next poll can finalize. */
+      sessionRetentionSeconds: positiveIntegerEnv("SIGNAL_SESSION_RETENTION_SECONDS", "900"),
+    },
   },
   /** Platforms accepted by POST /v1/meetings. Detection still recognizes all platforms; the rest are gated with 400 unsupported_platform. */
   enabledPlatforms: env("ENABLED_PLATFORMS", "jitsi").split(",").map((s) => s.trim()).filter(Boolean),

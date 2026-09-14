@@ -7,6 +7,7 @@
   "scripts": {
     "api": "bun run src/api/server.ts",
     "worker": "bun run src/worker/index.ts",
+    "signal-capture-worker": "bun run src/providers/signal/worker.ts",
     "mock-vexa": "bun run src/providers/vexa/mock-server.ts",
     "cli": "bun run src/cli.ts",
     "db:migrate": "bun run src/db/migrate.ts",
