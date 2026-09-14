@@ -20,14 +20,10 @@ interface MockMeeting extends VexaMeetingResponse {
   bot_name?: string;
   language?: string;
   meeting_url?: string;
-  recording_enabled?: boolean;
   transcribe_enabled?: boolean;
   automatic_leave?: VexaMeetingCreate["automatic_leave"];
   /** Deletable via DELETE /meetings (real Vexa: idle/scheduled rows only). */
   planned?: boolean;
-  /** Persisted recording bytes (control: `recording_base64`); served like the real recordings API. */
-  recording?: { bytes: Uint8Array; contentType: string };
-  speakerTimeline?: unknown;
 }
 
 export interface MockVexaOptions {
@@ -84,7 +80,6 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       bot_name: body.bot_name,
       language: body.language,
       meeting_url: body.meeting_url,
-      recording_enabled: body.recording_enabled,
       transcribe_enabled: body.transcribe_enabled,
       automatic_leave: body.automatic_leave,
     };
@@ -112,7 +107,6 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       status: m.status,
       start_time: m.start_time,
       end_time: m.end_time,
-      recordings: recordingsOf(m),
       notes: null,
       data: { ...m.data, completion_reason: m.completion_reason, failure_stage: m.failure_stage },
       segments: m.segments,
@@ -138,29 +132,6 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
     return c.json({ status: "deleted", id: m.id, platform: m.platform, native_meeting_id: m.native_meeting_id });
   });
 
-  // Recordings (real v0.12 shape, docs/vexa-samples/vexa-recordings-list.json): one bot recording per meeting
-  // with an audio master; `raw_url` streams the bytes. Only meetings given `recording_base64` have one.
-  const recordingsOf = (m: MockMeeting) =>
-    m.recording
-      ? [{ id: m.id * 1000, source: "bot", status: "completed", meeting_id: m.id, media_files: [{ id: m.id * 1000 + 1, type: "audio", format: "webm", is_final: true, file_size_bytes: m.recording.bytes.length }] }]
-      : [];
-  app.get("/recordings", (c) => c.json({ recordings: [...meetings.values()].flatMap(recordingsOf) }));
-  app.get("/recordings/:id/speaker-timeline", (c) => {
-    const m = [...meetings.values()].find((x) => x.id * 1000 === Number(c.req.param("id")));
-    if (!m?.recording || m.speakerTimeline === undefined) return c.json({ detail: "Speaker timeline not found" }, 404);
-    return c.json(m.speakerTimeline);
-  });
-  app.get("/recordings/:id/master", (c) => {
-    const m = [...meetings.values()].find((x) => x.id * 1000 === Number(c.req.param("id")));
-    if (!m?.recording) return c.json({ detail: "Recording not found" }, 404);
-    return c.json({ storage_path: `recordings/1/${m.id * 1000}/audio/master.webm`, media_file_id: m.id * 1000 + 1, raw_url: `/recordings/${m.id * 1000}/media/${m.id * 1000 + 1}/raw?type=audio`, duration_seconds: null });
-  });
-  app.get("/recordings/:id/media/:media_id/raw", (c) => {
-    const m = [...meetings.values()].find((x) => x.id * 1000 === Number(c.req.param("id")));
-    if (!m?.recording) return c.json({ detail: "Recording not found" }, 404);
-    return new Response(m.recording.bytes as unknown as ArrayBuffer, { headers: { "content-type": m.recording.contentType } });
-  });
-
   // ---- test control ----
   app.post("/_mock/meetings/:platform/:native_meeting_id", async (c) => {
     const m = meetings.get(key(c.req.param("platform"), c.req.param("native_meeting_id")));
@@ -171,15 +142,7 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       append_segments?: VexaTranscriptionSegment[];
       completion_reason?: VexaCompletionReason | null;
       planned?: boolean;
-      /** Base64 audio bytes to expose through the recordings API (WAV/webm). */
-      recording_base64?: string;
-      recording_content_type?: string;
-      speaker_timeline?: unknown;
     };
-    if (body.recording_base64 !== undefined) {
-      m.recording = { bytes: new Uint8Array(Buffer.from(body.recording_base64, "base64")), contentType: body.recording_content_type ?? "audio/wav" };
-    }
-    if (body.speaker_timeline !== undefined) m.speakerTimeline = body.speaker_timeline;
     if (body.status) {
       m.status = body.status;
       if (["active", "completed"].includes(body.status) && !m.start_time) m.start_time = now();

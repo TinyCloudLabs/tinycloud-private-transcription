@@ -4,12 +4,8 @@ import { ApiError } from "../domain/errors.ts";
 import type { Platform } from "../domain/platform.ts";
 import { isTerminal, mapVexaFailure, mapVexaStatus, type MeetingStatus } from "../domain/state.ts";
 import { VexaHttpError } from "../providers/vexa/client.ts";
-import { adaptSpeakerTimeline } from "../providers/vexa/speaker-timeline.ts";
 import { adaptVexaSegments, completionReasonOf } from "../providers/vexa/adapter.ts";
-import type { VexaRecording, VexaTranscriptionResponse } from "../providers/vexa/types.ts";
 import { toVexaPlatform } from "../providers/vexa/platform-map.ts";
-import { TranscriptionFallbackError, type AudioBlob } from "../providers/transcription/types.ts";
-import { VexaNativeProvider } from "../providers/transcription/vexa-native.ts";
 import { failMeeting, getMeetingById, storeTranscript, transition } from "../services/meetings.ts";
 import { enqueueMeetingWebhook } from "../webhooks/dispatcher.ts";
 import { observeCapture, recordCapture } from "../services/capture.ts";
@@ -32,21 +28,18 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
       meeting_url: meeting.meetingUrl,
       bot_name: meeting.botName ?? undefined,
       language: meeting.language ?? undefined,
+      // Vexa performs transcription, including when its deployment is configured to use Tinfoil.
+      // TinyCloud persists the completed Vexa segments and never re-transcribes a recording.
+      transcribe_enabled: true,
       // Vexa otherwise applies its ten-minute deployment fallback. Pin every TinyCloud meeting to
       // our configurable audio-silence window. This can expire with humans still connected;
       // participant presence does not veto Vexa's silence verdict.
       automatic_leave: { max_time_left_alone: ctx.config.vexa.maxTimeLeftAloneMs },
-      // Batch providers (Tinfoil) transcribe the persisted recording: ask for it explicitly (Vexa's
-      // default is true, but a deployment can flip RECORDING_ENABLED off). Do not also run Vexa's
-      // live Whisper path: one long Google Meet can otherwise fan out enough abandoned requests to
-      // saturate the single CPU worker before the authoritative batch transcription begins.
-      ...(needsRecording(ctx) ? { recording_enabled: true, transcribe_enabled: false } : {}),
     });
     const vexaNativeMeetingId = created.native_meeting_id ?? meeting.vexaNativeMeetingId;
     const dispatched = await recordCapture(ctx, meeting, {
       silence_timeout_ms: ctx.config.vexa.maxTimeLeftAloneMs,
-      ...(needsRecording(ctx) ? { recording_requested: true } : {}),
-      live_transcription_requested: !needsRecording(ctx),
+      live_transcription_requested: true,
     });
     const { meeting: updated, changed } = await transition(ctx, dispatched, "joining", {
       vexaPlatform: created.platform ?? vexaPlatform,
@@ -148,43 +141,11 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
     return;
   }
 
-  // A terminal bot state describes how capture ended, not whether all captured media was lost. In
-  // particular, left_alone/evicted/failed can retain a complete recording. Always salvage that
-  // recording before deciding this meeting failed.
+  // Vexa owns the STT windows and speaker attribution. Private transcription only normalizes and
+  // persists Vexa's completed segments; it must never re-fetch or re-transcribe recordings.
   const segments = adaptVexaSegments(vexa); // deduped by turn, epoch → meeting-relative seconds
   const hasLiveWords = segments.some((segment) => segment.text.trim().length > 0);
-  const currentMeetingId = meeting.id;
-  let cachedAudio: AudioBlob | null | undefined;
-  const fetchAudio = async () => {
-    if (cachedAudio !== undefined) return cachedAudio;
-    ctx.log.debug("fetching vexa recording", { meetingId: currentMeetingId, vexaMeetingId: vexa.id });
-    cachedAudio = await fetchVexaAudio(ctx, vexa);
-    if (cachedAudio) ctx.log.debug("vexa recording fetched", { meetingId: currentMeetingId, bytes: cachedAudio.bytes.length, contentType: cachedAudio.contentType });
-    return cachedAudio;
-  };
-
-  // With no live segments, a batch provider needs a usable recording to produce anything. This
-  // preflight also prevents the old fallback path from storing an empty "completed" transcript.
-  let usableAudio = true;
-  if (!hasLiveWords && needsRecording(ctx)) {
-    try {
-      usableAudio = !!(await fetchAudio());
-    } catch (error) {
-      const retryable = isRetryableRecordingFetchError(error);
-      const attempts = meeting.transcriptionAttempts + 1;
-      if (retryable && attempts < MAX_TRANSCRIPTION_ATTEMPTS) {
-        ctx.log.warn("vexa recording unavailable; will retry", { meetingId, attempts, error: String(error) });
-        await ctx.db.update(meetings).set({ transcriptionAttempts: attempts }).where(eq(meetings.id, meeting.id));
-        await ctx.queue.push({ type: "meeting.poll", meetingId }, TRANSCRIPTION_RETRY_BASE_MS * attempts);
-        return;
-      }
-      ctx.log.error("vexa recording could not be fetched", { meetingId, attempts, error: String(error) });
-      const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "The retained meeting audio could not be loaded for transcription.");
-      if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
-      return;
-    }
-  }
-  if (!hasLiveWords && (!needsRecording(ctx) || !usableAudio)) {
+  if (!hasLiveWords) {
     const f = reason ? mapVexaFailure(reason) : { code: "capture_failed" as const, message: "No usable audio was captured for this meeting." };
     const { meeting: failed, changed } = await failMeeting(ctx, meeting, f.code, f.message);
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
@@ -192,83 +153,26 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
   }
 
   ({ meeting } = await transition(ctx, meeting, "processing"));
-  ctx.log.debug("vexa meeting completed; finalizing", { meetingId: meeting.id, vexaSegments: segments.length, recordings: vexa.recordings?.length ?? 0 });
-  await finalize(ctx, meeting, segments, fetchAudio);
+  ctx.log.debug("vexa meeting completed; finalizing", { meetingId: meeting.id, vexaSegments: segments.length });
+  await finalize(ctx, meeting, segments);
 }
-
-/** True for providers that transcribe persisted audio (anything but the WhisperLive passthrough). */
-const needsRecording = (ctx: AppContext) => ctx.transcription.name !== "vexa";
-
-const isRetryableRecordingFetchError = (error: unknown) =>
-  (error instanceof ApiError && (error.code === "provider_unavailable" || error.code === "provider_timeout")) ||
-  (error instanceof VexaHttpError && (error.status >= 500 || error.status === 429 || error.notFound));
 
 async function finalize(
   ctx: AppContext,
   meeting: MeetingRow,
   vexaSegments: ReturnType<typeof adaptVexaSegments>,
-  fetchAudio: () => Promise<AudioBlob | null>,
 ) {
-  const primary = ctx.transcription.name;
-  let audioMissing = false;
   const input = {
     meetingId: meeting.id,
     language: meeting.language,
     vexaSegments,
-    fetchAudio: async () => {
-      try {
-        const audio = await fetchAudio();
-        if (!audio) audioMissing = true;
-        return audio;
-      } catch (error) {
-        // Vexa's recording endpoints return their own HTTP error type. Normalize transient/eventual
-        // recording failures so the meeting-level delayed retry handles them just like network timeouts.
-        if (error instanceof VexaHttpError && isRetryableRecordingFetchError(error)) {
-          throw new ApiError("provider_unavailable", "Meeting recording is temporarily unavailable");
-        }
-        throw error;
-      }
-    },
-  };
-  // Non-empty Vexa live segments are a valid loss-preserving fallback when the batch provider cannot run.
-  // Falling back is loss-preserving only when Vexa actually has words. Never turn an unusable batch
-  // recording plus zero live segments into an empty "completed" transcript.
-  const canFallback = () => needsRecording(ctx) && vexaSegments.some((segment) => segment.text.trim().length > 0);
-  let fallbackInfo: { from: string; reason: string } | null = null;
-  const fallback = async (reason: string, error: unknown) => {
-    ctx.log.warn("falling back to vexa-native transcript", { meetingId: meeting.id, provider: primary, reason, error: String(error) });
-    const transcript = await new VexaNativeProvider().transcribe(input);
-    fallbackInfo = { from: primary, reason };
-    ctx.log.info("transcript finalized", { meetingId: meeting.id, provider: "vexa", fallback_from: primary, fallback_reason: reason, segments: transcript.segments.length });
-    return transcript;
   };
   try {
-    let transcript;
-    let provider = primary;
-    try {
-      transcript = await ctx.transcription.transcribe(input);
-      const stats = (ctx.transcription as { lastStats?: Record<string, unknown> }).lastStats;
-      ctx.log.info("transcript finalized", { meetingId: meeting.id, provider, segments: transcript.segments.length, ...(stats ? { stats } : {}) });
-    } catch (e) {
-      const retryable = e instanceof ApiError && (e.code === "provider_unavailable" || e.code === "provider_timeout");
-      const attempts = meeting.transcriptionAttempts + 1;
-      if (retryable && attempts < MAX_TRANSCRIPTION_ATTEMPTS) throw e; // retried below
-      if (!canFallback()) throw e;
-      if (audioMissing) {
-        transcript = await fallback("no_usable_recording", e);
-      } else if (e instanceof TranscriptionFallbackError) {
-        transcript = await fallback(e.reason, e);
-      } else if (retryable) {
-        transcript = await fallback("provider_unavailable_after_retries", e);
-      } else {
-        throw e;
-      }
-      provider = "vexa";
-    }
+    const transcript = await ctx.transcription.transcribe(input);
     if (!transcript.text.trim()) {
       throw new ApiError("transcription_failed", "Transcription provider returned no words");
     }
-    await storeTranscript(ctx, meeting.id, transcript, provider, fallbackInfo);
+    await storeTranscript(ctx, meeting.id, transcript, "vexa");
     const { meeting: done, changed } = await transition(ctx, meeting, "completed");
     if (changed) await enqueueMeetingWebhook(ctx, done, "meeting.completed");
   } catch (e) {
@@ -289,49 +193,4 @@ async function finalize(
     );
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
   }
-}
-
-/** Below this the opus master is almost certainly silence (run 1 of the capture rig: 9 KB / 38 s ≈ 240 B/s; real speech ≈ 5 KB/s). */
-const MIN_AUDIO_BYTES_PER_SECOND = 1000;
-
-/**
- * Persisted meeting audio for the Tinfoil batch path (`recording_enabled` default true): the recording
- * list comes with the transcript row (`recordings[]`, else GET /recordings filtered by meeting_id),
- * `GET /recordings/{id}/master?type=audio` assembles master.webm, `raw_url` streams the bytes.
- * Returns null when nothing usable is persisted (Tinfoil provider then fails with transcription_failed).
- * Content sanity check: a master far below speech bitrate is treated as the known "silent tap" failure
- * (docs/vexa-findings.md) rather than sent to Tinfoil.
- */
-async function fetchVexaAudio(ctx: AppContext, vexa: VexaTranscriptionResponse): Promise<AudioBlob | null> {
-  let recordings: VexaRecording[] = (vexa.recordings ?? []).filter((r) => r.meeting_id === vexa.id);
-  if (recordings.length === 0) {
-    recordings = (await ctx.vexa.listRecordings()).recordings.filter((r) => r.meeting_id === vexa.id);
-  }
-  const durationSec =
-    vexa.start_time && vexa.end_time ? (Date.parse(vexa.end_time) - Date.parse(vexa.start_time)) / 1000 : null;
-  for (const rec of recordings) {
-    if (!rec.media_files?.some((f) => f.type === "audio")) continue;
-    const master = await ctx.vexa.recordingMaster(rec.id, "audio");
-    if (!master.raw_url) continue;
-    const { bytes, contentType } = await ctx.vexa.fetchBytes(master.raw_url);
-    if (bytes.length === 0) continue;
-    if (durationSec && durationSec > 5 && bytes.length / durationSec < MIN_AUDIO_BYTES_PER_SECOND) {
-      ctx.log.warn("vexa recording looks silent; skipping", { vexaMeetingId: vexa.id, recordingId: rec.id, bytes: bytes.length, durationSec });
-      continue;
-    }
-    let speakerTimeline: AudioBlob["speakerTimeline"];
-    if (vexa.platform === "google_meet") {
-      try {
-        speakerTimeline = adaptSpeakerTimeline(await ctx.vexa.recordingSpeakerTimeline(rec.id), rec.id);
-      } catch (error) {
-        if (!(error instanceof VexaHttpError && error.notFound)) {
-          speakerTimeline = [];
-          ctx.log.warn("recording speaker timeline unavailable; preserving unattributed audio", { recordingId: rec.id, error: String(error) });
-        }
-      }
-    }
-    return { bytes, filename: "meeting.webm", contentType: contentType.startsWith("audio/") ? contentType : "audio/webm",
-      ...(speakerTimeline === undefined ? {} : { speakerTimeline }) };
-  }
-  return null;
 }

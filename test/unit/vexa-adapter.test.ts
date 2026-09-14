@@ -41,3 +41,10 @@ test("toMeetingRelative: start_time origin when it precedes the first segment, e
   const rel = toMeetingRelative([{ start: 0, end: 3.2, text: "x", language: "en" }, { start: 3.5, end: 5, text: "y", language: "en" }], null);
   expect(rel.map((s) => [s.start, s.end])).toEqual([[0, 3.2], [3.5, 5]]);
 });
+
+test("rejects malformed completed segments at the Vexa transcript boundary", () => {
+  expect(() => adaptVexaSegments({
+    start_time: null,
+    segments: [{ start: 4, end: 3, text: "bad", language: "en", completed: true }],
+  })).toThrow("Vexa returned an invalid transcript segment");
+});

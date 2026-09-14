@@ -3,10 +3,7 @@
 Upstream: `Vexa-ai/vexa` @ `e0b356d6de3f8322db45d3cb9d66282ae108bebf` (main, "v0.12.22" release notes;
 `git describe` = v0.12.18-29). Control-plane images `vexaai/v012-*:v012`. Apache-2.0.
 **Since 2026-08-19 the BOT comes from our fork** `TinyCloudLabs/vexa` branch `tinycloud`
-(`2db950be`, image `ghcr.io/tinycloudlabs/vexa/bot:tc-2db950b`): the record-chunker defects
-below (static tap → late joiners missing from master.webm; silent master when nobody with audio
-was present at bot join) are **fixed there** — the tap is now a dynamic mix with a 2 s rescan,
-live-mixer parity. See README "Vexa fork".
+(`2db950be`, image `ghcr.io/tinycloudlabs/vexa/bot:tc-2db950b`).
 Stack under `infra/vexa`, local Jitsi under `infra/jitsi`, gate `scripts/vexa-smoke.ts` (**green, 3/3 runs**).
 Raw payloads: `docs/vexa-samples/*.json` (verbatim from the running stack).
 
@@ -16,7 +13,6 @@ Raw payloads: `docs/vexa-samples/*.json` (verbatim from the running stack).
 * Address everything else by `(platform, native_meeting_id)`: `GET /transcripts/jitsi/<room>@jitsi.local`, `DELETE /bots/jitsi/<room>@jitsi.local`. `@` in the path works unencoded or encoded.
 * Status values observed: `requested → joining → active → stopping → completed`; also `failed` (stopped before join: `completion_reason:"stopped"`, `failure_stage:"requested"`). Contract enums below.
 * Transcript = `TranscriptionResponse` with `segments[]` of `{start,end,text,language,speaker,completed,segment_id,absolute_start_time,absolute_end_time}`; `speaker` is the Jitsi display name ("Alice"). Segments include **draft rows** (`segment_id: "turn:N:p0"`, and live-poll `completed:false, source:"merged"`) alongside confirmed rows (`turn:N:0`) — dedupe by `turn:N` when building our transcript.
-* `recording_enabled:true` (default) **persists audio to MinIO** (`recordings/<user>/<recording_id>/<session>/audio/*.webm` + assembled `master.webm`, opus 48 kHz stereo) and exposes it via `GET /recordings/{id}/media/{media_file_id}/raw?type=audio` (raw bytes). Offline transcription of that file works → **the batch Tinfoil path is viable** (with a caveat below).
 
 ## Auth model
 * `ADMIN_TOKEN` (compose env; ours `dev-admin-token`) = `X-Admin-API-Key` for `admin-api` (`/admin/users`, `/admin/users/{id}/tokens?scopes=bot,tx`). Also signs the internal MeetingToken.
@@ -29,14 +25,14 @@ Request (what we send):
 ```json
 {"platform":"jitsi","meeting_url":"https://jitsi.local:8443/ptx-smoke-msxhmw1k","bot_name":"TinyCloud Notetaker","language":"en"}
 ```
-Other accepted fields (api.v1 `MeetingCreate`): `native_meeting_id`, `task` (`transcribe|translate`), `transcription_tier` (`realtime` default | `deferred`), `recording_enabled`, `transcribe_enabled`, `passcode` (Jitsi room password), `automatic_leave{max_bot_time,max_wait_for_admission,max_time_left_alone,no_one_joined_timeout}` (ms), `video`, `voice_agent_enabled`, … `webhook` config is per user (`PUT /user/webhook`), not per bot.
+Other accepted fields (api.v1 `MeetingCreate`): `native_meeting_id`, `task` (`transcribe|translate`), `transcription_tier` (`realtime` default | `deferred`), `transcribe_enabled`, `passcode` (Jitsi room password), `automatic_leave{max_bot_time,max_wait_for_admission,max_time_left_alone,no_one_joined_timeout}` (ms), `video`, `voice_agent_enabled`, … `webhook` config is per user (`PUT /user/webhook`), not per bot.
 
 Response **201** (`docs/vexa-samples/vexa-post-bots-response.json`):
 ```json
 {"id":1,"user_id":1,"platform":"jitsi","native_meeting_id":"ptx-smoke-msxhmw1k@jitsi.local",
  "constructed_meeting_url":"https://jitsi.local:8443/ptx-smoke-msxhmw1k","status":"requested",
  "bot_container_id":"mtg-1-02a27ddc","start_time":null,"end_time":null,"completion_reason":null,"failure_stage":null,
- "data":{"recording_enabled":true,"transcribe_enabled":true,"constructed_meeting_url":"https://jitsi.local:8443/ptx-smoke-msxhmw1k","sessions":["02a27ddc-…"]},
+ "data":{"transcribe_enabled":true,"constructed_meeting_url":"https://jitsi.local:8443/ptx-smoke-msxhmw1k","sessions":["02a27ddc-…"]},
  "created_at":"2026-08-17T17:08:43.862932Z","updated_at":"2026-08-17T17:08:44.361744Z"}
 ```
 Validation (all **422** `{"detail": "..."}` strings, no error codes):
@@ -58,12 +54,8 @@ lifecycle.v1 enums: `BotStatus` `joining|awaiting_admission|active|needs_help|co
 ```json
 {"id":1,"platform":"jitsi","native_meeting_id":"…@jitsi.local","constructed_meeting_url":"https://…","status":"completed",
  "start_time":"2026-08-17T17:08:51.852399Z","end_time":"2026-08-17T17:09:35.481743Z",
- "recordings":[{"id":440464823505,"source":"bot","status":"completed","meeting_id":1,"session_uid":"…",
-    "media_files":[{"id":433432982412,"type":"audio","format":"webm","is_final":true,"chunk_count":3,"file_size_bytes":7192,
-                    "storage_backend":"minio","storage_path":"recordings/1/440464823505/<session>/audio/000001.webm","metadata":{"sample_rate":16000},"duration_seconds":null}],
-    "playback_url":{"audio":"/recordings/440464823505/master?type=audio","video":null},"completed_at":"…"}],
  "notes":null,
- "data":{"recordings":[…same…],"stop_requested":true,"completion_reason":"stopped","recording_enabled":true,"transcribe_enabled":true,
+ "data":{"stop_requested":true,"completion_reason":"stopped","transcribe_enabled":true,
          "segments_captured":0,"status_transition":[…],"constructed_meeting_url":"…"},
  "segments":[
    {"start":1786986557.63,"end":1786986562.20,"text":"The quick brown fox jumps over the lazy dog.","language":"en","speaker":"Alice",
@@ -73,14 +65,7 @@ lifecycle.v1 enums: `BotStatus` `joining|awaiting_admission|active|needs_help|co
 Notes: `start`/`end` are **epoch seconds** (floats), not meeting-relative — compute offsets from `start_time`; `absolute_*` are ISO. While live, segments carry `"source":"merged"` and drafts have `completed:false`; after completion the field is gone and drafts flip to `completed:true` (dedupe on the `turn:N` prefix, prefer `turn:N:0`). `data.segments_captured` was `0` despite 7 segments (ignore). 404 `{"detail":"Meeting not found for platform jitsi and ID …"}` until the row exists (it exists immediately after POST, with `segments: []`).
 
 ## DELETE /bots/{platform}/{native_meeting_id}
-200 `{"status":"stopping","meeting_id":1,"native_meeting_id":"…"}`; second call 404 `{"detail":"No active meeting for this bot"}`. The bot leaves gracefully (`APP.conference.hangup()`), flushes the final recording chunk, and the row goes `stopping → completed` (~6 s). Also `DELETE /meetings/{platform}/{native}` and `DELETE /meetings/{meeting_id}` (204) exist to remove records.
-
-## `recording_enabled` — does audio persist, where?
-**Yes.** Default true (`RECORDING_ENABLED` env / per-request). The bot's page-side `createRecordingTap` mixes every `<audio>/<video>` element into one MediaRecorder (`audio/webm;codecs=opus`, 15 s timeslices, `VEXA_RECORDING_TIMESLICE_MS`), uploads chunks to meeting-api `/internal/recordings/upload`, which stores them in **MinIO** bucket `vexa` and assembles `master.webm` at finalization. Read back with the user key:
-`GET /recordings` (list) → `GET /recordings/{id}/master?type=audio` → `{"storage_path":".../master.webm","media_file_id":…,"raw_url":"/recordings/{id}/media/{media_file_id}/raw?type=audio","duration_seconds":null}` → `GET …/raw?type=audio` = `audio/webm` bytes.
-Verified: run 2 (12.6 s) and run 3 (22.8 s) recordings, decoded with ffmpeg and posted to whisper offline, transcribe to "The quick brown fox jumps over the lazy dog. Below from Alice." — the recording is the meeting mix, usable as the batch input to Tinfoil (`voxtral-mini-4b`) → **batch path viable**. Caveat: run 1's recording (37.9 s, 4 chunks, 9 KB) was **silence** although the live transcript was fine — the tap grabs media elements once at start (5×2 s retries), so it can latch onto a stale/silent element on the very first meeting after a cold stack; treat recording content as needing a sanity check (size/bitrate) before relying on it, and keep WhisperLive-shim as fallback. There is also `POST /meetings/{meeting_id}/transcribe` ("Transcribe a completed meeting recording", forwarded to meeting-api) — not exercised.
-
-**Batch-path status (2026-08-19): shipped and live-verified.** `TinfoilTranscriptionProvider` downloads the master, decodes it once with ffmpeg and sends one clip per Vexa speaker turn to Tinfoil (`TINFOIL_SEGMENTATION=turns`), keeping Vexa's speaker/timing (README "Confidential transcription"). Timeline alignment checked on 6 rig recordings: recording origin ≈ `start_time` (energy profile of the master vs Vexa's meeting-relative segments; per-turn Tinfoil text matches Vexa's words for the same window), master is ~5–10 s shorter than `start_time→end_time` (leave/flush). `bun run test:e2e` with `TRANSCRIPTION_PROVIDER=tinfoil`: green 2/2, `transcript.provider:"tinfoil"`, 2 and 3 calls. New caveats seen with two fake participants (`scripts/two-speaker-live.ts`, 4 runs) — **BOTH FIXED in our fork on 2026-08-19** (`TinyCloudLabs/vexa@029610db`, branch `tinycloud`): (a) upstream's record-chunker attached only the media elements present when it started (`[record-chunker] 3 media elements (strict) … combined 3 streams`) while the live mixer kept connecting new ones (`[mixed] connected remote stream 3` *after* `MediaRecorder started`) — Bob's audio track was signalled after the tap on every run, so his voice was absent from master.webm although the live transcript heard him; (b) if nobody with audio was in the room when the bot joined, the master was silent (10 KB / 46 s). The fork's `DynamicElementMixer` starts the recorder immediately (empty mix OK) and rescans every 2 s (`[record-chunker] dynamic mix started (47 elements at start; rescan every 2000ms)` … `attached media element (48 attached)` when Bob arrives). Verified on the rig with Bob joining AFTER the bot: per-turn Tinfoil transcript from the recording carries "Good morning, everyone. This is Bob. The meeting starts now." (2/2 runs, 12+13 calls), and whisper-decoding the CI-built image's master.webm shows Alice+Bob interleaved (master 1.2 MB vs the silent ~10 KB before). The worker's Vexa-native fallback stays as defence in depth. Also: `voxtral-small-24b` on Tinfoil rejects `verbose_json` (400) — `json` only, no timestamps.
+200 `{"status":"stopping","meeting_id":1,"native_meeting_id":"…"}`; second call 404 `{"detail":"No active meeting for this bot"}`. The bot leaves gracefully (`APP.conference.hangup()`), and the row goes `stopping → completed` (~6 s). Also `DELETE /meetings/{platform}/{native}` and `DELETE /meetings/{meeting_id}` (204) exist to remove records.
 
 ## Resource footprint per bot (this host: 64 vCPU, no GPU)
 * Bot container `ptx/vexa-bot:v012-devca` (image 1.62 GB, `shm=2g`, no cpu/mem limits set by runtime): Chromium launch burst ~10 cores for a few seconds, then ~10–15 % of one core steady, **~470 MB RSS** for a 2-party call. Xvfb+PulseAudio+headful Chromium.

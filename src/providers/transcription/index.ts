@@ -1,21 +1,14 @@
 import type { Config } from "../../config.ts";
-import { TinfoilTranscriptionProvider } from "./tinfoil.ts";
-import type { Logger } from "../../log.ts";
 import type { TranscriptionProvider } from "./types.ts";
 import { VexaNativeProvider } from "./vexa-native.ts";
 
-export type { TranscriptionProvider, TranscriptionInput, AudioBlob } from "./types.ts";
-export { TranscriptionFallbackError } from "./types.ts";
+export type { TranscriptionProvider, TranscriptionInput } from "./types.ts";
 export { VexaNativeProvider } from "./vexa-native.ts";
-export { TinfoilTranscriptionProvider } from "./tinfoil.ts";
 
-export function createTranscriptionProvider(cfg: Pick<Config, "transcriptionProvider" | "tinfoil">, log?: Logger): TranscriptionProvider {
-  switch (cfg.transcriptionProvider) {
-    case "vexa":
-      return new VexaNativeProvider();
-    case "tinfoil":
-      return new TinfoilTranscriptionProvider({ ...cfg.tinfoil, log });
-    default:
-      throw new Error(`Unknown TRANSCRIPTION_PROVIDER: ${cfg.transcriptionProvider}`);
-  }
+/**
+ * Backend selection is owned by Vexa. Both deployment selections consume Vexa's completed,
+ * speaker-attributed segments; no recording is downloaded or sent to another provider here.
+ */
+export function createTranscriptionProvider(_cfg: Pick<Config, "transcriptionProvider">): TranscriptionProvider {
+  return new VexaNativeProvider();
 }

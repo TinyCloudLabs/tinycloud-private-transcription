@@ -3,6 +3,7 @@ import { sql } from "drizzle-orm";
 import { createApp } from "../../src/api/app.ts";
 import { createApiKey } from "../../src/api/auth.ts";
 import { config as baseConfig } from "../../src/config.ts";
+import type { TranscriptionProviderName } from "../../src/config.ts";
 import { createContext, type AppContext } from "../../src/context.ts";
 import { runMigrations } from "../../src/db/migrate.ts";
 import { silentLogger, type Logger } from "../../src/log.ts";
@@ -40,16 +41,17 @@ export async function startHarness(
     enabledPlatforms?: string[];
     joinTimeoutSeconds?: number;
     maxTimeLeftAloneMs?: number;
+    transcriptionProvider?: TranscriptionProviderName;
   } = {},
 ): Promise<Harness> {
   const vexa = startMockVexa(0);
   const config = {
     ...baseConfig,
     vexa: { ...baseConfig.vexa, baseUrl: vexa.baseUrl, apiKey: vexa.apiKey, pollIntervalMs: 50 },
-    transcriptionProvider: (opts.transcription?.name ?? "vexa") as "vexa" | "tinfoil",
     ...(opts.enabledPlatforms ? { enabledPlatforms: opts.enabledPlatforms } : {}),
     ...(opts.joinTimeoutSeconds !== undefined ? { joinTimeoutSeconds: opts.joinTimeoutSeconds } : {}),
     ...(opts.maxTimeLeftAloneMs !== undefined ? { vexa: { ...baseConfig.vexa, baseUrl: vexa.baseUrl, apiKey: vexa.apiKey, pollIntervalMs: 50, maxTimeLeftAloneMs: opts.maxTimeLeftAloneMs } } : {}),
+    ...(opts.transcriptionProvider ? { transcriptionProvider: opts.transcriptionProvider } : {}),
   };
   const db = await runMigrations(config.databaseUrl);
   await db.execute(sql`truncate table webhook_deliveries, transcripts, meetings, api_keys, projects cascade`);
