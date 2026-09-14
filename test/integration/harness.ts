@@ -12,6 +12,7 @@ import { VexaNativeProvider } from "../../src/providers/transcription/vexa-nativ
 import type { TranscriptionProvider } from "../../src/providers/transcription/types.ts";
 import { Queue } from "../../src/worker/queue.ts";
 import { startWorker, type WorkerHandle } from "../../src/worker/index.ts";
+import type { SignalCaptureAdapter } from "../../src/providers/signal/adapter.ts";
 
 export type ApiResponse = Omit<Response, "json"> & { json(): Promise<any> };
 
@@ -40,6 +41,8 @@ export async function startHarness(
     enabledPlatforms?: string[];
     joinTimeoutSeconds?: number;
     maxTimeLeftAloneMs?: number;
+    signal?: SignalCaptureAdapter;
+    signalCapabilityKey?: string;
   } = {},
 ): Promise<Harness> {
   const vexa = startMockVexa(0);
@@ -50,6 +53,7 @@ export async function startHarness(
     ...(opts.enabledPlatforms ? { enabledPlatforms: opts.enabledPlatforms } : {}),
     ...(opts.joinTimeoutSeconds !== undefined ? { joinTimeoutSeconds: opts.joinTimeoutSeconds } : {}),
     ...(opts.maxTimeLeftAloneMs !== undefined ? { vexa: { ...baseConfig.vexa, baseUrl: vexa.baseUrl, apiKey: vexa.apiKey, pollIntervalMs: 50, maxTimeLeftAloneMs: opts.maxTimeLeftAloneMs } } : {}),
+    ...(opts.signalCapabilityKey ? { signal: { ...baseConfig.signal, capabilityKey: opts.signalCapabilityKey } } : {}),
   };
   const db = await runMigrations(config.databaseUrl);
   await db.execute(sql`truncate table webhook_deliveries, transcripts, meetings, api_keys, projects cascade`);
@@ -62,6 +66,7 @@ export async function startHarness(
     queue,
     vexa: new VexaClient({ baseUrl: vexa.baseUrl, apiKey: vexa.apiKey }),
     transcription: opts.transcription ?? new VexaNativeProvider(),
+    ...(opts.signal ? { signal: opts.signal } : {}),
     log: opts.log ?? silentLogger,
     webhookRetryDelaysMs: opts.webhookRetryDelaysMs ?? [0, 100, 200],
   });

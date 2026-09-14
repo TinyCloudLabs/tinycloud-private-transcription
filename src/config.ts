@@ -26,6 +26,12 @@ export const config = {
     /** Provisioned bot ceiling (matches `max_concurrent_bots` in infra/dstack/app-compose.yaml). Reported in /health. */
     maxConcurrentBots: Number(env("VEXA_MAX_CONCURRENT_BOTS", "5")),
   },
+  /** Loopback-only worker which owns Signal Desktop CDP and PulseAudio capture. */
+  signal: {
+    baseUrl: env("SIGNAL_CAPTURE_URL", "http://127.0.0.1:18076"),
+    capabilityKey: env("SIGNAL_CAPABILITY_KEY", ""),
+    maxConcurrentCalls: positiveIntegerEnv("SIGNAL_MAX_CONCURRENT_CALLS", "1"),
+  },
   /** Platforms accepted by POST /v1/meetings. Detection still recognizes all platforms; the rest are gated with 400 unsupported_platform. */
   enabledPlatforms: env("ENABLED_PLATFORMS", "jitsi").split(",").map((s) => s.trim()).filter(Boolean),
   /** Worker-side join deadline: a meeting still joining/waiting_for_admission this long after bot dispatch is failed and its bot stopped. */

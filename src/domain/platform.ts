@@ -1,7 +1,7 @@
 import { ApiError } from "./errors.ts";
 
-export type Platform = "google_meet" | "zoom" | "microsoft_teams" | "jitsi";
-export const PLATFORMS: Platform[] = ["google_meet", "zoom", "microsoft_teams", "jitsi"];
+export type Platform = "google_meet" | "zoom" | "microsoft_teams" | "jitsi" | "signal";
+export const PLATFORMS: Platform[] = ["google_meet", "zoom", "microsoft_teams", "jitsi", "signal"];
 
 export interface DetectedPlatform {
   platform: Platform;
@@ -26,6 +26,13 @@ export function detectPlatform(meetingUrl: string, override?: string): DetectedP
   }
   const host = u.hostname.toLowerCase();
   const labels = host.split(".");
+
+  // Signal group-call links put the admission capability in the fragment.  A fragment is never
+  // sent in a normal HTTP request, but clients POST the complete URL to us; keep it out of the
+  // ordinary meeting URL and hand it only to the Signal capture worker.
+  if (host === "signal.link" && u.pathname === "/call/" && u.hash.length > 1) {
+    return { platform: "signal", nativeMeetingId: null };
+  }
 
   if (host === "meet.google.com") {
     const code = singleSegment(u);

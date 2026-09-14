@@ -5,6 +5,7 @@ import { VexaClient } from "./providers/vexa/client.ts";
 import { createTranscriptionProvider, type TranscriptionProvider } from "./providers/transcription/index.ts";
 import { Queue } from "./worker/queue.ts";
 import { logger, type Logger } from "./log.ts";
+import { LoopbackSignalCaptureAdapter, type SignalCaptureAdapter } from "./providers/signal/adapter.ts";
 
 export interface AppContext {
   config: Config;
@@ -13,6 +14,7 @@ export interface AppContext {
   queue: Queue;
   vexa: VexaClient;
   transcription: TranscriptionProvider;
+  signal: SignalCaptureAdapter;
   log: Logger;
   /** Webhook retry schedule (ms after previous attempt). Overridable for tests. */
   webhookRetryDelaysMs: number[];
@@ -31,6 +33,7 @@ export function createContext(overrides: Partial<AppContext> & { config?: Config
     queue: overrides.queue ?? new Queue(redis),
     vexa: overrides.vexa ?? new VexaClient({ baseUrl: cfg.vexa.baseUrl, apiKey: cfg.vexa.apiKey }),
     transcription: overrides.transcription ?? createTranscriptionProvider(cfg, log),
+    signal: overrides.signal ?? new LoopbackSignalCaptureAdapter(cfg.signal.baseUrl),
     log,
     webhookRetryDelaysMs: overrides.webhookRetryDelaysMs ?? DEFAULT_WEBHOOK_RETRY_DELAYS_MS,
   };

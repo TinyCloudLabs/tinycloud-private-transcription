@@ -30,6 +30,10 @@ export const meetings = pgTable(
     vexaPlatform: text("vexa_platform"),
     vexaNativeMeetingId: text("vexa_native_meeting_id"),
     vexaBotId: text("vexa_bot_id"),
+    /** Signal worker session ID; unlike a call fragment this is safe operational metadata. */
+    signalSessionId: text("signal_session_id"),
+    /** AES-GCM encrypted Signal call fragment. Cleared as soon as capture becomes terminal. */
+    signalCapability: text("signal_capability"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     startedAt: timestamp("started_at", { withTimezone: true }),
     endedAt: timestamp("ended_at", { withTimezone: true }),
