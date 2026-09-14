@@ -13,7 +13,7 @@ import { VexaNativeProvider } from "../providers/transcription/vexa-native.ts";
 import { failMeeting, getMeetingById, storeTranscript, transition } from "../services/meetings.ts";
 import { enqueueMeetingWebhook } from "../webhooks/dispatcher.ts";
 import { observeCapture, recordCapture } from "../services/capture.ts";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 import { meetings } from "../db/schema.ts";
 import { normalizeSegments } from "../domain/transcript.ts";
 import { openSignalCapability } from "../providers/signal/capability.ts";
@@ -26,7 +26,7 @@ const TRANSCRIPTION_RETRY_BASE_MS = 30_000;
 export async function handleMeetingStart(ctx: AppContext, meetingId: string, attempt = 1): Promise<void> {
   const meeting = await getMeetingById(ctx, meetingId);
   if (!meeting || meeting.status !== "queued") return;
-  if (meeting.platform === "signal") return handleSignalStart(ctx, meeting);
+  if (meeting.platform === "signal") return handleSignalStart(ctx, meeting, attempt);
   const vexaPlatform = toVexaPlatform(meeting.platform as Exclude<Platform, "signal">);
   try {
     const created = await ctx.vexa.createBot({
@@ -202,20 +202,34 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
   await finalize(ctx, meeting, segments, fetchAudio);
 }
 
-async function handleSignalStart(ctx: AppContext, meeting: MeetingRow) {
+async function handleSignalStart(ctx: AppContext, meeting: MeetingRow, attempt: number) {
   try {
     if (!meeting.signalCapability) throw new ApiError("capture_failed", "Signal call capability is unavailable.");
     const capability = meeting.signalCapability;
     const reserved = await reserveSignalSeat(ctx, meeting.id);
-    if (!reserved) {
-      throw new ApiError("provider_unavailable", "Signal capture capacity is currently unavailable.");
-    }
+    // A full rig is a queue, not a failure: wait for a seat until the join deadline would elapse.
+    if (!reserved) return await requeueForSignalSeat(ctx, meeting, attempt, "capacity");
     meeting = reserved;
     // Reconstruct at the last possible boundary; never emit this URL in a log or persisted field.
     const callUrl = `${meeting.meetingUrl}#${openSignalCapability(capability, ctx.config.signal.capabilityKey)}`;
-    const created = await ctx.signal.start({ meetingId: meeting.id, callUrl, botName: meeting.botName ?? undefined, language: meeting.language ?? undefined });
+    let created;
+    try {
+      created = await ctx.signal.start({ meetingId: meeting.id, callUrl, botName: meeting.botName ?? undefined, language: meeting.language ?? undefined });
+    } catch (error) {
+      // The worker is the authority on its own seats and provisioning. When it says "busy" or "not
+      // ready", give the PTX seat back rather than holding it against a capture that never started.
+      if (error instanceof ApiError && (error.code === "provider_unavailable" || error.code === "provider_timeout") && (await releaseSignalSeat(ctx, meeting.id))) {
+        return await requeueForSignalSeat(ctx, meeting, attempt, error.code);
+      }
+      throw error;
+    }
     const [updated] = await ctx.db.update(meetings).set({ signalSessionId: created.sessionId }).where(and(eq(meetings.id, meeting.id), eq(meetings.status, "joining"))).returning();
-    if (!updated) return;
+    if (!updated) {
+      // Stopped or deleted while we were dispatching: don't leave the seat held in the worker.
+      await ctx.signal.leave(created.sessionId).catch(() => {});
+      await ctx.signal.remove(created.sessionId).catch(() => {});
+      return;
+    }
     ctx.log.info("signal capture dispatched", { meetingId: meeting.id, sessionId: created.sessionId, platform: "signal" });
     await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id }, ctx.config.vexa.pollIntervalMs);
     await ctx.queue.push({ type: "meeting.join_deadline", meetingId: meeting.id }, ctx.config.joinTimeoutSeconds * 1000);
@@ -223,6 +237,33 @@ async function handleSignalStart(ctx: AppContext, meeting: MeetingRow) {
     const { meeting: failed, changed } = await failMeeting(ctx, meeting, error instanceof ApiError ? error.code : "provider_unavailable", "Signal capture could not be started.");
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
   }
+}
+
+/**
+ * Bounded wait for a Signal seat. Attempts are spaced by the poll interval and stop once they would
+ * exceed JOIN_TIMEOUT_SECONDS, at which point the meeting fails as provider_unavailable — the same
+ * deadline a dispatched meeting gets for admission.
+ */
+async function requeueForSignalSeat(ctx: AppContext, meeting: MeetingRow, attempt: number, reason: string) {
+  const delayMs = Math.max(ctx.config.vexa.pollIntervalMs, 1_000);
+  if (attempt * delayMs < ctx.config.joinTimeoutSeconds * 1000) {
+    ctx.log.info("waiting for a signal capture seat", { meetingId: meeting.id, attempt, reason });
+    await ctx.queue.push({ type: "meeting.start", meetingId: meeting.id, attempt: attempt + 1 }, delayMs);
+    return;
+  }
+  const fresh = (await getMeetingById(ctx, meeting.id)) ?? meeting;
+  const { meeting: failed, changed } = await failMeeting(ctx, fresh, "provider_unavailable", "No Signal capture seat became available in time.");
+  if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+}
+
+/** Hands a reserved-but-unused seat back to the queue. Only safe while no worker session exists. */
+async function releaseSignalSeat(ctx: AppContext, meetingId: string): Promise<boolean> {
+  const released = await ctx.db
+    .update(meetings)
+    .set({ status: "queued" })
+    .where(and(eq(meetings.id, meetingId), eq(meetings.status, "joining"), isNull(meetings.signalSessionId)))
+    .returning();
+  return released.length > 0;
 }
 
 /** Serializes check-and-reserve so concurrent queued jobs cannot oversubscribe Signal Desktop seats. */
