@@ -22,8 +22,22 @@ const PHRASES: Record<string, string> = {
 const capabilityFor = (who: string) => `two-seat-${who}-capability-that-must-never-escape`;
 const urlFor = (who: string) => `https://signal.link/call/#${capabilityFor(who)}`;
 const speakerOf = (callUrl: string) => Object.keys(PHRASES).find((who) => callUrl.endsWith(capabilityFor(who)))!;
-const jitter = (maxMs: number) => Math.floor(Math.random() * maxMs);
-const shuffled = <T>(items: T[]): T[] => [...items].sort(() => Math.random() - 0.5);
+
+// Pseudorandom timing/order keeps the race coverage without making CI flaky or irreproducible.
+let randomState = 0x5eeda11c;
+const random = () => {
+  randomState = (randomState * 1664525 + 1013904223) >>> 0;
+  return randomState / 0x1_0000_0000;
+};
+const jitter = (maxMs: number) => Math.floor(random() * maxMs);
+const shuffled = <T>(items: T[]): T[] => {
+  const result = [...items];
+  for (let i = result.length - 1; i > 0; i--) {
+    const j = Math.floor(random() * (i + 1));
+    [result[i], result[j]] = [result[j], result[i]];
+  }
+  return result;
+};
 
 /** Stands in for Signal Desktop only: each seat is admitted after random jitter and speaks on leave. */
 class ScriptedSignalBackend implements SignalCallBackend {
@@ -86,7 +100,7 @@ describe("Signal two-seat capacity", () => {
       await Bun.sleep(jitter(60));
     }
     for (const who of order) await awaitStatus(ids[who], ["in_progress"]);
-    expect(backend.opened.sort()).toEqual(["alice", "bob"]);
+    expect([...backend.opened].sort()).toEqual(["alice", "bob"]);
 
     // Both seats are held, so a third meeting waits for capacity instead of failing.
     const carol = await create("carol");
@@ -116,5 +130,7 @@ describe("Signal two-seat capacity", () => {
     // The freed seats let the queued meeting through without any client retry.
     await awaitStatus(carol, ["in_progress", "processing", "completed"], 20_000);
     expect(backend.opened).toContain("carol");
+    expect((await h.api(`/v1/meetings/${carol}/stop`, { method: "POST" })).status).toBe(200);
+    await awaitStatus(carol, ["completed"]);
   }, 60_000);
 });
