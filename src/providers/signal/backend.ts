@@ -57,17 +57,25 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
     this.cdpUrl = requireLoopbackUrl(options.cdpUrl, "SIGNAL_CDP_URL");
   }
 
+  /** Reports every missing prerequisite at once: an operator provisioning a rig needs the whole list. */
   async preflight(): Promise<SignalBackendReadiness> {
-    if (!this.options.pulseSource) return { ready: false, reason: "SIGNAL_PULSE_SOURCE is not configured" };
-    if (!this.options.transcriber?.length) return { ready: false, reason: "SIGNAL_TRANSCRIBER is not configured" };
+    const missing: string[] = [];
+    if (!this.options.pulseSource) missing.push("SIGNAL_PULSE_SOURCE is not configured");
+    if (!this.options.transcriber?.length) missing.push("SIGNAL_TRANSCRIBER is not configured");
     try {
       const response = await fetch(new URL("/json/version", this.cdpUrl), { signal: AbortSignal.timeout(2_000) });
-      if (!response.ok) return { ready: false, reason: "Signal Desktop CDP is unavailable" };
+      if (!response.ok) missing.push("Signal Desktop CDP is unavailable");
     } catch {
-      return { ready: false, reason: "Signal Desktop CDP is unavailable" };
+      missing.push("Signal Desktop CDP is unavailable");
     }
-    const probe = Bun.spawn([this.options.parecPath ?? "parec", "--version"], { stdout: "ignore", stderr: "ignore" });
-    if ((await probe.exited) !== 0) return { ready: false, reason: "PulseAudio parec is unavailable" };
+    // Bun.spawn throws synchronously when the binary is absent, which is itself the answer.
+    const parec = this.options.parecPath ?? "parec";
+    try {
+      if ((await Bun.spawn([parec, "--version"], { stdout: "ignore", stderr: "ignore" }).exited) !== 0) missing.push("PulseAudio parec is unavailable");
+    } catch {
+      missing.push("PulseAudio parec is unavailable");
+    }
+    if (missing.length) return { ready: false, reason: missing.join("; ") };
     return { ready: true, reason: null };
   }
 
