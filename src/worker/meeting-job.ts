@@ -13,7 +13,7 @@ import { VexaNativeProvider } from "../providers/transcription/vexa-native.ts";
 import { failMeeting, getMeetingById, storeTranscript, transition } from "../services/meetings.ts";
 import { enqueueMeetingWebhook } from "../webhooks/dispatcher.ts";
 import { observeCapture, recordCapture } from "../services/capture.ts";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { meetings } from "../db/schema.ts";
 import { normalizeSegments } from "../domain/transcript.ts";
 import { openSignalCapability } from "../providers/signal/capability.ts";
@@ -205,27 +205,39 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
 async function handleSignalStart(ctx: AppContext, meeting: MeetingRow) {
   try {
     if (!meeting.signalCapability) throw new ApiError("capture_failed", "Signal call capability is unavailable.");
-    const capacity = await ctx.db.execute<{ running: string }>(sql`
-      select count(*)::text as running from ${meetings}
-      where ${meetings.platform} = 'signal'
-        and ${meetings.status} in ('joining', 'waiting_for_admission', 'in_progress', 'processing')
-    `);
-    if (Number(capacity[0]?.running ?? 0) >= ctx.config.signal.maxConcurrentCalls) {
+    const capability = meeting.signalCapability;
+    const reserved = await reserveSignalSeat(ctx, meeting.id);
+    if (!reserved) {
       throw new ApiError("provider_unavailable", "Signal capture capacity is currently unavailable.");
     }
+    meeting = reserved;
     // Reconstruct at the last possible boundary; never emit this URL in a log or persisted field.
-    const callUrl = `${meeting.meetingUrl}#${openSignalCapability(meeting.signalCapability, ctx.config.signal.capabilityKey)}`;
+    const callUrl = `${meeting.meetingUrl}#${openSignalCapability(capability, ctx.config.signal.capabilityKey)}`;
     const created = await ctx.signal.start({ meetingId: meeting.id, callUrl, botName: meeting.botName ?? undefined, language: meeting.language ?? undefined });
-    const { meeting: updated, changed } = await transition(ctx, meeting, "joining", { signalSessionId: created.sessionId });
-    if (changed) {
-      ctx.log.info("signal capture dispatched", { meetingId: meeting.id, sessionId: created.sessionId, platform: "signal" });
-      await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id }, ctx.config.vexa.pollIntervalMs);
-      await ctx.queue.push({ type: "meeting.join_deadline", meetingId: meeting.id }, ctx.config.joinTimeoutSeconds * 1000);
-    }
+    const [updated] = await ctx.db.update(meetings).set({ signalSessionId: created.sessionId }).where(and(eq(meetings.id, meeting.id), eq(meetings.status, "joining"))).returning();
+    if (!updated) return;
+    ctx.log.info("signal capture dispatched", { meetingId: meeting.id, sessionId: created.sessionId, platform: "signal" });
+    await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id }, ctx.config.vexa.pollIntervalMs);
+    await ctx.queue.push({ type: "meeting.join_deadline", meetingId: meeting.id }, ctx.config.joinTimeoutSeconds * 1000);
   } catch (error) {
     const { meeting: failed, changed } = await failMeeting(ctx, meeting, error instanceof ApiError ? error.code : "provider_unavailable", "Signal capture could not be started.");
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
   }
+}
+
+/** Serializes check-and-reserve so concurrent queued jobs cannot oversubscribe Signal Desktop seats. */
+async function reserveSignalSeat(ctx: AppContext, meetingId: string): Promise<MeetingRow | null> {
+  return ctx.db.transaction(async (tx) => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext('ptx-signal-capture-capacity'))`);
+    const capacity = await tx.execute<{ running: string }>(sql`
+      select count(*)::text as running from ${meetings}
+      where ${meetings.platform} = 'signal'
+        and ${meetings.status} in ('joining', 'waiting_for_admission', 'in_progress', 'processing')
+    `);
+    if (Number(capacity[0]?.running ?? 0) >= ctx.config.signal.maxConcurrentCalls) return null;
+    const [reserved] = await tx.update(meetings).set({ status: "joining" }).where(and(eq(meetings.id, meetingId), eq(meetings.status, "queued"))).returning();
+    return reserved ?? null;
+  });
 }
 
 async function handleSignalPoll(ctx: AppContext, meeting: MeetingRow) {

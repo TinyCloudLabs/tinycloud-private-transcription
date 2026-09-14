@@ -203,7 +203,8 @@ export async function recoverMeeting(ctx: AppContext, meeting: MeetingRow): Prom
   if (status !== "failed") {
     throw new ApiError("invalid_request", "Only failed meetings can be recovered.");
   }
-  if (!meeting.vexaPlatform || !meeting.vexaNativeMeetingId) {
+  const hasRetainedCapture = meeting.platform === "signal" ? !!meeting.signalSessionId : !!meeting.vexaPlatform && !!meeting.vexaNativeMeetingId;
+  if (!hasRetainedCapture) {
     throw new ApiError("invalid_request", "This meeting has no retained capture-provider record to recover.");
   }
   const [updated] = await ctx.db
