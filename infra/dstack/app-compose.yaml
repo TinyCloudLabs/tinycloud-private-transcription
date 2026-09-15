@@ -6,6 +6,8 @@
 # VEXA_INTERNAL_API_SECRET, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD, TINFOIL_API_KEY (optional),
 # TRANSCRIPTION_PROVIDER (vexa|tinfoil), PTX_IMAGE (our api/worker image), VEXA_IMAGE_TAG (v012),
 # PTX_BOT_IMAGE (fork bot image override; defaults to the pinned fork tag below).
+# SIGNAL_CAPTURE_IMAGE is the one-seat Signal Desktop rig.  Its profile volume is deliberately
+# persistent: linking a Signal account is an operator action, never a deployment side effect.
 #
 # Vexa services mirror infra/vexa/upstream/deploy/compose/docker-compose.yml @ e0b356d (+ our
 # docker-compose.override.yml whisper service), minus agent-api/mcp/terminal (not needed for V1).
@@ -47,7 +49,7 @@ services:
       # tinycloud.chat answer 400 unsupported_platform for every https://meet.google.com/<code>
       # even though detection and the Vexa bot both handle google_meet. Pinned by
       # test/unit/deploy-config.test.ts; override per-deployment in infra/dstack/.env.
-      ENABLED_PLATFORMS: ${ENABLED_PLATFORMS:-jitsi,google_meet}
+      ENABLED_PLATFORMS: ${ENABLED_PLATFORMS:-jitsi,google_meet,signal}
       AUTO_MIGRATE: "true"
       LOG_LEVEL: info
     volumes:
@@ -77,13 +79,44 @@ services:
       TINFOIL_BASE_URL: https://inference.tinfoil.sh
       TINFOIL_API_KEY: ${TINFOIL_API_KEY:-}
       TINFOIL_MODEL: ${TINFOIL_MODEL:-voxtral-small-24b}
+      # The capture worker shares this service's network namespace, so this is never routable
+      # from another container or a CVM interface.
+      SIGNAL_CAPTURE_URL: http://127.0.0.1:18076
+      SIGNAL_CAPABILITY_KEY: ${SIGNAL_CAPABILITY_KEY:-}
+      SIGNAL_MAX_CONCURRENT_CALLS: "1"
       LOG_LEVEL: info
+    ports:
+      # Bootstrap-only noVNC. Keep it host-loopback so operators reach it over SSH, never public HTTP.
+      - "127.0.0.1:6080:6080"
     volumes:
       - vexa-provision:/run/vexa:ro
     depends_on:
       api:
         condition: service_healthy
     networks: [ptx, vexa]
+
+  # Exactly one linked Signal Desktop. `network_mode: service:worker` makes worker -> capture
+  # and capture -> CDP loopback-only while still allowing Signal's own outbound call traffic.
+  signal-capture:
+    image: ${SIGNAL_CAPTURE_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:v1}
+    build:
+      context: ../signal-seat
+    network_mode: "service:worker"
+    restart: unless-stopped
+    environment:
+      SIGNAL_CAPTURE_BIND: 127.0.0.1
+      SIGNAL_CAPTURE_PORT: "18076"
+      SIGNAL_CDP_URL: http://127.0.0.1:9222
+      SIGNAL_PULSE_SOURCE: ${SIGNAL_PULSE_SOURCE:-ptx_sink.monitor}
+      SIGNAL_TRANSCRIBER: "/opt/ptx/signal-transcriber"
+      SIGNAL_WHISPER_URL: http://whisper:8000/v1/audio/transcriptions
+      SIGNAL_MAX_CONCURRENT_CALLS: "1"
+      SIGNAL_PROFILE_DIR: /var/lib/signal
+    volumes:
+      - signal-profile:/var/lib/signal
+    depends_on:
+      whisper:
+        condition: service_healthy
 
   postgres:
     image: postgres:16-alpine
@@ -334,6 +367,7 @@ services:
 
   # One-shot: create the service-owned Vexa user + `bot,tx` API key and hand it to api/worker.
   vexa-provision:
+  signal-profile:
     image: curlimages/curl:8.10.1
     user: root
     entrypoint: ["/bin/sh", "-c"]

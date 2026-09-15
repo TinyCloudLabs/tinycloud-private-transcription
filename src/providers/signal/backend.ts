@@ -37,6 +37,15 @@ export interface SignalCallBackend {
   open(request: SignalCallRequest): Promise<SignalCallSession>;
 }
 
+/** UI evidence only: action attempts never become an in-progress meeting by themselves. */
+export function signalUiState(text: string): SignalCaptureSnapshot["status"] | "ended" {
+  const body = text.toLowerCase();
+  if (/call ended|call has ended|ended this call/.test(body)) return "ended";
+  if (/waiting for (someone|the host|admission)|waiting to be admitted/.test(body)) return "waiting_for_admission";
+  if (/leave call|mute|unmute|participants/.test(body)) return "in_progress";
+  return "joining";
+}
+
 /**
  * The production seat. Signal Desktop is driven only through its loopback CDP endpoint and
  * `parec` reads only the explicitly configured PulseAudio monitor source. The optional
@@ -116,7 +125,17 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
     try {
       cdp = await CdpConnection.connect(this.cdpUrl.toString());
       // This is the only point at which the fragment exists in this worker. Never retain it on a session.
-      target = await cdp.openTarget(request.callUrl);
+      // Signal Desktop owns this custom scheme. Opening it in the Desktop CDP target makes the
+      // external call link land in the linked portable profile, rather than a browser tab.
+      target = await cdp.openTarget(request.callUrl.replace(/^https:/, "sgnl:"));
+      await cdp.evaluate(target, `(() => {
+        const labels = [/allow/i, /continue/i, /join call/i, /^join$/i];
+        for (const node of document.querySelectorAll('button,[role="button"]')) {
+          const label = (node.textContent || node.getAttribute('aria-label') || '').trim();
+          if (labels.some((re) => re.test(label))) { node.click(); break; }
+        }
+        return document.body?.innerText || '';
+      })()`);
       recorder = Bun.spawn([this.options.parecPath ?? "parec", "--device", this.options.pulseSource, "--file-format=wav", wav], { stdout: "ignore", stderr: "ignore" });
     } catch {
       await finalize();
@@ -124,7 +143,15 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
     }
     return {
       snapshot: async () => {
-        if (!closed && Date.now() - begun >= (this.options.joinGraceMs ?? 3_000)) state = "in_progress";
+        if (!closed && target && cdp) {
+          const ui = await cdp.evaluate<string>(target, "document.body?.innerText || ''").catch(() => "");
+          const observed = signalUiState(ui);
+          if (observed === "ended") {
+            await finalize();
+            return { status: state === "failed" ? "failed" : "completed", ...(segments ? { segments } : {}) };
+          }
+          state = observed;
+        }
         return state === "completed" ? { status: state, segments } : state === "failed" ? { status: state, errorCode: "capture_failed" } : { status: state };
       },
       leave: finalize,

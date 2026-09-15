@@ -102,6 +102,8 @@ production window. Green 2/2 on 2026-08-17 (~2 min each; evidence in `tmp/e2e-<r
 | `SIGNAL_CAPTURE_URL` | `http://127.0.0.1:18076` | loopback-only Signal capture-worker endpoint; it owns Signal Desktop CDP and PulseAudio |
 | `SIGNAL_CAPABILITY_KEY` | none | required 32-byte base64 (or 64-hex-character) key used to encrypt Signal call URL fragments at rest |
 | `SIGNAL_MAX_CONCURRENT_CALLS` | `1` | provisioned Signal Desktop seat count |
+| `SIGNAL_PULSE_SOURCE` | `ptx_sink.monitor` in dstack | PulseAudio monitor captured by the isolated Signal seat |
+| `SIGNAL_TRANSCRIBER` | bundled dstack adapter | local WAV-to-JSON adapter using the in-CVM Whisper service |
 | `JOIN_TIMEOUT_SECONDS` | `600` | worker-side join deadline: a meeting still `joining`/`waiting_for_admission` this long after bot dispatch is failed (`meeting_join_failed`/`waiting_room_timeout`), its bot stopped, and `meeting.failed` emitted |
 | `TRANSCRIPTION_PROVIDER` | `vexa` | `vexa` (WhisperLive passthrough) or `tinfoil` |
 | `TINFOIL_BASE_URL` | `https://inference.tinfoil.sh` | OpenAI-compatible `/v1/audio/transcriptions` |
@@ -361,6 +363,15 @@ are not pruned), but a redeploy after expiry cannot re-pull it.
 `PTX_IMAGE`; and for private transcription `TRANSCRIPTION_PROVIDER=tinfoil`, `TINFOIL_API_KEY`,
 `TINFOIL_MODEL` (from the project `.env`). Everything in that file is encrypted client-side and sealed into
 the CVM (`phala deploy -e`); nothing secret lives in `app-compose.yaml`.
+
+**Signal one-seat rig.** The `signal-capture` service is a headless Signal Desktop image with Xvfb,
+PulseAudio/`parec`, noVNC and the Bun capture worker. It shares the `worker` network namespace: PTX talks
+to capture on `127.0.0.1:18076`, and capture talks to Signal CDP on `127.0.0.1:9222`; neither port is
+published. noVNC alone is published on `127.0.0.1:6080` for SSH-tunnel bootstrap. The `signal-profile`
+volume is persistent but starts unlinked. Link the seat manually through that SSH tunnel, then confirm
+`/health` reports ready before submitting a Signal URL. A missing linked profile, display host, or audio
+source is an environment gate, not evidence of a passed Signal call. TinyChat needs no change: its existing
+`POST /v1/meetings` proxy accepts Signal URLs once the production `ENABLED_PLATFORMS` includes `signal`.
 
 **Deploy / update.**
 
