@@ -9,6 +9,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
 const compose = readFileSync(new URL("../../infra/dstack/app-compose.yaml", import.meta.url), "utf8");
+const seatBoot = readFileSync(new URL("../../infra/signal-seat/boot.sh", import.meta.url), "utf8");
 
 /** The `environment:` block of the named service, up to the next same-indent key. */
 function serviceEnv(service: string): string {
@@ -25,18 +26,38 @@ function serviceEnv(service: string): string {
 }
 
 describe("infra/dstack/app-compose.yaml", () => {
-  test("the api service enables google_meet alongside jitsi", () => {
+  test("the api service enables deployed meeting platforms including Signal", () => {
     const env = serviceEnv("api");
     const line = env.split("\n").find((l) => l.trim().startsWith("ENABLED_PLATFORMS:"));
     expect(line).toBeDefined();
     // Whatever the operator override is, the baked-in default must cover both.
     expect(line).toContain("jitsi");
     expect(line).toContain("google_meet");
+    expect(line).toContain("signal");
   });
 
   test("the worker gives every Vexa meeting the TinyCloud empty-room window", () => {
     const env = serviceEnv("worker");
     const line = env.split("\n").find((l) => l.trim().startsWith("VEXA_MAX_TIME_LEFT_ALONE_MS:"));
     expect(line).toContain("300000");
+  });
+
+  test("ships one loopback-only Signal seat in the worker network namespace", () => {
+    const worker = serviceEnv("worker");
+    expect(worker).toContain("SIGNAL_CAPTURE_URL: http://127.0.0.1:18076");
+    expect(worker).toContain("SIGNAL_MAX_CONCURRENT_CALLS: \"1\"");
+    const workerStart = compose.indexOf("\n  worker:\n");
+    const workerBlock = compose.slice(workerStart, compose.indexOf("\n  signal-capture:\n", workerStart));
+    expect(workerBlock).toContain("127.0.0.1:6080:6080");
+    const captureStart = compose.indexOf("\n  signal-capture:\n");
+    const capture = compose.slice(captureStart, compose.indexOf("\n  postgres:\n", captureStart));
+    expect(capture).toContain("context: ../..");
+    expect(capture).toContain("dockerfile: infra/signal-seat/Dockerfile");
+    expect(capture).toContain('network_mode: "service:worker"');
+    expect(capture).toContain("SIGNAL_CAPTURE_BIND: 127.0.0.1");
+    expect(capture).not.toContain("ports:");
+    expect(seatBoot).toContain("sink_name=ptx_input_sink");
+    expect(seatBoot).toContain("master=ptx_input_sink.monitor source_name=ptx_input");
+    expect(seatBoot).not.toContain("master=ptx_sink.monitor source_name=ptx_input");
   });
 });
