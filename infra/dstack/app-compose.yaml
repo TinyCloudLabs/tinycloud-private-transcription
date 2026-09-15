@@ -100,7 +100,8 @@ services:
   signal-capture:
     image: ${SIGNAL_CAPTURE_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:v1}
     build:
-      context: ../signal-seat
+      context: ../..
+      dockerfile: infra/signal-seat/Dockerfile
     network_mode: "service:worker"
     restart: unless-stopped
     environment:

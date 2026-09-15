@@ -50,6 +50,8 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(workerBlock).toContain("127.0.0.1:6080:6080");
     const captureStart = compose.indexOf("\n  signal-capture:\n");
     const capture = compose.slice(captureStart, compose.indexOf("\n  postgres:\n", captureStart));
+    expect(capture).toContain("context: ../..");
+    expect(capture).toContain("dockerfile: infra/signal-seat/Dockerfile");
     expect(capture).toContain('network_mode: "service:worker"');
     expect(capture).toContain("SIGNAL_CAPTURE_BIND: 127.0.0.1");
     expect(capture).not.toContain("ports:");

@@ -42,9 +42,18 @@ export function signalUiState(text: string): SignalCaptureSnapshot["status"] | "
   const body = text.toLowerCase();
   if (/call ended|call has ended|ended this call/.test(body)) return "ended";
   if (/waiting for (someone|the host|admission)|waiting to be admitted/.test(body)) return "waiting_for_admission";
-  if (/leave call|mute|unmute|participants/.test(body)) return "in_progress";
+  // `Leave call` is a call-only control. Do not infer success from generic mute/participant text.
+  if (/\bleave call\b/.test(body)) return "in_progress";
   return "joining";
 }
+
+const clickSignalAction = `(labels => {
+  const controls = [...document.querySelectorAll('button,[role="button"]')];
+  const labelOf = node => (node.getAttribute('aria-label') || node.textContent || '').trim().toLowerCase();
+  const control = controls.find(node => labels.includes(labelOf(node)));
+  if (control) { control.click(); return labelOf(control); }
+  return null;
+})(`;
 
 /**
  * The production seat. Signal Desktop is driven only through its loopback CDP endpoint and
@@ -128,14 +137,9 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
       // Signal Desktop owns this custom scheme. Opening it in the Desktop CDP target makes the
       // external call link land in the linked portable profile, rather than a browser tab.
       target = await cdp.openTarget(request.callUrl.replace(/^https:/, "sgnl:"));
-      await cdp.evaluate(target, `(() => {
-        const labels = [/allow/i, /continue/i, /join call/i, /^join$/i];
-        for (const node of document.querySelectorAll('button,[role="button"]')) {
-          const label = (node.textContent || node.getAttribute('aria-label') || '').trim();
-          if (labels.some((re) => re.test(label))) { node.click(); break; }
-        }
-        return document.body?.innerText || '';
-      })()`);
+      // Only exact known Signal permission/lobby actions are eligible. Never click an arbitrary
+      // `continue`/`allow` button that could belong to an unrelated Desktop surface.
+      await cdp.evaluate(target, `${clickSignalAction}["allow", "join call", "join"])`);
       recorder = Bun.spawn([this.options.parecPath ?? "parec", "--device", this.options.pulseSource, "--file-format=wav", wav], { stdout: "ignore", stderr: "ignore" });
     } catch {
       await finalize();
@@ -154,7 +158,10 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
         }
         return state === "completed" ? { status: state, segments } : state === "failed" ? { status: state, errorCode: "capture_failed" } : { status: state };
       },
-      leave: finalize,
+      leave: async () => {
+        if (target && cdp) await cdp.evaluate(target, `${clickSignalAction}["leave call"])`).catch(() => {});
+        await finalize();
+      },
       dispose: finalize,
     };
   }
