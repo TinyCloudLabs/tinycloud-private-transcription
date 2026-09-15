@@ -367,7 +367,6 @@ services:
 
   # One-shot: create the service-owned Vexa user + `bot,tx` API key and hand it to api/worker.
   vexa-provision:
-  signal-profile:
     image: curlimages/curl:8.10.1
     user: root
     entrypoint: ["/bin/sh", "-c"]
@@ -401,6 +400,7 @@ volumes:
   minio-data:
   whisper-cache:
   vexa-provision:
+  signal-profile:
 
 networks:
   ptx: {}
