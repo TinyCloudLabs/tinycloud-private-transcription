@@ -27,6 +27,12 @@ export interface CdpTarget {
   sessionId: string;
 }
 
+export interface CdpTargetInfo {
+  targetId: string;
+  type: string;
+  url: string;
+}
+
 /** One WebSocket to a browser-level CDP endpoint, with flat sessions for attached targets. */
 export class CdpConnection {
   private nextId = 1;
@@ -99,6 +105,18 @@ export class CdpConnection {
   /** Opens `url` in a new target and attaches a flat session to it. */
   async openTarget(url: string): Promise<CdpTarget> {
     const { targetId } = await this.send<{ targetId: string }>("Target.createTarget", { url });
+    const { sessionId } = await this.send<{ sessionId: string }>("Target.attachToTarget", { targetId, flatten: true });
+    return { targetId, sessionId };
+  }
+
+  /** Returns inspectable page targets so a protocol deep link can be followed into Signal's call window. */
+  async pageTargets(): Promise<CdpTargetInfo[]> {
+    const { targetInfos } = await this.send<{ targetInfos?: CdpTargetInfo[] }>("Target.getTargets");
+    return (targetInfos ?? []).filter((target) => target.type === "page");
+  }
+
+  /** Attaches to an already-open page without creating or navigating it. */
+  async attachTarget(targetId: string): Promise<CdpTarget> {
     const { sessionId } = await this.send<{ sessionId: string }>("Target.attachToTarget", { targetId, flatten: true });
     return { targetId, sessionId };
   }

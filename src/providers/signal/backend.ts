@@ -55,6 +55,8 @@ const clickSignalAction = `(labels => {
   return null;
 })(`;
 
+const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 /**
  * The production seat. Signal Desktop is driven only through its loopback CDP endpoint and
  * `parec` reads only the explicitly configured PulseAudio monitor source. The optional
@@ -103,7 +105,10 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
     const dir = await mkdtemp(join(tmpdir(), "ptx-signal-"));
     const wav = join(dir, "capture.wav");
     let cdp: CdpConnection | null = null;
-    let target: CdpTarget | null = null;
+    // `launchTarget` is ours and is safe to close. `callTarget` may be Signal's pre-existing
+    // call window, which belongs to Desktop and must remain open after this session ends.
+    let launchTarget: CdpTarget | null = null;
+    let callTarget: CdpTarget | null = null;
     let recorder: ReturnType<typeof Bun.spawn> | null = null;
     let state: SignalCaptureSnapshot["status"] = "joining";
     let segments: RawSegment[] | undefined;
@@ -126,7 +131,7 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
       } catch {
         state = "failed";
       } finally {
-        if (target && cdp) await cdp.closeTarget(target);
+        if (launchTarget && cdp) await cdp.closeTarget(launchTarget);
         cdp?.close();
         await rm(dir, { recursive: true, force: true });
       }
@@ -136,10 +141,11 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
       // This is the only point at which the fragment exists in this worker. Never retain it on a session.
       // Signal Desktop owns this custom scheme. Opening it in the Desktop CDP target makes the
       // external call link land in the linked portable profile, rather than a browser tab.
-      target = await cdp.openTarget(request.callUrl.replace(/^https:/, "sgnl:"));
-      // Only exact known Signal permission/lobby actions are eligible. Never click an arbitrary
-      // `continue`/`allow` button that could belong to an unrelated Desktop surface.
-      await cdp.evaluate(target, `${clickSignalAction}["allow", "join call", "join"])`);
+      launchTarget = await cdp.openTarget(request.callUrl.replace(/^https:/, "sgnl:"));
+      // Signal can hand a sgnl:// link from the ephemeral target to its existing call window.
+      // Wait for that handoff, then rediscover page targets on every poll instead of assuming the
+      // newly-created target owns the call UI.
+      await pause(this.options.joinGraceMs ?? 500);
       recorder = Bun.spawn([this.options.parecPath ?? "parec", "--device", this.options.pulseSource, "--file-format=wav", wav], { stdout: "ignore", stderr: "ignore" });
     } catch {
       await finalize();
@@ -147,9 +153,34 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
     }
     return {
       snapshot: async () => {
-        if (!closed && target && cdp) {
-          const ui = await cdp.evaluate<string>(target, "document.body?.innerText || ''").catch(() => "");
-          const observed = signalUiState(ui);
+        if (!closed && cdp) {
+          // Prefer the last observed call target, then inspect all current pages. This lets the
+          // action retry survive the Desktop deep-link handoff and late permission/lobby surfaces.
+          const candidates: CdpTarget[] = callTarget ? [callTarget] : [];
+          const known = new Set(candidates.map((candidate) => candidate.targetId));
+          for (const page of await cdp.pageTargets().catch(() => [])) {
+            if (!known.has(page.targetId)) {
+              const attached = await cdp.attachTarget(page.targetId).catch(() => null);
+              if (attached) candidates.push(attached);
+            }
+          }
+          let observed: SignalCaptureSnapshot["status"] | "ended" = "joining";
+          for (const candidate of candidates) {
+            const ui = await cdp.evaluate<string>(candidate, "document.body?.innerText || ''").catch(() => "");
+            const candidateState = signalUiState(ui);
+            // A real call control or admission/ended state is stronger evidence than a blank
+            // deep-link target. Keep that target for the next poll.
+            if (candidateState !== "joining" || /\b(join call|allow|join)\b/i.test(ui)) {
+              callTarget = candidate;
+              observed = candidateState;
+              break;
+            }
+          }
+          // Only exact known Signal permission/lobby actions are eligible. Retrying this on
+          // observed joining/waiting states handles surfaces that appear after navigation.
+          if (callTarget && (observed === "joining" || observed === "waiting_for_admission")) {
+            await cdp.evaluate(callTarget, `${clickSignalAction}["allow", "join call", "join"])`).catch(() => {});
+          }
           if (observed === "ended") {
             await finalize();
             return { status: state === "failed" ? "failed" : "completed", ...(segments ? { segments } : {}) };
@@ -159,7 +190,7 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
         return state === "completed" ? { status: state, segments } : state === "failed" ? { status: state, errorCode: "capture_failed" } : { status: state };
       },
       leave: async () => {
-        if (target && cdp) await cdp.evaluate(target, `${clickSignalAction}["leave call"])`).catch(() => {});
+        if (callTarget && cdp) await cdp.evaluate(callTarget, `${clickSignalAction}["leave call"])`).catch(() => {});
         await finalize();
       },
       dispose: finalize,
