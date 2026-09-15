@@ -1,5 +1,5 @@
 name: Publish image
-# Builds the api/worker image (Dockerfile at repo root, linux/amd64 only — Phala CVMs are TDX x86_64)
+# Builds the api/worker and Signal Desktop seat images (linux/amd64 only — Phala CVMs are TDX x86_64)
 # and pushes it to GHCR with the workflow's GITHUB_TOKEN. Tags:
 #   ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:<git sha>   (immutable; pin this in infra/dstack/.env PTX_IMAGE)
 #   ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:v1          (moving; on feat/v1 + main)
@@ -19,6 +19,7 @@ on:
       - drizzle.config.ts
       - tsconfig.json
       - src/**
+      - infra/signal-seat/**
       - .github/workflows/publish-image.yml
   workflow_dispatch:
 
@@ -31,7 +32,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api
+  API_IMAGE: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api
+  SEAT_IMAGE: ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat
 
 jobs:
   publish:
@@ -52,8 +54,8 @@ jobs:
       - name: Compute tags
         id: tags
         run: |
-          tags="${IMAGE}:${GITHUB_SHA}"$'\n'"${IMAGE}:v1"
-          if [ "${GITHUB_REF_NAME}" = "main" ]; then tags="${tags}"$'\n'"${IMAGE}:latest"; fi
+          tags="${API_IMAGE}:${GITHUB_SHA}"$'\n'"${API_IMAGE}:v1"
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then tags="${tags}"$'\n'"${API_IMAGE}:latest"; fi
           {
             echo "tags<<EOF"
             echo "$tags"
@@ -79,6 +81,54 @@ jobs:
         run: |
           {
             echo "### Image"
+            echo
+            echo '```'
+            echo "${{ steps.tags.outputs.tags }}"
+            echo '```'
+            echo "- digest: \`${{ steps.build.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish-signal-seat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute tags
+        id: tags
+        run: |
+          tags="${SEAT_IMAGE}:${GITHUB_SHA}"$'\n'"${SEAT_IMAGE}:v1"
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then tags="${tags}"$'\n'"${SEAT_IMAGE}:latest"; fi
+          {
+            echo "tags<<EOF"
+            echo "$tags"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Build and push Signal seat
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/signal-seat/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=TinyCloud Signal Desktop capture seat
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Summary
+        run: |
+          {
+            echo "### Signal seat image"
             echo
             echo '```'
             echo "${{ steps.tags.outputs.tags }}"

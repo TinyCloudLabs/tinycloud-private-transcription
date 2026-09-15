@@ -10,6 +10,7 @@ import { readFileSync } from "node:fs";
 
 const compose = readFileSync(new URL("../../infra/dstack/app-compose.yaml", import.meta.url), "utf8");
 const seatBoot = readFileSync(new URL("../../infra/signal-seat/boot.sh", import.meta.url), "utf8");
+const publishWorkflow = readFileSync(new URL("../../.github/workflows/publish-image.yml", import.meta.url), "utf8");
 
 /** The `environment:` block of the named service, up to the next same-indent key. */
 function serviceEnv(service: string): string {
@@ -59,5 +60,11 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(seatBoot).toContain("sink_name=ptx_input_sink");
     expect(seatBoot).toContain("master=ptx_input_sink.monitor source_name=ptx_input");
     expect(seatBoot).not.toContain("master=ptx_sink.monitor source_name=ptx_input");
+  });
+
+  test("publishes and CI-builds the Signal seat image", () => {
+    expect(publishWorkflow).toContain("infra/signal-seat/**");
+    expect(publishWorkflow).toContain("tinycloud-private-transcription/signal-seat");
+    expect(publishWorkflow).toContain("file: infra/signal-seat/Dockerfile");
   });
 });
