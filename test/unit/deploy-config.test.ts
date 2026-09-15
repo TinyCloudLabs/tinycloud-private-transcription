@@ -9,6 +9,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
 const compose = readFileSync(new URL("../../infra/dstack/app-compose.yaml", import.meta.url), "utf8");
+const seatBoot = readFileSync(new URL("../../infra/signal-seat/boot.sh", import.meta.url), "utf8");
 
 /** The `environment:` block of the named service, up to the next same-indent key. */
 function serviceEnv(service: string): string {
@@ -55,5 +56,8 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(capture).toContain('network_mode: "service:worker"');
     expect(capture).toContain("SIGNAL_CAPTURE_BIND: 127.0.0.1");
     expect(capture).not.toContain("ports:");
+    expect(seatBoot).toContain("sink_name=ptx_input_sink");
+    expect(seatBoot).toContain("master=ptx_input_sink.monitor source_name=ptx_input");
+    expect(seatBoot).not.toContain("master=ptx_sink.monitor source_name=ptx_input");
   });
 });

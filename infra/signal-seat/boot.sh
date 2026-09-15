@@ -9,9 +9,11 @@ chmod 700 "$XDG_RUNTIME_DIR" "$SIGNAL_PROFILE_DIR"
 pulseaudio --start --exit-idle-time=-1
 pactl load-module module-null-sink sink_name=ptx_sink >/dev/null 2>&1 || true
 # Signal's playback is the transcription input; make this the process-wide default before
-# Desktop starts. The remapped source also gives Desktop a deterministic silent input device.
+# Desktop starts. Its microphone must be a separate silent sink: never route the captured
+# playback monitor back into the call.
 pactl set-default-sink ptx_sink
-pactl load-module module-remap-source master=ptx_sink.monitor source_name=ptx_input >/dev/null 2>&1 || true
+pactl load-module module-null-sink sink_name=ptx_input_sink >/dev/null 2>&1 || true
+pactl load-module module-remap-source master=ptx_input_sink.monitor source_name=ptx_input >/dev/null 2>&1 || true
 pactl set-default-source ptx_input
 Xvfb "$DISPLAY" -screen 0 1280x800x24 -nolisten tcp &
 x11vnc -display "$DISPLAY" -localhost -forever -shared -nopw -rfbport 5900 &
