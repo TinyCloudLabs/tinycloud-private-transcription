@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { LoopbackSignalCaptureAdapter } from "../../src/providers/signal/adapter.ts";
-import { ReplaySignalBackend } from "../../src/providers/signal/backend.ts";
+import { ReplaySignalBackend, type SignalCallBackend, type SignalCallSession } from "../../src/providers/signal/backend.ts";
 import { createSignalWorkerApp } from "../../src/providers/signal/worker.ts";
 import { silentLogger } from "../../src/log.ts";
 
@@ -107,6 +107,88 @@ describe("Signal capture worker boundary", () => {
       expect(snapshot.errorCode).toBe("waiting_room_timeout");
     } finally {
       stuck.server.stop(true);
+    }
+  });
+
+  test("does not free capacity until asynchronous Desktop cleanup completes", async () => {
+    let release!: () => void;
+    const cleanup = new Promise<void>((resolve) => { release = resolve; });
+    const backend: SignalCallBackend = {
+      name: "delayed-cleanup",
+      async preflight() { return { ready: true, reason: null }; },
+      async open(): Promise<SignalCallSession> {
+        return {
+          async snapshot() { return { status: "completed", segments: [{ start: 0, end: 1, text: "done" }] }; },
+          async leave() {},
+          async dispose() { await cleanup; },
+        };
+      },
+    };
+    const { app } = createSignalWorkerApp({ backend, maxConcurrentCalls: 1, joinTimeoutMs: 30_000, maxCallMs: 60_000, sessionRetentionMs: 60_000, log: silentLogger });
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: app.fetch });
+    try {
+      const adapter = new LoopbackSignalCaptureAdapter(`http://127.0.0.1:${server.port}`);
+      const first = await adapter.start({ meetingId: "mtg_cleanup", callUrl });
+      const pending = adapter.status(first.sessionId);
+      await Bun.sleep(10);
+      await expect(adapter.start({ meetingId: "mtg_cleanup_second", callUrl })).rejects.toMatchObject({ code: "provider_unavailable" });
+      release();
+      expect((await pending).status).toBe("completed");
+      expect((await adapter.start({ meetingId: "mtg_cleanup_second", callUrl })).sessionId).toStartWith("sig_");
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("leaves a seat after a snapshot failure before releasing its capacity", async () => {
+    let leaves = 0;
+    const backend: SignalCallBackend = {
+      name: "snapshot-failure",
+      async preflight() { return { ready: true, reason: null }; },
+      async open(): Promise<SignalCallSession> {
+        return {
+          async snapshot() { throw new Error("CDP disappeared"); },
+          async leave() { leaves++; },
+          async dispose() {},
+        };
+      },
+    };
+    const { app } = createSignalWorkerApp({ backend, maxConcurrentCalls: 1, joinTimeoutMs: 30_000, maxCallMs: 60_000, sessionRetentionMs: 60_000, log: silentLogger });
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: app.fetch });
+    try {
+      const adapter = new LoopbackSignalCaptureAdapter(`http://127.0.0.1:${server.port}`);
+      const { sessionId } = await adapter.start({ meetingId: "mtg_snapshot_failure", callUrl });
+      expect((await adapter.status(sessionId)).status).toBe("failed");
+      expect(leaves).toBe(1);
+      expect((await adapter.start({ meetingId: "mtg_snapshot_reuse", callUrl })).sessionId).toStartWith("sig_");
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("keeps a failed cleanup quarantined when delete is requested", async () => {
+    const backend: SignalCallBackend = {
+      name: "cleanup-failure",
+      async preflight() { return { ready: true, reason: null }; },
+      async open(): Promise<SignalCallSession> {
+        return {
+          async snapshot() { return { status: "completed", segments: [{ start: 0, end: 1, text: "done" }] }; },
+          async leave() {},
+          async dispose() { throw new Error("Desktop still owns the call"); },
+        };
+      },
+    };
+    const { app } = createSignalWorkerApp({ backend, maxConcurrentCalls: 1, joinTimeoutMs: 30_000, maxCallMs: 60_000, sessionRetentionMs: 60_000, log: silentLogger });
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: app.fetch });
+    try {
+      const base = `http://127.0.0.1:${server.port}`;
+      const adapter = new LoopbackSignalCaptureAdapter(base);
+      const { sessionId } = await adapter.start({ meetingId: "mtg_cleanup_failure", callUrl });
+      expect((await adapter.status(sessionId)).status).toBe("failed");
+      expect((await fetch(`${base}/v1/calls/${sessionId}`, { method: "DELETE" })).status).toBe(503);
+      await expect(adapter.start({ meetingId: "mtg_cleanup_blocked", callUrl })).rejects.toMatchObject({ code: "provider_unavailable" });
+    } finally {
+      server.stop(true);
     }
   });
 

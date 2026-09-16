@@ -67,6 +67,11 @@ const clickSignalAction = `(labels => {
   return null;
 })(`;
 
+// Signal often renders call controls as icons.  Include their accessible names in the bounded UI
+// evidence we inspect, otherwise a healthy icon-only "Leave call" control looks like a blank page.
+// This value is used only in-memory to drive the current call and is never logged or persisted.
+const signalUiText = "[document.body?.innerText || '', ...[...document.querySelectorAll('button,[role=\"button\"]')].map(node => node.getAttribute('aria-label') || '')].join('\\n')";
+
 const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /**
@@ -106,7 +111,7 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
         const targets = await cdp.pageTargets();
         const text = (await Promise.all(targets.map(async (target) => {
           const attached = await cdp.attachTarget(target.targetId).catch(() => null);
-          return attached ? await cdp.evaluate<string>(attached, "document.body?.innerText || ''").catch(() => "") : "";
+          return attached ? await cdp.evaluate<string>(attached, signalUiText).catch(() => "") : "";
         }))).join("\n");
         cdp.close();
         const link = signalDesktopLinkState(text);
@@ -141,31 +146,41 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
     let state: SignalCaptureSnapshot["status"] = "joining";
     let segments: RawSegment[] | undefined;
     let closed = false;
+    let finalizing: Promise<void> | null = null;
+    // Set on either observed in-call UI or an attempted join. A join can hand off before the next
+    // poll, so waiting for `Leave call` evidence alone is too late to protect the physical seat.
+    let callMayBeActive = false;
     const begun = Date.now();
     const finalize = async () => {
-      if (closed) return;
-      closed = true;
-      recorder?.kill();
-      await recorder?.exited.catch(() => {});
-      // Do not include child stderr or URL-derived CDP errors in a response or log.
-      try {
-        if (this.options.transcriber) {
-          const child = Bun.spawn([...this.options.transcriber, wav], { stdout: "pipe", stderr: "ignore" });
-          const output = await new Response(child.stdout).text();
-          if ((await child.exited) !== 0) throw new Error("local transcriber failed");
-          segments = parseReplayScript({ segments: JSON.parse(output) }).segments;
-          state = "completed";
+      if (finalizing) return await finalizing;
+      finalizing = (async () => {
+        closed = true;
+        recorder?.kill();
+        await recorder?.exited.catch(() => {});
+        // Do not include child stderr or URL-derived CDP errors in a response or log.
+        try {
+          if (this.options.transcriber) {
+            const child = Bun.spawn([...this.options.transcriber, wav], { stdout: "pipe", stderr: "ignore" });
+            const output = await new Response(child.stdout).text();
+            if ((await child.exited) !== 0) throw new Error("local transcriber failed");
+            segments = parseReplayScript({ segments: JSON.parse(output) }).segments;
+            state = "completed";
+          }
+        } catch {
+          state = "failed";
+        } finally {
+          if (launchTarget && cdp) await cdp.closeTarget(launchTarget);
+          cdp?.close();
+          await rm(dir, { recursive: true, force: true });
         }
-      } catch {
-        state = "failed";
-      } finally {
-        if (launchTarget && cdp) await cdp.closeTarget(launchTarget);
-        cdp?.close();
-        await rm(dir, { recursive: true, force: true });
-      }
+      })();
+      return await finalizing;
     };
     try {
       cdp = await CdpConnection.connect(this.cdpUrl.toString());
+      // Start every fallible local resource before opening the bearer deep link. Once Signal has
+      // accepted that link, open() cannot abandon a possible remote call without a tracked seat.
+      recorder = Bun.spawn([this.options.parecPath ?? "parec", "--device", this.options.pulseSource, "--file-format=wav", wav], { stdout: "ignore", stderr: "ignore" });
       // This is the only point at which the fragment exists in this worker. Never retain it on a session.
       // Signal Desktop owns this custom scheme. Opening it in the Desktop CDP target makes the
       // external call link land in the linked portable profile, rather than a browser tab.
@@ -174,11 +189,48 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
       // Wait for that handoff, then rediscover page targets on every poll instead of assuming the
       // newly-created target owns the call UI.
       await pause(this.options.joinGraceMs ?? 500);
-      recorder = Bun.spawn([this.options.parecPath ?? "parec", "--device", this.options.pulseSource, "--file-format=wav", wav], { stdout: "ignore", stderr: "ignore" });
     } catch {
       await finalize();
       throw new Error("Signal Desktop could not join the call");
     }
+    const leaveCall = async () => {
+      if (closed) return await finalize();
+      if (cdp) {
+        // A deep link can hand the call to a different target after the last poll. Re-discover
+        // it before releasing capacity; closing only our launch target does not leave a call.
+        const candidates: CdpTarget[] = callTarget ? [callTarget] : [];
+        const known = new Set(candidates.map((candidate) => candidate.targetId));
+        for (const page of await cdp.pageTargets().catch(() => [])) {
+          if (!known.has(page.targetId)) {
+            const attached = await cdp.attachTarget(page.targetId).catch(() => null);
+            if (attached) candidates.push(attached);
+          }
+        }
+        let left = false;
+        let leftTarget: CdpTarget | null = null;
+        for (const candidate of candidates) {
+          const clicked = await cdp.evaluate<string | null>(candidate, `${clickSignalAction}["leave call"])`).catch(() => null);
+          if (clicked === "leave call") { left = true; leftTarget = candidate; callTarget = candidate; break; }
+        }
+        // Once a join was attempted, a missing control is not proof of departure.
+        // Leave the session quarantined so the worker cannot admit a second call on this Desktop.
+        if (callMayBeActive && !left) throw new Error("Signal Desktop leave control is unavailable");
+        if (left) {
+          // A click is only an action attempt. Wait briefly for either an explicit ended surface
+          // or the linked inbox, both of which are positive evidence that no call remains.
+          const deadline = Date.now() + 2_000;
+          let departed = false;
+          while (!departed && Date.now() < deadline) {
+            await pause(100);
+            const ui = leftTarget ? await cdp.evaluate<string>(leftTarget, signalUiText).catch(() => "") : "";
+            const uiState = signalUiState(ui);
+            departed = (uiState === "ended" || signalDesktopLinkState(ui) === "linked") && uiState !== "in_progress" && uiState !== "waiting_for_admission";
+          }
+          if (!departed) throw new Error("Signal Desktop departure cannot be verified");
+        }
+      }
+      await finalize();
+    };
     return {
       snapshot: async () => {
         if (!closed && cdp) {
@@ -194,7 +246,7 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
           }
           let observed: SignalCaptureSnapshot["status"] | "ended" = "joining";
           for (const candidate of candidates) {
-            const ui = await cdp.evaluate<string>(candidate, "document.body?.innerText || ''").catch(() => "");
+            const ui = await cdp.evaluate<string>(candidate, signalUiText).catch(() => "");
             const candidateState = signalUiState(ui);
             // A real call control or admission/ended state is stronger evidence than a blank
             // deep-link target. Keep that target for the next poll.
@@ -207,21 +259,24 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
           // Only exact known Signal permission/lobby actions are eligible. Retrying this on
           // observed joining/waiting states handles surfaces that appear after navigation.
           if (callTarget && (observed === "joining" || observed === "waiting_for_admission")) {
-            await cdp.evaluate(callTarget, `${clickSignalAction}["allow", "join call", "join"])`).catch(() => {});
+            // A CDP request can click and then lose its reply. From this point the physical call
+            // may exist, so cleanup must require positive departure evidence.
+            callMayBeActive = true;
+            await cdp.evaluate<string | null>(callTarget, `${clickSignalAction}["allow", "join call", "join"])`).catch(() => null);
           }
           if (observed === "ended") {
             await finalize();
             return { status: state === "failed" ? "failed" : "completed", ...(segments ? { segments } : {}) };
           }
           state = observed;
+          if (observed === "in_progress") callMayBeActive = true;
         }
         return state === "completed" ? { status: state, segments } : state === "failed" ? { status: state, errorCode: "capture_failed" } : { status: state };
       },
-      leave: async () => {
-        if (callTarget && cdp) await cdp.evaluate(callTarget, `${clickSignalAction}["leave call"])`).catch(() => {});
-        await finalize();
-      },
-      dispose: finalize,
+      leave: leaveCall,
+      // Disposal is the worker's last-resort release path. It must leave a live existing Signal
+      // call window before cleaning local capture resources.
+      dispose: leaveCall,
     };
   }
 }
