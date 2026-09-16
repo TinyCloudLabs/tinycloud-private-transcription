@@ -13,6 +13,8 @@ describe("Signal Desktop UI state", () => {
   test("does not report the QR linking screen as a usable seat", () => {
     expect(signalDesktopLinkState("Link your device Scan the QR code")).toBe("unlinked");
     expect(signalDesktopLinkState("New message Search chats")).toBe("linked");
+    expect(signalDesktopLinkState("Search\nChats\nSettings\nStories\nCalls")).toBe("linked");
+    expect(signalDesktopLinkState("Search\nLink a new device\nChats")).toBe("unlinked");
     expect(signalDesktopLinkState("Signal")).toBe("unknown");
   });
 });

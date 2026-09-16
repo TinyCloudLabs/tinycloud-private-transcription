@@ -100,7 +100,10 @@ export function signalUiState(text: string): SignalCaptureSnapshot["status"] | "
 export function signalDesktopLinkState(text: string): "linked" | "unlinked" | "unknown" {
   const body = text.toLowerCase();
   if (/link (?:your |a )?(?:device|phone)|scan (?:the )?qr|qr code|link a new device/.test(body)) return "unlinked";
-  if (/\bnew message\b|\bsearch\b.*\bchats?\b|\bcompose\b.*\bmessage\b/.test(body)) return "linked";
+  if (
+    /\bnew message\b|\bcompose\b.*\bmessage\b/.test(body)
+    || (/\bsearch\b/.test(body) && /\b(chats?|stories|calls)\b/.test(body))
+  ) return "linked";
   return "unknown";
 }
 
@@ -115,7 +118,7 @@ const clickSignalAction = `(labels => {
 // Signal often renders call controls as icons.  Include their accessible names in the bounded UI
 // evidence we inspect, otherwise a healthy icon-only "Leave call" control looks like a blank page.
 // This value is used only in-memory to drive the current call and is never logged or persisted.
-const signalUiText = "[document.body?.innerText || '', ...[...document.querySelectorAll('button,[role=\"button\"]')].map(node => node.getAttribute('aria-label') || '')].join('\\n')";
+const signalUiText = "[document.body?.innerText || '', ...[...document.querySelectorAll('*')].flatMap(node => ['aria-label', 'title', 'placeholder', 'data-testid'].map(name => node.getAttribute(name) || ''))].join('\\n')";
 
 const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
