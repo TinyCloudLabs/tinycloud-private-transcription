@@ -20,6 +20,7 @@
  *
  * Env: DATABASE_URL, REDIS_URL (docker-compose.dev.yml defaults), SIGNAL_CALL_URL (required for
  *      a live desktop backend; never logged or written to evidence), SIGNAL_REPLAY_SCRIPT,
+ *      SIGNAL_EXPECTED_PHRASE (required for live capture; checked in-memory only),
  *      SMOKE_CAPTURE_SECONDS (30), SMOKE_TIMEOUT_S (120). On a dev rig shared with `bun test` (which truncates tables and
  *      clears the queue) point SMOKE_DATABASE_URL / SMOKE_REDIS_URL at a scratch database and a
  *      spare Redis index so a concurrent suite cannot eat this run's jobs.
@@ -36,7 +37,15 @@ const OUT = "tmp";
 const TIMEOUT_S = Number(process.env.SMOKE_TIMEOUT_S ?? 120);
 const CAPTURE_SECONDS = Number(process.env.SMOKE_CAPTURE_SECONDS ?? 30);
 const suppliedCallUrl = process.env.SIGNAL_CALL_URL;
+const expectedPhrase = process.env.SIGNAL_EXPECTED_PHRASE?.trim();
 const replayCallUrl = "https://signal.link/call/#replay-only";
+let secretFragments: string[] = [];
+const redact = (value: unknown): unknown => {
+  if (typeof value === "string") return secretFragments.reduce((safe, secret) => safe.replaceAll(secret, "[REDACTED]"), value);
+  if (Array.isArray(value)) return value.map(redact);
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redact(item)]));
+  return value;
+};
 const callUrlFor = (isReplay: boolean) => {
   const callUrl = suppliedCallUrl ?? (isReplay ? replayCallUrl : null);
   if (!callUrl) throw new Error("SIGNAL_CALL_URL is required for a live Signal smoke; supply it privately and do not paste it into logs or evidence.");
@@ -56,7 +65,7 @@ if (!Number.isSafeInteger(CAPTURE_SECONDS) || CAPTURE_SECONDS < 1 || CAPTURE_SEC
 
 mkdirSync(OUT, { recursive: true });
 const log = (m: string) => console.log(`[signal-smoke ${new Date().toISOString().slice(11, 19)}] ${m}`);
-const save = (name: string, data: unknown) => writeFileSync(`${OUT}/${name}`, JSON.stringify(data, null, 2) + "\n");
+const save = (name: string, data: unknown) => writeFileSync(`${OUT}/${name}`, JSON.stringify(redact(data), null, 2) + "\n");
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const freePort = () => { const s = Bun.serve({ port: 0, fetch: () => new Response("") }); const p = s.port; s.stop(true); return p; };
 
@@ -110,6 +119,8 @@ async function main() {
     process.exit(2);
   }
   const { callUrl: CALL_URL, capability: CAPABILITY } = callUrlFor(healthBody.backend === "replay");
+  secretFragments = [CAPABILITY];
+  if (healthBody.backend !== "replay" && !expectedPhrase) throw new Error("SIGNAL_EXPECTED_PHRASE is required for a live Signal smoke.");
 
   // 2. Real API + queue worker processes, real Postgres/Redis, real API key.
   await runMigrations(databaseUrl);
@@ -175,13 +186,13 @@ async function main() {
         stopped = await read(await call(`/v1/meetings/${id}/stop`, { method: "POST" }));
         stoppedAgain = await read(await call(`/v1/meetings/${id}/stop`, { method: "POST" }));
         save("signal-smoke-stop.json", { first: stopped, second: stoppedAgain });
-        log(`POST /stop → ${stopped.http_status} ${JSON.stringify(stopped.body)} ; repeat → ${stoppedAgain.http_status} ${JSON.stringify(stoppedAgain.body)}`);
+        log(`POST /stop → ${stopped.http_status} ${JSON.stringify(redact(stopped.body))} ; repeat → ${stoppedAgain.http_status} ${JSON.stringify(redact(stoppedAgain.body))}`);
       }
       if (status === "completed") {
         transcript = await read(await call(`/v1/meetings/${id}/transcript`));
         break;
       }
-      if (status === "failed" || status === "cancelled") { save("signal-smoke-failure.json", view); throw new Error(`meeting ended as ${status}: ${JSON.stringify(view.body.error)}`); }
+      if (status === "failed" || status === "cancelled") { save("signal-smoke-failure.json", view); throw new Error(`meeting ended as ${status}: ${JSON.stringify(redact(view.body.error))}`); }
       await sleep(400);
     }
     save("signal-smoke-lifecycle.json", lifecycle);
@@ -198,9 +209,10 @@ async function main() {
 
     const segments = transcript.body.segments ?? [];
     const unknownSpeakers = segments.length > 0 && segments.every((s: any) => s.speaker_name === "Unknown" && s.attribution === "unknown");
+    const expectedPhraseMatched = healthBody.backend === "replay" || segments.some((s: any) => typeof s.text === "string" && s.text.toLowerCase().includes(expectedPhrase!.toLowerCase()));
     const stopIdempotent = !!stopped && !!stoppedAgain && stopped.http_status === 200 && stoppedAgain.http_status === 200 && JSON.stringify(stopped.body) === JSON.stringify(stoppedAgain.body);
     const leaked = [...bodies, ...(hook ? [hook.rawBody] : []), ...captureLog, ...serviceLog].some((t) => t.includes(CAPABILITY));
-    const ok = transcript.body.status === "completed" && unknownSpeakers && stopIdempotent && !leaked && !!hook && lifecycle.some((l) => l.status === "in_progress");
+    const ok = transcript.body.status === "completed" && unknownSpeakers && expectedPhraseMatched && stopIdempotent && !leaked && !!hook && lifecycle.some((l) => l.status === "in_progress");
 
     const summary = {
       ok,
@@ -212,6 +224,7 @@ async function main() {
       transcript_status: transcript.body.status,
       segments: segments.length,
       unknown_speakers: unknownSpeakers,
+      expected_phrase_matched: expectedPhraseMatched,
       webhook: hook ? { type: hook.body.type, signature_valid: verifyWebhookSignature(webhookSecret, hook.rawBody, hook.headers["x-webhook-signature"]) } : null,
       fragment_leaked: leaked,
     };
@@ -224,8 +237,8 @@ async function main() {
     worker.kill();
     capture.kill();
     await ctx.redis.close?.();
-    writeFileSync(`${OUT}/signal-smoke-process.log`, [...captureLog, ...serviceLog].join(""));
+    writeFileSync(`${OUT}/signal-smoke-process.log`, redact([...captureLog, ...serviceLog].join("")) as string);
   }
 }
 
-await main().catch((e) => { console.error(e); process.exit(1); });
+await main().catch((e) => { console.error(redact(e instanceof Error ? e.message : String(e))); process.exit(1); });

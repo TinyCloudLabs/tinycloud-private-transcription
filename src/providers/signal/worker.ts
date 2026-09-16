@@ -33,6 +33,8 @@ interface Seat {
   /** Set once the seat is terminal; the backend session is disposed by then. */
   terminal: SignalCaptureSnapshot | null;
   terminalAt: number;
+  /** In-progress cleanup retains capacity until the backend has left and released the Desktop. */
+  cleanup: Promise<SignalCaptureSnapshot> | null;
 }
 
 /**
@@ -84,14 +86,35 @@ export function createSignalWorkerApp(opts: SignalWorkerOptions) {
     for (const [id, seat] of seats) if (seat.terminal && now - seat.terminalAt > opts.sessionRetentionMs) seats.delete(id);
   };
 
-  /** Ends a seat, disposing the backend session so the Signal Desktop seat is actually released. */
+  /**
+   * Ends a seat only after the backend has left and released the Desktop. In particular, do not
+   * publish a terminal snapshot (and thereby free capacity) while asynchronous cleanup is pending.
+   */
   const settle = async (seat: Seat, snapshot: SignalCaptureSnapshot) => {
     if (seat.terminal) return seat.terminal;
-    seat.terminal = snapshot;
-    seat.terminalAt = Date.now();
-    await seat.session.dispose().catch((e) => opts.log.warn("signal seat dispose failed", { sessionId: seat.id, meetingId: seat.meetingId, error: String(e) }));
-    opts.log.info("signal seat released", { sessionId: seat.id, meetingId: seat.meetingId, status: snapshot.status });
-    return snapshot;
+    if (seat.cleanup) return await seat.cleanup;
+    // A terminal seat may never retain a joining/active state. Treat a broken leave backend as
+    // capture failure and keep its capacity until cleanup has completed.
+    if (snapshot.status !== "completed" && snapshot.status !== "failed") snapshot = { status: "failed", errorCode: "capture_failed" };
+    seat.cleanup = (async () => {
+      try {
+        // `dispose` is a resource guarantee, not proof that the existing Desktop call window
+        // was left. Ask the backend to leave first on every terminal/error path.
+        await seat.session.leave();
+        await seat.session.dispose();
+        seat.terminal = snapshot;
+        seat.terminalAt = Date.now();
+        opts.log.info("signal seat released", { sessionId: seat.id, meetingId: seat.meetingId, status: snapshot.status });
+        return snapshot;
+      } catch (e) {
+        // Fail closed: an unproven release must continue to occupy the only linked Desktop seat.
+        // A later observe/delete retries cleanup rather than admitting a second call.
+        opts.log.warn("signal seat cleanup failed", { sessionId: seat.id, meetingId: seat.meetingId, error: String(e) });
+        seat.cleanup = null;
+        return { status: "failed", errorCode: "capture_failed" };
+      }
+    })();
+    return await seat.cleanup;
   };
 
   /** Reads the backend and applies the worker's own bounds. */
@@ -163,7 +186,7 @@ export function createSignalWorkerApp(opts: SignalWorkerOptions) {
         opts.log.error("signal capture could not open a call", { meetingId: body.meetingId, error: String(e) });
         return c.json({ error: { code: "capture_failed", message: "Signal Desktop could not open the call." } }, 502);
       }
-      seats.set(id, { id, meetingId: body.meetingId, session, startedAt: Date.now(), terminal: null, terminalAt: 0 });
+      seats.set(id, { id, meetingId: body.meetingId, session, startedAt: Date.now(), terminal: null, terminalAt: 0, cleanup: null });
       opts.log.info("signal seat opened", { sessionId: id, meetingId: body.meetingId, backend: opts.backend.name });
       return c.json({ session_id: id }, 201);
     } finally {
@@ -194,6 +217,9 @@ export function createSignalWorkerApp(opts: SignalWorkerOptions) {
       await seat.session.leave().catch(() => {});
       await settle(seat, { status: "failed", errorCode: "capture_failed" });
     }
+    // Do not turn an unresolved physical call into a logical deletion. The retained seat keeps
+    // capacity closed and a later delete/observe will retry its cleanup.
+    if (!seat.terminal) return c.json({ error: { code: "cleanup_pending", message: "Signal seat cleanup is not complete." } }, 503);
     seats.delete(seat.id);
     return c.body(null, 204);
   });
