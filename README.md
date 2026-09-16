@@ -277,7 +277,7 @@ Every image referenced by the dstack compose file, including the bot and agent i
 runtime, has an immutable digest. Postgres, Redis, Valkey, unchanged Vexa v0.12 components, CPU whisper, and the curl
 helper use the exact public linux/amd64 image configs already running on `ptx-dev`. The configured-but-unused
 Vexa agent images use the public `v012` manifest digests because no agent image is cached on the CVM. The
-accepted API and Signal defaults come from main commit `ffaa4055`; the accepted Vexa bot, meeting-api, and
+accepted API and Signal defaults come from main commit `5402ee20`; the accepted Vexa bot, meeting-api, and
 gateway defaults come from `e49f3f3`. Image override variables take complete references and must remain
 digest-pinned.
 
