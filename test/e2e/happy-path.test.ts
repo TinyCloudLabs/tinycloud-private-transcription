@@ -15,9 +15,9 @@
  * Env: VEXA_BASE_URL (http://localhost:18066) VEXA_API_KEY (minted via admin-api if unset)
  *      JITSI_BASE_URL (https://jitsi.local:8443) JITSI_HOST_IP (127.0.0.1) E2E_ALICE_SECONDS (75) E2E_TIMEOUT_S (300)
  *      E2E_AUTO_LEAVE_MS (60000; explicit short test window, independent of the production default)
- *      TRANSCRIPTION_PROVIDER (vexa|tinfoil, from .env) selects Vexa's deployment backend. TinyCloud
- *      always stores Vexa's completed speaker-attributed segments and does not download or
- *      re-transcribe recordings.
+ *      TRANSCRIPTION_PROVIDER is a PTX compatibility label only; Vexa's STT endpoint is configured
+ *      separately. TinyCloud stores Vexa's completed speaker-attributed segments and does not
+ *      download or re-transcribe recordings.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";

@@ -11,10 +11,10 @@ const PROVIDER_NAMES: Record<TranscriptionProviderName, true> = {
 };
 
 /**
- * Backend selection is owned by Vexa. Both deployment selections consume Vexa's completed,
- * speaker-attributed segments; no recording is downloaded or sent to another provider here.
- * The name is still validated so a typo in TRANSCRIPTION_PROVIDER fails at boot instead of
- * silently reporting an unknown backend through /health.
+ * This setting is a PTX compatibility label; Vexa's STT endpoint is configured separately. Both
+ * values consume Vexa's completed, speaker-attributed segments, and no recording is downloaded or
+ * sent to another provider here. The name is still validated so a typo in TRANSCRIPTION_PROVIDER
+ * fails at boot instead of silently reporting an unknown backend through /health.
  */
 export function createTranscriptionProvider(cfg: Pick<Config, "transcriptionProvider">): TranscriptionProvider {
   if (!Object.hasOwn(PROVIDER_NAMES, cfg.transcriptionProvider)) {

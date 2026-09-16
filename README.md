@@ -104,7 +104,7 @@ production window. Green 2/2 on 2026-08-17 (~2 min each; evidence in `tmp/e2e-<r
 | `SIGNAL_PULSE_SOURCE` | `ptx_sink.monitor` in dstack | PulseAudio monitor captured by the isolated Signal seat |
 | `SIGNAL_TRANSCRIBER` | bundled dstack adapter | local WAV-to-JSON adapter using the in-CVM Whisper service |
 | `JOIN_TIMEOUT_SECONDS` | `600` | worker-side join deadline: a meeting still `joining`/`waiting_for_admission` this long after bot dispatch is failed (`meeting_join_failed`/`waiting_room_timeout`), its bot stopped, and `meeting.failed` emitted |
-| `TRANSCRIPTION_PROVIDER` | `vexa` | Vexa deployment backend (`vexa` or `tinfoil`); TinyCloud always ingests Vexa-produced segments |
+| `TRANSCRIPTION_PROVIDER` | `vexa` | PTX compatibility label (`vexa` or `tinfoil`); both ingest Vexa-produced segments. This does not configure Vexa's STT endpoint; the shipped Compose still uses local Whisper and Tinfoil wiring is deferred. |
 | `AUTO_MIGRATE` | `true` | API runs migrations at boot |
 | `LOG_LEVEL` | `info` | JSON logs |
 
@@ -178,8 +178,9 @@ Types in `src/providers/vexa/types.ts`; pure mapping in `src/providers/vexa/adap
   and **`data.completion_reason`** (that is where it lives on transcript rows; the top-level
   field exists only on MeetingResponse rows). `data.failure_stage`, `data.last_error`, `data.status_transition[]` also exist.
 - Segments: `{start,end,text,language,speaker,completed,segment_id,absolute_start_time,absolute_end_time}`.
-  `start`/`end` are **epoch seconds** → we rebase to meeting-relative seconds (origin = `start_time` when it
-  precedes the first segment, else the first segment). `segment_id` is `turn:N:<seq>` (confirmed; a turn can
+  `start`/`end` may be epoch seconds or meeting-relative seconds. Epoch values are rebased (origin =
+  `start_time` when it precedes the first segment, else the first segment); relative values pass through.
+  `segment_id` is `turn:N:<seq>` (confirmed; a turn can
   have several) or `turn:N:p<seq>` (draft) → drafts of a turn that has confirmed rows are dropped, ids are
   upserted (last wins), `completed:false` rows are dropped. `speaker` is the Jitsi display name.
 - Status map: `requested|joining→joining`, `awaiting_admission|needs_help→waiting_for_admission`,
@@ -189,11 +190,16 @@ Types in `src/providers/vexa/types.ts`; pure mapping in `src/providers/vexa/adap
 - `GET /bots/status` → `{running:[MeetingResponse…], running_bots:[…same], count}` (non-terminal rows only).
 ## Vexa-native transcript ingestion
 
-Every meeting requests `transcribe_enabled:true`, including deployments whose Vexa backend is selected as
-Tinfoil. On completion, TinyCloud validates, de-duplicates, rebases, normalizes, and stores Vexa's completed
+Every meeting requests `transcribe_enabled:true`. On completion, TinyCloud validates, de-duplicates,
+rebases, normalizes, and stores Vexa's completed
 speaker-attributed segments. It makes no recording, timeline, audio-decoding, partitioning, or downstream
 transcription request. `POST /v1/meetings/{id}/recover` remains tenant-scoped and retries the same retained
 Vexa transcript row; transcript storage is an upsert and only the winning terminal transition emits a webhook.
+
+`TRANSCRIPTION_PROVIDER=tinfoil` currently selects the same Vexa-native ingestion path for compatibility;
+it does not configure Vexa's STT service. The shipped Compose still points Vexa at local Whisper. A future
+deployment change may wire TinyCloud Tinfoil as Vexa's text-only STT backend; Vexa remains responsible for
+speaker attribution.
 
 ### Known gaps / risks
 
@@ -207,9 +213,8 @@ Vexa transcript row; transcript storage is an upsert and only the winning termin
   DB/MinIO purge inside the CVM (follow-up).
 - **Jitsi live validation** is marked pending upstream; it works against docker-jitsi-meet stable-11146-2
   (bot needs `https://` + hostname + a trusted cert).
-- **Tinfoil contract probe and late-joiner validation are deferred pre-merge**: the real Tinfoil
-  deployment contract has not yet been probed, and the two-speaker/late-joiner fixture validation is
-  intentionally reserved for the later gate. `fixtures/bob.wav` remains in the repository for that work.
+- **Tinfoil wiring and live two-speaker/late-joiner acceptance remain deferred follow-ups**: the shipped
+  Compose still uses local Whisper inside Vexa. `fixtures/bob.wav` remains for the later live gate.
 - The capture rig needed a host iptables fix (Docker's FORWARD/NAT chains had been flushed) — see infra/README.md.
 
 ## Vexa fork ([TinyCloudLabs/vexa](https://github.com/TinyCloudLabs/vexa))
@@ -289,7 +294,8 @@ are not pruned), but a redeploy after expiry cannot re-pull it.
 
 **Env.** `cp infra/dstack/.env.example infra/dstack/.env` (gitignored) and fill it: random 32-char values for
 `POSTGRES_PASSWORD`, `VEXA_DB_PASSWORD`, `VEXA_ADMIN_TOKEN`, `VEXA_INTERNAL_API_SECRET`, `MINIO_ROOT_PASSWORD`;
-`PTX_IMAGE`; and `TRANSCRIPTION_PROVIDER` when the Vexa deployment selects a backend. Everything in that
+`PTX_IMAGE`; leave `TRANSCRIPTION_PROVIDER=vexa` until Vexa's Tinfoil STT endpoint is explicitly wired.
+Everything in that
 file is encrypted client-side and sealed into
 the CVM (`phala deploy -e`); nothing secret lives in `app-compose.yaml`.
 

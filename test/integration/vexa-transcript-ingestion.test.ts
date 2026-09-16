@@ -2,10 +2,11 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { startHarness, type Harness } from "./harness.ts";
 
 /**
- * Ingestion of Vexa-produced segments for a Tinfoil-selected deployment: the meeting is dispatched
- * with live transcription on, the completed segments are stored as-is, and nothing downstream is
- * ever asked to transcribe again. A malformed Vexa transcript has to reach a terminal state too —
- * the worker loop drops a thrown job without re-queueing it.
+ * Ingestion of Vexa-produced segments under the legacy Tinfoil compatibility label: the meeting is
+ * dispatched with live transcription on, the completed segments are stored as-is, and nothing
+ * downstream is ever asked to transcribe again. This label does not configure Vexa's STT endpoint.
+ * A malformed Vexa transcript has to reach a terminal state too — the worker loop drops a thrown
+ * job without re-queueing it.
  */
 let h: Harness;
 beforeAll(async () => {
@@ -29,7 +30,7 @@ const waitStatus = (id: string, wanted: string) =>
   }, { label: `meeting ${id} -> ${wanted}` });
 
 describe("Vexa-native transcript ingestion", () => {
-  test("a Tinfoil-selected meeting is captured with live transcription and never re-transcribed", async () => {
+  test("the tinfoil compatibility label captures with live transcription and never re-transcribes", async () => {
     const { id, native } = await dispatch("IngestNoSecondPass");
     const bot = h.vexa.meetings.get(`jitsi/${native}`)!;
     expect(bot.transcribe_enabled).toBe(true);

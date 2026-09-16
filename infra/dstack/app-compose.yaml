@@ -4,7 +4,7 @@
 #   phala deploy -n ptx-dev -c infra/dstack/app-compose.yaml -e infra/dstack/.env -t tdx.large --disk-size 40G
 # Encrypted env (never in this file): POSTGRES_PASSWORD, VEXA_DB_PASSWORD, VEXA_ADMIN_TOKEN,
 # VEXA_INTERNAL_API_SECRET, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD,
-# TRANSCRIPTION_PROVIDER (vexa|tinfoil, the Vexa deployment's backend), PTX_IMAGE (our api/worker
+# TRANSCRIPTION_PROVIDER (PTX compatibility label; does not configure Vexa's STT endpoint), PTX_IMAGE (our api/worker
 # image), VEXA_IMAGE_TAG (v012 for unchanged upstream components),
 # PTX_BOT_IMAGE (fork bot image override; defaults to the pinned fork image below).
 # SIGNAL_CAPTURE_IMAGE is the one-seat Signal Desktop rig.  Its profile volume is deliberately

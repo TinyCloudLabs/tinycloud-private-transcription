@@ -140,7 +140,7 @@ describe("happy path: create -> joined -> completed -> transcript + webhook", ()
     expect(t.status).toBe(202);
   });
 
-  test("Tinfoil-selected Vexa completion stores its segments without a second transcription", async () => {
+  test("the tinfoil compatibility label stores Vexa segments without a second transcription", async () => {
     await h.vexa.control("jitsi", nativeId, { status: "completed", segments: SEGMENTS, completion_reason: "stopped" });
     const body = await waitStatus(id, "completed");
     expect(body.ended_at).toBeTruthy();
