@@ -224,15 +224,16 @@ STT and native speaker attribution; this service consumes the completed attribut
 of downloading and retranscribing recordings. The remaining Vexa components stay on their unchanged
 upstream v0.12 images.
 
-- **Branches**: `tinycloud` = current upstream (`59e2c413`) + the selected TinyCloud overlay, merged as
-  `e49f3f3f`. `main` tracks upstream untouched. The separate local rig remains pinned by
+- **Branches**: `tinycloud` = current upstream (`59e2c413`) + the selected TinyCloud overlay, currently
+  at `a8e0d758`. `main` tracks upstream untouched. The separate local rig remains pinned by
   `infra/vexa/upstream` and `infra/vexa/UPSTREAM_PIN` until that fixture is refreshed.
 - **The patch**: `core/meetings/modules/record-chunker` — `createRecordingTap` builds a dynamic mix
   (`DynamicElementMixer`): the recorder starts immediately (even with zero audio elements) and a 2 s
   rescan (live-mixer parity) attaches new elements / detaches ended ones. Pinned by the module's
   `dynamic-tap.smoke.test.ts`.
-- **Images**: bot, meeting-api, and gateway use `ghcr.io/tinycloudlabs/vexa/<component>:tc-e49f3f3`
-  pinned by digest in `infra/dstack/app-compose.yaml`. The bot workflow is `tinycloud-bot-image`; the older
+- **Images**: the bot uses `ghcr.io/tinycloudlabs/vexa/bot:tc-a8e0d75`; meeting-api and gateway remain on
+  `ghcr.io/tinycloudlabs/vexa/<component>:tc-e49f3f3`. All are pinned by digest in
+  `infra/dstack/app-compose.yaml`. The bot workflow is `tinycloud-bot-image`; the older
   `ghcr.io/tinycloudlabs/vexa-bot` package was created while the fork was private, is stuck private,
   and is deprecated — nothing pushes to it);
   the local rig layers the dev CA on top (`infra/vexa/bot/Dockerfile` → `ptx/vexa-bot:tc-devca`). Admin,
@@ -277,9 +278,9 @@ Every image referenced by the dstack compose file, including the bot and agent i
 runtime, has an immutable digest. Postgres, Redis, Valkey, unchanged Vexa v0.12 components, CPU whisper, and the curl
 helper use the exact public linux/amd64 image configs already running on `ptx-dev`. The configured-but-unused
 Vexa agent images use the public `v012` manifest digests because no agent image is cached on the CVM. The
-accepted API and Signal defaults come from main commit `5402ee20`; the accepted Vexa bot, meeting-api, and
-gateway defaults come from `e49f3f3`. Image override variables take complete references and must remain
-digest-pinned.
+accepted API and Signal defaults come from main commit `5402ee20`; the accepted Vexa bot default comes
+from `a8e0d758`, while meeting-api and gateway remain on `e49f3f3`. Image override variables take complete
+references and must remain digest-pinned.
 
 MinIO is pinned to the exact releases running on `ptx-dev`: server
 `RELEASE.2025-09-07T16-13-09Z` and client `RELEASE.2025-08-13T08-35-41Z`. Their public Quay manifest-list

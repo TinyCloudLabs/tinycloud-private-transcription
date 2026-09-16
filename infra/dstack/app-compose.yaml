@@ -262,7 +262,7 @@ services:
   # image no container references. This no-op service makes compose pull the fork bot image at boot (~1.6 GB
   # compressed) and its exited container pins the image so the prune keeps it.
   bot-image-keeper:
-    image: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-e49f3f3@sha256:578f38ae8d0791b11cd1b7bde98484de95181912d72051a7860edcc1f31b4000}
+    image: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-a8e0d75@sha256:1422bd5113d01df606b3171bd236042685c04ed7f681f69cd9afeba010df4dc7}
     entrypoint: ["/bin/true"]
     restart: "no"
     network_mode: none
@@ -271,7 +271,7 @@ services:
     image: ${VEXA_RUNTIME_IMAGE:-vexaai/v012-runtime:v012@sha256:a1f6448fbb380b9433364e8b572ec25a12aa4f274bf403f1d83a89cbf5812f2d}
     group_add: ["0"]
     environment:
-      BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-e49f3f3@sha256:578f38ae8d0791b11cd1b7bde98484de95181912d72051a7860edcc1f31b4000}
+      BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-a8e0d75@sha256:1422bd5113d01df606b3171bd236042685c04ed7f681f69cd9afeba010df4dc7}
       AGENT_IMAGE: ${VEXA_AGENT_IMAGE:-vexaai/v012-agent-api:v012@sha256:6eb37574b33aab233aabbe5907e06e106bae44a403e5df781a436da8201a928d}
       AGENT_WORKER_IMAGE: ${VEXA_AGENT_WORKER_IMAGE:-vexaai/v012-agent-worker:v012@sha256:a1120b24765ff6b1c86c5f9ddee35b5e71fdbb9543a23b918b278373ad705022}
       REDIS_URL: redis://redis:6379/0
