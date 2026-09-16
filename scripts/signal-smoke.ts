@@ -20,7 +20,7 @@
  *
  * Env: DATABASE_URL, REDIS_URL (docker-compose.dev.yml defaults), SIGNAL_CALL_URL (required for
  *      a live desktop backend; never logged or written to evidence), SIGNAL_REPLAY_SCRIPT,
- *      SMOKE_TIMEOUT_S (120). On a dev rig shared with `bun test` (which truncates tables and
+ *      SMOKE_CAPTURE_SECONDS (30), SMOKE_TIMEOUT_S (120). On a dev rig shared with `bun test` (which truncates tables and
  *      clears the queue) point SMOKE_DATABASE_URL / SMOKE_REDIS_URL at a scratch database and a
  *      spare Redis index so a concurrent suite cannot eat this run's jobs.
  */
@@ -34,17 +34,25 @@ import { verifyWebhookSignature } from "../src/webhooks/signature.ts";
 
 const OUT = "tmp";
 const TIMEOUT_S = Number(process.env.SMOKE_TIMEOUT_S ?? 120);
+const CAPTURE_SECONDS = Number(process.env.SMOKE_CAPTURE_SECONDS ?? 30);
 const suppliedCallUrl = process.env.SIGNAL_CALL_URL;
 const replayCallUrl = "https://signal.link/call/#replay-only";
 const callUrlFor = (isReplay: boolean) => {
   const callUrl = suppliedCallUrl ?? (isReplay ? replayCallUrl : null);
   if (!callUrl) throw new Error("SIGNAL_CALL_URL is required for a live Signal smoke; supply it privately and do not paste it into logs or evidence.");
-  const url = new URL(callUrl);
-  if (url.protocol !== "https:" || url.hostname.toLowerCase() !== "signal.link" || url.pathname !== "/call/" || url.hash.length < 2) {
+  try {
+    const url = new URL(callUrl);
+    if (url.protocol === "https:" && url.hostname.toLowerCase() === "signal.link" && url.pathname === "/call/" && url.hash.length >= 2) {
+      return { callUrl, capability: url.hash.slice(1) };
+    }
+  } catch {
+    // URL parser errors include their input; never let that bearer capability reach main.catch.
+  }
+  {
     throw new Error("SIGNAL_CALL_URL must be a Signal call link with a fragment.");
   }
-  return { callUrl, capability: url.hash.slice(1) };
 };
+if (!Number.isSafeInteger(CAPTURE_SECONDS) || CAPTURE_SECONDS < 1 || CAPTURE_SECONDS > 300) throw new Error("SMOKE_CAPTURE_SECONDS must be an integer from 1 to 300.");
 
 mkdirSync(OUT, { recursive: true });
 const log = (m: string) => console.log(`[signal-smoke ${new Date().toISOString().slice(11, 19)}] ${m}`);
@@ -150,14 +158,20 @@ async function main() {
     let stopped: { http_status: number; body: any } | null = null;
     let stoppedAgain: { http_status: number; body: any } | null = null;
     let transcript: { http_status: number; body: any } | null = null;
+    let captureUntil = 0;
     const deadline = Date.now() + TIMEOUT_S * 1000;
     while (Date.now() < deadline) {
       const view = await read(await call(`/v1/meetings/${id}`));
       const status: string = view.body.status;
       if (lifecycle.at(-1)?.status !== status) { lifecycle.push({ at: new Date().toISOString(), status }); log(`status → ${status}`); }
 
-      // 5. Idempotent stop, issued once the bot is actually in the call.
-      if (status === "in_progress" && !stopped) {
+      // 5. Keep the real seat in-call long enough for the operator to say the unique phrase;
+      // stopping immediately after admission could produce an empty but otherwise valid transcript.
+      if (status === "in_progress" && !captureUntil) {
+        captureUntil = Date.now() + CAPTURE_SECONDS * 1000;
+        log(`Signal call is in progress; speak the test phrase now. Capturing for ${CAPTURE_SECONDS} seconds before idempotent stop.`);
+      }
+      if (status === "in_progress" && !stopped && Date.now() >= captureUntil) {
         stopped = await read(await call(`/v1/meetings/${id}/stop`, { method: "POST" }));
         stoppedAgain = await read(await call(`/v1/meetings/${id}/stop`, { method: "POST" }));
         save("signal-smoke-stop.json", { first: stopped, second: stoppedAgain });
