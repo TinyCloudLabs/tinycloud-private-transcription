@@ -266,8 +266,10 @@ GitHub Actions workflow `.github/workflows/publish-image.yml` on every push to `
 the Dockerfile, `src/`, or the lockfile (or `gh workflow run publish-image.yml`). It authenticates with the
 workflow's `GITHUB_TOKEN` (`packages: write`); watch it with `gh run watch` and take the digest from the run
 summary. Production defaults use the full `:<sha>@sha256:<digest>` reference from the accepted workflow;
-when advancing it, update `PTX_IMAGE` and `SIGNAL_CAPTURE_IMAGE` in both the compose file and
-`infra/dstack/.env.example`. Do not use the moving `:v1` or `:latest` tags for deployment. (The older package
+when advancing them, update the immutable API/worker and Signal-seat references directly in
+`infra/dstack/app-compose.yaml`. They deliberately cannot be overridden by sealed environment values,
+which prevents an old deployment env from silently selecting stale code. Do not use the moving `:v1`
+or `:latest` tags for deployment. (The older package
 `ghcr.io/tinycloudlabs/tinycloud-private-transcription` — no `/api`
 suffix — was created while the repo was private, is stuck private, and is deprecated; nothing pushes to it.)
 
@@ -275,7 +277,7 @@ Every image referenced by the dstack compose file, including the bot and agent i
 runtime, has an immutable digest. Postgres, Redis, Valkey, unchanged Vexa v0.12 components, CPU whisper, and the curl
 helper use the exact public linux/amd64 image configs already running on `ptx-dev`. The configured-but-unused
 Vexa agent images use the public `v012` manifest digests because no agent image is cached on the CVM. The
-accepted API and Signal defaults come from main commit `2a488f17`; the accepted Vexa bot, meeting-api, and
+accepted API and Signal defaults come from main commit `ffaa4055`; the accepted Vexa bot, meeting-api, and
 gateway defaults come from `e49f3f3`. Image override variables take complete references and must remain
 digest-pinned.
 
@@ -298,19 +300,20 @@ itself has to be reachable. Two options for the private-transcription image:
    `DSTACK_DOCKER_PASSWORD=<PAT with read:packages only>` to `infra/dstack/.env`; the pre-launch script does
    `docker login ghcr.io` with them before pulling. Do not use a broad-scope OAuth/PAT here.
 
-**Fallback (no registry access, expires in 24 h)** — anonymous ttl.sh push from the dev host:
+**Development fallback (no registry access, expires in 24 h)** — anonymous ttl.sh push from the dev host:
 
 ```bash
 git archive HEAD Dockerfile package.json bun.lock src drizzle.config.ts tsconfig.json | tar -x -C /tmp/ptx-build
 sudo docker build --platform linux/amd64 -t ttl.sh/ptx-api-$(git rev-parse --short HEAD):24h /tmp/ptx-build
-sudo docker push ttl.sh/ptx-api-$(git rev-parse --short HEAD):24h      # then set PTX_IMAGE to that tag
+sudo docker push ttl.sh/ptx-api-$(git rev-parse --short HEAD):24h
 ```
-Containers already running keep their image across restarts (compose pull is fail-soft, and referenced images
-are not pruned), but a redeploy after expiry cannot re-pull it.
+This is for a local compose edit only; production pins must remain immutable GHCR references committed to
+`app-compose.yaml`. Containers already running keep their image across restarts, but a redeploy after expiry
+cannot re-pull a ttl.sh image.
 
 **Env.** `cp infra/dstack/.env.example infra/dstack/.env` (gitignored) and fill it: random 32-char values for
 `POSTGRES_PASSWORD`, `VEXA_DB_PASSWORD`, `VEXA_ADMIN_TOKEN`, `VEXA_INTERNAL_API_SECRET`, `MINIO_ROOT_PASSWORD`;
-`PTX_IMAGE`; leave `TRANSCRIPTION_PROVIDER=vexa` until Vexa's Tinfoil STT endpoint is explicitly wired.
+leave `TRANSCRIPTION_PROVIDER=vexa` until Vexa's Tinfoil STT endpoint is explicitly wired.
 Everything in that
 file is encrypted client-side and sealed into
 the CVM (`phala deploy -e`); nothing secret lives in `app-compose.yaml`.

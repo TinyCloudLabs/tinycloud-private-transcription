@@ -37,6 +37,51 @@ export interface SignalCallBackend {
   open(request: SignalCallRequest): Promise<SignalCallSession>;
 }
 
+interface SignalRuntimeOptions {
+  pulseSource: string;
+  parecPath?: string;
+  pactlPath?: string;
+  transcriber?: string[];
+}
+
+/** Local audio/transcription gates, separated from CDP so each production dependency is testable. */
+export async function signalRuntimePrerequisites(options: SignalRuntimeOptions): Promise<string[]> {
+  const missing: string[] = [];
+  if (!options.pulseSource) missing.push("SIGNAL_PULSE_SOURCE is not configured");
+  if (!options.transcriber?.length) missing.push("SIGNAL_TRANSCRIBER is not configured");
+
+  const parec = options.parecPath ?? "parec";
+  try {
+    if ((await Bun.spawn([parec, "--version"], { stdout: "ignore", stderr: "ignore" }).exited) !== 0) missing.push("PulseAudio parec is unavailable");
+  } catch {
+    missing.push("PulseAudio parec is unavailable");
+  }
+
+  if (options.pulseSource) {
+    const pactl = options.pactlPath ?? "pactl";
+    try {
+      const child = Bun.spawn([pactl, "list", "short", "sources"], { stdout: "pipe", stderr: "ignore" });
+      const output = await new Response(child.stdout).text();
+      const sourceExists = (await child.exited) === 0 && output
+        .split("\n")
+        .some((line) => line.trim().split(/\s+/)[1] === options.pulseSource);
+      if (!sourceExists) missing.push("configured PulseAudio source is unavailable");
+    } catch {
+      missing.push("configured PulseAudio source is unavailable");
+    }
+  }
+
+  if (options.transcriber?.length) {
+    try {
+      const child = Bun.spawn([...options.transcriber, "--check"], { stdout: "ignore", stderr: "ignore" });
+      if ((await child.exited) !== 0) missing.push("Signal transcriber is unavailable");
+    } catch {
+      missing.push("Signal transcriber is unavailable");
+    }
+  }
+  return missing;
+}
+
 /** UI evidence only: action attempts never become an in-progress meeting by themselves. */
 export function signalUiState(text: string): SignalCaptureSnapshot["status"] | "ended" {
   const body = text.toLowerCase();
@@ -88,6 +133,7 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
     cdpUrl: string;
     pulseSource: string;
     parecPath?: string;
+    pactlPath?: string;
     transcriber?: string[];
     joinGraceMs?: number;
   }) {
@@ -96,9 +142,7 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
 
   /** Reports every missing prerequisite at once: an operator provisioning a rig needs the whole list. */
   async preflight(): Promise<SignalBackendReadiness> {
-    const missing: string[] = [];
-    if (!this.options.pulseSource) missing.push("SIGNAL_PULSE_SOURCE is not configured");
-    if (!this.options.transcriber?.length) missing.push("SIGNAL_TRANSCRIBER is not configured");
+    const missing = await signalRuntimePrerequisites(this.options);
     try {
       const response = await fetch(new URL("/json/version", this.cdpUrl), { signal: AbortSignal.timeout(2_000) });
       if (!response.ok) missing.push("Signal Desktop CDP is unavailable");
@@ -120,13 +164,6 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
       } catch {
         missing.push("Signal Desktop link state cannot be verified");
       }
-    }
-    // Bun.spawn throws synchronously when the binary is absent, which is itself the answer.
-    const parec = this.options.parecPath ?? "parec";
-    try {
-      if ((await Bun.spawn([parec, "--version"], { stdout: "ignore", stderr: "ignore" }).exited) !== 0) missing.push("PulseAudio parec is unavailable");
-    } catch {
-      missing.push("PulseAudio parec is unavailable");
     }
     if (missing.length) return { ready: false, reason: missing.join("; ") };
     return { ready: true, reason: null };
