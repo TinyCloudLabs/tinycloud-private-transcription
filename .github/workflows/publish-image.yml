@@ -1,7 +1,7 @@
 name: Publish image
 # Builds the api/worker and Signal Desktop seat images (linux/amd64 only — Phala CVMs are TDX x86_64)
 # and pushes it to GHCR with the workflow's GITHUB_TOKEN. Tags:
-#   ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:<git sha>   (immutable; pin this in infra/dstack/.env PTX_IMAGE)
+#   ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:<git sha>   (immutable; pin this in app-compose.yaml)
 #   ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:v1          (moving; on feat/v1 + main)
 #   ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:latest      (moving; on main only)
 # The package must be PUBLIC for the CVM to pull it anonymously. The `.../api` package was created by this workflow

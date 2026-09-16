@@ -22,9 +22,9 @@ and retries only the exact permission/lobby actions while the observed UI is joi
 admission. It records only the configured PulseAudio monitor via `parec`, and invokes the local
 `SIGNAL_TRANSCRIBER` argv prefix with a temporary WAV filename. The transcriber writes JSON
 `RawSegment[]` to stdout; it has no access to the URL capability. The WAV and ephemeral CDP target
-are removed on leave or delete. A linked Signal Desktop profile, a PulseAudio source, and a local
-transcriber are environment provisioning requirements; without them `/health` reports not ready and
-no live-capture claim may be made.
+are removed on leave or delete. A linked Signal Desktop profile, the exact PulseAudio source, and a
+healthy local transcriber are environment provisioning requirements; without them `/health` reports
+not ready and no live-capture claim may be made.
 
 To run the real-call operator check, attach a linked account to the persistent `signal-profile`
 volume, set `SIGNAL_PULSE_SOURCE` to the seat's playback monitor and provide the in-CVM Whisper
@@ -35,11 +35,17 @@ uses a non-live placeholder only for replay-contract checks. Do not use replay m
 a live call.
 
 On dstack, `signal-capability-provision` generates the AES-256 key once inside the persistent
-`signal-runtime` volume. API and queue worker wait for that private file and load it only into their
-process environments; it is neither an operator-supplied deployment secret nor a public health
-field. The capture worker writes a fragment-free readiness record to the same private volume every
-five seconds. Public PTX `/health` degrades when that record is absent, stale, unlinked, or not
-ready, instead of treating core database health as Signal readiness.
+`signal-runtime` volume (the legacy volume name is retained so upgrades preserve the existing key).
+API and queue worker mount it read-only at `/run/signal-capability`, wait for the private file, and
+load it only into their process environments. Signal Desktop/capture cannot mount or modify the key.
+The capture worker writes a fragment-free readiness record to a separate
+`signal-health` volume every five seconds; only the API mounts that record read-only. Public PTX
+`/health` degrades when the record is absent, stale, unlinked, missing its exact PulseAudio source,
+or unable to reach Whisper through the transcriber's bounded `--check`.
+
+TinyChat needs no Signal-specific route. Its browser client calls
+`https://api.tinycloud.chat/api/transcriber/meetings`, whose existing proxy forwards the unchanged
+PTX V1 contract.
 
 Coordination exception: no Linear issue was created for this slice because the workspace's free
 issue limit rejected creation; do not retry issue creation until capacity is available.

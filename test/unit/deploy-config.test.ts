@@ -13,6 +13,7 @@ const repo = fileURLToPath(new URL("../..", import.meta.url));
 const compose = readFileSync(new URL("../../infra/dstack/app-compose.yaml", import.meta.url), "utf8");
 const envExample = readFileSync(new URL("../../infra/dstack/.env.example", import.meta.url), "utf8");
 const seatBoot = readFileSync(new URL("../../infra/signal-seat/boot.sh", import.meta.url), "utf8");
+const signalTranscriber = readFileSync(new URL("../../infra/signal-seat/signal-transcriber", import.meta.url), "utf8");
 const publishWorkflow = readFileSync(new URL("../../.github/workflows/publish-image.yml", import.meta.url), "utf8");
 
 /** The `environment:` block of the named service, up to the next same-indent key. */
@@ -76,9 +77,9 @@ describe("infra/dstack/app-compose.yaml", () => {
 
   test("pins every deploy and runtime-pulled image to an approved immutable digest", () => {
     const expected = {
-      api: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:8965a9968d9bc66bfe19c2e20249c63f46fc0abe@sha256:996f0ef8d51a43530161eed265ca20eced7ba48a928dbc0508ef55d275e1d6b8",
-      worker: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:8965a9968d9bc66bfe19c2e20249c63f46fc0abe@sha256:996f0ef8d51a43530161eed265ca20eced7ba48a928dbc0508ef55d275e1d6b8",
-      "signal-capture": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:8965a9968d9bc66bfe19c2e20249c63f46fc0abe@sha256:c496a52be44a8389dbd7ded34d8dbf71335f01b337bfb953f3d2bc8b20fc5195",
+      api: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:ffaa4055f231457e37399788e9bba561714ca5c5@sha256:d7da979e9d9bdf88c468dd5dd0203df986bdd04c0a05befd35e40634b6e07764",
+      worker: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:ffaa4055f231457e37399788e9bba561714ca5c5@sha256:d7da979e9d9bdf88c468dd5dd0203df986bdd04c0a05befd35e40634b6e07764",
+      "signal-capture": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:ffaa4055f231457e37399788e9bba561714ca5c5@sha256:39b8cb2a04594fb498cd92cddc42b27c5b29fc21b84659ad517e4abeed5ce9f6",
       "signal-capability-provision": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
       postgres: "postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685",
       redis: "redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf",
@@ -115,8 +116,12 @@ describe("infra/dstack/app-compose.yaml", () => {
     const imageOverrides = envExample
       .split("\n")
       .filter((line) => /^[A-Z_]+_IMAGE=/.test(line));
-    expect(imageOverrides.length).toBe(7);
+    expect(imageOverrides.length).toBe(5);
     for (const line of imageOverrides) expect(line).toMatch(/@sha256:[0-9a-f]{64}$/);
+    expect(compose).not.toContain("${PTX_IMAGE");
+    expect(compose).not.toContain("${SIGNAL_CAPTURE_IMAGE");
+    expect(envExample).not.toMatch(/^PTX_IMAGE=/m);
+    expect(envExample).not.toMatch(/^SIGNAL_CAPTURE_IMAGE=/m);
   });
 
   test("pins the Vexa bot, meeting-api, and gateway to the accepted fork commit and digests", () => {
@@ -159,13 +164,18 @@ describe("infra/dstack/app-compose.yaml", () => {
     const workerStart = compose.indexOf("\n  worker:\n");
     const workerBlock = compose.slice(workerStart, compose.indexOf("\n  signal-capture:\n", workerStart));
     expect(workerBlock).toContain("127.0.0.1:6080:6080");
-    expect(workerBlock).toContain("signal-runtime:/run/signal:ro");
+    expect(workerBlock).toContain("signal-runtime:/run/signal-capability:ro");
+    expect(workerBlock).not.toContain("signal-health:");
     const captureStart = compose.indexOf("\n  signal-capture:\n");
-    const capture = compose.slice(captureStart, compose.indexOf("\n  postgres:\n", captureStart));
+    const capture = compose.slice(captureStart, compose.indexOf("\n  signal-capability-provision:\n", captureStart));
     expect(capture).not.toContain("build:");
     expect(capture).toContain('network_mode: "service:worker"');
     expect(capture).toContain("SIGNAL_CAPTURE_BIND: 127.0.0.1");
-    expect(capture).toContain("SIGNAL_HEALTH_PATH: /run/signal/health.json");
+    expect(capture).toContain("SIGNAL_HEALTH_PATH: /run/signal-health/health.json");
+    expect(capture).toContain("SIGNAL_WHISPER_HEALTH_URL: http://whisper:8000/health");
+    expect(capture).toContain("signal-health:/run/signal-health");
+    expect(capture).not.toContain("signal-capability:");
+    expect(capture).not.toContain("signal-runtime:");
     expect(capture).not.toContain("ports:");
     expect(seatBoot).toContain("sink_name=ptx_input_sink");
     expect(seatBoot).toContain("master=ptx_input_sink.monitor source_name=ptx_input");
@@ -173,8 +183,11 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(seatBoot).toContain("mktemp -d /tmp/ptx-signal-runtime");
     expect(seatBoot).toContain('rm -f "/tmp/.X${DISPLAY_NUMBER}-lock" "/tmp/.X11-unix/X${DISPLAY_NUMBER}"');
     expect(compose).toContain("signal-capability-provision:");
-    expect(compose).toContain("signal-runtime:/run/signal");
+    expect(compose).toContain("signal-runtime:/run/signal-capability");
+    expect(compose).toContain("signal-health:/run/signal-health");
     expect(compose).not.toContain("SIGNAL_CAPABILITY_KEY:");
+    expect(signalTranscriber).toContain('"${1:-}" = "--check"');
+    expect(signalTranscriber).toContain("SIGNAL_WHISPER_HEALTH_URL");
   });
 
   test("publishes and CI-builds the Signal seat image", () => {

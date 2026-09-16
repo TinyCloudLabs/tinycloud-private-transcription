@@ -1,8 +1,14 @@
 #!/bin/sh
 set -eu
 
+if [ "${1:-}" = "--check" ]; then
+  curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+    "${SIGNAL_WHISPER_HEALTH_URL:?SIGNAL_WHISPER_HEALTH_URL is required}" >/dev/null
+  exit 0
+fi
+
 wav="$1"
-response="$(curl --fail --silent --show-error -F "file=@${wav};type=audio/wav" -F model=local "${SIGNAL_WHISPER_URL:?SIGNAL_WHISPER_URL is required}")"
+response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 300 -F "file=@${wav};type=audio/wav" -F model=local "${SIGNAL_WHISPER_URL:?SIGNAL_WHISPER_URL is required}")"
 text="$(printf '%s' "$response" | jq -r '.text // empty')"
 [ -n "$text" ] || exit 1
 jq -n --arg text "$text" '[{start:0,end:0,text:$text}]'

@@ -4,12 +4,13 @@
 #   phala deploy -n ptx-dev -c infra/dstack/app-compose.yaml -e infra/dstack/.env -t tdx.large --disk-size 40G
 # Encrypted env (never in this file): POSTGRES_PASSWORD, VEXA_DB_PASSWORD, VEXA_ADMIN_TOKEN,
 # VEXA_INTERNAL_API_SECRET, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD,
-# TRANSCRIPTION_PROVIDER (PTX compatibility label; does not configure Vexa's STT endpoint), PTX_IMAGE (our api/worker
-# image), VEXA_ADMIN_IMAGE / VEXA_RUNTIME_IMAGE / VEXA_AGENT_IMAGE / VEXA_AGENT_WORKER_IMAGE
+# TRANSCRIPTION_PROVIDER (PTX compatibility label; does not configure Vexa's STT endpoint),
+# VEXA_ADMIN_IMAGE / VEXA_RUNTIME_IMAGE / VEXA_AGENT_IMAGE / VEXA_AGENT_WORKER_IMAGE
 # (digest-pinned v012 upstream components),
 # PTX_BOT_IMAGE (fork bot image override; defaults to the pinned fork image below).
-# SIGNAL_CAPTURE_IMAGE is the one-seat Signal Desktop rig.  Its profile volume is deliberately
-# persistent: linking a Signal account is an operator action, never a deployment side effect.
+# The PTX API/worker and one-seat Signal Desktop images are immutable production pins in this file,
+# not sealed-environment overrides. The Signal profile volume is deliberately persistent: linking
+# a Signal account is an operator action, never a deployment side effect.
 #
 # Vexa service topology mirrors infra/vexa/upstream/deploy/compose/docker-compose.yml. Bot,
 # meeting-api, and gateway are pinned to the accepted TinyCloud fork merge; unchanged components
@@ -26,9 +27,9 @@
 services:
   # ─── ours ────────────────────────────────────────────────────────────────────────────────────
   api:
-    image: ${PTX_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:8965a9968d9bc66bfe19c2e20249c63f46fc0abe@sha256:996f0ef8d51a43530161eed265ca20eced7ba48a928dbc0508ef55d275e1d6b8}
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:ffaa4055f231457e37399788e9bba561714ca5c5@sha256:d7da979e9d9bdf88c468dd5dd0203df986bdd04c0a05befd35e40634b6e07764
     # VEXA_API_KEY is minted at first boot by `vexa-provision` (below) into a shared volume.
-    command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal/capability-key ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal/capability-key ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal/capability-key); exec bun run src/api/server.ts"]
+    command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal-capability/capability-key); exec bun run src/api/server.ts"]
     restart: unless-stopped
     ports:
       - "8080:8080"
@@ -52,10 +53,12 @@ services:
       ENABLED_PLATFORMS: ${ENABLED_PLATFORMS:-jitsi,google_meet,signal}
       AUTO_MIGRATE: "true"
       LOG_LEVEL: info
-      SIGNAL_HEALTH_PATH: /run/signal/health.json
+      SIGNAL_HEALTH_PATH: /run/signal-health/health.json
     volumes:
       - vexa-provision:/run/vexa:ro
-      - signal-runtime:/run/signal:ro
+      # Keep the existing volume name so upgrades preserve the already-generated AES key.
+      - signal-runtime:/run/signal-capability:ro
+      - signal-health:/run/signal-health:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -66,8 +69,8 @@ services:
     networks: [ptx, vexa]
 
   worker:
-    image: ${PTX_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:8965a9968d9bc66bfe19c2e20249c63f46fc0abe@sha256:996f0ef8d51a43530161eed265ca20eced7ba48a928dbc0508ef55d275e1d6b8}
-    command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal/capability-key ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal/capability-key ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal/capability-key); exec bun run src/worker/index.ts"]
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:ffaa4055f231457e37399788e9bba561714ca5c5@sha256:d7da979e9d9bdf88c468dd5dd0203df986bdd04c0a05befd35e40634b6e07764
+    command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal-capability/capability-key); exec bun run src/worker/index.ts"]
     restart: unless-stopped
     environment:
       DATABASE_URL: postgres://ptx:${POSTGRES_PASSWORD}@postgres:5432/ptx
@@ -88,7 +91,7 @@ services:
       - "127.0.0.1:6080:6080"
     volumes:
       - vexa-provision:/run/vexa:ro
-      - signal-runtime:/run/signal:ro
+      - signal-runtime:/run/signal-capability:ro
     depends_on:
       api:
         condition: service_healthy
@@ -97,7 +100,7 @@ services:
   # Exactly one linked Signal Desktop. `network_mode: service:worker` makes worker -> capture
   # and capture -> CDP loopback-only while still allowing Signal's own outbound call traffic.
   signal-capture:
-    image: ${SIGNAL_CAPTURE_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:8965a9968d9bc66bfe19c2e20249c63f46fc0abe@sha256:c496a52be44a8389dbd7ded34d8dbf71335f01b337bfb953f3d2bc8b20fc5195}
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:ffaa4055f231457e37399788e9bba561714ca5c5@sha256:39b8cb2a04594fb498cd92cddc42b27c5b29fc21b84659ad517e4abeed5ce9f6
     network_mode: "service:worker"
     restart: unless-stopped
     environment:
@@ -107,12 +110,13 @@ services:
       SIGNAL_PULSE_SOURCE: ${SIGNAL_PULSE_SOURCE:-ptx_sink.monitor}
       SIGNAL_TRANSCRIBER: "/opt/ptx/signal-transcriber"
       SIGNAL_WHISPER_URL: http://whisper:8000/v1/audio/transcriptions
+      SIGNAL_WHISPER_HEALTH_URL: http://whisper:8000/health
       SIGNAL_MAX_CONCURRENT_CALLS: "1"
       SIGNAL_PROFILE_DIR: /var/lib/signal
-      SIGNAL_HEALTH_PATH: /run/signal/health.json
+      SIGNAL_HEALTH_PATH: /run/signal-health/health.json
     volumes:
       - signal-profile:/var/lib/signal
-      - signal-runtime:/run/signal
+      - signal-health:/run/signal-health
     depends_on:
       whisper:
         condition: service_healthy
@@ -127,13 +131,13 @@ services:
       - |
         set -eu
         umask 077
-        [ -s /run/signal/capability-key ] && exit 0
-        head -c 32 /dev/urandom | base64 | tr -d '\n' > /run/signal/capability-key.next
-        chmod 600 /run/signal/capability-key.next
-        mv /run/signal/capability-key.next /run/signal/capability-key
-        [ -s /run/signal/capability-key ]
+        [ -s /run/signal-capability/capability-key ] && exit 0
+        head -c 32 /dev/urandom | base64 | tr -d '\n' > /run/signal-capability/capability-key.next
+        chmod 600 /run/signal-capability/capability-key.next
+        mv /run/signal-capability/capability-key.next /run/signal-capability/capability-key
+        [ -s /run/signal-capability/capability-key ]
     volumes:
-      - signal-runtime:/run/signal
+      - signal-runtime:/run/signal-capability
     restart: on-failure
 
   postgres:
@@ -419,7 +423,9 @@ volumes:
   whisper-cache:
   vexa-provision:
   signal-profile:
+  # Legacy name retained to preserve the existing capability key across in-place upgrades.
   signal-runtime:
+  signal-health:
 
 networks:
   ptx: {}
