@@ -3,8 +3,9 @@
 # (control plane + CPU whisper) that spawns meeting bots. Deploy:
 #   phala deploy -n ptx-dev -c infra/dstack/app-compose.yaml -e infra/dstack/.env -t tdx.large --disk-size 40G
 # Encrypted env (never in this file): POSTGRES_PASSWORD, VEXA_DB_PASSWORD, VEXA_ADMIN_TOKEN,
-# VEXA_INTERNAL_API_SECRET, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD, TINFOIL_API_KEY (optional),
-# TRANSCRIPTION_PROVIDER (vexa|tinfoil), PTX_IMAGE (our api/worker image), VEXA_IMAGE_TAG (v012),
+# VEXA_INTERNAL_API_SECRET, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD,
+# TRANSCRIPTION_PROVIDER (vexa|tinfoil, the Vexa deployment's backend), PTX_IMAGE (our api/worker
+# image), VEXA_IMAGE_TAG (v012),
 # PTX_BOT_IMAGE (fork bot image override; defaults to the pinned fork tag below).
 # SIGNAL_CAPTURE_IMAGE is the one-seat Signal Desktop rig.  Its profile volume is deliberately
 # persistent: linking a Signal account is an operator action, never a deployment side effect.
@@ -42,9 +43,6 @@ services:
       REDIS_URL: redis://redis:6379
       VEXA_BASE_URL: http://gateway:8000
       TRANSCRIPTION_PROVIDER: ${TRANSCRIPTION_PROVIDER:-vexa}
-      TINFOIL_BASE_URL: https://inference.tinfoil.sh
-      TINFOIL_API_KEY: ${TINFOIL_API_KEY:-}
-      TINFOIL_MODEL: ${TINFOIL_MODEL:-voxtral-small-24b}
       # Platforms POST /v1/meetings accepts. The code default is jitsi only, which made
       # tinycloud.chat answer 400 unsupported_platform for every https://meet.google.com/<code>
       # even though detection and the Vexa bot both handle google_meet. Pinned by
@@ -76,9 +74,6 @@ services:
       # fallback so an empty or silent meeting releases capacity sooner on Jitsi or Google Meet.
       VEXA_MAX_TIME_LEFT_ALONE_MS: ${VEXA_MAX_TIME_LEFT_ALONE_MS:-300000}
       TRANSCRIPTION_PROVIDER: ${TRANSCRIPTION_PROVIDER:-vexa}
-      TINFOIL_BASE_URL: https://inference.tinfoil.sh
-      TINFOIL_API_KEY: ${TINFOIL_API_KEY:-}
-      TINFOIL_MODEL: ${TINFOIL_MODEL:-voxtral-small-24b}
       # The capture worker shares this service's network namespace, so this is never routable
       # from another container or a CVM interface.
       SIGNAL_CAPTURE_URL: http://127.0.0.1:18076
@@ -311,7 +306,7 @@ services:
       TRANSCRIPTION_SERVICE_TOKEN: local-stt        # faster-whisper-server ignores auth; non-empty marks STT "configured"
       TRANSCRIPTION_MODEL: ""
       TRANSCRIBE_ENABLED: "true"
-      RECORDING_ENABLED: "true"                     # persists meeting audio to MinIO (Tinfoil batch input)
+      RECORDING_ENABLED: "true"                     # preserves Vexa recording playback; PTX does not re-transcribe it
       MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}

@@ -43,7 +43,6 @@ export interface VexaMeetingCreate {
   language?: string;
   task?: "transcribe" | "translate";
   transcribe_enabled?: boolean;
-  recording_enabled?: boolean;
   /** Vexa's per-meeting lifecycle limits. `max_time_left_alone` is milliseconds without remote participant audio. */
   automatic_leave?: { max_time_left_alone: number };
   passcode?: string;
@@ -69,14 +68,12 @@ export interface VexaMeetingData {
   completion_reason?: VexaCompletionReason | null;
   failure_stage?: VexaFailureStage | null;
   stop_requested?: boolean;
-  recording_enabled?: boolean;
   transcribe_enabled?: boolean;
   /** Observed 0 even with segments present — do not rely on it. */
   segments_captured?: number;
   status_transition?: VexaStatusTransition[];
   constructed_meeting_url?: string;
   last_error?: { reason?: string; exit_code?: number | null; error_details?: string } | null;
-  recordings?: VexaRecording[];
   sessions?: string[];
   [k: string]: unknown;
 }
@@ -120,38 +117,6 @@ export interface VexaTranscriptionSegment {
   created_at?: string | null;
 }
 
-export interface VexaMediaFile {
-  id: number;
-  type: "audio" | "video" | string;
-  format: string; // "webm"
-  is_final: boolean;
-  chunk_count?: number;
-  chunk_seq?: number;
-  file_size_bytes?: number | null;
-  storage_backend?: string; // "minio"
-  storage_path?: string;
-  metadata?: { sample_rate?: number; [k: string]: unknown };
-  duration_seconds?: number | null;
-  first_chunk_at?: string | null;
-  finalized_at?: string | null;
-  finalized_by?: string | null;
-  created_at?: string;
-}
-
-/** Element of GET /recordings `recordings[]` and of GET /transcripts `recordings[]`. */
-export interface VexaRecording {
-  id: number;
-  source: string; // "bot"
-  status: string; // "completed"
-  user_id?: number;
-  meeting_id: number;
-  session_uid?: string;
-  media_files: VexaMediaFile[];
-  playback_url?: { audio: string | null; video: string | null };
-  created_at?: string;
-  completed_at?: string | null;
-}
-
 /** GET /transcripts/{platform}/{native_meeting_id} */
 export interface VexaTranscriptionResponse {
   id: number;
@@ -162,7 +127,6 @@ export interface VexaTranscriptionResponse {
   /** Bot became active (ISO). Used as the meeting-relative time origin. */
   start_time: string | null;
   end_time: string | null;
-  recordings?: VexaRecording[];
   notes?: string | null;
   data?: VexaMeetingData | null;
   segments: VexaTranscriptionSegment[];
@@ -193,19 +157,4 @@ export interface VexaDeleteMeetingResponse {
 /** GET /meetings */
 export interface VexaMeetingListResponse {
   meetings: VexaMeetingResponse[];
-}
-
-/** GET /recordings — every recording owned by the API key's user (no server-side filter). */
-export interface VexaRecordingsResponse {
-  recordings: VexaRecording[];
-}
-
-/** GET /recordings/{id}/master?type=audio — finalizes master.webm and points at the raw byte route. */
-export interface VexaRecordingMasterResponse {
-  id: number;
-  type: string;
-  storage_path: string | null;
-  media_file_id: number | null;
-  raw_url: string | null; // "/recordings/{id}/media/{media_file_id}/raw?type=audio"
-  duration_seconds: number | null;
 }
