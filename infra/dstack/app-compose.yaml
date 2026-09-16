@@ -26,7 +26,7 @@
 services:
   # ─── ours ────────────────────────────────────────────────────────────────────────────────────
   api:
-    image: ${PTX_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:2a488f17a0aad9946b1986cf552f1958fd3663ca@sha256:314415740d7f2d2ad65c9e646de0c4bff6c806454b3ecad6ce3c6e442f4f2365}
+    image: ${PTX_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:8965a9968d9bc66bfe19c2e20249c63f46fc0abe@sha256:996f0ef8d51a43530161eed265ca20eced7ba48a928dbc0508ef55d275e1d6b8}
     # VEXA_API_KEY is minted at first boot by `vexa-provision` (below) into a shared volume.
     command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal/capability-key ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal/capability-key ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal/capability-key); exec bun run src/api/server.ts"]
     restart: unless-stopped
@@ -66,7 +66,7 @@ services:
     networks: [ptx, vexa]
 
   worker:
-    image: ${PTX_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:2a488f17a0aad9946b1986cf552f1958fd3663ca@sha256:314415740d7f2d2ad65c9e646de0c4bff6c806454b3ecad6ce3c6e442f4f2365}
+    image: ${PTX_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:8965a9968d9bc66bfe19c2e20249c63f46fc0abe@sha256:996f0ef8d51a43530161eed265ca20eced7ba48a928dbc0508ef55d275e1d6b8}
     command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal/capability-key ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal/capability-key ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal/capability-key); exec bun run src/worker/index.ts"]
     restart: unless-stopped
     environment:
@@ -97,7 +97,7 @@ services:
   # Exactly one linked Signal Desktop. `network_mode: service:worker` makes worker -> capture
   # and capture -> CDP loopback-only while still allowing Signal's own outbound call traffic.
   signal-capture:
-    image: ${SIGNAL_CAPTURE_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:2a488f17a0aad9946b1986cf552f1958fd3663ca@sha256:fd0f05a238e43f7571173bf684521f2f89da79392b684e9113d101df785a747f}
+    image: ${SIGNAL_CAPTURE_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:8965a9968d9bc66bfe19c2e20249c63f46fc0abe@sha256:c496a52be44a8389dbd7ded34d8dbf71335f01b337bfb953f3d2bc8b20fc5195}
     network_mode: "service:worker"
     restart: unless-stopped
     environment:
