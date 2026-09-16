@@ -145,7 +145,8 @@ describe("infra/dstack/app-compose.yaml", () => {
     const env = serviceEnv("api");
     const line = env.split("\n").find((l) => l.trim().startsWith("ENABLED_PLATFORMS:"));
     expect(line).toBeDefined();
-    // Whatever the operator override is, the baked-in default must cover both.
+    // Production support must not depend on a mutable or stale deployment override.
+    expect(line).not.toContain("${");
     expect(line).toContain("jitsi");
     expect(line).toContain("google_meet");
     expect(line).toContain("signal");
