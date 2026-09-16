@@ -41,10 +41,11 @@ test("createBot / getTranscript / stopBot / deleteMeeting against mock", async (
 
 test("real-shape transcript: epoch timing, turn ids, data.completion_reason", async () => {
   await client.createBot({ platform: "jitsi", native_meeting_id: "Shape@jitsi.local", meeting_url: "https://jitsi.local/Shape" });
+  const epoch = Date.now() / 1000;
   await mock.control("jitsi", "Shape@jitsi.local", {
     status: "completed",
     completion_reason: "stopped",
-    segments: [{ start: 3.9, end: 8.9, text: "The quick brown fox jumps over the lazy dog.", language: "en", speaker: "Alice", completed: true }],
+    segments: [{ start: epoch, end: epoch + 5, text: "The quick brown fox jumps over the lazy dog.", language: "en", speaker: "Alice", completed: true }],
   });
   const t = await client.getTranscript("jitsi", "Shape@jitsi.local");
   expect(t.data?.completion_reason).toBe("stopped");

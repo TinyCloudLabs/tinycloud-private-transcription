@@ -98,7 +98,7 @@ export interface VexaMeetingResponse {
 }
 
 /**
- * Transcript row. `start`/`end` are EPOCH SECONDS (floats), not meeting-relative; `absolute_*` are ISO.
+ * Transcript row. `start`/`end` may be epoch seconds or meeting-relative seconds; `absolute_*` are ISO.
  * `segment_id` is `turn:N:<seq>` for confirmed rows and `turn:N:p<seq>` for drafts (drafts may linger
  * next to the confirmed rows of the same turn — see `adapter.ts`). `source:"merged"` and
  * `completed:false` appear while the meeting is live.

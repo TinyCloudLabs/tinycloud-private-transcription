@@ -1,10 +1,10 @@
 /**
  * Mock Vexa API gateway for tests and local dev. Implements the subset of Vexa's public API we
- * use, mirroring the REAL v0.12 shapes in docs/vexa-samples (epoch-second segment timing, turn:N:x
+ * use, mirroring Vexa's public shapes (epoch or meeting-relative segment timing, turn:N:x
  * segment ids, `data.completion_reason`, `{running,running_bots,count}` bot status, 409 on deleting a
  * bot-lifecycle row), plus `/_mock/*` control endpoints so tests can drive the meeting lifecycle.
- * Control segments may be given meeting-relative (start < 1e9); they are stored as epoch seconds
- * relative to the meeting's `start_time`, exactly like the real gateway returns them.
+ * Control segments retain their supplied timing convention, exactly as meeting-api does, while the
+ * mock fills the corresponding absolute timestamps.
  */
 import { Hono } from "hono";
 import type {
@@ -156,15 +156,13 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       const originSec = Date.parse(m.start_time) / 1000;
       const toReal = (seg: VexaTranscriptionSegment, i: number): VexaTranscriptionSegment => {
         const epoch = seg.start >= 1e9;
-        const start = epoch ? seg.start : originSec + seg.start;
-        const end = epoch ? seg.end : originSec + seg.end;
+        const absoluteStart = epoch ? seg.start : originSec + seg.start;
+        const absoluteEnd = epoch ? seg.end : originSec + seg.end;
         return {
           ...seg,
-          start,
-          end,
           segment_id: seg.segment_id ?? `turn:${i}:0`,
-          absolute_start_time: seg.absolute_start_time ?? new Date(start * 1000).toISOString(),
-          absolute_end_time: seg.absolute_end_time ?? new Date(end * 1000).toISOString(),
+          absolute_start_time: seg.absolute_start_time ?? new Date(absoluteStart * 1000).toISOString(),
+          absolute_end_time: seg.absolute_end_time ?? new Date(absoluteEnd * 1000).toISOString(),
         };
       };
       if (body.segments) m.segments = body.segments.map(toReal);
