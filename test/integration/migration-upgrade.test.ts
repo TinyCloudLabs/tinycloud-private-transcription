@@ -52,13 +52,14 @@ test("0004-0007 retain production retry and fallback state for rollback", async 
       INSERT INTO api_keys (id, project_id, key_hash, scopes)
       VALUES ('key_legacy', 'legacy-project', ${hashApiKey(apiKey)}, ARRAY['meetings:*'])
     `);
-    for (const attempt of [1, 2, 3, 4]) {
+    for (const [index, attempt] of [1, 1, 1, 2].entries()) {
+      const ordinal = index + 1;
       await productionDb.execute(sql`
         INSERT INTO meetings (
           id, project_id, meeting_url, platform, status, transcription_attempts
         ) VALUES (
-          ${`mtg_legacy_${attempt}`}, 'legacy-project', ${`https://meet.jit.si/Legacy${attempt}`},
-          'jitsi', ${attempt === 1 ? "completed" : "failed"}, ${attempt}
+          ${`mtg_legacy_${ordinal}`}, 'legacy-project', ${`https://meet.jit.si/Legacy${ordinal}`},
+          'jitsi', ${ordinal === 1 ? "completed" : "failed"}, ${attempt}
         )
       `);
     }
@@ -68,7 +69,7 @@ test("0004-0007 retain production retry and fallback state for rollback", async 
       ) VALUES (
         'mtg_legacy_1', 'en', 1.5,
         '{"speakers":[],"segments":[],"text":"legacy transcript"}'::jsonb,
-        'vexa', 'tinfoil', 'provider_unavailable_after_retries'
+        'vexa', 'tinfoil', 'no_usable_recording'
       )
     `);
     await productionDb.$client.close();
@@ -83,10 +84,21 @@ test("0004-0007 retain production retry and fallback state for rollback", async 
     `);
     expect(retryRows).toEqual([
       { id: "mtg_legacy_1", transcription_attempts: 1 },
-      { id: "mtg_legacy_2", transcription_attempts: 2 },
-      { id: "mtg_legacy_3", transcription_attempts: 3 },
-      { id: "mtg_legacy_4", transcription_attempts: 4 },
+      { id: "mtg_legacy_2", transcription_attempts: 1 },
+      { id: "mtg_legacy_3", transcription_attempts: 1 },
+      { id: "mtg_legacy_4", transcription_attempts: 2 },
     ]);
+    const [retryAggregate] = await db.execute(sql`
+      SELECT
+        count(*)::int AS count,
+        min(transcription_attempts)::int AS min,
+        max(transcription_attempts)::int AS max,
+        count(DISTINCT transcription_attempts)::int AS distinct,
+        sum(transcription_attempts)::int AS sum
+      FROM meetings
+      WHERE transcription_attempts > 0
+    `);
+    expect(retryAggregate).toEqual({ count: 4, min: 1, max: 2, distinct: 2, sum: 5 });
 
     const [fallback] = await db.execute(sql`
       SELECT fallback_from, fallback_reason
@@ -95,7 +107,7 @@ test("0004-0007 retain production retry and fallback state for rollback", async 
     `);
     expect(fallback).toEqual({
       fallback_from: "tinfoil",
-      fallback_reason: "provider_unavailable_after_retries",
+      fallback_reason: "no_usable_recording",
     });
 
     const columns = await db.execute(sql`
