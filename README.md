@@ -236,7 +236,8 @@ upstream v0.12 images.
   `ghcr.io/tinycloudlabs/vexa-bot` package was created while the fork was private, is stuck private,
   and is deprecated — nothing pushes to it);
   the local rig layers the dev CA on top (`infra/vexa/bot/Dockerfile` → `ptx/vexa-bot:tc-devca`). Admin,
-  runtime, and agent images stay upstream `vexaai/v012-*:v012`.
+  runtime, and agent images stay on upstream `vexaai/v012-*:v012`, with their exact registry digests
+  pinned. The agent images are configured for the runtime but are not used by the meeting capture path.
 - **Syncing upstream** (in the fork repo): `git fetch upstream --tags && git checkout main && git merge
   --ff-only upstream/main && git push origin main --tags`, then rebase/merge `tinycloud` onto `main`,
   re-run the record-chunker tests, push, and bump this repo's submodule pin + bot image tag.
@@ -264,11 +265,21 @@ immutable, `:v1` moving on feat/v1 + main, `:latest` on main), built for linux/a
 GitHub Actions workflow `.github/workflows/publish-image.yml` on every push to `feat/v1` / `main` that touches
 the Dockerfile, `src/`, or the lockfile (or `gh workflow run publish-image.yml`). It authenticates with the
 workflow's `GITHUB_TOKEN` (`packages: write`); watch it with `gh run watch` and take the digest from the run
-summary. Pin `PTX_IMAGE=ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:<sha>` (or `:v1`) in
-`infra/dstack/.env`. (The older package `ghcr.io/tinycloudlabs/tinycloud-private-transcription` — no `/api`
+summary. Production defaults use the full `:<sha>@sha256:<digest>` reference from the accepted workflow;
+when advancing it, update `PTX_IMAGE` and `SIGNAL_CAPTURE_IMAGE` in both the compose file and
+`infra/dstack/.env.example`. Do not use the moving `:v1` or `:latest` tags for deployment. (The older package
+`ghcr.io/tinycloudlabs/tinycloud-private-transcription` — no `/api`
 suffix — was created while the repo was private, is stuck private, and is deprecated; nothing pushes to it.)
 
-The compose file also pins MinIO to the exact releases running on `ptx-dev`: server
+Every image referenced by the dstack compose file, including the bot and agent images selected by Vexa's
+runtime, has an immutable digest. Postgres, Redis, Valkey, unchanged Vexa v0.12 components, CPU whisper, and the curl
+helper use the exact public linux/amd64 image configs already running on `ptx-dev`. The configured-but-unused
+Vexa agent images use the public `v012` manifest digests because no agent image is cached on the CVM. The
+accepted API and Signal defaults come from main commit `2a488f17`; the accepted Vexa bot, meeting-api, and
+gateway defaults come from `e49f3f3`. Image override variables take complete references and must remain
+digest-pinned.
+
+MinIO is pinned to the exact releases running on `ptx-dev`: server
 `RELEASE.2025-09-07T16-13-09Z` and client `RELEASE.2025-08-13T08-35-41Z`. Their public Quay manifest-list
 digests match the images already cached by the CVM, so fresh pulls are deterministic without changing the
 MinIO command, `/data` volume, health check, credentials, or initialization flow.
