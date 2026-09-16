@@ -9,6 +9,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
 const compose = readFileSync(new URL("../../infra/dstack/app-compose.yaml", import.meta.url), "utf8");
+const envExample = readFileSync(new URL("../../infra/dstack/.env.example", import.meta.url), "utf8");
 const seatBoot = readFileSync(new URL("../../infra/signal-seat/boot.sh", import.meta.url), "utf8");
 const publishWorkflow = readFileSync(new URL("../../.github/workflows/publish-image.yml", import.meta.url), "utf8");
 
@@ -26,6 +27,18 @@ function serviceEnv(service: string): string {
   return envEnd === -1 ? envRest : envRest.slice(0, envEnd);
 }
 
+function serviceImage(service: string): string {
+  const start = compose.indexOf(`\n  ${service}:\n`);
+  expect(start).toBeGreaterThan(-1);
+  const rest = compose.slice(start + 1);
+  const end = rest.search(/\n {2}\S/);
+  const block = end === -1 ? rest : rest.slice(0, end);
+  const image = block.match(/^ {4}image: (.+)$/m)?.[1];
+  expect(image).toBeDefined();
+  const defaultImage = image?.match(/^\$\{[^:}]+:-(.+)\}$/)?.[1] ?? image;
+  return defaultImage ?? "";
+}
+
 describe("infra/dstack/app-compose.yaml", () => {
   test("pins public pullable MinIO server and client releases by digest", () => {
     const serverImage = compose.match(/\n  minio:\n    image: ([^\n]+)/)?.[1];
@@ -41,6 +54,50 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(compose).not.toMatch(/image:\s+quay\.io\/minio\/(?:minio|mc):latest/);
   });
 
+  test("pins every deploy and runtime-pulled image to an approved immutable digest", () => {
+    const expected = {
+      api: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:2a488f17a0aad9946b1986cf552f1958fd3663ca@sha256:314415740d7f2d2ad65c9e646de0c4bff6c806454b3ecad6ce3c6e442f4f2365",
+      worker: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:2a488f17a0aad9946b1986cf552f1958fd3663ca@sha256:314415740d7f2d2ad65c9e646de0c4bff6c806454b3ecad6ce3c6e442f4f2365",
+      "signal-capture": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:2a488f17a0aad9946b1986cf552f1958fd3663ca@sha256:fd0f05a238e43f7571173bf684521f2f89da79392b684e9113d101df785a747f",
+      postgres: "postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685",
+      redis: "redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf",
+      "vexa-redis": "valkey/valkey:8-alpine@sha256:d2e18f3410b6f616de1417f570fa55261af2898b9c5b2cfb6781ce2373ea43d1",
+      "vexa-postgres": "postgres:17-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73",
+      minio: "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
+      "minio-init": "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727",
+      "admin-api": "vexaai/v012-admin-api:v012@sha256:4c702354384eafe3a933cd537a106b7c15067cfd368a5f6da1a6e675e7e03e04",
+      "bot-image-keeper": "ghcr.io/tinycloudlabs/vexa/bot:tc-e49f3f3@sha256:578f38ae8d0791b11cd1b7bde98484de95181912d72051a7860edcc1f31b4000",
+      runtime: "vexaai/v012-runtime:v012@sha256:a1f6448fbb380b9433364e8b572ec25a12aa4f274bf403f1d83a89cbf5812f2d",
+      whisper: "fedirz/faster-whisper-server:latest-cpu@sha256:760e5e43d427dc6cfbbc4731934b908b7de9c7e6d5309c6a1f0c8c923a5b6030",
+      "meeting-api": "ghcr.io/tinycloudlabs/vexa/meeting-api:tc-e49f3f3@sha256:8cedc5943d943bee0dcb42a1be0478225b4ce9f4e9e6c53cd7a10507a2f794d3",
+      gateway: "ghcr.io/tinycloudlabs/vexa/gateway:tc-e49f3f3@sha256:01d9ecd1f126eb8e7943017bfff1e5fb6329c37ced46924925e73bb90630756d",
+      "vexa-provision": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
+    } as const;
+
+    for (const [service, image] of Object.entries(expected)) {
+      expect(serviceImage(service)).toBe(image);
+      expect(image).toMatch(/@sha256:[0-9a-f]{64}$/);
+    }
+
+    const runtime = serviceEnv("runtime");
+    expect(runtime).toContain(
+      "BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-e49f3f3@sha256:578f38ae8d0791b11cd1b7bde98484de95181912d72051a7860edcc1f31b4000}",
+    );
+    expect(runtime).toContain(
+      "AGENT_IMAGE: ${VEXA_AGENT_IMAGE:-vexaai/v012-agent-api:v012@sha256:6eb37574b33aab233aabbe5907e06e106bae44a403e5df781a436da8201a928d}",
+    );
+    expect(runtime).toContain(
+      "AGENT_WORKER_IMAGE: ${VEXA_AGENT_WORKER_IMAGE:-vexaai/v012-agent-worker:v012@sha256:a1120b24765ff6b1c86c5f9ddee35b5e71fdbb9543a23b918b278373ad705022}",
+    );
+    expect(compose).not.toContain("VEXA_IMAGE_TAG");
+
+    const imageOverrides = envExample
+      .split("\n")
+      .filter((line) => /^[A-Z_]+_IMAGE=/.test(line));
+    expect(imageOverrides.length).toBe(7);
+    for (const line of imageOverrides) expect(line).toMatch(/@sha256:[0-9a-f]{64}$/);
+  });
+
   test("pins the Vexa bot, meeting-api, and gateway to the accepted fork commit and digests", () => {
     expect(compose).toContain(
       "ghcr.io/tinycloudlabs/vexa/bot:tc-e49f3f3@sha256:578f38ae8d0791b11cd1b7bde98484de95181912d72051a7860edcc1f31b4000",
@@ -54,8 +111,8 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(compose).not.toContain("tc-2db950b");
     expect(compose).not.toContain("vexaai/v012-meeting-api");
     expect(compose).not.toContain("vexaai/v012-gateway");
-    expect(compose).toContain("vexaai/v012-runtime:${VEXA_IMAGE_TAG:-v012}");
-    expect(compose).toContain("vexaai/v012-agent-api:${VEXA_IMAGE_TAG:-v012}");
+    expect(compose).toContain("vexaai/v012-runtime:v012@sha256:");
+    expect(compose).toContain("vexaai/v012-agent-api:v012@sha256:");
   });
 
   test("the api service enables deployed meeting platforms including Signal", () => {

@@ -5,7 +5,8 @@
 # Encrypted env (never in this file): POSTGRES_PASSWORD, VEXA_DB_PASSWORD, VEXA_ADMIN_TOKEN,
 # VEXA_INTERNAL_API_SECRET, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD,
 # TRANSCRIPTION_PROVIDER (PTX compatibility label; does not configure Vexa's STT endpoint), PTX_IMAGE (our api/worker
-# image), VEXA_IMAGE_TAG (v012 for unchanged upstream components),
+# image), VEXA_ADMIN_IMAGE / VEXA_RUNTIME_IMAGE / VEXA_AGENT_IMAGE / VEXA_AGENT_WORKER_IMAGE
+# (digest-pinned v012 upstream components),
 # PTX_BOT_IMAGE (fork bot image override; defaults to the pinned fork image below).
 # SIGNAL_CAPTURE_IMAGE is the one-seat Signal Desktop rig.  Its profile volume is deliberately
 # persistent: linking a Signal account is an operator action, never a deployment side effect.
@@ -25,7 +26,7 @@
 services:
   # ─── ours ────────────────────────────────────────────────────────────────────────────────────
   api:
-    image: ${PTX_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:v1}
+    image: ${PTX_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:2a488f17a0aad9946b1986cf552f1958fd3663ca@sha256:314415740d7f2d2ad65c9e646de0c4bff6c806454b3ecad6ce3c6e442f4f2365}
     # VEXA_API_KEY is minted at first boot by `vexa-provision` (below) into a shared volume.
     command: ["sh", "-c", "while [ ! -s /run/vexa/api-key ]; do sleep 2; done; export VEXA_API_KEY=$(cat /run/vexa/api-key); exec bun run src/api/server.ts"]
     restart: unless-stopped
@@ -63,7 +64,7 @@ services:
     networks: [ptx, vexa]
 
   worker:
-    image: ${PTX_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:v1}
+    image: ${PTX_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:2a488f17a0aad9946b1986cf552f1958fd3663ca@sha256:314415740d7f2d2ad65c9e646de0c4bff6c806454b3ecad6ce3c6e442f4f2365}
     command: ["sh", "-c", "while [ ! -s /run/vexa/api-key ]; do sleep 2; done; export VEXA_API_KEY=$(cat /run/vexa/api-key); exec bun run src/worker/index.ts"]
     restart: unless-stopped
     environment:
@@ -94,7 +95,7 @@ services:
   # Exactly one linked Signal Desktop. `network_mode: service:worker` makes worker -> capture
   # and capture -> CDP loopback-only while still allowing Signal's own outbound call traffic.
   signal-capture:
-    image: ${SIGNAL_CAPTURE_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:v1}
+    image: ${SIGNAL_CAPTURE_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:2a488f17a0aad9946b1986cf552f1958fd3663ca@sha256:fd0f05a238e43f7571173bf684521f2f89da79392b684e9113d101df785a747f}
     build:
       context: ../..
       dockerfile: infra/signal-seat/Dockerfile
@@ -116,7 +117,7 @@ services:
         condition: service_healthy
 
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     restart: unless-stopped
     environment:
       POSTGRES_USER: ptx
@@ -132,7 +133,7 @@ services:
     networks: [ptx]
 
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
@@ -146,7 +147,7 @@ services:
 
   # ─── Vexa capture stack (published images; nothing built) ───────────────────────────────────
   vexa-redis:
-    image: valkey/valkey:8-alpine
+    image: valkey/valkey:8-alpine@sha256:d2e18f3410b6f616de1417f570fa55261af2898b9c5b2cfb6781ce2373ea43d1
     command: ["valkey-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
@@ -161,7 +162,7 @@ services:
     restart: unless-stopped
 
   vexa-postgres:
-    image: postgres:17-alpine
+    image: postgres:17-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
     command: ["postgres", "-c", "idle_in_transaction_session_timeout=60000"]
     environment:
       POSTGRES_DB: vexa
@@ -211,7 +212,7 @@ services:
     networks: [vexa]
 
   admin-api:
-    image: vexaai/v012-admin-api:${VEXA_IMAGE_TAG:-v012}
+    image: ${VEXA_ADMIN_IMAGE:-vexaai/v012-admin-api:v012@sha256:4c702354384eafe3a933cd537a106b7c15067cfd368a5f6da1a6e675e7e03e04}
     environment:
       DB_HOST: vexa-postgres
       DB_PORT: "5432"
@@ -245,12 +246,12 @@ services:
     network_mode: none
 
   runtime:
-    image: vexaai/v012-runtime:${VEXA_IMAGE_TAG:-v012}
+    image: ${VEXA_RUNTIME_IMAGE:-vexaai/v012-runtime:v012@sha256:a1f6448fbb380b9433364e8b572ec25a12aa4f274bf403f1d83a89cbf5812f2d}
     group_add: ["0"]
     environment:
       BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-e49f3f3@sha256:578f38ae8d0791b11cd1b7bde98484de95181912d72051a7860edcc1f31b4000}
-      AGENT_IMAGE: vexaai/v012-agent-api:${VEXA_IMAGE_TAG:-v012}
-      AGENT_WORKER_IMAGE: vexaai/v012-agent-worker:${VEXA_IMAGE_TAG:-v012}
+      AGENT_IMAGE: ${VEXA_AGENT_IMAGE:-vexaai/v012-agent-api:v012@sha256:6eb37574b33aab233aabbe5907e06e106bae44a403e5df781a436da8201a928d}
+      AGENT_WORKER_IMAGE: ${VEXA_AGENT_WORKER_IMAGE:-vexaai/v012-agent-worker:v012@sha256:a1120b24765ff6b1c86c5f9ddee35b5e71fdbb9543a23b918b278373ad705022}
       REDIS_URL: redis://redis:6379/0
       INTERNAL_API_SECRET: ${VEXA_INTERNAL_API_SECRET}
       LOG_LEVEL: info
@@ -273,7 +274,7 @@ services:
     restart: unless-stopped
 
   whisper:
-    image: fedirz/faster-whisper-server:latest-cpu
+    image: fedirz/faster-whisper-server:latest-cpu@sha256:760e5e43d427dc6cfbbc4731934b908b7de9c7e6d5309c6a1f0c8c923a5b6030
     environment:
       WHISPER__MODEL: ${WHISPER_MODEL:-Systran/faster-whisper-small.en}
       WHISPER__INFERENCE_DEVICE: cpu
@@ -364,7 +365,7 @@ services:
 
   # One-shot: create the service-owned Vexa user + `bot,tx` API key and hand it to api/worker.
   vexa-provision:
-    image: curlimages/curl:8.10.1
+    image: curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b
     user: root
     entrypoint: ["/bin/sh", "-c"]
     command:
