@@ -49,7 +49,7 @@ describe("infra/dstack/app-compose.yaml", () => {
     );
     expect(rendered.exitCode).toBe(0);
     const services = Object.values(JSON.parse(rendered.stdout.toString()).services) as Array<Record<string, unknown>>;
-    expect(services.length).toBe(16);
+    expect(services.length).toBe(17);
     for (const service of services) {
       expect(service.build).toBeUndefined();
       expect(service.image).toBeString();
@@ -79,6 +79,7 @@ describe("infra/dstack/app-compose.yaml", () => {
       api: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:2a488f17a0aad9946b1986cf552f1958fd3663ca@sha256:314415740d7f2d2ad65c9e646de0c4bff6c806454b3ecad6ce3c6e442f4f2365",
       worker: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:2a488f17a0aad9946b1986cf552f1958fd3663ca@sha256:314415740d7f2d2ad65c9e646de0c4bff6c806454b3ecad6ce3c6e442f4f2365",
       "signal-capture": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:2a488f17a0aad9946b1986cf552f1958fd3663ca@sha256:fd0f05a238e43f7571173bf684521f2f89da79392b684e9113d101df785a747f",
+      "signal-capability-provision": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
       postgres: "postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685",
       redis: "redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf",
       "vexa-redis": "valkey/valkey:8-alpine@sha256:d2e18f3410b6f616de1417f570fa55261af2898b9c5b2cfb6781ce2373ea43d1",
@@ -158,15 +159,21 @@ describe("infra/dstack/app-compose.yaml", () => {
     const workerStart = compose.indexOf("\n  worker:\n");
     const workerBlock = compose.slice(workerStart, compose.indexOf("\n  signal-capture:\n", workerStart));
     expect(workerBlock).toContain("127.0.0.1:6080:6080");
+    expect(workerBlock).toContain("signal-runtime:/run/signal:ro");
     const captureStart = compose.indexOf("\n  signal-capture:\n");
     const capture = compose.slice(captureStart, compose.indexOf("\n  postgres:\n", captureStart));
     expect(capture).not.toContain("build:");
     expect(capture).toContain('network_mode: "service:worker"');
     expect(capture).toContain("SIGNAL_CAPTURE_BIND: 127.0.0.1");
+    expect(capture).toContain("SIGNAL_HEALTH_PATH: /run/signal/health.json");
     expect(capture).not.toContain("ports:");
     expect(seatBoot).toContain("sink_name=ptx_input_sink");
     expect(seatBoot).toContain("master=ptx_input_sink.monitor source_name=ptx_input");
     expect(seatBoot).not.toContain("master=ptx_sink.monitor source_name=ptx_input");
+    expect(seatBoot).toContain("mktemp -d /tmp/ptx-signal-runtime");
+    expect(compose).toContain("signal-capability-provision:");
+    expect(compose).toContain("signal-runtime:/run/signal");
+    expect(compose).not.toContain("SIGNAL_CAPABILITY_KEY:");
   });
 
   test("publishes and CI-builds the Signal seat image", () => {

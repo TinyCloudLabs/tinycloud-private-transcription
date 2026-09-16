@@ -1,5 +1,7 @@
 import { Hono } from "hono";
 import { randomUUID } from "node:crypto";
+import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import type { Logger } from "../../log.ts";
 import type { SignalCaptureSnapshot } from "./adapter.ts";
 import type { SignalCallBackend, SignalCallSession } from "./backend.ts";
@@ -19,6 +21,8 @@ export interface SignalWorkerOptions {
   /** How long a terminal snapshot stays readable after the call ends. */
   sessionRetentionMs: number;
   log: Logger;
+  /** Shared, non-secret readiness record consumed by the public PTX health endpoint. */
+  healthPath?: string;
 }
 
 interface Seat {
@@ -40,6 +44,9 @@ interface Seat {
  */
 export function createSignalWorkerApp(opts: SignalWorkerOptions) {
   const seats = new Map<string, Seat>();
+  // A reservation covers the async readiness/open gap.  Without it, two simultaneous requests
+  // can both see an empty seat and make the one linked Desktop join two calls.
+  let reservations = 0;
   const app = new Hono();
 
   // Defence in depth against DNS rebinding: the socket is bound to loopback, and a request that
@@ -51,7 +58,21 @@ export function createSignalWorkerApp(opts: SignalWorkerOptions) {
     return next();
   });
 
-  const live = () => [...seats.values()].filter((s) => !s.terminal).length;
+  const live = () => reservations + [...seats.values()].filter((s) => !s.terminal).length;
+  const readiness = async () => {
+    const value = await opts.backend.preflight().catch((e) => ({ ready: false, reason: String(e) }));
+    if (opts.healthPath) {
+      try {
+        mkdirSync(dirname(opts.healthPath), { recursive: true });
+        const next = `${opts.healthPath}.next`;
+        writeFileSync(next, JSON.stringify({ ready: value.ready, reason: value.reason, observed_at: new Date().toISOString() }) + "\n", { mode: 0o644 });
+        renameSync(next, opts.healthPath);
+      } catch (e) {
+        opts.log.warn("signal readiness record failed", { error: String(e) });
+      }
+    }
+    return value;
+  };
 
   const purge = () => {
     const now = Date.now();
@@ -95,16 +116,16 @@ export function createSignalWorkerApp(opts: SignalWorkerOptions) {
 
   app.get("/health", async (c) => {
     purge();
-    const readiness = await opts.backend.preflight().catch((e) => ({ ready: false, reason: String(e) }));
+    const state = await readiness();
     return c.json(
       {
-        status: readiness.ready ? "ok" : "degraded",
+        status: state.ready ? "ok" : "degraded",
         backend: opts.backend.name,
-        ready: readiness.ready,
-        reason: readiness.reason,
+        ready: state.ready,
+        reason: state.reason,
         capacity: { running: live(), max: opts.maxConcurrentCalls },
       },
-      readiness.ready ? 200 : 503,
+      state.ready ? 200 : 503,
     );
   });
 
@@ -122,22 +143,27 @@ export function createSignalWorkerApp(opts: SignalWorkerOptions) {
       opts.log.warn("signal capture at capacity", { meetingId: body.meetingId, running: live(), max: opts.maxConcurrentCalls });
       return c.json({ error: { code: "capacity_exhausted", message: "All Signal capture seats are in use." } }, 429);
     }
-    const readiness = await opts.backend.preflight().catch((e) => ({ ready: false, reason: String(e) }));
-    if (!readiness.ready) {
-      opts.log.error("signal capture backend not ready", { meetingId: body.meetingId, backend: opts.backend.name, reason: readiness.reason });
-      return c.json({ error: { code: "backend_unavailable", message: readiness.reason ?? "Signal capture backend is unavailable." } }, 503);
-    }
-    const id = `sig_${randomUUID()}`;
-    let session: SignalCallSession;
+    reservations++;
     try {
-      session = await opts.backend.open({ meetingId: body.meetingId, callUrl: body.callUrl, botName: typeof body.botName === "string" ? body.botName : undefined, language: typeof body.language === "string" ? body.language : undefined });
-    } catch (e) {
-      opts.log.error("signal capture could not open a call", { meetingId: body.meetingId, error: String(e) });
-      return c.json({ error: { code: "capture_failed", message: "Signal Desktop could not open the call." } }, 502);
+      const state = await readiness();
+      if (!state.ready) {
+        opts.log.error("signal capture backend not ready", { meetingId: body.meetingId, backend: opts.backend.name, reason: state.reason });
+        return c.json({ error: { code: "backend_unavailable", message: state.reason ?? "Signal capture backend is unavailable." } }, 503);
+      }
+      const id = `sig_${randomUUID()}`;
+      let session: SignalCallSession;
+      try {
+        session = await opts.backend.open({ meetingId: body.meetingId, callUrl: body.callUrl, botName: typeof body.botName === "string" ? body.botName : undefined, language: typeof body.language === "string" ? body.language : undefined });
+      } catch (e) {
+        opts.log.error("signal capture could not open a call", { meetingId: body.meetingId, error: String(e) });
+        return c.json({ error: { code: "capture_failed", message: "Signal Desktop could not open the call." } }, 502);
+      }
+      seats.set(id, { id, meetingId: body.meetingId, session, startedAt: Date.now(), terminal: null, terminalAt: 0 });
+      opts.log.info("signal seat opened", { sessionId: id, meetingId: body.meetingId, backend: opts.backend.name });
+      return c.json({ session_id: id }, 201);
+    } finally {
+      reservations--;
     }
-    seats.set(id, { id, meetingId: body.meetingId, session, startedAt: Date.now(), terminal: null, terminalAt: 0 });
-    opts.log.info("signal seat opened", { sessionId: id, meetingId: body.meetingId, backend: opts.backend.name });
-    return c.json({ session_id: id }, 201);
   });
 
   app.get("/v1/calls/:id", async (c) => {
@@ -167,7 +193,7 @@ export function createSignalWorkerApp(opts: SignalWorkerOptions) {
     return c.body(null, 204);
   });
 
-  return { app, seats };
+  return { app, seats, publishReadiness: readiness };
 }
 
 const isSignalCallUrl = (value: string): boolean => {
@@ -192,15 +218,17 @@ if (import.meta.main) {
   const { capture, maxConcurrentCalls } = config.signal;
   if (!isLoopbackHost(capture.bind)) throw new Error(`SIGNAL_CAPTURE_BIND must be loopback-only (got ${capture.bind})`);
   const backend = createSignalBackend(capture);
-  const { app } = createSignalWorkerApp({
+  const { app, publishReadiness } = createSignalWorkerApp({
     backend,
     maxConcurrentCalls,
     joinTimeoutMs: config.joinTimeoutSeconds * 1000,
     maxCallMs: capture.maxCallSeconds * 1000,
     sessionRetentionMs: capture.sessionRetentionSeconds * 1000,
     log: logger,
+    healthPath: capture.healthPath || undefined,
   });
   const server = Bun.serve({ hostname: capture.bind, port: capture.port, fetch: app.fetch });
-  const readiness = await backend.preflight().catch((e) => ({ ready: false, reason: String(e) }));
+  const readiness = await publishReadiness();
+  setInterval(() => { void publishReadiness(); }, 5_000).unref();
   logger.info("signal capture worker listening", { hostname: server.hostname, port: server.port, backend: backend.name, ready: readiness.ready, reason: readiness.reason });
 }

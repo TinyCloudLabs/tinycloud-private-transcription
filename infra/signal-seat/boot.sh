@@ -1,10 +1,15 @@
 #!/bin/sh
 set -eu
 
-export DISPLAY="${DISPLAY:-:99}"
-export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/xdg}"
-mkdir -p "$XDG_RUNTIME_DIR" "$SIGNAL_PROFILE_DIR"
+export DISPLAY="${DISPLAY:-:$(expr $$ % 8000 + 100)}"
+# Docker restart retains /tmp. A new private runtime directory prevents stale PulseAudio sockets
+# and X11 state from keeping an otherwise persistent, linked profile in a restart loop.
+export XDG_RUNTIME_DIR="$(mktemp -d /tmp/ptx-signal-runtime.XXXXXX)"
+mkdir -p "$SIGNAL_PROFILE_DIR"
 chmod 700 "$XDG_RUNTIME_DIR" "$SIGNAL_PROFILE_DIR"
+# These are Chromium runtime locks, not Signal profile data.  A container crash can leave them
+# behind and prevent the persistent linked profile from starting after an ordinary restart.
+rm -f "$SIGNAL_PROFILE_DIR/SingletonCookie" "$SIGNAL_PROFILE_DIR/SingletonLock" "$SIGNAL_PROFILE_DIR/SingletonSocket"
 
 pulseaudio --start --exit-idle-time=-1
 pactl load-module module-null-sink sink_name=ptx_sink >/dev/null 2>&1 || true

@@ -31,6 +31,16 @@ volume, set `SIGNAL_PULSE_SOURCE` to the seat's playback monitor and provide the
 endpoint through `SIGNAL_TRANSCRIBER`; then reach the loopback-only noVNC port over SSH and run
 `bun run scripts/signal-smoke.ts`. Do not use the replay mode as evidence of a live call.
 
+On dstack, `signal-capability-provision` generates the AES-256 key once inside the persistent
+`signal-runtime` volume. API and queue worker wait for that private file and load it only into their
+process environments; it is neither an operator-supplied deployment secret nor a public health
+field. The capture worker writes a fragment-free readiness record to the same private volume every
+five seconds. Public PTX `/health` degrades when that record is absent, stale, unlinked, or not
+ready, instead of treating core database health as Signal readiness.
+
+Coordination exception: no Linear issue was created for this slice because the workspace's free
+issue limit rejected creation; do not retry issue creation until capacity is available.
+
 The first slice maps worker states to the normal PTX lifecycle and normalizes every segment to the
 single `Unknown` speaker with `attribution: "unknown"`. Signal chat, reactions, camera, screen
 share, autonomous speech, and true speaker attribution remain out of scope.

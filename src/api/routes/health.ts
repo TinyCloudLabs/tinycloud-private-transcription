@@ -1,4 +1,5 @@
 import { sql } from "drizzle-orm";
+import { readFileSync } from "node:fs";
 import { Hono } from "hono";
 import type { AppContext } from "../../context.ts";
 
@@ -10,8 +11,9 @@ export function healthRoutes(ctx: AppContext) {
       ctx.redis.ping().then(() => true, () => false),
       ctx.vexa.botStatus().then((s) => ({ ok: true, running_bots: s.running_bots.length }), () => ({ ok: false, running_bots: null })),
     ]);
+    const signal = signalReadiness(ctx.config.signal.capture.healthPath, ctx.config.enabledPlatforms.includes("signal"));
     const core = postgres && redis;
-    const status = !core ? "error" : vexa.ok ? "ok" : "degraded";
+    const status = !core ? "error" : vexa.ok && signal.ready ? "ok" : "degraded";
     return c.json(
       {
         status,
@@ -22,10 +24,25 @@ export function healthRoutes(ctx: AppContext) {
           // running = bots Vexa reports as live (null when Vexa is unreachable); max = provisioned ceiling.
           bot_capacity: { running: vexa.running_bots, max: ctx.config.vexa.maxConcurrentBots },
           transcription_provider: ctx.transcription.name,
+          signal,
         },
       },
       core ? 200 : 503,
     );
   });
   return r;
+}
+
+function signalReadiness(path: string, enabled: boolean) {
+  if (!enabled) return { enabled: false, ready: true, reason: null };
+  if (!path) return { enabled: true, ready: false, reason: "Signal capture readiness is not configured" };
+  try {
+    const record = JSON.parse(readFileSync(path, "utf8")) as { ready?: unknown; reason?: unknown; observed_at?: unknown };
+    const observedAt = typeof record.observed_at === "string" ? Date.parse(record.observed_at) : NaN;
+    const age = Date.now() - observedAt;
+    if (!Number.isFinite(observedAt) || age < 0 || age > 15_000) return { enabled: true, ready: false, reason: "Signal capture readiness is stale" };
+    return { enabled: true, ready: record.ready === true, reason: typeof record.reason === "string" ? record.reason : null };
+  } catch {
+    return { enabled: true, ready: false, reason: "Signal capture readiness is unavailable" };
+  }
 }
