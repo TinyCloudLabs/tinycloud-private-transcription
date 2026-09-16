@@ -29,7 +29,20 @@ no live-capture claim may be made.
 To run the real-call operator check, attach a linked account to the persistent `signal-profile`
 volume, set `SIGNAL_PULSE_SOURCE` to the seat's playback monitor and provide the in-CVM Whisper
 endpoint through `SIGNAL_TRANSCRIBER`; then reach the loopback-only noVNC port over SSH and run
-`bun run scripts/signal-smoke.ts`. Do not use the replay mode as evidence of a live call.
+`SIGNAL_CALL_URL='https://signal.link/call/#…' bun run scripts/signal-smoke.ts`. The script requires
+that operator-supplied link for a live backend, does not log it or write it to its evidence, and
+uses a non-live placeholder only for replay-contract checks. Do not use replay mode as evidence of
+a live call.
+
+On dstack, `signal-capability-provision` generates the AES-256 key once inside the persistent
+`signal-runtime` volume. API and queue worker wait for that private file and load it only into their
+process environments; it is neither an operator-supplied deployment secret nor a public health
+field. The capture worker writes a fragment-free readiness record to the same private volume every
+five seconds. Public PTX `/health` degrades when that record is absent, stale, unlinked, or not
+ready, instead of treating core database health as Signal readiness.
+
+Coordination exception: no Linear issue was created for this slice because the workspace's free
+issue limit rejected creation; do not retry issue creation until capacity is available.
 
 The first slice maps worker states to the normal PTX lifecycle and normalizes every segment to the
 single `Unknown` speaker with `attribution: "unknown"`. Signal chat, reactions, camera, screen

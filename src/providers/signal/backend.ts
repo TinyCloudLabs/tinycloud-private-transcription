@@ -47,6 +47,18 @@ export function signalUiState(text: string): SignalCaptureSnapshot["status"] | "
   return "joining";
 }
 
+/**
+ * A reachable CDP endpoint is not proof that this Desktop profile can join a call. In particular,
+ * the device-link QR view has CDP too. Keep this deliberately conservative: an unfamiliar view is
+ * unavailable rather than falsely ready.
+ */
+export function signalDesktopLinkState(text: string): "linked" | "unlinked" | "unknown" {
+  const body = text.toLowerCase();
+  if (/link (?:your |a )?(?:device|phone)|scan (?:the )?qr|qr code|link a new device/.test(body)) return "unlinked";
+  if (/\bnew message\b|\bsearch\b.*\bchats?\b|\bcompose\b.*\bmessage\b/.test(body)) return "linked";
+  return "unknown";
+}
+
 const clickSignalAction = `(labels => {
   const controls = [...document.querySelectorAll('button,[role="button"]')];
   const labelOf = node => (node.getAttribute('aria-label') || node.textContent || '').trim().toLowerCase();
@@ -87,6 +99,22 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
       if (!response.ok) missing.push("Signal Desktop CDP is unavailable");
     } catch {
       missing.push("Signal Desktop CDP is unavailable");
+    }
+    if (!missing.includes("Signal Desktop CDP is unavailable")) {
+      try {
+        const cdp = await CdpConnection.connect(this.cdpUrl.toString());
+        const targets = await cdp.pageTargets();
+        const text = (await Promise.all(targets.map(async (target) => {
+          const attached = await cdp.attachTarget(target.targetId).catch(() => null);
+          return attached ? await cdp.evaluate<string>(attached, "document.body?.innerText || ''").catch(() => "") : "";
+        }))).join("\n");
+        cdp.close();
+        const link = signalDesktopLinkState(text);
+        if (link === "unlinked") missing.push("Signal Desktop is not linked");
+        if (link === "unknown") missing.push("Signal Desktop link state cannot be verified");
+      } catch {
+        missing.push("Signal Desktop link state cannot be verified");
+      }
     }
     // Bun.spawn throws synchronously when the binary is absent, which is itself the answer.
     const parec = this.options.parecPath ?? "parec";

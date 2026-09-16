@@ -79,6 +79,23 @@ describe("Signal capture worker boundary", () => {
     }
   });
 
+  test("reserves its only seat before asynchronous readiness work", async () => {
+    const replay = new ReplaySignalBackend({ admittedAfterMs: 0, activeAfterMs: 0, endsAfterMs: 60_000, segments: [{ start: 0, end: 1, text: "seat" }] });
+    const { app } = createSignalWorkerApp({
+      backend: { name: "delayed-replay", preflight: async () => { await Bun.sleep(25); return { ready: true, reason: null }; }, open: replay.open.bind(replay) },
+      maxConcurrentCalls: 1, joinTimeoutMs: 30_000, maxCallMs: 60_000, sessionRetentionMs: 60_000, log: silentLogger,
+    });
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: app.fetch });
+    try {
+      const base = `http://127.0.0.1:${server.port}/v1/calls`;
+      const start = (meetingId: string) => fetch(base, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ meetingId, callUrl }) });
+      const [first, second] = await Promise.all([start("mtg_race_1"), start("mtg_race_2")]);
+      expect([first.status, second.status].sort()).toEqual([201, 429]);
+    } finally {
+      server.stop(true);
+    }
+  });
+
   test("bounds admission: a call that never goes active fails as waiting_room_timeout", async () => {
     const stuck = startWorker({ joinTimeoutMs: 1, activeAfterMs: 60_000, endsAfterMs: 60_000 });
     try {

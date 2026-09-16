@@ -49,6 +49,8 @@ export const config = {
       maxCallSeconds: positiveIntegerEnv("SIGNAL_MAX_CALL_SECONDS", "7200"),
       /** How long a terminal snapshot stays readable so PTX's next poll can finalize. */
       sessionRetentionSeconds: positiveIntegerEnv("SIGNAL_SESSION_RETENTION_SECONDS", "900"),
+      /** Shared, non-secret readiness record written by the isolated capture worker. */
+      healthPath: env("SIGNAL_HEALTH_PATH", ""),
     },
   },
   /** Platforms accepted by POST /v1/meetings. Detection still recognizes all platforms; the rest are gated with 400 unsupported_platform. */

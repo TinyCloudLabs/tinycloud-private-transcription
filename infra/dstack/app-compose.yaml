@@ -28,7 +28,7 @@ services:
   api:
     image: ${PTX_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:2a488f17a0aad9946b1986cf552f1958fd3663ca@sha256:314415740d7f2d2ad65c9e646de0c4bff6c806454b3ecad6ce3c6e442f4f2365}
     # VEXA_API_KEY is minted at first boot by `vexa-provision` (below) into a shared volume.
-    command: ["sh", "-c", "while [ ! -s /run/vexa/api-key ]; do sleep 2; done; export VEXA_API_KEY=$(cat /run/vexa/api-key); exec bun run src/api/server.ts"]
+    command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal/capability-key ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal/capability-key ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal/capability-key); exec bun run src/api/server.ts"]
     restart: unless-stopped
     ports:
       - "8080:8080"
@@ -52,8 +52,10 @@ services:
       ENABLED_PLATFORMS: ${ENABLED_PLATFORMS:-jitsi,google_meet,signal}
       AUTO_MIGRATE: "true"
       LOG_LEVEL: info
+      SIGNAL_HEALTH_PATH: /run/signal/health.json
     volumes:
       - vexa-provision:/run/vexa:ro
+      - signal-runtime:/run/signal:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -65,7 +67,7 @@ services:
 
   worker:
     image: ${PTX_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:2a488f17a0aad9946b1986cf552f1958fd3663ca@sha256:314415740d7f2d2ad65c9e646de0c4bff6c806454b3ecad6ce3c6e442f4f2365}
-    command: ["sh", "-c", "while [ ! -s /run/vexa/api-key ]; do sleep 2; done; export VEXA_API_KEY=$(cat /run/vexa/api-key); exec bun run src/worker/index.ts"]
+    command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal/capability-key ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal/capability-key ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal/capability-key); exec bun run src/worker/index.ts"]
     restart: unless-stopped
     environment:
       DATABASE_URL: postgres://ptx:${POSTGRES_PASSWORD}@postgres:5432/ptx
@@ -79,7 +81,6 @@ services:
       # The capture worker shares this service's network namespace, so this is never routable
       # from another container or a CVM interface.
       SIGNAL_CAPTURE_URL: http://127.0.0.1:18076
-      SIGNAL_CAPABILITY_KEY: ${SIGNAL_CAPABILITY_KEY:-}
       SIGNAL_MAX_CONCURRENT_CALLS: "1"
       LOG_LEVEL: info
     ports:
@@ -87,6 +88,7 @@ services:
       - "127.0.0.1:6080:6080"
     volumes:
       - vexa-provision:/run/vexa:ro
+      - signal-runtime:/run/signal:ro
     depends_on:
       api:
         condition: service_healthy
@@ -107,11 +109,32 @@ services:
       SIGNAL_WHISPER_URL: http://whisper:8000/v1/audio/transcriptions
       SIGNAL_MAX_CONCURRENT_CALLS: "1"
       SIGNAL_PROFILE_DIR: /var/lib/signal
+      SIGNAL_HEALTH_PATH: /run/signal/health.json
     volumes:
       - signal-profile:/var/lib/signal
+      - signal-runtime:/run/signal
     depends_on:
       whisper:
         condition: service_healthy
+
+  signal-capability-provision:
+    # Generates a stable AES-256 capability key inside the CVM's persistent volume. The key never
+    # enters dstack input, a compose environment, logs, or a host-facing port.
+    image: curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b
+    user: root
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        umask 077
+        [ -s /run/signal/capability-key ] && exit 0
+        head -c 32 /dev/urandom | base64 | tr -d '\n' > /run/signal/capability-key.next
+        chmod 600 /run/signal/capability-key.next
+        mv /run/signal/capability-key.next /run/signal/capability-key
+        [ -s /run/signal/capability-key ]
+    volumes:
+      - signal-runtime:/run/signal
+    restart: on-failure
 
   postgres:
     image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
@@ -396,6 +419,7 @@ volumes:
   whisper-cache:
   vexa-provision:
   signal-profile:
+  signal-runtime:
 
 networks:
   ptx: {}

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { signalUiState } from "../../src/providers/signal/backend.ts";
+import { signalDesktopLinkState, signalUiState } from "../../src/providers/signal/backend.ts";
 
 describe("Signal Desktop UI state", () => {
   test("only publishes in-progress after an observed call control", () => {
@@ -8,5 +8,11 @@ describe("Signal Desktop UI state", () => {
     expect(signalUiState("Mute Participants")).toBe("joining");
     expect(signalUiState("Mute  Leave call  Participants")).toBe("in_progress");
     expect(signalUiState("This call has ended")).toBe("ended");
+  });
+
+  test("does not report the QR linking screen as a usable seat", () => {
+    expect(signalDesktopLinkState("Link your device Scan the QR code")).toBe("unlinked");
+    expect(signalDesktopLinkState("New message Search chats")).toBe("linked");
+    expect(signalDesktopLinkState("Signal")).toBe("unknown");
   });
 });
