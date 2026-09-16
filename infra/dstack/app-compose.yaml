@@ -1,17 +1,18 @@
 # dstack / Phala CVM app-compose for tinycloud-private-transcription (V1).
-# ONE CVM runs: our api + worker + postgres + redis, and the pinned Vexa v0.12 capture stack
+# ONE CVM runs: our api + worker + postgres + redis, and the pinned TinyCloud Vexa capture stack
 # (control plane + CPU whisper) that spawns meeting bots. Deploy:
 #   phala deploy -n ptx-dev -c infra/dstack/app-compose.yaml -e infra/dstack/.env -t tdx.large --disk-size 40G
 # Encrypted env (never in this file): POSTGRES_PASSWORD, VEXA_DB_PASSWORD, VEXA_ADMIN_TOKEN,
 # VEXA_INTERNAL_API_SECRET, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD,
 # TRANSCRIPTION_PROVIDER (vexa|tinfoil, the Vexa deployment's backend), PTX_IMAGE (our api/worker
-# image), VEXA_IMAGE_TAG (v012),
-# PTX_BOT_IMAGE (fork bot image override; defaults to the pinned fork tag below).
+# image), VEXA_IMAGE_TAG (v012 for unchanged upstream components),
+# PTX_BOT_IMAGE (fork bot image override; defaults to the pinned fork image below).
 # SIGNAL_CAPTURE_IMAGE is the one-seat Signal Desktop rig.  Its profile volume is deliberately
 # persistent: linking a Signal account is an operator action, never a deployment side effect.
 #
-# Vexa services mirror infra/vexa/upstream/deploy/compose/docker-compose.yml @ e0b356d (+ our
-# docker-compose.override.yml whisper service), minus agent-api/mcp/terminal (not needed for V1).
+# Vexa service topology mirrors infra/vexa/upstream/deploy/compose/docker-compose.yml. Bot,
+# meeting-api, and gateway are pinned to the accepted TinyCloud fork merge; unchanged components
+# remain on upstream v0.12 images. Agent-api/mcp/terminal are omitted because V1 does not need them.
 #
 # BOT SPAWNING NEEDS THE DOCKER SOCKET: Vexa's `runtime` creates one container per meeting bot
 # (BROWSER_IMAGE = the fork bot image, ~3.6 GB, Chromium+Xvfb+PulseAudio) through
@@ -143,7 +144,7 @@ services:
       retries: 20
     networks: [ptx]
 
-  # ─── Vexa v0.12 capture stack (published images; nothing built) ─────────────────────────────
+  # ─── Vexa capture stack (published images; nothing built) ───────────────────────────────────
   vexa-redis:
     image: valkey/valkey:8-alpine
     command: ["valkey-server", "--appendonly", "yes", "--appendfsync", "everysec"]
@@ -238,7 +239,7 @@ services:
   # image no container references. This no-op service makes compose pull the fork bot image at boot (~1.6 GB
   # compressed) and its exited container pins the image so the prune keeps it.
   bot-image-keeper:
-    image: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-2db950b}
+    image: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-e49f3f3@sha256:578f38ae8d0791b11cd1b7bde98484de95181912d72051a7860edcc1f31b4000}
     entrypoint: ["/bin/true"]
     restart: "no"
     network_mode: none
@@ -247,7 +248,7 @@ services:
     image: vexaai/v012-runtime:${VEXA_IMAGE_TAG:-v012}
     group_add: ["0"]
     environment:
-      BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-2db950b}
+      BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-e49f3f3@sha256:578f38ae8d0791b11cd1b7bde98484de95181912d72051a7860edcc1f31b4000}
       AGENT_IMAGE: vexaai/v012-agent-api:${VEXA_IMAGE_TAG:-v012}
       AGENT_WORKER_IMAGE: vexaai/v012-agent-worker:${VEXA_IMAGE_TAG:-v012}
       REDIS_URL: redis://redis:6379/0
@@ -289,7 +290,7 @@ services:
     restart: unless-stopped
 
   meeting-api:
-    image: vexaai/v012-meeting-api:${VEXA_IMAGE_TAG:-v012}
+    image: ghcr.io/tinycloudlabs/vexa/meeting-api:tc-e49f3f3@sha256:8cedc5943d943bee0dcb42a1be0478225b4ce9f4e9e6c53cd7a10507a2f794d3
     environment:
       DB_HOST: vexa-postgres
       DB_PORT: "5432"
@@ -335,7 +336,7 @@ services:
     restart: unless-stopped
 
   gateway:
-    image: vexaai/v012-gateway:${VEXA_IMAGE_TAG:-v012}
+    image: ghcr.io/tinycloudlabs/vexa/gateway:tc-e49f3f3@sha256:01d9ecd1f126eb8e7943017bfff1e5fb6329c37ced46924925e73bb90630756d
     environment:
       ADMIN_API_URL: http://admin-api:8001
       MEETING_API_URL: http://meeting-api:8080

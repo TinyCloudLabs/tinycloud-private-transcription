@@ -27,6 +27,23 @@ function serviceEnv(service: string): string {
 }
 
 describe("infra/dstack/app-compose.yaml", () => {
+  test("pins the Vexa bot, meeting-api, and gateway to the accepted fork commit and digests", () => {
+    expect(compose).toContain(
+      "ghcr.io/tinycloudlabs/vexa/bot:tc-e49f3f3@sha256:578f38ae8d0791b11cd1b7bde98484de95181912d72051a7860edcc1f31b4000",
+    );
+    expect(compose).toContain(
+      "ghcr.io/tinycloudlabs/vexa/meeting-api:tc-e49f3f3@sha256:8cedc5943d943bee0dcb42a1be0478225b4ce9f4e9e6c53cd7a10507a2f794d3",
+    );
+    expect(compose).toContain(
+      "ghcr.io/tinycloudlabs/vexa/gateway:tc-e49f3f3@sha256:01d9ecd1f126eb8e7943017bfff1e5fb6329c37ced46924925e73bb90630756d",
+    );
+    expect(compose).not.toContain("tc-2db950b");
+    expect(compose).not.toContain("vexaai/v012-meeting-api");
+    expect(compose).not.toContain("vexaai/v012-gateway");
+    expect(compose).toContain("vexaai/v012-runtime:${VEXA_IMAGE_TAG:-v012}");
+    expect(compose).toContain("vexaai/v012-agent-api:${VEXA_IMAGE_TAG:-v012}");
+  });
+
   test("the api service enables deployed meeting platforms including Signal", () => {
     const env = serviceEnv("api");
     const line = env.split("\n").find((l) => l.trim().startsWith("ENABLED_PLATFORMS:"));
