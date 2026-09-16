@@ -171,6 +171,7 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(seatBoot).toContain("master=ptx_input_sink.monitor source_name=ptx_input");
     expect(seatBoot).not.toContain("master=ptx_sink.monitor source_name=ptx_input");
     expect(seatBoot).toContain("mktemp -d /tmp/ptx-signal-runtime");
+    expect(seatBoot).toContain('rm -f "/tmp/.X${DISPLAY_NUMBER}-lock" "/tmp/.X11-unix/X${DISPLAY_NUMBER}"');
     expect(compose).toContain("signal-capability-provision:");
     expect(compose).toContain("signal-runtime:/run/signal");
     expect(compose).not.toContain("SIGNAL_CAPABILITY_KEY:");

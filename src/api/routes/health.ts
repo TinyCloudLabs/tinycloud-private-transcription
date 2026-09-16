@@ -34,15 +34,20 @@ export function healthRoutes(ctx: AppContext) {
 }
 
 function signalReadiness(path: string, enabled: boolean) {
-  if (!enabled) return { enabled: false, ready: true, reason: null };
-  if (!path) return { enabled: true, ready: false, reason: "Signal capture readiness is not configured" };
+  if (!enabled) return { enabled: false, ready: true, reason: null, capacity: null };
+  if (!path) return { enabled: true, ready: false, reason: "Signal capture readiness is not configured", capacity: null };
   try {
-    const record = JSON.parse(readFileSync(path, "utf8")) as { ready?: unknown; reason?: unknown; observed_at?: unknown };
+    const record = JSON.parse(readFileSync(path, "utf8")) as { ready?: unknown; reason?: unknown; observed_at?: unknown; capacity?: { running?: unknown; max?: unknown } };
     const observedAt = typeof record.observed_at === "string" ? Date.parse(record.observed_at) : NaN;
     const age = Date.now() - observedAt;
-    if (!Number.isFinite(observedAt) || age < 0 || age > 15_000) return { enabled: true, ready: false, reason: "Signal capture readiness is stale" };
-    return { enabled: true, ready: record.ready === true, reason: typeof record.reason === "string" ? record.reason : null };
+    if (!Number.isFinite(observedAt) || age < 0 || age > 15_000) return { enabled: true, ready: false, reason: "Signal capture readiness is stale", capacity: null };
+    const running = record.capacity?.running;
+    const max = record.capacity?.max;
+    const capacity = Number.isSafeInteger(running) && (running as number) >= 0 && Number.isSafeInteger(max) && (max as number) > 0
+      ? { running, max }
+      : null;
+    return { enabled: true, ready: record.ready === true, reason: typeof record.reason === "string" ? record.reason : null, capacity };
   } catch {
-    return { enabled: true, ready: false, reason: "Signal capture readiness is unavailable" };
+    return { enabled: true, ready: false, reason: "Signal capture readiness is unavailable", capacity: null };
   }
 }

@@ -7,6 +7,10 @@ export DISPLAY="${DISPLAY:-:$(expr $$ % 8000 + 100)}"
 export XDG_RUNTIME_DIR="$(mktemp -d /tmp/ptx-signal-runtime.XXXXXX)"
 mkdir -p "$SIGNAL_PROFILE_DIR"
 chmod 700 "$XDG_RUNTIME_DIR" "$SIGNAL_PROFILE_DIR"
+# DISPLAY is deterministic across ordinary container restarts.  These are only stale Xvfb runtime
+# markers (not profile data); remove them before starting a replacement server on that display.
+DISPLAY_NUMBER="${DISPLAY#:}"
+rm -f "/tmp/.X${DISPLAY_NUMBER}-lock" "/tmp/.X11-unix/X${DISPLAY_NUMBER}"
 # These are Chromium runtime locks, not Signal profile data.  A container crash can leave them
 # behind and prevent the persistent linked profile from starting after an ordinary restart.
 rm -f "$SIGNAL_PROFILE_DIR/SingletonCookie" "$SIGNAL_PROFILE_DIR/SingletonLock" "$SIGNAL_PROFILE_DIR/SingletonSocket"

@@ -47,6 +47,7 @@ describe("health", () => {
     expect(b.status).toBe("ok");
     expect(b.checks).toMatchObject({ postgres: true, redis: true, vexa: true, transcription_provider: "vexa" });
     expect(b.checks.bot_capacity).toEqual({ running: expect.any(Number), max: 5 });
+    expect(b.checks.signal).toEqual({ enabled: false, ready: true, reason: null, capacity: null });
   });
 });
 

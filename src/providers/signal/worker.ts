@@ -65,7 +65,12 @@ export function createSignalWorkerApp(opts: SignalWorkerOptions) {
       try {
         mkdirSync(dirname(opts.healthPath), { recursive: true });
         const next = `${opts.healthPath}.next`;
-        writeFileSync(next, JSON.stringify({ ready: value.ready, reason: value.reason, observed_at: new Date().toISOString() }) + "\n", { mode: 0o644 });
+        writeFileSync(next, JSON.stringify({
+          ready: value.ready,
+          reason: value.reason,
+          observed_at: new Date().toISOString(),
+          capacity: { running: live(), max: opts.maxConcurrentCalls },
+        }) + "\n", { mode: 0o644 });
         renameSync(next, opts.healthPath);
       } catch (e) {
         opts.log.warn("signal readiness record failed", { error: String(e) });

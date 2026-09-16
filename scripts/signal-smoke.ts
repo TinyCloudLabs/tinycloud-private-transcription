@@ -18,7 +18,8 @@
  * end to end — the evidence records which of the two ran, and a replay run is never evidence of
  * live Signal capture.
  *
- * Env: DATABASE_URL, REDIS_URL (docker-compose.dev.yml defaults), SIGNAL_REPLAY_SCRIPT,
+ * Env: DATABASE_URL, REDIS_URL (docker-compose.dev.yml defaults), SIGNAL_CALL_URL (required for
+ *      a live desktop backend; never logged or written to evidence), SIGNAL_REPLAY_SCRIPT,
  *      SMOKE_TIMEOUT_S (120). On a dev rig shared with `bun test` (which truncates tables and
  *      clears the queue) point SMOKE_DATABASE_URL / SMOKE_REDIS_URL at a scratch database and a
  *      spare Redis index so a concurrent suite cannot eat this run's jobs.
@@ -33,9 +34,17 @@ import { verifyWebhookSignature } from "../src/webhooks/signature.ts";
 
 const OUT = "tmp";
 const TIMEOUT_S = Number(process.env.SMOKE_TIMEOUT_S ?? 120);
-// A throwaway capability: this script never uses a real Signal call link.
-const CAPABILITY = `smoke-${randomBytes(24).toString("base64url")}`;
-const CALL_URL = `https://signal.link/call/#${CAPABILITY}`;
+const suppliedCallUrl = process.env.SIGNAL_CALL_URL;
+const replayCallUrl = "https://signal.link/call/#replay-only";
+const callUrlFor = (isReplay: boolean) => {
+  const callUrl = suppliedCallUrl ?? (isReplay ? replayCallUrl : null);
+  if (!callUrl) throw new Error("SIGNAL_CALL_URL is required for a live Signal smoke; supply it privately and do not paste it into logs or evidence.");
+  const url = new URL(callUrl);
+  if (url.protocol !== "https:" || url.hostname.toLowerCase() !== "signal.link" || url.pathname !== "/call/" || url.hash.length < 2) {
+    throw new Error("SIGNAL_CALL_URL must be a Signal call link with a fragment.");
+  }
+  return { callUrl, capability: url.hash.slice(1) };
+};
 
 mkdirSync(OUT, { recursive: true });
 const log = (m: string) => console.log(`[signal-smoke ${new Date().toISOString().slice(11, 19)}] ${m}`);
@@ -57,8 +66,11 @@ async function main() {
   const capabilityKey = randomBytes(32).toString("base64");
   const capturePort = freePort();
   const apiPort = freePort();
+  // The parent script needs the link only to submit the public request. Child processes reconstruct
+  // it from the sealed database capability and must not inherit an operator's raw environment value.
+  const { SIGNAL_CALL_URL: _signalCallUrl, ...childEnv } = process.env;
   const shared = {
-    ...process.env,
+    ...childEnv,
     DATABASE_URL: databaseUrl,
     REDIS_URL: redisUrl,
     ENABLED_PLATFORMS: "signal",
@@ -89,6 +101,7 @@ async function main() {
     capture.kill();
     process.exit(2);
   }
+  const { callUrl: CALL_URL, capability: CAPABILITY } = callUrlFor(healthBody.backend === "replay");
 
   // 2. Real API + queue worker processes, real Postgres/Redis, real API key.
   await runMigrations(databaseUrl);
@@ -123,7 +136,7 @@ async function main() {
     const idempotencyKey = `signal-smoke-${randomBytes(8).toString("hex")}`;
     const created = await read(await call("/v1/meetings", { method: "POST", headers: { "idempotency-key": idempotencyKey }, json: { meeting_url: CALL_URL, bot_name: "TinyCloud Notetaker", language: "en", webhook_url: webhookUrl, metadata: { smoke: true } } }));
     save("signal-smoke-create.json", created);
-    log(`POST /v1/meetings → ${created.http_status} ${created.body.id} ${created.body.status} platform=${created.body.platform} url=${created.body.meeting_url}`);
+    log(`POST /v1/meetings → ${created.http_status} ${created.body.id} ${created.body.status} platform=${created.body.platform}`);
     if (created.http_status !== 201) throw new Error(`create failed: ${created.http_status}`);
     const id: string = created.body.id;
 
