@@ -27,6 +27,20 @@ function serviceEnv(service: string): string {
 }
 
 describe("infra/dstack/app-compose.yaml", () => {
+  test("pins public pullable MinIO server and client releases by digest", () => {
+    const serverImage = compose.match(/\n  minio:\n    image: ([^\n]+)/)?.[1];
+    const clientImage = compose.match(/\n  minio-init:\n    image: ([^\n]+)/)?.[1];
+
+    expect(serverImage).toBe(
+      "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
+    );
+    expect(clientImage).toBe(
+      "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727",
+    );
+    expect(compose).not.toMatch(/image:\s+minio\/(?:minio|mc):/);
+    expect(compose).not.toMatch(/image:\s+quay\.io\/minio\/(?:minio|mc):latest/);
+  });
+
   test("pins the Vexa bot, meeting-api, and gateway to the accepted fork commit and digests", () => {
     expect(compose).toContain(
       "ghcr.io/tinycloudlabs/vexa/bot:tc-e49f3f3@sha256:578f38ae8d0791b11cd1b7bde98484de95181912d72051a7860edcc1f31b4000",

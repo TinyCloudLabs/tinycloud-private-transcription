@@ -268,9 +268,14 @@ summary. Pin `PTX_IMAGE=ghcr.io/tinycloudlabs/tinycloud-private-transcription/ap
 `infra/dstack/.env`. (The older package `ghcr.io/tinycloudlabs/tinycloud-private-transcription` — no `/api`
 suffix — was created while the repo was private, is stuck private, and is deprecated; nothing pushes to it.)
 
-The CVM must be able to pull that image. dstack's pre-launch script runs `docker image prune -af` on every
+The compose file also pins MinIO to the exact releases running on `ptx-dev`: server
+`RELEASE.2025-09-07T16-13-09Z` and client `RELEASE.2025-08-13T08-35-41Z`. Their public Quay manifest-list
+digests match the images already cached by the CVM, so fresh pulls are deterministic without changing the
+MinIO command, `/data` volume, health check, credentials, or initialization flow.
+
+The CVM must be able to pull these images. dstack's pre-launch script runs `docker image prune -af` on every
 boot and `docker compose pull` before `up`, so a pre-pulled image does not survive an update — the registry
-itself has to be reachable. Two options:
+itself has to be reachable. Two options for the private-transcription image:
 
 1. **Public package (preferred, current setup).** A GHCR package created by a workflow inherits the repository's
    visibility at creation time (the `org.opencontainers.image.source` label links it to the repo). The `/api`
