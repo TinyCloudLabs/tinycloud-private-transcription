@@ -7,7 +7,9 @@
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
+const repo = fileURLToPath(new URL("../..", import.meta.url));
 const compose = readFileSync(new URL("../../infra/dstack/app-compose.yaml", import.meta.url), "utf8");
 const envExample = readFileSync(new URL("../../infra/dstack/.env.example", import.meta.url), "utf8");
 const seatBoot = readFileSync(new URL("../../infra/signal-seat/boot.sh", import.meta.url), "utf8");
@@ -40,6 +42,24 @@ function serviceImage(service: string): string {
 }
 
 describe("infra/dstack/app-compose.yaml", () => {
+  test("renders as an image-only deployment with no local build contexts", () => {
+    const rendered = Bun.spawnSync(
+      ["docker", "compose", "-f", "infra/dstack/app-compose.yaml", "--env-file", "infra/dstack/.env.example", "config", "--format", "json"],
+      { cwd: repo, stdout: "pipe", stderr: "pipe" },
+    );
+    expect(rendered.exitCode).toBe(0);
+    const services = Object.values(JSON.parse(rendered.stdout.toString()).services) as Array<Record<string, unknown>>;
+    expect(services.length).toBe(16);
+    for (const service of services) {
+      expect(service.build).toBeUndefined();
+      expect(service.image).toBeString();
+      expect(service.image).toMatch(/@sha256:[0-9a-f]{64}$/);
+    }
+    expect(compose).not.toMatch(/^\s+build:/m);
+    expect(compose).not.toMatch(/^\s+context:/m);
+    expect(compose).not.toMatch(/^\s+dockerfile:/m);
+  });
+
   test("pins public pullable MinIO server and client releases by digest", () => {
     const serverImage = compose.match(/\n  minio:\n    image: ([^\n]+)/)?.[1];
     const clientImage = compose.match(/\n  minio-init:\n    image: ([^\n]+)/)?.[1];
@@ -140,8 +160,7 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(workerBlock).toContain("127.0.0.1:6080:6080");
     const captureStart = compose.indexOf("\n  signal-capture:\n");
     const capture = compose.slice(captureStart, compose.indexOf("\n  postgres:\n", captureStart));
-    expect(capture).toContain("context: ../..");
-    expect(capture).toContain("dockerfile: infra/signal-seat/Dockerfile");
+    expect(capture).not.toContain("build:");
     expect(capture).toContain('network_mode: "service:worker"');
     expect(capture).toContain("SIGNAL_CAPTURE_BIND: 127.0.0.1");
     expect(capture).not.toContain("ports:");

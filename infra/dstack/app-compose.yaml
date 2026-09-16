@@ -96,9 +96,6 @@ services:
   # and capture -> CDP loopback-only while still allowing Signal's own outbound call traffic.
   signal-capture:
     image: ${SIGNAL_CAPTURE_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:2a488f17a0aad9946b1986cf552f1958fd3663ca@sha256:fd0f05a238e43f7571173bf684521f2f89da79392b684e9113d101df785a747f}
-    build:
-      context: ../..
-      dockerfile: infra/signal-seat/Dockerfile
     network_mode: "service:worker"
     restart: unless-stopped
     environment:
