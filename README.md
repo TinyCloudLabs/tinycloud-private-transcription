@@ -271,8 +271,8 @@ when advancing it, update `PTX_IMAGE` and `SIGNAL_CAPTURE_IMAGE` in both the com
 `ghcr.io/tinycloudlabs/tinycloud-private-transcription` — no `/api`
 suffix — was created while the repo was private, is stuck private, and is deprecated; nothing pushes to it.)
 
-Every image pulled by the dstack compose file, including the bot and agent images pulled by Vexa's runtime,
-has an immutable digest. Postgres, Redis, Valkey, unchanged Vexa v0.12 components, CPU whisper, and the curl
+Every image referenced by the dstack compose file, including the bot and agent images selected by Vexa's
+runtime, has an immutable digest. Postgres, Redis, Valkey, unchanged Vexa v0.12 components, CPU whisper, and the curl
 helper use the exact public linux/amd64 image configs already running on `ptx-dev`. The configured-but-unused
 Vexa agent images use the public `v012` manifest digests because no agent image is cached on the CVM. The
 accepted API and Signal defaults come from main commit `2a488f17`; the accepted Vexa bot, meeting-api, and
