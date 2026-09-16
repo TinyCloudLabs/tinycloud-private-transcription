@@ -373,7 +373,10 @@ capture can remain marked ready. These are code-level failure mechanisms, not a 
 any particular meeting without its matching logs.
 
 The CVM compose file waits for the API's healthcheck before starting the worker. The API's
-`AUTO_MIGRATE` path applies every ordered migration through `0007_remove_transcript_fallback`
-before listening, so this gate prevents the worker from querying the Signal columns or the cleaned
-transcript schema before migration completes. For workers started outside this compose file, run
-`bun run db:migrate` first. This cleanup does not reconstruct historical evidence or add diarization.
+`AUTO_MIGRATE` path applies every ordered migration through `0007_retain_legacy_transcript_state`
+before listening, so this gate prevents the worker from querying the Signal columns before migration
+completes. The physical `meetings.transcription_attempts`, `transcripts.fallback_from`, and
+`transcripts.fallback_reason` columns are deprecated and retained only for rollback to the
+pre-native-ingestion image; current code deliberately omits them from its ORM schema and public
+responses. For workers started outside this compose file, run `bun run db:migrate` first. This
+cleanup does not reconstruct historical evidence or add diarization.
