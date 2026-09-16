@@ -1,10 +1,10 @@
 /**
  * Mock Vexa API gateway for tests and local dev. Implements the subset of Vexa's public API we
- * use, mirroring the REAL v0.12 shapes in docs/vexa-samples (epoch-second segment timing, turn:N:x
+ * use, mirroring Vexa's public shapes (epoch or meeting-relative segment timing, turn:N:x
  * segment ids, `data.completion_reason`, `{running,running_bots,count}` bot status, 409 on deleting a
  * bot-lifecycle row), plus `/_mock/*` control endpoints so tests can drive the meeting lifecycle.
- * Control segments may be given meeting-relative (start < 1e9); they are stored as epoch seconds
- * relative to the meeting's `start_time`, exactly like the real gateway returns them.
+ * Control segments retain their supplied timing convention, exactly as meeting-api does, while the
+ * mock fills the corresponding absolute timestamps.
  */
 import { Hono } from "hono";
 import type {
@@ -20,14 +20,10 @@ interface MockMeeting extends VexaMeetingResponse {
   bot_name?: string;
   language?: string;
   meeting_url?: string;
-  recording_enabled?: boolean;
   transcribe_enabled?: boolean;
   automatic_leave?: VexaMeetingCreate["automatic_leave"];
   /** Deletable via DELETE /meetings (real Vexa: idle/scheduled rows only). */
   planned?: boolean;
-  /** Persisted recording bytes (control: `recording_base64`); served like the real recordings API. */
-  recording?: { bytes: Uint8Array; contentType: string };
-  speakerTimeline?: unknown;
 }
 
 export interface MockVexaOptions {
@@ -49,12 +45,15 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
     const k = c.req.header("X-API-Key");
     if (!k) return c.json({ detail: "Missing API key" }, 401);
     if (k !== apiKey) return c.json({ detail: "Invalid API key" }, 401);
-    requests.push({ method: c.req.method, path: c.req.path });
+    // POST /bots is recorded by its handler after parsing so tests can assert the exact create
+    // payload rather than inferring it from the mock's derived meeting state.
+    if (c.req.method !== "POST" || c.req.path !== "/bots") requests.push({ method: c.req.method, path: c.req.path });
     return next();
   });
 
   app.post("/bots", async (c) => {
     const body = (await c.req.json()) as VexaMeetingCreate;
+    requests.push({ method: c.req.method, path: c.req.path, body });
     if (!body.platform) return c.json({ detail: "platform required" }, 422);
     // Vexa parses meeting_url when native_meeting_id is missing; emulate for teams.
     const nativeId =
@@ -84,7 +83,6 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       bot_name: body.bot_name,
       language: body.language,
       meeting_url: body.meeting_url,
-      recording_enabled: body.recording_enabled,
       transcribe_enabled: body.transcribe_enabled,
       automatic_leave: body.automatic_leave,
     };
@@ -112,7 +110,6 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       status: m.status,
       start_time: m.start_time,
       end_time: m.end_time,
-      recordings: recordingsOf(m),
       notes: null,
       data: { ...m.data, completion_reason: m.completion_reason, failure_stage: m.failure_stage },
       segments: m.segments,
@@ -138,29 +135,6 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
     return c.json({ status: "deleted", id: m.id, platform: m.platform, native_meeting_id: m.native_meeting_id });
   });
 
-  // Recordings (real v0.12 shape, docs/vexa-samples/vexa-recordings-list.json): one bot recording per meeting
-  // with an audio master; `raw_url` streams the bytes. Only meetings given `recording_base64` have one.
-  const recordingsOf = (m: MockMeeting) =>
-    m.recording
-      ? [{ id: m.id * 1000, source: "bot", status: "completed", meeting_id: m.id, media_files: [{ id: m.id * 1000 + 1, type: "audio", format: "webm", is_final: true, file_size_bytes: m.recording.bytes.length }] }]
-      : [];
-  app.get("/recordings", (c) => c.json({ recordings: [...meetings.values()].flatMap(recordingsOf) }));
-  app.get("/recordings/:id/speaker-timeline", (c) => {
-    const m = [...meetings.values()].find((x) => x.id * 1000 === Number(c.req.param("id")));
-    if (!m?.recording || m.speakerTimeline === undefined) return c.json({ detail: "Speaker timeline not found" }, 404);
-    return c.json(m.speakerTimeline);
-  });
-  app.get("/recordings/:id/master", (c) => {
-    const m = [...meetings.values()].find((x) => x.id * 1000 === Number(c.req.param("id")));
-    if (!m?.recording) return c.json({ detail: "Recording not found" }, 404);
-    return c.json({ storage_path: `recordings/1/${m.id * 1000}/audio/master.webm`, media_file_id: m.id * 1000 + 1, raw_url: `/recordings/${m.id * 1000}/media/${m.id * 1000 + 1}/raw?type=audio`, duration_seconds: null });
-  });
-  app.get("/recordings/:id/media/:media_id/raw", (c) => {
-    const m = [...meetings.values()].find((x) => x.id * 1000 === Number(c.req.param("id")));
-    if (!m?.recording) return c.json({ detail: "Recording not found" }, 404);
-    return new Response(m.recording.bytes as unknown as ArrayBuffer, { headers: { "content-type": m.recording.contentType } });
-  });
-
   // ---- test control ----
   app.post("/_mock/meetings/:platform/:native_meeting_id", async (c) => {
     const m = meetings.get(key(c.req.param("platform"), c.req.param("native_meeting_id")));
@@ -171,15 +145,7 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       append_segments?: VexaTranscriptionSegment[];
       completion_reason?: VexaCompletionReason | null;
       planned?: boolean;
-      /** Base64 audio bytes to expose through the recordings API (WAV/webm). */
-      recording_base64?: string;
-      recording_content_type?: string;
-      speaker_timeline?: unknown;
     };
-    if (body.recording_base64 !== undefined) {
-      m.recording = { bytes: new Uint8Array(Buffer.from(body.recording_base64, "base64")), contentType: body.recording_content_type ?? "audio/wav" };
-    }
-    if (body.speaker_timeline !== undefined) m.speakerTimeline = body.speaker_timeline;
     if (body.status) {
       m.status = body.status;
       if (["active", "completed"].includes(body.status) && !m.start_time) m.start_time = now();
@@ -190,15 +156,13 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       const originSec = Date.parse(m.start_time) / 1000;
       const toReal = (seg: VexaTranscriptionSegment, i: number): VexaTranscriptionSegment => {
         const epoch = seg.start >= 1e9;
-        const start = epoch ? seg.start : originSec + seg.start;
-        const end = epoch ? seg.end : originSec + seg.end;
+        const absoluteStart = epoch ? seg.start : originSec + seg.start;
+        const absoluteEnd = epoch ? seg.end : originSec + seg.end;
         return {
           ...seg,
-          start,
-          end,
           segment_id: seg.segment_id ?? `turn:${i}:0`,
-          absolute_start_time: seg.absolute_start_time ?? new Date(start * 1000).toISOString(),
-          absolute_end_time: seg.absolute_end_time ?? new Date(end * 1000).toISOString(),
+          absolute_start_time: seg.absolute_start_time ?? new Date(absoluteStart * 1000).toISOString(),
+          absolute_end_time: seg.absolute_end_time ?? new Date(absoluteEnd * 1000).toISOString(),
         };
       };
       if (body.segments) m.segments = body.segments.map(toReal);

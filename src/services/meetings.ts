@@ -152,15 +152,12 @@ export async function storeTranscript(
   meetingId: string,
   t: NormalizedTranscript,
   provider: string,
-  fallback: { from: string; reason: string } | null = null,
 ) {
   const row = {
     language: t.language,
     durationSeconds: t.duration_seconds,
     segmentsJson: { speakers: t.speakers, segments: t.segments, text: t.text },
     provider,
-    fallbackFrom: fallback?.from ?? null,
-    fallbackReason: fallback?.reason ?? null,
   };
   await ctx.db
     .insert(transcripts)
@@ -186,7 +183,7 @@ export async function stopMeeting(ctx: AppContext, meeting: MeetingRow): Promise
 }
 
 /**
- * Re-run finalization for a failed meeting whose capture-provider row/recording is still retained.
+ * Re-run finalization for a failed meeting whose capture-provider row is still retained.
  * The compare-and-set makes concurrent calls idempotent: only the caller that moves failed →
  * processing enqueues a poll. Completed and already-processing meetings are successful no-ops.
  */
@@ -213,7 +210,6 @@ export async function recoverMeeting(ctx: AppContext, meeting: MeetingRow): Prom
       status: "processing",
       errorCode: null,
       errorMessage: null,
-      transcriptionAttempts: 0,
     })
     .where(and(eq(meetings.id, meeting.id), eq(meetings.projectId, meeting.projectId), eq(meetings.status, "failed")))
     .returning();
@@ -230,7 +226,6 @@ export async function recoverMeeting(ctx: AppContext, meeting: MeetingRow): Prom
         status: "failed",
         errorCode: meeting.errorCode,
         errorMessage: meeting.errorMessage,
-        transcriptionAttempts: meeting.transcriptionAttempts,
       })
       .where(and(eq(meetings.id, meeting.id), eq(meetings.projectId, meeting.projectId), eq(meetings.status, "processing")));
     throw error;
@@ -307,11 +302,10 @@ export function serializeMeeting(m: MeetingRow, transcript: TranscriptRow | null
   };
 }
 
-/** `transcript_provider` (+ fallback provenance when the configured provider fell back). */
+/** The provider that produced the stored Vexa transcript. */
 export function transcriptProviderFields(t: TranscriptRow) {
   return {
     transcript_provider: t.provider,
-    ...(t.fallbackFrom ? { fallback_from: t.fallbackFrom, fallback_reason: t.fallbackReason } : {}),
   };
 }
 
@@ -331,7 +325,6 @@ export function serializeTranscript(m: MeetingRow, t: TranscriptRow) {
     duration_seconds: t.durationSeconds,
     provider: t.provider,
     ...(m.captureDiagnostics ? { capture: m.captureDiagnostics } : {}),
-    ...(t.fallbackFrom ? { fallback_from: t.fallbackFrom, fallback_reason: t.fallbackReason } : {}),
     speakers: body.speakers,
     segments: body.segments,
     text: body.text,

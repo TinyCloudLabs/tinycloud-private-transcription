@@ -4,8 +4,6 @@ import type {
   VexaMeetingResponse,
   VexaTranscriptionResponse,
   VexaBotStatusResponse,
-  VexaRecordingsResponse,
-  VexaRecordingMasterResponse,
   VexaStopBotResponse,
   VexaDeleteMeetingResponse,
 } from "./types.ts";
@@ -112,39 +110,6 @@ export class VexaClient {
 
   botStatus() {
     return this.request<VexaBotStatusResponse>("GET", "/bots/status");
-  }
-
-  /** GET /recordings — all of the key's recordings; filter by `meeting_id` client-side. */
-  listRecordings() {
-    return this.request<VexaRecordingsResponse>("GET", "/recordings");
-  }
-
-  /** GET /recordings/{id}/master?type=audio — assembles master.webm and returns its raw byte URL. */
-  recordingMaster(recordingId: number, type = "audio") {
-    return this.request<VexaRecordingMasterResponse>("GET", `/recordings/${recordingId}/master?type=${type}`);
-  }
-
-  async recordingSpeakerTimeline(recordingId: number) {
-    // Audio finality can become visible just before its metadata object is durable. Give
-    // that upload a bounded chance to finish before the caller commits an unknown transcript.
-    const delays = [0, 250, 750];
-    for (let attempt = 0; ; attempt++) {
-      if (delays[attempt]) await Bun.sleep(delays[attempt]!);
-      try {
-        return await this.request<unknown>("GET", `/recordings/${recordingId}/speaker-timeline`);
-      } catch (error) {
-        const retryable = error instanceof VexaHttpError
-          ? [404, 422, 429].includes(error.status) || error.status >= 500
-          : error instanceof ApiError && ["provider_timeout", "provider_unavailable"].includes(error.code);
-        if (!retryable || attempt === delays.length - 1) throw error;
-      }
-    }
-  }
-
-  /** Fetch bytes from a gateway-relative path such as `raw_url` (needs X-API-Key). */
-  async fetchBytes(gatewayPath: string, timeoutMs = 60_000): Promise<{ bytes: Uint8Array; contentType: string }> {
-    const res = await this.raw("GET", gatewayPath, undefined, timeoutMs);
-    return { bytes: new Uint8Array(await res.arrayBuffer()), contentType: res.headers.get("content-type") ?? "application/octet-stream" };
   }
 
   async health(): Promise<boolean> {

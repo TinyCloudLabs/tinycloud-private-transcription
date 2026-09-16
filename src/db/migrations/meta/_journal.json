@@ -50,6 +50,13 @@
       "when": 1790000002000,
       "tag": "0006_transcript_columns_reconcile",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1790020000000,
+      "tag": "0007_remove_transcript_fallback",
+      "breakpoints": true
     }
   ]
 }

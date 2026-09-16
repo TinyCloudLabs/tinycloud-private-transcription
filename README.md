@@ -6,10 +6,9 @@ A meeting primitive: send a meeting URL in, a bot joins the call, and you get a 
 structured transcript out — with state you can track (`queued → joining → waiting_for_admission →
 in_progress → processing → completed`) and signed webhooks on completion. The public API (meetings,
 transcripts, webhooks, error taxonomy) is ours and is the contract clients build against;
-[Vexa](https://github.com/Vexa-ai/vexa) is the internal, replaceable meeting-capture implementation, and
-transcription can run either on Vexa's own WhisperLive or on a confidential-inference provider (Tinfoil)
-inside a Phala/dstack CVM, so meeting audio never leaves attested hardware. The full contract is in
-[SPEC.md](./SPEC.md).
+[Vexa](https://github.com/Vexa-ai/vexa) is the internal, replaceable meeting-capture implementation.
+TinyCloud stores Vexa's completed, speaker-attributed segments and never downloads recordings or runs a
+second transcription pass. The full contract is in [SPEC.md](./SPEC.md).
 
 ## Quickstart
 
@@ -39,7 +38,7 @@ src/worker/         queue loop: sends bots via Vexa, polls status, finalizes tra
 src/db/             drizzle schema + SQL migrations
 src/domain/         pure logic: IDs (mtg_+ULID), platform detection, state machine, error taxonomy, transcript normalization
 src/providers/vexa/ Vexa client, types (from Vexa's frozen OpenAPI), mock server
-src/providers/transcription/ TranscriptionProvider: VexaNativeProvider | TinfoilTranscriptionProvider
+src/providers/transcription/ Vexa segment normalization provider
 src/services/       meeting service (create/get/stop/delete/transition)
 src/webhooks/       HMAC signature + delivery/retry
 test/               unit + integration (API ↔ mock Vexa ↔ worker ↔ Postgres/Redis)
@@ -105,11 +104,7 @@ production window. Green 2/2 on 2026-08-17 (~2 min each; evidence in `tmp/e2e-<r
 | `SIGNAL_PULSE_SOURCE` | `ptx_sink.monitor` in dstack | PulseAudio monitor captured by the isolated Signal seat |
 | `SIGNAL_TRANSCRIBER` | bundled dstack adapter | local WAV-to-JSON adapter using the in-CVM Whisper service |
 | `JOIN_TIMEOUT_SECONDS` | `600` | worker-side join deadline: a meeting still `joining`/`waiting_for_admission` this long after bot dispatch is failed (`meeting_join_failed`/`waiting_room_timeout`), its bot stopped, and `meeting.failed` emitted |
-| `TRANSCRIPTION_PROVIDER` | `vexa` | `vexa` (WhisperLive passthrough) or `tinfoil` |
-| `TINFOIL_BASE_URL` | `https://inference.tinfoil.sh` | OpenAI-compatible `/v1/audio/transcriptions` |
-| `TINFOIL_API_KEY` | – | no live calls are made in tests |
-| `TINFOIL_MODEL` | `voxtral-small-24b` | |
-| `TINFOIL_SEGMENTATION` | `turns` | `turns` (one Tinfoil call per Vexa speaker turn, keeps segmentation) or `whole` (one call, one segment) — see below |
+| `TRANSCRIPTION_PROVIDER` | `vexa` | PTX compatibility label (`vexa` or `tinfoil`); both ingest Vexa-produced segments. This does not configure Vexa's STT endpoint; the shipped Compose still uses local Whisper and Tinfoil wiring is deferred. |
 | `AUTO_MIGRATE` | `true` | API runs migrations at boot |
 | `LOG_LEVEL` | `info` | JSON logs |
 
@@ -136,7 +131,7 @@ curl -s -i $API/v1/meetings/$ID/transcript -H "Authorization: Bearer $KEY"
 # stop (idempotent) → {"id","status"}
 curl -s -X POST $API/v1/meetings/$ID/stop -H "Authorization: Bearer $KEY"
 
-# recover a failed meeting from audio still retained by the capture provider (idempotent)
+# recover a failed meeting from its retained capture-provider row (idempotent)
 curl -s -X POST $API/v1/meetings/$ID/recover -H "Authorization: Bearer $KEY"
 
 # delete → 204 (asks Vexa to delete too; Vexa v0.12 keeps bot-owned rows and answers 409 — logged, see "Known gaps")
@@ -158,9 +153,8 @@ curl -s -X POST localhost:18056/_mock/meetings/jitsi/TinyCloudDemo -H 'Content-T
 ### Webhooks
 
 `meeting.completed` / `meeting.failed` are POSTed to `webhook_url` as
-`{"id":"evt_…","type":"meeting.completed","created_at":"…","data":{"meeting_id":"…","metadata":{},"transcript_provider":"tinfoil"}}`
-(`data.error` is added on failure; `data.fallback_from`/`data.fallback_reason` are added when the
-configured provider fell back to the Vexa-native transcript). Header `X-Webhook-Signature: sha256=<hex>` is HMAC-SHA256 over the
+`{"id":"evt_…","type":"meeting.completed","created_at":"…","data":{"meeting_id":"…","metadata":{},"transcript_provider":"vexa"}}`
+(`data.error` is added on failure.) Header `X-Webhook-Signature: sha256=<hex>` is HMAC-SHA256 over the
 raw body with the project's webhook secret (printed by `create-key`). Retries: immediate, 1m, 5m, 30m, 2h,
 persisted in `webhook_deliveries`. Webhook failure never changes meeting status.
 
@@ -181,11 +175,12 @@ Types in `src/providers/vexa/types.ts`; pure mapping in `src/providers/vexa/adap
   `(platform, native_meeting_id)`; we store the native id as an opaque string.
 - `GET /transcripts/{platform}/{native_meeting_id}` is the worker's single poll: `status`
   (`requested → joining → active → stopping → completed`, or `failed`), `start_time` (bot active), `segments[]`,
-  `recordings[]`, and **`data.completion_reason`** (that is where it lives on transcript rows; the top-level
+  and **`data.completion_reason`** (that is where it lives on transcript rows; the top-level
   field exists only on MeetingResponse rows). `data.failure_stage`, `data.last_error`, `data.status_transition[]` also exist.
 - Segments: `{start,end,text,language,speaker,completed,segment_id,absolute_start_time,absolute_end_time}`.
-  `start`/`end` are **epoch seconds** → we rebase to meeting-relative seconds (origin = `start_time` when it
-  precedes the first segment, else the first segment). `segment_id` is `turn:N:<seq>` (confirmed; a turn can
+  `start`/`end` may be epoch seconds or meeting-relative seconds. Epoch values are rebased (origin =
+  `start_time` when it precedes the first segment, else the first segment); relative values pass through.
+  `segment_id` is `turn:N:<seq>` (confirmed; a turn can
   have several) or `turn:N:p<seq>` (draft) → drafts of a turn that has confirmed rows are dropped, ids are
   upserted (last wins), `completed:false` rows are dropped. `speaker` is the Jitsi display name.
 - Status map: `requested|joining→joining`, `awaiting_admission|needs_help→waiting_for_admission`,
@@ -193,77 +188,18 @@ Types in `src/providers/vexa/types.ts`; pure mapping in `src/providers/vexa/adap
   `failed→failed`; `completion_reason` → our error codes (`src/domain/state.ts`).
 - `DELETE /bots/{p}/{id}` → 200 `{status:"stopping",meeting_id,native_meeting_id}`; 404 once no bot is active.
 - `GET /bots/status` → `{running:[MeetingResponse…], running_bots:[…same], count}` (non-terminal rows only).
-- Recordings (Tinfoil batch input): `recordings[]` on the transcript row (or `GET /recordings`, filtered by
-  `meeting_id`) → `GET /recordings/{id}/master?type=audio` assembles `master.webm` → `raw_url` streams the bytes
-  (`X-API-Key` required). `src/worker/meeting-job.ts#fetchVexaAudio` applies a content sanity check
-  (bytes/second below ~1 kB/s ⇒ treated as the known silent-tap failure and skipped).
+## Vexa-native transcript ingestion
 
-## Confidential transcription (Tinfoil)
+Every meeting requests `transcribe_enabled:true`. On completion, TinyCloud validates, de-duplicates,
+rebases, normalizes, and stores Vexa's completed
+speaker-attributed segments. It makes no recording, timeline, audio-decoding, partitioning, or downstream
+transcription request. `POST /v1/meetings/{id}/recover` remains tenant-scoped and retries the same retained
+Vexa transcript row; transcript storage is an upsert and only the winning terminal transition emits a webhook.
 
-`TRANSCRIPTION_PROVIDER=tinfoil` transcribes the **persisted meeting recording** on Tinfoil's confidential
-inference (`POST /v1/audio/transcriptions`, OpenAI-compatible, `voxtral-small-24b`) instead of using
-Vexa's WhisperLive words. Verified live: Voxtral on Tinfoil rejects `response_format=verbose_json` (400) and
-`json` returns `{text, usage:{seconds}}` only — **no timestamps, no diarization** — so speaker segmentation
-has to come from Vexa's speaker timeline. `src/providers/transcription/tinfoil.ts`:
-
-1. The worker asks Vexa for `recording_enabled:true` and `transcribe_enabled:false`, then downloads the
-   audio master at completion (`fetchVexaAudio`, with the bitrate sanity check for the known silent-tap
-   capture). Capture-only mode prevents Vexa's per-speaker live requests from overwhelming its local
-   Whisper worker; Tinfoil remains the authoritative transcription provider.
-2. `TINFOIL_SEGMENTATION=turns` (default): the recording is decoded **once** with `ffmpeg` (16 kHz mono PCM,
-   temp files; `apk add ffmpeg` in the Dockerfile), Vexa's speaker-labelled segments (already
-   meeting-relative, same origin as the recording = the bot's `start_time`) are merged into **turns**
-   (adjacent same-speaker segments with a gap ≤ 0.75 s), each turn is cut from the PCM (±0.25 s pad; turns
-   < 0.4 s skipped) into a WAV clip and sent to Tinfoil — ≤ 3 concurrent calls, ≤ 2 retries with backoff on
-   5xx/429/timeouts. Result: one segment per turn with `speaker_id/speaker_name` and `start/end` from Vexa,
-   `text` from Tinfoil; `text` = `Speaker: …` lines; `duration_seconds` = the recording's length. A failed
-   minority of turns keeps Vexa's own words for those turns (logged). Cost: one call of a few seconds per
-   turn (a 30 s two-person exchange ≈ 5–10 calls, ~2–3 s wall time total).
-   `TINFOIL_SEGMENTATION=whole`: one call with the whole recording; one segment attributed to the dominant
-   Vexa speaker (no segmentation) — also what `turns` does when Vexa heard no segments at all.
-3. **Fallback to the Vexa-native transcript** (never a failed meeting when Vexa has words): no usable
-   recording (none persisted / silent tap), recording silent (< −60 dBFS RMS) or undecodable, more than
-   half of the turns failing (4xx), or Tinfoil unavailable after the worker's 3 retries in `processing`.
-   The worker logs `falling back to vexa-native transcript {reason}` + `transcript finalized
-   {provider, fallback_from, fallback_reason, stats}`; the stored transcript and `GET /transcript` carry
-   **`provider: "tinfoil" | "vexa"`** (`transcripts.provider`), so callers can tell which path produced it.
-   The fallback is also persisted (`transcripts.fallback_from`/`fallback_reason`) and surfaced to clients:
-   `GET /v1/meetings/{id}` (once completed) and the `meeting.completed` webhook `data` carry
-   `transcript_provider` plus `fallback_from`/`fallback_reason` when a fallback fired.
-
-Recording-only Google Meet speaker attribution uses `GET /recordings/{id}/speaker-timeline` when
-provided by the capture stack. The adapter validates the exact recording identity and keeps offsets
-on the recorder's clock. Batch processing covers the entire recording, including short turns,
-unidentified windows and overlap; no audio is omitted because its speaker is unknown. Participant
-IDs distinguish equal display names. Transcript segments optionally expose `attribution` as
-`identified`, `unknown` or `overlap`. Unknown/overlap windows never inherit the dominant name.
-The normal concurrency and request-duration bounds apply. Failed inference windows reject the
-result for meeting-level retry, rather than finalizing a transcript with missing sections.
-Timeline fetches retry transient or incomplete uploads at most three times, with 250 ms and 750 ms
-delays, because the final audio receipt can precede its metadata. Authorization failures are not retried.
-PCM decoding preserves encoded timestamp gaps with FFmpeg's
-[`aresample` timestamp compensation](https://ffmpeg.org/ffmpeg-resampler.html#Resampler-Options), so later
-audio does not shift under an earlier speaker label. Inserted silence represents absent encoded audio;
-it does not recover speech that was never captured. Original recording bytes remain unchanged.
-
-Limits: when the recording timeline is absent (including older capture deployments), capture-only
-Tinfoil meetings still fall back to whole-file transcription with a generic speaker. Invalid metadata
-is logged and processed as unknown; recorded audio remains available.
-Long whole-file recordings are split at the quietest 100 ms window before each ten-minute limit; chunk
-failures return to the meeting-level delayed retry instead of blocking the serial worker with inline retries.
-Meetings created before capture-only mode may still have Vexa segments and use speaker-attributed turn mode.
-`POST /v1/meetings/{id}/recover` retries finalization for a failed row when Vexa still retains its recording;
-it is tenant-scoped, concurrent callers safely converge, and a repeated call while `processing` repairs a
-possible database-to-queue crash window. Duplicate polls remain safe because transcript storage is an upsert
-and only the winning terminal state transition emits a completion webhook.
-Vexa's speaker labels come from Jitsi dominant-speaker events (`"Speaker"` = unknown). ~~Vexa v0.12's
-recording tap only mixes the media elements present when it starts~~ — **fixed in our Vexa fork**
-([TinyCloudLabs/vexa](https://github.com/TinyCloudLabs/vexa) branch `tinycloud`, see "Vexa fork" below): the
-record-chunker's tap is now dynamic (rescans like the live mixer), so a participant who joins after the bot
-IS in the recording; verified live with Bob joining after the bot (`scripts/two-speaker-live.ts`, per-turn
-Tinfoil transcript carries Bob's words, 2/2 runs 2026-08-19). Probes: `bun run scripts/tinfoil-check.ts [--two-speakers]` (1–2 live calls),
-`bun run scripts/two-speaker-live.ts` (Alice + Bob on the rig, per-turn path), `TRANSCRIPTION_PROVIDER=tinfoil
-bun run test:e2e` (asserts `transcript.provider === "tinfoil"`; green 2/2 on 2026-08-19, 2 + 3 calls).
+`TRANSCRIPTION_PROVIDER=tinfoil` currently selects the same Vexa-native ingestion path for compatibility;
+it does not configure Vexa's STT service. The shipped Compose still points Vexa at local Whisper. A future
+deployment change may wire TinyCloud Tinfoil as Vexa's text-only STT backend; Vexa remains responsible for
+speaker attribution.
 
 ### Known gaps / risks
 
@@ -275,34 +211,32 @@ bun run test:e2e` (asserts `transcript.provider === "tinfoil"`; green 2/2 on 202
   meeting the bot lifecycle touched answers `409 "Meeting is no longer planned (bot lifecycle owns it)"`.
   Our DELETE removes our data and logs the 409; purging Vexa's copy needs an upstream route or a direct
   DB/MinIO purge inside the CVM (follow-up).
-- **Silent recording**: fixed in our Vexa fork for the known causes (static tap latching a stale element /
-  nobody with audio present at bot join — the tap now starts over an empty mix and attaches audio as it
-  appears). The worker's bitrate/RMS sanity check + Vexa-native fallback stay as defence in depth.
-- **Recording misses late audio tracks**: **fixed in our Vexa fork** (dynamic record-chunker, see "Vexa
-  fork" below); verified live 2/2 with Bob joining after the bot.
 - **Jitsi live validation** is marked pending upstream; it works against docker-jitsi-meet stable-11146-2
   (bot needs `https://` + hostname + a trusted cert).
+- **Tinfoil wiring and live two-speaker/late-joiner acceptance remain deferred follow-ups**: the shipped
+  Compose still uses local Whisper inside Vexa. `fixtures/bob.wav` remains for the later live gate.
 - The capture rig needed a host iptables fix (Docker's FORWARD/NAT chains had been flushed) — see infra/README.md.
 
 ## Vexa fork ([TinyCloudLabs/vexa](https://github.com/TinyCloudLabs/vexa))
 
-Our per-turn confidential path transcribes the **persisted recording**, so the recording must hear
-everyone. Upstream Vexa v0.12's record-chunker attached only the media tracks present when the tap
-started: a participant joining after the bot was missing from `master.webm` (the live transcript still
-heard them), and an empty-at-join room produced a silent/absent master. Upstream's live mixer already
-rescans for late tracks; the recording tap did not — so we maintain a fork rather than wait upstream.
+The CVM runs commit-addressed bot, meeting-api, and gateway images from our Vexa fork. Vexa performs
+STT and native speaker attribution; this service consumes the completed attributed segments instead
+of downloading and retranscribing recordings. The remaining Vexa components stay on their unchanged
+upstream v0.12 images.
 
-- **Branches**: `tinycloud` = upstream base (`e0b356d6`, v0.12.22) + our patches — this is what the rig
-  pins (`infra/vexa/upstream` submodule, `infra/vexa/UPSTREAM_PIN`). `main` tracks upstream untouched.
-- **The patch**: `core/meetings/modules/record-chunker` — `createRecordingTap` now builds a dynamic mix
-  (`DynamicElementMixer`): recorder starts immediately (even with zero audio elements) and a 2 s rescan
-  (live-mixer parity) attaches new elements / detaches ended ones. Pinned by the module's
+- **Branches**: `tinycloud` = current upstream (`59e2c413`) + the selected TinyCloud overlay, merged as
+  `e49f3f3f`. `main` tracks upstream untouched. The separate local rig remains pinned by
+  `infra/vexa/upstream` and `infra/vexa/UPSTREAM_PIN` until that fixture is refreshed.
+- **The patch**: `core/meetings/modules/record-chunker` — `createRecordingTap` builds a dynamic mix
+  (`DynamicElementMixer`): the recorder starts immediately (even with zero audio elements) and a 2 s
+  rescan (live-mixer parity) attaches new elements / detaches ended ones. Pinned by the module's
   `dynamic-tap.smoke.test.ts`.
-- **Bot image**: `ghcr.io/tinycloudlabs/vexa/bot:tc-<shortsha>` (fork workflow `tinycloud-bot-image`; the older
+- **Images**: bot, meeting-api, and gateway use `ghcr.io/tinycloudlabs/vexa/<component>:tc-e49f3f3`
+  pinned by digest in `infra/dstack/app-compose.yaml`. The bot workflow is `tinycloud-bot-image`; the older
   `ghcr.io/tinycloudlabs/vexa-bot` package was created while the fork was private, is stuck private,
   and is deprecated — nothing pushes to it);
-  the rig layers the dev CA on top (`infra/vexa/bot/Dockerfile` → `ptx/vexa-bot:tc-devca`). Control-plane
-  images stay upstream `vexaai/v012-*:v012`.
+  the local rig layers the dev CA on top (`infra/vexa/bot/Dockerfile` → `ptx/vexa-bot:tc-devca`). Admin,
+  runtime, and agent images stay upstream `vexaai/v012-*:v012`.
 - **Syncing upstream** (in the fork repo): `git fetch upstream --tags && git checkout main && git merge
   --ff-only upstream/main && git push origin main --tags`, then rebase/merge `tinycloud` onto `main`,
   re-run the record-chunker tests, push, and bump this repo's submodule pin + bot image tag.
@@ -310,7 +244,7 @@ rescans for late tracks; the recording tap did not — so we maintain a fork rat
 
 ## Deploy (Phala/dstack)
 
-`infra/dstack/app-compose.yaml` runs api + worker + postgres + redis and the pinned Vexa v0.12 stack
+`infra/dstack/app-compose.yaml` runs api + worker + postgres + redis and the pinned Vexa stack
 (admin-api, runtime, meeting-api, gateway, valkey, postgres, MinIO, CPU whisper) in ONE CVM; only `:8080`
 is published. Bot spawning needs `/var/run/docker.sock` mounted into Vexa's `runtime` (one container per
 bot on the fixed `ptx-vexa` network). A one-shot `vexa-provision` job mints the Vexa API key at first boot.
@@ -360,8 +294,9 @@ are not pruned), but a redeploy after expiry cannot re-pull it.
 
 **Env.** `cp infra/dstack/.env.example infra/dstack/.env` (gitignored) and fill it: random 32-char values for
 `POSTGRES_PASSWORD`, `VEXA_DB_PASSWORD`, `VEXA_ADMIN_TOKEN`, `VEXA_INTERNAL_API_SECRET`, `MINIO_ROOT_PASSWORD`;
-`PTX_IMAGE`; and for private transcription `TRANSCRIPTION_PROVIDER=tinfoil`, `TINFOIL_API_KEY`,
-`TINFOIL_MODEL` (from the project `.env`). Everything in that file is encrypted client-side and sealed into
+`PTX_IMAGE`; leave `TRANSCRIPTION_PROVIDER=vexa` until Vexa's Tinfoil STT endpoint is explicitly wired.
+Everything in that
+file is encrypted client-side and sealed into
 the CVM (`phala deploy -e`); nothing secret lives in `app-compose.yaml`.
 
 **Signal one-seat rig.** The `signal-capture` service is a headless Signal Desktop image with Xvfb,
@@ -406,7 +341,7 @@ Debug: `phala logs ptx-dev -f`, `phala logs ptx-dev --serial --tail 200` (image 
 ### Diagnosing an unexpected bot departure
 
 Read `capture` from `GET /v1/meetings/{id}`. Keep it alongside transcript status: a completed
-transcript can be a salvaged recording from an interrupted call. `left_alone` is a detector verdict,
+transcript can be retained after an interrupted call. `left_alone` is a detector verdict,
 not proof that participants stopped speaking. `evicted` is a removal-detector verdict, not proof
 that a person removed the bot. `stopped` can include a runtime termination signal; compare it
 with `stop_requested_by` rather than assuming the user pressed Stop. Exit 137 alone does not
@@ -433,7 +368,7 @@ capture can remain marked ready. These are code-level failure mechanisms, not a 
 any particular meeting without its matching logs.
 
 The CVM compose file waits for the API's healthcheck before starting the worker. The API's
-`AUTO_MIGRATE` path applies migration `0003_capture_diagnostics` before listening, so this gate
-prevents the worker from querying the new column before migration completes. For workers started
-outside this compose file, run `bun run db:migrate` first. No bot timeout behavior changes with
-this diagnostics update. It does not reconstruct missing historical evidence or add diarization.
+`AUTO_MIGRATE` path applies every ordered migration through `0007_remove_transcript_fallback`
+before listening, so this gate prevents the worker from querying the Signal columns or the cleaned
+transcript schema before migration completes. For workers started outside this compose file, run
+`bun run db:migrate` first. This cleanup does not reconstruct historical evidence or add diarization.

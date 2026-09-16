@@ -6,7 +6,7 @@ import { startHarness, type Harness } from "./harness.ts";
 
 let h: Harness;
 beforeAll(async () => {
-  h = await startHarness();
+  h = await startHarness({ transcriptionProvider: "tinfoil" });
 });
 afterAll(async () => {
   await h.stop();
@@ -111,6 +111,15 @@ describe("happy path: create -> joined -> completed -> transcript + webhook", ()
     expect(m!.bot_name).toBe("TinyCloud Notetaker");
     expect(m!.meeting_url).toBe("https://jitsi.local/DemoRoom");
     expect(m!.language).toBe("en");
+    expect(m!.transcribe_enabled).toBe(true);
+    const createRequest = h.vexa.requests.find((request) => request.method === "POST" && request.path === "/bots");
+    expect(createRequest?.body).toMatchObject({
+      platform: "jitsi",
+      native_meeting_id: nativeId,
+      meeting_url: "https://jitsi.local/DemoRoom",
+      transcribe_enabled: true,
+    });
+    expect(createRequest?.body).not.toHaveProperty("recording_enabled");
   });
 
   test("awaiting_admission -> waiting_for_admission; transcript is 202", async () => {
@@ -131,15 +140,13 @@ describe("happy path: create -> joined -> completed -> transcript + webhook", ()
     expect(t.status).toBe(202);
   });
 
-  test("Vexa completed -> processing -> completed with normalized transcript", async () => {
+  test("the tinfoil compatibility label stores Vexa segments without a second transcription", async () => {
     await h.vexa.control("jitsi", nativeId, { status: "completed", segments: SEGMENTS, completion_reason: "stopped" });
     const body = await waitStatus(id, "completed");
     expect(body.ended_at).toBeTruthy();
     expect(body.completed_at).toBeTruthy();
     expect(body.transcript).toEqual({ status: "completed" });
     expect(body.transcript_provider).toBe("vexa");
-    expect(body.fallback_from).toBeUndefined();
-    expect(body.fallback_reason).toBeUndefined();
     expect(body.error).toBeUndefined();
 
     const t = await h.api(`/v1/meetings/${id}/transcript`);
@@ -161,6 +168,8 @@ describe("happy path: create -> joined -> completed -> transcript + webhook", ()
     ]);
     expect(tr.text).toBe(`Sam: ${SEGMENTS[0].text}\nAlex: ${SEGMENTS[1].text}`);
     expect(tr.created_at).toBeTruthy();
+    expect(h.ctx.transcription.name).toBe("vexa");
+    expect(h.vexa.requests.some((q) => q.path.startsWith("/recordings"))).toBe(false);
   });
 
   test("meeting.completed webhook delivered with valid HMAC signature", async () => {
@@ -171,7 +180,6 @@ describe("happy path: create -> joined -> completed -> transcript + webhook", ()
       created_at: expect.any(String),
       data: { meeting_id: id, metadata: { customer: "acme", n: 1 }, transcript_provider: "vexa" },
     });
-    expect(hook.body.data.fallback_from).toBeUndefined();
     expect(hook.headers["x-webhook-event"]).toBe("meeting.completed");
     expect(verifyWebhookSignature(h.webhookSecret, hook.rawBody, hook.headers["x-webhook-signature"])).toBe(true);
     expect(verifyWebhookSignature("wrong", hook.rawBody, hook.headers["x-webhook-signature"])).toBe(false);

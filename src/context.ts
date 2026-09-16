@@ -32,7 +32,7 @@ export function createContext(overrides: Partial<AppContext> & { config?: Config
     redis,
     queue: overrides.queue ?? new Queue(redis),
     vexa: overrides.vexa ?? new VexaClient({ baseUrl: cfg.vexa.baseUrl, apiKey: cfg.vexa.apiKey }),
-    transcription: overrides.transcription ?? createTranscriptionProvider(cfg, log),
+    transcription: overrides.transcription ?? createTranscriptionProvider(cfg),
     signal: overrides.signal ?? new LoopbackSignalCaptureAdapter(cfg.signal.baseUrl),
     log,
     webhookRetryDelaysMs: overrides.webhookRetryDelaysMs ?? DEFAULT_WEBHOOK_RETRY_DELAYS_MS,
