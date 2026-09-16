@@ -110,7 +110,7 @@ export async function handleJoinDeadline(ctx: AppContext, meetingId: string): Pr
 }
 
 /** Job: meeting.poll — sync status from Vexa; finalize when the bot has left. */
-export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Promise<void> {
+export async function handleMeetingPoll(ctx: AppContext, meetingId: string, transcriptWaitAttempt = 0): Promise<void> {
   let meeting = await getMeetingById(ctx, meetingId);
   if (!meeting || isTerminal(meeting.status as MeetingStatus)) return;
   if (meeting.platform === "signal") return handleSignalPoll(ctx, meeting);
@@ -161,6 +161,25 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
   }
   const hasLiveWords = segments.some((segment) => segment.text.trim().length > 0);
   if (!hasLiveWords) {
+    // The bot lifecycle can finish before Vexa's STT worker has written its final segments. Keep
+    // the public meeting in processing and make one bounded poll chain; this never re-dispatches a
+    // bot or asks another STT backend to transcribe the captured speech.
+    const maxTranscriptWaitAttempts = Math.ceil(ctx.config.vexa.transcriptFinalizationGraceMs / ctx.config.vexa.pollIntervalMs);
+    // An eviction or admission failure cannot gain speech after the fact. Normal bot completion
+    // (including left-alone after people stop speaking) can race the asynchronous STT writer.
+    const canStillReceiveTranscript = !reason || reason === "stopped" || reason === "left_alone" || reason === "max_bot_time_exceeded";
+    if (vexa.status === "completed" && canStillReceiveTranscript && transcriptWaitAttempt < maxTranscriptWaitAttempts) {
+      ({ meeting } = await transition(ctx, meeting, "processing"));
+      const nextAttempt = transcriptWaitAttempt + 1;
+      ctx.log.info("waiting for Vexa terminal transcript", {
+        meetingId,
+        attempt: nextAttempt,
+        maxAttempts: maxTranscriptWaitAttempts,
+        graceMs: ctx.config.vexa.transcriptFinalizationGraceMs,
+      });
+      await ctx.queue.push({ type: "meeting.poll", meetingId, transcriptWaitAttempt: nextAttempt }, ctx.config.vexa.pollIntervalMs);
+      return;
+    }
     const f = reason ? mapVexaFailure(reason) : { code: "capture_failed" as const, message: "No usable audio was captured for this meeting." };
     const { meeting: failed, changed } = await failMeeting(ctx, meeting, f.code, f.message);
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");

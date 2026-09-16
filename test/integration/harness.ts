@@ -42,6 +42,7 @@ export async function startHarness(
     enabledPlatforms?: string[];
     joinTimeoutSeconds?: number;
     maxTimeLeftAloneMs?: number;
+    transcriptFinalizationGraceMs?: number;
     signal?: SignalCaptureAdapter;
     signalCapabilityKey?: string;
     signalMaxConcurrentCalls?: number;
@@ -51,10 +52,16 @@ export async function startHarness(
   const vexa = startMockVexa(0);
   const config = {
     ...baseConfig,
-    vexa: { ...baseConfig.vexa, baseUrl: vexa.baseUrl, apiKey: vexa.apiKey, pollIntervalMs: 50 },
+    vexa: {
+      ...baseConfig.vexa,
+      baseUrl: vexa.baseUrl,
+      apiKey: vexa.apiKey,
+      pollIntervalMs: 50,
+      ...(opts.maxTimeLeftAloneMs !== undefined ? { maxTimeLeftAloneMs: opts.maxTimeLeftAloneMs } : {}),
+      ...(opts.transcriptFinalizationGraceMs !== undefined ? { transcriptFinalizationGraceMs: opts.transcriptFinalizationGraceMs } : {}),
+    },
     ...(opts.enabledPlatforms ? { enabledPlatforms: opts.enabledPlatforms } : {}),
     ...(opts.joinTimeoutSeconds !== undefined ? { joinTimeoutSeconds: opts.joinTimeoutSeconds } : {}),
-    ...(opts.maxTimeLeftAloneMs !== undefined ? { vexa: { ...baseConfig.vexa, baseUrl: vexa.baseUrl, apiKey: vexa.apiKey, pollIntervalMs: 50, maxTimeLeftAloneMs: opts.maxTimeLeftAloneMs } } : {}),
     ...(opts.signalCapabilityKey || opts.signalMaxConcurrentCalls !== undefined
       ? { signal: { ...baseConfig.signal, ...(opts.signalCapabilityKey ? { capabilityKey: opts.signalCapabilityKey } : {}), ...(opts.signalMaxConcurrentCalls !== undefined ? { maxConcurrentCalls: opts.signalMaxConcurrentCalls } : {}) } }
       : {}),

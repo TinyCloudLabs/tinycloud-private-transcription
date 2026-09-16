@@ -25,6 +25,8 @@ export const config = {
     baseUrl: env("VEXA_BASE_URL", "http://localhost:18066"),
     apiKey: env("VEXA_API_KEY", ""),
     pollIntervalMs: Number(env("VEXA_POLL_INTERVAL_MS", "5000")),
+    /** How long PTX continues polling a completed Vexa row whose STT segments have not arrived yet. */
+    transcriptFinalizationGraceMs: positiveIntegerEnv("VEXA_TRANSCRIPT_FINALIZATION_GRACE_MS", "60000"),
     /** Per-meeting Vexa remote-participant audio silence window before the bot completes with `left_alone`. */
     maxTimeLeftAloneMs: positiveIntegerEnv("VEXA_MAX_TIME_LEFT_ALONE_MS", "300000"),
     /** Provisioned bot ceiling (matches `max_concurrent_bots` in infra/dstack/app-compose.yaml). Reported in /health. */

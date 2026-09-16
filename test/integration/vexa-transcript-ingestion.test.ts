@@ -10,7 +10,7 @@ import { startHarness, type Harness } from "./harness.ts";
  */
 let h: Harness;
 beforeAll(async () => {
-  h = await startHarness({ transcriptionProvider: "tinfoil" });
+  h = await startHarness({ transcriptionProvider: "tinfoil", enabledPlatforms: ["jitsi", "google_meet"], transcriptFinalizationGraceMs: 200 });
 });
 afterAll(async () => h.stop());
 
@@ -30,11 +30,43 @@ const waitStatus = (id: string, wanted: string) =>
   }, { label: `meeting ${id} -> ${wanted}` });
 
 describe("Vexa-native transcript ingestion", () => {
+  test("Google Meet keeps polling one bounded Vexa path while final STT segments arrive", async () => {
+    const r = await h.api("/v1/meetings", {
+      method: "POST",
+      json: { meeting_url: "https://meet.google.com/latency-proof", webhook_url: h.webhook.url },
+    });
+    expect(r.status).toBe(201);
+    const { id } = await r.json();
+    const native = "latency-proof";
+    await h.waitFor(async () => h.vexa.meetings.get(`google_meet/${native}`) ?? null, { label: "Google Meet dispatched" });
+
+    const beforeTerminalPoll = h.vexa.requests.length;
+    await h.vexa.control("google_meet", native, { status: "completed", completion_reason: "stopped" });
+    await waitStatus(id, "processing");
+    // This mirrors Vexa's asynchronous STT write: the bot row is terminal before its final words.
+    await h.vexa.control("google_meet", native, {
+      append_segments: [{ start: 0, end: 2, text: "Speech survived STT latency.", language: "en", speaker: "Alice", completed: true }],
+    });
+    await waitStatus(id, "completed");
+
+    const transcript = await (await h.api(`/v1/meetings/${id}/transcript`)).json();
+    expect(transcript.text).toBe("Alice: Speech survived STT latency.");
+    const terminalPolls = h.vexa.requests.slice(beforeTerminalPoll).filter((q) => q.path === `/transcripts/google_meet/${native}`);
+    expect(terminalPolls).toHaveLength(2); // one empty observation and one scheduled final-segment read
+    expect(
+      h.vexa.requests.filter(
+        (q) => q.method === "POST" && q.path === "/bots" && (q.body as { native_meeting_id?: string }).native_meeting_id === native,
+      ),
+    ).toHaveLength(1);
+  });
+
   test("the tinfoil compatibility label captures with live transcription and never re-transcribes", async () => {
     const { id, native } = await dispatch("IngestNoSecondPass");
     const bot = h.vexa.meetings.get(`jitsi/${native}`)!;
     expect(bot.transcribe_enabled).toBe(true);
-    const createRequest = h.vexa.requests.find((request) => request.method === "POST" && request.path === "/bots");
+    const createRequest = h.vexa.requests.find(
+      (request) => request.method === "POST" && request.path === "/bots" && (request.body as { native_meeting_id?: string }).native_meeting_id === native,
+    );
     expect(createRequest?.body).toMatchObject({
       platform: "jitsi",
       native_meeting_id: native,
