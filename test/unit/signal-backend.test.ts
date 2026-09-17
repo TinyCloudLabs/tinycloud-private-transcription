@@ -3,6 +3,7 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  driveSignalDepartureAction,
   driveSignalJoiningAction,
   launchSignalDesktopCall,
   parseReplayScript,
@@ -124,8 +125,11 @@ describe("Signal capture boundary", () => {
           for (const label of Object.keys(visible) as SignalUiAction[]) {
             if (visible[label] && expression === signalActionLocatorExpression([label])) return point(label);
           }
-          if (visible["join"] && expression === signalActionLocatorExpression(["join call", "join", "start call"])) {
+          if (visible["join"] && expression === signalActionLocatorExpression(["ask to join", "join call", "join", "start call"])) {
             return point("join");
+          }
+          if (visible["ask to join"] && expression === signalActionLocatorExpression(["ask to join", "join call", "join", "start call"])) {
+            return point("ask to join");
           }
           return null;
         },
@@ -143,6 +147,22 @@ describe("Signal capture boundary", () => {
     expect(await run({ join: true })).toEqual({ action: null, events: [] });
     expect(await run({ "turn on camera": true, join: true }))
       .toEqual({ action: "join", events: ["join-armed", "click:join"] });
+    expect(await run({ "turn on camera": true, "ask to join": true }))
+      .toEqual({ action: "ask to join", events: ["join-armed", "click:ask to join"] });
+  });
+
+  test("cancels a pending admission request with an exact trusted control", async () => {
+    const target = { targetId: "target-1", sessionId: "session-1" };
+    const events: string[] = [];
+    const cdp = {
+      evaluate: async (_target: unknown, expression: string) => expression === signalActionLocatorExpression(["cancel request", "leave call", "leave"])
+        ? { label: "cancel request", x: 20, y: 30 }
+        : null,
+      trustedClick: async (_target: unknown, action: { label: SignalUiAction }) => { events.push(action.label); },
+    } as unknown as CdpConnection;
+
+    expect(await driveSignalDepartureAction(cdp, target)).toBe("cancel request");
+    expect(events).toEqual(["cancel request"]);
   });
 
   test("rejects empty or malformed replay transcripts", () => {

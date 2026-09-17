@@ -62,7 +62,7 @@ describe("Signal capture worker boundary", () => {
     expect((await rig.adapter.status(sessionId)).status).toBe("completed");
     await rig.adapter.remove(sessionId);
     await rig.adapter.remove(sessionId);
-    await rig.adapter.leave("sig_does-not-exist");
+    await rig.adapter.leave("sig_00000000-0000-4000-8000-000000000099");
   });
 
   test("a full rig answers 429, which PTX maps to a retryable provider outage", async () => {
@@ -96,6 +96,54 @@ describe("Signal capture worker boundary", () => {
     }
   });
 
+  test("deduplicates an accepted start by meetingId and sweeps an orphaned session", async () => {
+    let opens = 0;
+    let leaves = 0;
+    const backend: SignalCallBackend = {
+      name: "idempotent-start",
+      async preflight() { return { ready: true, reason: null }; },
+      async open(): Promise<SignalCallSession> {
+        opens++;
+        return {
+          async snapshot() { return { status: "waiting_for_admission" }; },
+          async leave() { leaves++; },
+          async dispose() {},
+        };
+      },
+    };
+    const worker = createSignalWorkerApp({
+      backend,
+      maxConcurrentCalls: 1,
+      joinTimeoutMs: 1,
+      maxCallMs: 60_000,
+      sessionRetentionMs: 60_000,
+      sweepIntervalMs: 5,
+      log: silentLogger,
+    });
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: worker.app.fetch });
+    try {
+      const endpoint = `http://127.0.0.1:${server.port}/v1/calls`;
+      const start = () => fetch(endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ meetingId: "mtg_lost_response", callUrl }),
+      }).then((response) => response.json() as Promise<{ session_id: string }>);
+      const first = await start(); // caller can lose this response
+      const recovered = await start();
+      expect(first.session_id).toBe(recovered.session_id);
+      expect(opens).toBe(1);
+      const owner = await fetch(`${endpoint}/by-meeting/mtg_lost_response`).then((response) => response.json() as Promise<{ session_id: string }>);
+      expect(owner.session_id).toBe(first.session_id);
+      await waitFor(async () => leaves > 0 ? true : null);
+      const health = await fetch(`http://127.0.0.1:${server.port}/health`).then((response) => response.json() as Promise<{ capacity: { running: number; max: number } }>);
+      expect(health.capacity)
+        .toEqual({ running: 0, max: 1 });
+    } finally {
+      worker.stop();
+      server.stop(true);
+    }
+  });
+
   test("bounds admission: a call that never goes active fails as waiting_room_timeout", async () => {
     const stuck = startWorker({ joinTimeoutMs: 1, activeAfterMs: 60_000, endsAfterMs: 60_000 });
     try {
@@ -107,6 +155,54 @@ describe("Signal capture worker boundary", () => {
       expect(snapshot.errorCode).toBe("waiting_room_timeout");
     } finally {
       stuck.server.stop(true);
+    }
+  });
+
+  test("a pre-admission cancellation fails without publishing hallucinated transcript evidence", async () => {
+    let left = false;
+    const backend: SignalCallBackend = {
+      name: "cancelled-lobby",
+      async preflight() { return { ready: true, reason: null }; },
+      async open(): Promise<SignalCallSession> {
+        return {
+          async snapshot() {
+            // Deliberately model the non-empty result that Whisper can produce from lobby audio.
+            return left
+              ? { status: "completed", segments: [{ start: 0, end: 1, text: "hallucinated lobby audio" }] }
+              : { status: "waiting_for_admission" };
+          },
+          async leave() { left = true; },
+          async dispose() {},
+        };
+      },
+    };
+    const worker = createSignalWorkerApp({
+      backend,
+      maxConcurrentCalls: 1,
+      joinTimeoutMs: 1,
+      maxCallMs: 60_000,
+      sessionRetentionMs: 60_000,
+      sweepIntervalMs: 5,
+      log: silentLogger,
+    });
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: worker.app.fetch });
+    try {
+      const adapter = new LoopbackSignalCaptureAdapter(`http://127.0.0.1:${server.port}`);
+      const { sessionId } = await adapter.start({ meetingId: "mtg_cancelled_lobby", callUrl });
+      const terminal = await waitFor(async () => {
+        const snapshot = await adapter.status(sessionId);
+        return snapshot.status === "failed" ? snapshot : null;
+      });
+      expect(terminal).toMatchObject({ status: "failed", errorCode: "waiting_room_timeout" });
+      expect(terminal.segments).toBeUndefined();
+      expect(left).toBe(true);
+      await waitFor(async () => {
+        const health = await fetch(`http://127.0.0.1:${server.port}/health`).then((response) => response.json() as Promise<{ capacity: { running: number; max: number } }>);
+        return health.capacity.running === 0 ? health : null;
+      });
+    } finally {
+      worker.stop();
+      server.stop(true);
     }
   });
 
@@ -201,7 +297,30 @@ describe("Signal capture worker boundary", () => {
     expect(await bad.text()).not.toContain(CAPABILITY);
   });
 
+  test("authenticates a network-reachable seat control endpoint", async () => {
+    const controlToken = "seat-control-token";
+    const worker = createSignalWorkerApp({
+      backend: new ReplaySignalBackend({ admittedAfterMs: 0, activeAfterMs: 0, endsAfterMs: 60_000, segments: [{ start: 0, end: 1, text: "secured" }] }),
+      maxConcurrentCalls: 1,
+      joinTimeoutMs: 30_000,
+      maxCallMs: 60_000,
+      sessionRetentionMs: 60_000,
+      controlToken,
+      log: silentLogger,
+    });
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: worker.app.fetch });
+    try {
+      const base = `http://127.0.0.1:${server.port}`;
+      expect((await fetch(`${base}/health`)).status).toBe(403);
+      const adapter = new LoopbackSignalCaptureAdapter(base, [controlToken]);
+      expect((await adapter.start({ meetingId: "mtg_authenticated", callUrl })).sessionId).toStartWith("sig_");
+    } finally {
+      worker.stop();
+      server.stop(true);
+    }
+  });
+
   test("refuses to be pointed at a non-loopback capture worker", () => {
-    expect(() => new LoopbackSignalCaptureAdapter("http://10.0.0.7:18076")).toThrow("loopback-only");
+    expect(() => new LoopbackSignalCaptureAdapter("http://10.0.0.7:18076")).toThrow("require control tokens");
   });
 });

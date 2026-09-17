@@ -50,7 +50,7 @@ describe("infra/dstack/app-compose.yaml", () => {
     );
     expect(rendered.exitCode).toBe(0);
     const services = Object.values(JSON.parse(rendered.stdout.toString()).services) as Array<Record<string, unknown>>;
-    expect(services.length).toBe(17);
+    expect(services.length).toBe(20);
     for (const service of services) {
       expect(service.build).toBeUndefined();
       expect(service.image).toBeString();
@@ -80,6 +80,9 @@ describe("infra/dstack/app-compose.yaml", () => {
       api: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:0c8f1e52a2305319478a5fa8f9144bbbae8ce1be@sha256:8def9f59c433849c7509c0b763e674ef238e7352be38217205bfa2800bd5207b",
       worker: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:0c8f1e52a2305319478a5fa8f9144bbbae8ce1be@sha256:8def9f59c433849c7509c0b763e674ef238e7352be38217205bfa2800bd5207b",
       "signal-capture": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:0c8f1e52a2305319478a5fa8f9144bbbae8ce1be@sha256:52e1d39de98db3713af59b052a9dd1d96173644c83e6231d8fe8c3650a138dc0",
+      "signal-capture-2": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:0c8f1e52a2305319478a5fa8f9144bbbae8ce1be@sha256:52e1d39de98db3713af59b052a9dd1d96173644c83e6231d8fe8c3650a138dc0",
+      "signal-capture-3": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:0c8f1e52a2305319478a5fa8f9144bbbae8ce1be@sha256:52e1d39de98db3713af59b052a9dd1d96173644c83e6231d8fe8c3650a138dc0",
+      "signal-control-provision": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
       "signal-capability-provision": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
       postgres: "postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685",
       redis: "redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf",
@@ -158,26 +161,50 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(line).toContain("300000");
   });
 
-  test("ships one loopback-only Signal seat in the worker network namespace", () => {
+  test("ships three authenticated Signal seats with isolated CDP namespaces", () => {
+    const api = serviceEnv("api");
+    expect(api).toContain("SIGNAL_MAX_CONCURRENT_CALLS: \"3\"");
+    expect(api).toContain("SIGNAL_HEALTH_PATHS: /run/signal-health-1/health.json,/run/signal-health-2/health.json,/run/signal-health-3/health.json");
     const worker = serviceEnv("worker");
-    expect(worker).toContain("SIGNAL_CAPTURE_URL: http://127.0.0.1:18076");
-    expect(worker).toContain("SIGNAL_MAX_CONCURRENT_CALLS: \"1\"");
+    expect(worker).toContain("SIGNAL_CAPTURE_URLS: http://signal-capture:18076,http://signal-capture-2:18077,http://signal-capture-3:18078");
+    expect(worker).toContain("SIGNAL_CAPTURE_TOKEN_PATHS: /run/signal-control-1/token,/run/signal-control-2/token,/run/signal-control-3/token");
+    expect(worker).toContain("SIGNAL_MAX_CONCURRENT_CALLS: \"3\"");
     const workerStart = compose.indexOf("\n  worker:\n");
     const workerBlock = compose.slice(workerStart, compose.indexOf("\n  signal-capture:\n", workerStart));
-    expect(workerBlock).toContain("127.0.0.1:6080:6080");
     expect(workerBlock).toContain("signal-runtime:/run/signal-capability:ro");
+    expect(workerBlock).toContain("signal-control-1:/run/signal-control-1:ro");
+    expect(workerBlock).toContain("signal-control-2:/run/signal-control-2:ro");
+    expect(workerBlock).toContain("signal-control-3:/run/signal-control-3:ro");
     expect(workerBlock).not.toContain("signal-health:");
-    const captureStart = compose.indexOf("\n  signal-capture:\n");
-    const capture = compose.slice(captureStart, compose.indexOf("\n  signal-capability-provision:\n", captureStart));
-    expect(capture).not.toContain("build:");
-    expect(capture).toContain('network_mode: "service:worker"');
-    expect(capture).toContain("SIGNAL_CAPTURE_BIND: 127.0.0.1");
-    expect(capture).toContain("SIGNAL_HEALTH_PATH: /run/signal-health/health.json");
-    expect(capture).toContain("SIGNAL_WHISPER_HEALTH_URL: http://whisper:8000/health");
-    expect(capture).toContain("signal-health:/run/signal-health");
-    expect(capture).not.toContain("signal-capability:");
-    expect(capture).not.toContain("signal-runtime:");
-    expect(capture).not.toContain("ports:");
+    const seats = [
+      { service: "signal-capture", capture: "18076", cdp: "9222", vnc: "5900", novnc: "6080", profile: "signal-profile", health: "signal-health", control: "signal-control-1", network: "signal-seat-1" },
+      { service: "signal-capture-2", capture: "18077", cdp: "9223", vnc: "5901", novnc: "6081", profile: "signal-profile-2", health: "signal-health-2", control: "signal-control-2", network: "signal-seat-2" },
+      { service: "signal-capture-3", capture: "18078", cdp: "9224", vnc: "5902", novnc: "6082", profile: "signal-profile-3", health: "signal-health-3", control: "signal-control-3", network: "signal-seat-3" },
+    ];
+    for (const [index, seat] of seats.entries()) {
+      const start = compose.indexOf(`\n  ${seat.service}:\n`);
+      const nextService = index + 1 < seats.length ? seats[index + 1].service : "signal-control-provision";
+      const capture = compose.slice(start, compose.indexOf(`\n  ${nextService}:\n`, start));
+      expect(capture).not.toContain("build:");
+      expect(capture).not.toContain("network_mode:");
+      expect(capture).toContain("SIGNAL_CAPTURE_BIND: 0.0.0.0");
+      expect(capture).toContain(`SIGNAL_CAPTURE_PORT: \"${seat.capture}\"`);
+      expect(capture).toContain("SIGNAL_CAPTURE_TOKEN_PATH: /run/signal-control/token");
+      expect(capture).toContain(`SIGNAL_CDP_PORT: \"${seat.cdp}\"`);
+      expect(capture).toContain(`SIGNAL_VNC_PORT: \"${seat.vnc}\"`);
+      expect(capture).toContain(`SIGNAL_NOVNC_PORT: \"${seat.novnc}\"`);
+      expect(capture).toContain(`127.0.0.1:${seat.novnc}:${seat.novnc}`);
+      expect(capture).toContain("SIGNAL_HEALTH_PATH: /run/signal-health/health.json");
+      expect(capture).toContain("SIGNAL_WHISPER_HEALTH_URL: http://whisper:8000/health");
+      expect(capture).toContain("SIGNAL_WHISPER_MODEL: small.en");
+      expect(capture).toContain(`${seat.profile}:/var/lib/signal`);
+      expect(capture).toContain(`${seat.health}:/run/signal-health`);
+      expect(capture).toContain(`${seat.control}:/run/signal-control:ro`);
+      expect(capture).toContain(`${seat.network}: {}`);
+      expect(capture).toContain("vexa:\n        gw_priority: 1");
+      expect(capture).not.toContain("signal-capability:");
+      expect(capture).not.toContain("signal-runtime:");
+    }
     expect(seatBoot).toContain("sink_name=ptx_input_sink");
     expect(seatBoot).toContain("master=ptx_input_sink.monitor source_name=ptx_input");
     expect(seatBoot).not.toContain("master=ptx_sink.monitor source_name=ptx_input");
@@ -185,12 +212,16 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(seatBoot).toContain('rm -f "/tmp/.X${DISPLAY_NUMBER}-lock" "/tmp/.X11-unix/X${DISPLAY_NUMBER}"');
     expect(seatBoot).toContain("--use-fake-ui-for-media-stream");
     expect(seatBoot).toContain("--use-fake-device-for-media-stream");
+    expect(seatBoot).toContain('VNC_PORT="${SIGNAL_VNC_PORT:-5900}"');
+    expect(seatBoot).toContain('NOVNC_PORT="${SIGNAL_NOVNC_PORT:-6080}"');
+    expect(seatBoot).toContain('CDP_PORT="${SIGNAL_CDP_PORT:-9222}"');
     expect(compose).toContain("signal-capability-provision:");
     expect(compose).toContain("signal-runtime:/run/signal-capability");
     expect(compose).toContain("signal-health:/run/signal-health");
     expect(compose).not.toContain("SIGNAL_CAPABILITY_KEY:");
     expect(signalTranscriber).toContain('"${1:-}" = "--check"');
     expect(signalTranscriber).toContain("SIGNAL_WHISPER_HEALTH_URL");
+    expect(signalTranscriber).toContain('model=${SIGNAL_WHISPER_MODEL:-small.en}');
   });
 
   test("publishes and CI-builds the Signal seat image", () => {

@@ -87,9 +87,10 @@ export async function signalRuntimePrerequisites(options: SignalRuntimeOptions):
 export function signalUiState(text: string): SignalCaptureSnapshot["status"] | "ended" {
   const body = text.toLowerCase();
   if (/call ended|call has ended|ended this call/.test(body)) return "ended";
-  if (/waiting for (someone|the host|admission)|waiting to be admitted/.test(body)) return "waiting_for_admission";
-  // `Leave call` is a call-only control. Do not infer success from generic mute/participant text.
-  if (/\bleave call\b/.test(body)) return "in_progress";
+  if (/waiting for (someone|the host|admission)|waiting to be admitted|cancel request/.test(body)) return "waiting_for_admission";
+  // Signal 7.x uses both `Leave call` and a standalone `Leave` call-control label. Require the
+  // standalone form to occupy its own UI-evidence line so prose cannot imply an active call.
+  if (/\bleave call\b/.test(body) || /(?:^|\n)\s*leave\s*(?:\n|$)/.test(body)) return "in_progress";
   return "joining";
 }
 
@@ -108,7 +109,7 @@ export function signalDesktopLinkState(text: string): "linked" | "unlinked" | "u
   return "unknown";
 }
 
-export type SignalUiAction = "allow access" | "join" | "join call" | "start call" | "turn off camera" | "turn on camera" | "leave call";
+export type SignalUiAction = "allow access" | "ask to join" | "cancel request" | "join" | "join call" | "start call" | "turn off camera" | "turn on camera" | "leave" | "leave call";
 
 interface SignalUiActionPoint {
   label: SignalUiAction;
@@ -124,7 +125,7 @@ const locateSignalAction = `(labels => {
   for (const control of controls) {
     const label = labelOf(control);
     if (!labels.includes(label) || control.disabled || control.getAttribute('aria-disabled') === 'true') continue;
-    if (['join', 'join call', 'start call', 'turn off camera', 'turn on camera'].includes(label)
+    if (['ask to join', 'cancel request', 'join', 'join call', 'start call', 'turn off camera', 'turn on camera', 'leave', 'leave call'].includes(label)
         && !control.closest('.module-calling__modal-container, .module-calling__container')) continue;
     const style = getComputedStyle(control);
     if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) continue;
@@ -182,12 +183,23 @@ export async function driveSignalJoiningAction(
   const cameraOff = await findSignalAction(cdp, target, ["turn on camera"]);
   if (!cameraOff) return null;
 
-  const join = await findSignalAction(cdp, target, ["join call", "join", "start call"]);
+  const join = await findSignalAction(cdp, target, ["ask to join", "join call", "join", "start call"]);
   if (!join) return null;
   // The click can reach Signal even if CDP loses its reply, so quarantine semantics begin first.
   onJoinAttempt();
   await cdp.trustedClick(target, join);
   return join.label;
+}
+
+/** Cancels an admission request or leaves an active call using only exact Signal controls. */
+export async function driveSignalDepartureAction(
+  cdp: CdpConnection,
+  target: CdpTarget,
+): Promise<SignalUiAction | null> {
+  const action = await findSignalAction(cdp, target, ["cancel request", "leave call", "leave"]);
+  if (!action) return null;
+  await cdp.trustedClick(target, action);
+  return action.label;
 }
 
 // Signal often renders call controls as icons.  Include their accessible names in the bounded UI
@@ -327,6 +339,9 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
     // Set on either observed in-call UI or an attempted join. A join can hand off before the next
     // poll, so waiting for `Leave call` evidence alone is too late to protect the physical seat.
     let callMayBeActive = false;
+    // Transcribe only after positive in-call UI evidence. Lobby/approval audio can otherwise yield
+    // a Whisper hallucination and falsely complete a meeting that never joined.
+    let observedInProgress = false;
     const begun = Date.now();
     const finalize = async () => {
       if (finalizing) return await finalizing;
@@ -336,7 +351,7 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
         await recorder?.exited.catch(() => {});
         // Do not include child stderr or URL-derived CDP errors in a response or log.
         try {
-          if (this.options.transcriber) {
+          if (this.options.transcriber && observedInProgress) {
             const child = Bun.spawn([...this.options.transcriber, wav], { stdout: "pipe", stderr: "ignore" });
             const output = await new Response(child.stdout).text();
             if ((await child.exited) !== 0) throw new Error("local transcriber failed");
@@ -382,8 +397,8 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
         let left = false;
         let leftTarget: CdpTarget | null = null;
         for (const candidate of candidates) {
-          const action = await findSignalAction(cdp, candidate, ["leave call"]);
-          if (action && await cdp.trustedClick(candidate, action).then(() => true, () => false)) {
+          const action = await driveSignalDepartureAction(cdp, candidate).catch(() => null);
+          if (action) {
             left = true;
             leftTarget = candidate;
             callTarget = candidate;
@@ -407,6 +422,9 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
           if (!departed) throw new Error("Signal Desktop departure cannot be verified");
         }
       }
+      // A lobby cancellation has never established a call.  In particular, do not let a later
+      // WAV/Whisper result turn it into a completed meeting with transcript evidence.
+      if (!observedInProgress) state = "failed";
       await finalize();
     };
     return {
@@ -428,7 +446,7 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
             const candidateState = signalUiState(ui);
             // A real call control or admission/ended state is stronger evidence than a blank
             // deep-link target. Keep that target for the next poll.
-            if (candidateState !== "joining" || /\b(join call|start call|allow access|turn (?:off|on) camera|join)\b/i.test(ui)) {
+            if (candidateState !== "joining" || /\b(ask to join|join call|start call|allow access|turn (?:off|on) camera|join)\b/i.test(ui)) {
               callTarget = candidate;
               observed = candidateState;
               break;
@@ -440,10 +458,16 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
             await driveSignalJoiningAction(cdp, callTarget, () => { callMayBeActive = true; }).catch(() => {});
           }
           if (observed === "ended") {
+            // The Desktop can end a rejected/cancelled lobby before an in-call control was ever
+            // observed. That is a failed admission, not an empty completed transcript.
+            if (!observedInProgress) state = "failed";
             await finalize();
-            return { status: state === "failed" ? "failed" : "completed", ...(segments ? { segments } : {}) };
+            return state === "failed"
+              ? { status: "failed", errorCode: "meeting_join_failed" }
+              : { status: "completed", ...(segments ? { segments } : {}) };
           }
           state = observed;
+          if (observed === "in_progress") observedInProgress = true;
           if (observed === "waiting_for_admission" || observed === "in_progress") callMayBeActive = true;
         }
         return state === "completed" ? { status: state, segments } : state === "failed" ? { status: state, errorCode: "capture_failed" } : { status: state };

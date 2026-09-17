@@ -1,6 +1,6 @@
 import { Hono } from "hono";
-import { randomUUID } from "node:crypto";
-import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { randomUUID, timingSafeEqual } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import type { Logger } from "../../log.ts";
 import { isSignalCallUrl } from "../../domain/platform.ts";
@@ -21,9 +21,13 @@ export interface SignalWorkerOptions {
   maxCallMs: number;
   /** How long a terminal snapshot stays readable after the call ends. */
   sessionRetentionMs: number;
+  /** Background enforcement cadence. Production defaults to five seconds. */
+  sweepIntervalMs?: number;
   log: Logger;
   /** Shared, non-secret readiness record consumed by the public PTX health endpoint. */
   healthPath?: string;
+  /** Required when the control API is reachable outside this container's loopback namespace. */
+  controlToken?: string;
 }
 
 interface Seat {
@@ -36,7 +40,13 @@ interface Seat {
   terminalAt: number;
   /** In-progress cleanup retains capacity until the backend has left and released the Desktop. */
   cleanup: Promise<SignalCaptureSnapshot> | null;
+  /** Serializes polling, deadline enforcement, and the background safety sweep. */
+  observation: Promise<SignalCaptureSnapshot> | null;
 }
+
+type StartOutcome =
+  | { ok: true; id: string }
+  | { ok: false; status: 429 | 502 | 503; code: "capacity_exhausted" | "backend_unavailable" | "capture_failed"; message: string };
 
 /**
  * The loopback-only Signal capture worker.
@@ -47,17 +57,27 @@ interface Seat {
  */
 export function createSignalWorkerApp(opts: SignalWorkerOptions) {
   const seats = new Map<string, Seat>();
+  const starts = new Map<string, Promise<StartOutcome>>();
   // A reservation covers the async readiness/open gap.  Without it, two simultaneous requests
   // can both see an empty seat and make the one linked Desktop join two calls.
   let reservations = 0;
   const app = new Hono();
 
-  // Defence in depth against DNS rebinding: the socket is bound to loopback, and a request that
-  // claims a routable Host never reaches a handler.
+  // Loopback seats reject routable Host headers. Network-isolated production seats authenticate
+  // every request with a per-seat token that no sibling Signal container can read.
   app.use("*", async (c, next) => {
-    const host = c.req.header("host") ?? "";
-    const hostname = host.startsWith("[") ? host.slice(0, host.indexOf("]") + 1) : host.split(":")[0];
-    if (hostname && !isLoopbackHost(hostname)) return c.json({ error: { code: "forbidden", message: "Signal capture worker is loopback-only." } }, 403);
+    if (opts.controlToken) {
+      const supplied = c.req.header("authorization")?.replace(/^Bearer\s+/i, "") ?? "";
+      const expectedBytes = Buffer.from(opts.controlToken);
+      const suppliedBytes = Buffer.from(supplied);
+      if (expectedBytes.length !== suppliedBytes.length || !timingSafeEqual(expectedBytes, suppliedBytes)) {
+        return c.json({ error: { code: "forbidden", message: "Signal capture control token is invalid." } }, 403);
+      }
+    } else {
+      const host = c.req.header("host") ?? "";
+      const hostname = host.startsWith("[") ? host.slice(0, host.indexOf("]") + 1) : host.split(":")[0];
+      if (hostname && !isLoopbackHost(hostname)) return c.json({ error: { code: "forbidden", message: "Signal capture worker is loopback-only." } }, 403);
+    }
     return next();
   });
 
@@ -70,7 +90,9 @@ export function createSignalWorkerApp(opts: SignalWorkerOptions) {
         const next = `${opts.healthPath}.next`;
         writeFileSync(next, JSON.stringify({
           ready: value.ready,
-          reason: value.reason,
+          // Never copy backend/desktop text into the public-health handoff. A compromised seat
+          // can control its own readiness file, so the API maps only this fixed code.
+          reason_code: value.ready ? null : "seat_unavailable",
           observed_at: new Date().toISOString(),
           capacity: { running: live(), max: opts.maxConcurrentCalls },
         }) + "\n", { mode: 0o644 });
@@ -119,7 +141,7 @@ export function createSignalWorkerApp(opts: SignalWorkerOptions) {
   };
 
   /** Reads the backend and applies the worker's own bounds. */
-  const observe = async (seat: Seat): Promise<SignalCaptureSnapshot> => {
+  const observeOnce = async (seat: Seat): Promise<SignalCaptureSnapshot> => {
     if (seat.terminal) return seat.terminal;
     let snapshot: SignalCaptureSnapshot;
     try {
@@ -141,6 +163,42 @@ export function createSignalWorkerApp(opts: SignalWorkerOptions) {
       return await settle(seat, await seat.session.snapshot().catch(() => ({ status: "failed", errorCode: "capture_failed" }) as SignalCaptureSnapshot));
     }
     return snapshot;
+  };
+
+  const observe = async (seat: Seat): Promise<SignalCaptureSnapshot> => {
+    if (seat.observation) return await seat.observation;
+    seat.observation = observeOnce(seat).finally(() => { seat.observation = null; });
+    return await seat.observation;
+  };
+
+  const openSeat = async (body: { meetingId: string; callUrl: string; botName?: string; language?: string }): Promise<StartOutcome> => {
+    const existing = [...seats.values()].find((seat) => seat.meetingId === body.meetingId);
+    if (existing) return { ok: true, id: existing.id };
+    if (live() >= opts.maxConcurrentCalls) {
+      opts.log.warn("signal capture at capacity", { meetingId: body.meetingId, running: live(), max: opts.maxConcurrentCalls });
+      return { ok: false, status: 429, code: "capacity_exhausted", message: "All Signal capture seats are in use." };
+    }
+    reservations++;
+    try {
+      const state = await readiness();
+      if (!state.ready) {
+        opts.log.error("signal capture backend not ready", { meetingId: body.meetingId, backend: opts.backend.name, reason: state.reason });
+        return { ok: false, status: 503, code: "backend_unavailable", message: state.reason ?? "Signal capture backend is unavailable." };
+      }
+      const id = `sig_${randomUUID()}`;
+      let session: SignalCallSession;
+      try {
+        session = await opts.backend.open(body);
+      } catch (e) {
+        opts.log.error("signal capture could not open a call", { meetingId: body.meetingId, error: String(e) });
+        return { ok: false, status: 502, code: "capture_failed", message: "Signal Desktop could not open the call." };
+      }
+      seats.set(id, { id, meetingId: body.meetingId, session, startedAt: Date.now(), terminal: null, terminalAt: 0, cleanup: null, observation: null });
+      opts.log.info("signal seat opened", { sessionId: id, meetingId: body.meetingId, backend: opts.backend.name });
+      return { ok: true, id };
+    } finally {
+      reservations--;
+    }
   };
 
   app.get("/health", async (c) => {
@@ -168,31 +226,34 @@ export function createSignalWorkerApp(opts: SignalWorkerOptions) {
       // Deliberately does not echo the value back: it may be a real bearer capability.
       return c.json({ error: { code: "invalid_request", message: "callUrl must be a Signal call link with a fragment." } }, 400);
     }
-    if (live() >= opts.maxConcurrentCalls) {
-      opts.log.warn("signal capture at capacity", { meetingId: body.meetingId, running: live(), max: opts.maxConcurrentCalls });
-      return c.json({ error: { code: "capacity_exhausted", message: "All Signal capture seats are in use." } }, 429);
+    const normalized = {
+      meetingId: body.meetingId,
+      callUrl: body.callUrl,
+      ...(typeof body.botName === "string" ? { botName: body.botName } : {}),
+      ...(typeof body.language === "string" ? { language: body.language } : {}),
+    };
+    const meetingId = body.meetingId;
+    let pending = starts.get(meetingId);
+    if (!pending) {
+      pending = openSeat(normalized);
+      starts.set(meetingId, pending);
+      void pending.finally(() => starts.delete(meetingId));
     }
-    reservations++;
-    try {
-      const state = await readiness();
-      if (!state.ready) {
-        opts.log.error("signal capture backend not ready", { meetingId: body.meetingId, backend: opts.backend.name, reason: state.reason });
-        return c.json({ error: { code: "backend_unavailable", message: state.reason ?? "Signal capture backend is unavailable." } }, 503);
-      }
-      const id = `sig_${randomUUID()}`;
-      let session: SignalCallSession;
-      try {
-        session = await opts.backend.open({ meetingId: body.meetingId, callUrl: body.callUrl, botName: typeof body.botName === "string" ? body.botName : undefined, language: typeof body.language === "string" ? body.language : undefined });
-      } catch (e) {
-        opts.log.error("signal capture could not open a call", { meetingId: body.meetingId, error: String(e) });
-        return c.json({ error: { code: "capture_failed", message: "Signal Desktop could not open the call." } }, 502);
-      }
-      seats.set(id, { id, meetingId: body.meetingId, session, startedAt: Date.now(), terminal: null, terminalAt: 0, cleanup: null });
-      opts.log.info("signal seat opened", { sessionId: id, meetingId: body.meetingId, backend: opts.backend.name });
-      return c.json({ session_id: id }, 201);
-    } finally {
-      reservations--;
-    }
+    const result = await pending;
+    if (result.ok) return c.json({ session_id: result.id }, 201);
+    if (result.status === 429) return c.json({ error: { code: result.code, message: result.message } }, 429);
+    if (result.status === 503) return c.json({ error: { code: result.code, message: result.message } }, 503);
+    return c.json({ error: { code: result.code, message: result.message } }, 502);
+  });
+
+  // Lets a reconstructed PTX adapter recover the original physical seat before it forwards the
+  // call capability anywhere. This makes start idempotent across PTX worker restarts, not merely
+  // across retries handled by one capture process.
+  app.get("/v1/calls/by-meeting/:meetingId", (c) => {
+    purge();
+    const seat = [...seats.values()].find((value) => value.meetingId === c.req.param("meetingId"));
+    if (!seat) return c.json({ error: { code: "not_found", message: "No capture session for this meeting." } }, 404);
+    return c.json({ session_id: seat.id });
   });
 
   app.get("/v1/calls/:id", async (c) => {
@@ -225,7 +286,13 @@ export function createSignalWorkerApp(opts: SignalWorkerOptions) {
     return c.body(null, 204);
   });
 
-  return { app, seats, publishReadiness: readiness };
+  const sweep = setInterval(() => {
+    purge();
+    for (const seat of seats.values()) if (!seat.terminal) void observe(seat);
+  }, opts.sweepIntervalMs ?? 5_000);
+  sweep.unref();
+
+  return { app, seats, publishReadiness: readiness, stop: () => clearInterval(sweep) };
 }
 
 /**
@@ -239,7 +306,8 @@ export function createSignalBackend(capture: Config["signal"]["capture"]): Signa
 
 if (import.meta.main) {
   const { capture, maxConcurrentCalls } = config.signal;
-  if (!isLoopbackHost(capture.bind)) throw new Error(`SIGNAL_CAPTURE_BIND must be loopback-only (got ${capture.bind})`);
+  const controlToken = capture.controlTokenPath ? readFileSync(capture.controlTokenPath, "utf8").trim() : "";
+  if (!isLoopbackHost(capture.bind) && !controlToken) throw new Error(`SIGNAL_CAPTURE_BIND must be loopback-only unless SIGNAL_CAPTURE_TOKEN_PATH is configured (got ${capture.bind})`);
   const backend = createSignalBackend(capture);
   const { app, publishReadiness } = createSignalWorkerApp({
     backend,
@@ -249,6 +317,7 @@ if (import.meta.main) {
     sessionRetentionMs: capture.sessionRetentionSeconds * 1000,
     log: logger,
     healthPath: capture.healthPath || undefined,
+    controlToken: controlToken || undefined,
   });
   const server = Bun.serve({ hostname: capture.bind, port: capture.port, fetch: app.fetch });
   const readiness = await publishReadiness();
