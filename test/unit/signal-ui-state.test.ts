@@ -5,8 +5,11 @@ describe("Signal Desktop UI state", () => {
   test("only publishes in-progress after an observed call control", () => {
     expect(signalUiState("Connecting to call")).toBe("joining");
     expect(signalUiState("Waiting to be admitted by the host")).toBe("waiting_for_admission");
+    expect(signalUiState("Cancel request")).toBe("waiting_for_admission");
     expect(signalUiState("Mute Participants")).toBe("joining");
     expect(signalUiState("Mute  Leave call  Participants")).toBe("in_progress");
+    expect(signalUiState("Mute\nLeave\nParticipants")).toBe("in_progress");
+    expect(signalUiState("You can leave a message")).toBe("joining");
     expect(signalUiState("This call has ended")).toBe("ended");
   });
 

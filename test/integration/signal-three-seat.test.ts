@@ -1,10 +1,10 @@
 /**
- * Two randomized Signal seats through the public PTX API and the REAL loopback capture worker.
+ * Three randomized Signal seats through the public PTX API and real authenticated capture workers.
  *
  * Only the Signal Desktop leg is scripted: the worker, its HTTP boundary, its capacity accounting,
  * the PTX adapter, queue, database, and API are the production code paths. Seats join after random
- * jitter and are stopped in random order, and a third meeting proves a full rig queues rather than
- * fails. docs/signal-capture.md describes the live variant of the same shape (two linked Signal
+ * jitter and are stopped in random order, and a fourth meeting proves a full rig queues rather than
+ * fails. docs/signal-capture.md describes the live variant of the same shape (three linked Signal
  * Desktop profiles playing distinct WAVs into one call).
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -18,11 +18,13 @@ const PHRASES: Record<string, string> = {
   alice: "the quick brown fox jumps over the lazy dog",
   bob: "pack my box with five dozen liquor jugs",
   carol: "how vexingly quick daft zebras jump",
+  dave: "sphinx of black quartz judge my vow",
 };
 const CAPABILITIES: Record<string, string> = {
   alice: "bcdf-ghkm-npqr-stxz-cbdg-fhkn-mqps-rtzx",
   bob: "bcdf-ghkm-npqr-stxz-cbdg-fhkn-mqps-rtzs",
   carol: "bcdf-ghkm-npqr-stxz-cbdg-fhkn-mqps-rtzt",
+  dave: "bcdf-ghkm-npqr-stxz-cbdg-fhkn-mqps-rtzq",
 };
 const capabilityFor = (who: string) => CAPABILITIES[who];
 const urlFor = (who: string) => `https://signal.link/call/#key=${capabilityFor(who)}`;
@@ -68,23 +70,25 @@ class ScriptedSignalBackend implements SignalCallBackend {
 }
 
 let h: Harness;
-let server: ReturnType<typeof Bun.serve>;
-let backend: ScriptedSignalBackend;
+let servers: Array<ReturnType<typeof Bun.serve>>;
+let backends: ScriptedSignalBackend[];
 
 beforeAll(async () => {
-  backend = new ScriptedSignalBackend();
-  const { app } = createSignalWorkerApp({ backend, maxConcurrentCalls: 2, joinTimeoutMs: 30_000, maxCallMs: 60_000, sessionRetentionMs: 60_000, log: silentLogger });
-  server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: app.fetch });
+  backends = Array.from({ length: 3 }, () => new ScriptedSignalBackend());
+  servers = backends.map((backend) => {
+    const { app } = createSignalWorkerApp({ backend, maxConcurrentCalls: 1, joinTimeoutMs: 30_000, maxCallMs: 60_000, sessionRetentionMs: 60_000, log: silentLogger });
+    return Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: app.fetch });
+  });
   h = await startHarness({
     enabledPlatforms: ["signal"],
-    signal: new LoopbackSignalCaptureAdapter(`http://127.0.0.1:${server.port}`),
+    signal: new LoopbackSignalCaptureAdapter(servers.map((server) => `http://127.0.0.1:${server.port}`)),
     signalCapabilityKey: Buffer.alloc(32, 11).toString("base64"),
-    signalMaxConcurrentCalls: 2,
+    signalMaxConcurrentCalls: 3,
   });
 });
 afterAll(async () => {
   await h.stop();
-  server.stop(true);
+  for (const server of servers) server.stop(true);
 });
 
 const create = async (who: string) => {
@@ -92,26 +96,32 @@ const create = async (who: string) => {
   expect(r.status).toBe(201);
   return (await r.json()).id as string;
 };
-const statusOf = async (id: string) => (await (await h.api(`/v1/meetings/${id}`)).json()).status as string;
+const statusOf = async (id: string) => {
+  const response = await h.api(`/v1/meetings/${id}`);
+  const body = await response.json();
+  if (typeof body.status !== "string") throw new Error(`meeting status unavailable (HTTP ${response.status}, code ${body.error?.code ?? "unknown"})`);
+  return body.status;
+};
 const awaitStatus = (id: string, want: string[], timeoutMs = 15_000) =>
   h.waitFor(async () => (want.includes(await statusOf(id)) ? await statusOf(id) : null), { timeoutMs, label: `${id} → ${want.join("|")}` });
 
-describe("Signal two-seat capacity", () => {
-  test("runs two randomized seats concurrently, queues a third, and attributes every segment to Unknown", async () => {
-    const order = shuffled(["alice", "bob"]);
+describe("Signal three-seat capacity", () => {
+  test("runs three isolated seats concurrently, queues a fourth, and attributes every segment to Unknown", async () => {
+    const order = shuffled(["alice", "bob", "carol"]);
     const ids: Record<string, string> = {};
     for (const who of order) {
       ids[who] = await create(who);
       await Bun.sleep(jitter(60));
     }
     for (const who of order) await awaitStatus(ids[who], ["in_progress"]);
-    expect([...backend.opened].sort()).toEqual(["alice", "bob"]);
+    expect(backends.flatMap((backend) => backend.opened).sort()).toEqual(["alice", "bob", "carol"]);
+    expect(backends.every((backend) => backend.opened.length === 1)).toBe(true);
 
-    // Both seats are held, so a third meeting waits for capacity instead of failing.
-    const carol = await create("carol");
+    // All three seats are held, so a fourth meeting waits for capacity instead of failing.
+    const dave = await create("dave");
     await Bun.sleep(400);
-    expect(await statusOf(carol)).toBe("queued");
-    expect(backend.opened).not.toContain("carol");
+    expect(await statusOf(dave)).toBe("queued");
+    expect(backends.flatMap((backend) => backend.opened)).not.toContain("dave");
 
     // Release the seats in random order; each transcript keeps its own words.
     for (const who of shuffled(order)) {
@@ -132,10 +142,10 @@ describe("Signal two-seat capacity", () => {
       expect(JSON.stringify(body)).not.toContain(capabilityFor(who));
     }
 
-    // The freed seats let the queued meeting through without any client retry.
-    await awaitStatus(carol, ["in_progress", "processing", "completed"], 20_000);
-    expect(backend.opened).toContain("carol");
-    expect((await h.api(`/v1/meetings/${carol}/stop`, { method: "POST" })).status).toBe(200);
-    await awaitStatus(carol, ["completed"]);
+    // A freed physical seat lets the queued meeting through without any client retry.
+    await awaitStatus(dave, ["in_progress", "processing", "completed"], 20_000);
+    expect(backends.flatMap((backend) => backend.opened)).toContain("dave");
+    expect((await h.api(`/v1/meetings/${dave}/stop`, { method: "POST" })).status).toBe(200);
+    await awaitStatus(dave, ["completed"]);
   }, 60_000);
 });

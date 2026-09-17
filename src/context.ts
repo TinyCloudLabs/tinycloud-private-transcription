@@ -6,6 +6,7 @@ import { createTranscriptionProvider, type TranscriptionProvider } from "./provi
 import { Queue } from "./worker/queue.ts";
 import { logger, type Logger } from "./log.ts";
 import { LoopbackSignalCaptureAdapter, type SignalCaptureAdapter } from "./providers/signal/adapter.ts";
+import { readFileSync } from "node:fs";
 
 export interface AppContext {
   config: Config;
@@ -33,7 +34,10 @@ export function createContext(overrides: Partial<AppContext> & { config?: Config
     queue: overrides.queue ?? new Queue(redis),
     vexa: overrides.vexa ?? new VexaClient({ baseUrl: cfg.vexa.baseUrl, apiKey: cfg.vexa.apiKey }),
     transcription: overrides.transcription ?? createTranscriptionProvider(cfg),
-    signal: overrides.signal ?? new LoopbackSignalCaptureAdapter(cfg.signal.baseUrl),
+    signal: overrides.signal ?? new LoopbackSignalCaptureAdapter(
+      cfg.signal.captureUrls,
+      cfg.signal.controlTokenPaths.map((path) => readFileSync(path, "utf8").trim()),
+    ),
     log,
     webhookRetryDelaysMs: overrides.webhookRetryDelaysMs ?? DEFAULT_WEBHOOK_RETRY_DELAYS_MS,
   };

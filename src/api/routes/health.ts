@@ -11,7 +11,11 @@ export function healthRoutes(ctx: AppContext) {
       ctx.redis.ping().then(() => true, () => false),
       ctx.vexa.botStatus().then((s) => ({ ok: true, running_bots: s.running_bots.length }), () => ({ ok: false, running_bots: null })),
     ]);
-    const signal = signalReadiness(ctx.config.signal.capture.healthPath, ctx.config.enabledPlatforms.includes("signal"));
+    const signal = signalReadiness(
+      ctx.config.signal.healthPaths,
+      ctx.config.enabledPlatforms.includes("signal"),
+      ctx.config.signal.maxConcurrentCalls,
+    );
     const core = postgres && redis;
     const status = !core ? "error" : vexa.ok && signal.ready ? "ok" : "degraded";
     return c.json(
@@ -33,21 +37,49 @@ export function healthRoutes(ctx: AppContext) {
   return r;
 }
 
-function signalReadiness(path: string, enabled: boolean) {
+export function signalReadiness(paths: string[], enabled: boolean, provisionedSeats: number) {
   if (!enabled) return { enabled: false, ready: true, reason: null, capacity: null };
-  if (!path) return { enabled: true, ready: false, reason: "Signal capture readiness is not configured", capacity: null };
-  try {
-    const record = JSON.parse(readFileSync(path, "utf8")) as { ready?: unknown; reason?: unknown; observed_at?: unknown; capacity?: { running?: unknown; max?: unknown } };
-    const observedAt = typeof record.observed_at === "string" ? Date.parse(record.observed_at) : NaN;
-    const age = Date.now() - observedAt;
-    if (!Number.isFinite(observedAt) || age < 0 || age > 15_000) return { enabled: true, ready: false, reason: "Signal capture readiness is stale", capacity: null };
-    const running = record.capacity?.running;
-    const max = record.capacity?.max;
-    const capacity = Number.isSafeInteger(running) && (running as number) >= 0 && Number.isSafeInteger(max) && (max as number) > 0
-      ? { running, max }
-      : null;
-    return { enabled: true, ready: record.ready === true, reason: typeof record.reason === "string" ? record.reason : null, capacity };
-  } catch {
-    return { enabled: true, ready: false, reason: "Signal capture readiness is unavailable", capacity: null };
+  if (!paths.length) return { enabled: true, ready: false, reason: "Signal capture readiness is not configured", capacity: null };
+  if (paths.length !== provisionedSeats) return { enabled: true, ready: false, reason: "Signal capture readiness does not match provisioned capacity", capacity: null };
+
+  let running = 0;
+  let max = 0;
+  let validCapacity = true;
+  const failures: string[] = [];
+  for (const [index, path] of paths.entries()) {
+    try {
+      const record = JSON.parse(readFileSync(path, "utf8")) as { ready?: unknown; reason_code?: unknown; observed_at?: unknown; capacity?: { running?: unknown; max?: unknown } };
+      const observedAt = typeof record.observed_at === "string" ? Date.parse(record.observed_at) : NaN;
+      const age = Date.now() - observedAt;
+      if (!Number.isFinite(observedAt) || age < 0 || age > 15_000) {
+        failures.push(`seat ${index + 1} readiness is stale`);
+        validCapacity = false;
+        continue;
+      }
+      const seatRunning = record.capacity?.running;
+      const seatMax = record.capacity?.max;
+      if (!Number.isSafeInteger(seatRunning) || (seatRunning as number) < 0 || (seatRunning as number) > 1
+          || seatMax !== 1) {
+        failures.push(`seat ${index + 1} capacity is invalid`);
+        validCapacity = false;
+      } else {
+        running += seatRunning as number;
+        max += seatMax as number;
+      }
+      if (record.ready !== true) {
+        failures.push(`seat ${index + 1} is not ready`);
+        validCapacity = false;
+      }
+    } catch {
+      failures.push(`seat ${index + 1} readiness is unavailable`);
+      validCapacity = false;
+    }
   }
+
+  return {
+    enabled: true,
+    ready: failures.length === 0,
+    reason: failures.length ? failures.join("; ") : null,
+    capacity: validCapacity ? { running, max } : null,
+  };
 }

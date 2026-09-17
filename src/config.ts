@@ -30,9 +30,17 @@ export const config = {
     /** Provisioned bot ceiling (matches `max_concurrent_bots` in infra/dstack/app-compose.yaml). Reported in /health. */
     maxConcurrentBots: Number(env("VEXA_MAX_CONCURRENT_BOTS", "5")),
   },
-  /** Loopback-only worker which owns Signal Desktop CDP and PulseAudio capture. */
+  /** Isolated capture workers which own Signal Desktop CDP and PulseAudio capture. */
   signal: {
-    baseUrl: env("SIGNAL_CAPTURE_URL", "http://127.0.0.1:18076"),
+    /** One loopback capture endpoint per independently linked Signal Desktop seat. */
+    captureUrls: env("SIGNAL_CAPTURE_URLS", env("SIGNAL_CAPTURE_URL", "http://127.0.0.1:18076"))
+      .split(",").map((value) => value.trim()).filter(Boolean),
+    /** One private control-token file per capture endpoint; required for non-loopback endpoints. */
+    controlTokenPaths: env("SIGNAL_CAPTURE_TOKEN_PATHS", "")
+      .split(",").map((value) => value.trim()).filter(Boolean),
+    /** Non-secret readiness records written independently by each capture seat. */
+    healthPaths: env("SIGNAL_HEALTH_PATHS", env("SIGNAL_HEALTH_PATH", ""))
+      .split(",").map((value) => value.trim()).filter(Boolean),
     capabilityKey: env("SIGNAL_CAPABILITY_KEY", ""),
     maxConcurrentCalls: positiveIntegerEnv("SIGNAL_MAX_CONCURRENT_CALLS", "1"),
     /** Capture-worker process settings. Bind and CDP endpoint are rejected unless loopback. */
@@ -52,6 +60,8 @@ export const config = {
       sessionRetentionSeconds: positiveIntegerEnv("SIGNAL_SESSION_RETENTION_SECONDS", "900"),
       /** Shared, non-secret readiness record written by the isolated capture worker. */
       healthPath: env("SIGNAL_HEALTH_PATH", ""),
+      /** Private bearer token authenticating the PTX worker to this seat's control API. */
+      controlTokenPath: env("SIGNAL_CAPTURE_TOKEN_PATH", ""),
     },
   },
   /** Platforms accepted by POST /v1/meetings. Detection still recognizes all platforms; the rest are gated with 400 unsupported_platform. */

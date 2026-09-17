@@ -45,6 +45,10 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number } = 
 
 if (import.meta.main) {
   const ctx = createContext();
+  if (ctx.config.enabledPlatforms.includes("signal")
+      && ctx.config.signal.captureUrls.length !== ctx.config.signal.maxConcurrentCalls) {
+    throw new Error("SIGNAL_CAPTURE_URLS must match SIGNAL_MAX_CONCURRENT_CALLS");
+  }
   ctx.log.info("worker started", { provider: ctx.transcription.name });
   const w = startWorker(ctx);
   const shutdown = async () => {

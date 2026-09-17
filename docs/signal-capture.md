@@ -1,8 +1,8 @@
 # Signal capture boundary
 
-Signal is a PTX capture platform, not a Vexa platform. `src/providers/signal/adapter.ts` speaks
-only to a loopback capture worker. That worker owns the Signal Desktop CDP session and its
-PulseAudio monitor source; PTX only starts, polls, leaves, and removes bounded sessions.
+Signal is a PTX capture platform, not a Vexa platform. `src/providers/signal/adapter.ts` routes to
+three authenticated capture workers. Each worker owns one Signal Desktop CDP session and PulseAudio
+monitor source; PTX only starts, polls, leaves, and removes bounded sessions.
 
 The worker API is deliberately small:
 
@@ -10,14 +10,16 @@ The worker API is deliberately small:
 - `GET /v1/calls/{session_id}` returns a bounded lifecycle state plus timestamped word segments.
 - `POST /v1/calls/{session_id}/leave` and `DELETE /v1/calls/{session_id}` release the seat.
 
-The service rejects a non-loopback `SIGNAL_CAPTURE_URL`. A `signal.link/call/#key=…` fragment is an
+Non-loopback control endpoints require a per-seat bearer token, while each unauthenticated CDP stays
+inside its own container's loopback namespace. A `signal.link/call/#key=…` fragment is an
 admission capability: PTX stores only AES-GCM ciphertext in `meetings.signal_capability`, never
 returns it from meeting reads or webhooks, and clears it at terminal capture. The worker receives
 the reconstructed URL only at dispatch. Do not add it to capture diagnostics, logs, metadata, or
 status payloads.
 
 `bun run signal-capture-worker` provides the local production boundary. It refuses a non-loopback
-CDP URL/bind, opens the `sgnl://` deep link through a short-lived native Signal Desktop launcher,
+CDP URL and refuses a non-loopback control bind without a token. It opens the `sgnl://` deep link
+through a short-lived native Signal Desktop launcher,
 confirms the launcher has exited, then rediscovers Signal's call window and retries only the exact
 permission/lobby actions while the observed UI is joining or awaiting admission. It records only
 the configured PulseAudio monitor via `parec`, and invokes the local
@@ -40,10 +42,11 @@ On dstack, `signal-capability-provision` generates the AES-256 key once inside t
 `signal-runtime` volume (the legacy volume name is retained so upgrades preserve the existing key).
 API and queue worker mount it read-only at `/run/signal-capability`, wait for the private file, and
 load it only into their process environments. Signal Desktop/capture cannot mount or modify the key.
-The capture worker writes a fragment-free readiness record to a separate
-`signal-health` volume every five seconds; only the API mounts that record read-only. Public PTX
-`/health` degrades when the record is absent, stale, unlinked, missing its exact PulseAudio source,
-or unable to reach Whisper through the transcriber's bounded `--check`.
+Each capture worker writes a fixed-code, fragment-free readiness record to its own health volume
+every five seconds; only that seat and the read-only API mount the volume. Public PTX `/health`
+advertises capacity only when all three records are fresh and ready. It degrades when any seat is
+absent, stale, unlinked, missing its exact PulseAudio source, or unable to reach Whisper through the
+transcriber's bounded `--check`.
 
 TinyChat needs no Signal-specific route. Its browser client calls
 `https://api.tinycloud.chat/api/transcriber/meetings`, whose existing proxy forwards the unchanged
@@ -56,10 +59,12 @@ The first slice maps worker states to the normal PTX lifecycle and normalizes ev
 single `Unknown` speaker with `attribution: "unknown"`. Signal chat, reactions, camera, screen
 share, autonomous speech, and true speaker attribution remain out of scope.
 
-## Two-seat E2E plan
+## Three-seat E2E plan
 
-Run two randomized local Signal Desktop profiles against one call link: each seat joins after a
-random jitter, plays a distinct short WAV through its PulseAudio source, then leaves in randomized
-order. Assert that PTX reaches `completed`, returns both phrases as timestamped segments with
+Run three isolated Signal Desktop profiles against three call links: each seat joins after a random
+jitter, receives a distinct spoken phrase through its PulseAudio source, then leaves in randomized
+order while a fourth request remains queued. Assert that PTX reaches `completed`, returns each phrase as timestamped segments with
 unknown attribution, and never exposes the call fragment in API bodies, webhook bodies, worker
 logs, or persisted plaintext. Repeat with a join timeout and an explicit stop to prove seat release.
+Use three distinct Signal identities for the production proof; multiple linked desktops on one
+account are not accepted as evidence of reliable simultaneous-call capacity.
