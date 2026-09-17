@@ -225,13 +225,13 @@ of downloading and retranscribing recordings. The remaining Vexa components stay
 upstream v0.12 images.
 
 - **Branches**: `tinycloud` = current upstream (`59e2c413`) + the selected TinyCloud overlay, currently
-  at `a8e0d758`. `main` tracks upstream untouched. The separate local rig remains pinned by
+  at `89c8cf88`. `main` tracks upstream untouched. The separate local rig remains pinned by
   `infra/vexa/upstream` and `infra/vexa/UPSTREAM_PIN` until that fixture is refreshed.
 - **The patch**: `core/meetings/modules/record-chunker` — `createRecordingTap` builds a dynamic mix
   (`DynamicElementMixer`): the recorder starts immediately (even with zero audio elements) and a 2 s
   rescan (live-mixer parity) attaches new elements / detaches ended ones. Pinned by the module's
   `dynamic-tap.smoke.test.ts`.
-- **Images**: the bot uses `ghcr.io/tinycloudlabs/vexa/bot:tc-a8e0d75`; meeting-api and gateway remain on
+- **Images**: the bot uses `ghcr.io/tinycloudlabs/vexa/bot:tc-be83d6c`; meeting-api and gateway remain on
   `ghcr.io/tinycloudlabs/vexa/<component>:tc-e49f3f3`. All are pinned by digest in
   `infra/dstack/app-compose.yaml`. The bot workflow is `tinycloud-bot-image`; the older
   `ghcr.io/tinycloudlabs/vexa-bot` package was created while the fork was private, is stuck private,
@@ -279,7 +279,7 @@ runtime, has an immutable digest. Postgres, Redis, Valkey, unchanged Vexa v0.12 
 helper use the exact public linux/amd64 image configs already running on `ptx-dev`. The configured-but-unused
 Vexa agent images use the public `v012` manifest digests because no agent image is cached on the CVM. The
 accepted API and Signal defaults come from main commit `5402ee20`; the accepted Vexa bot default comes
-from `a8e0d758`, while meeting-api and gateway remain on `e49f3f3`. Image override variables take complete
+from `be83d6cb`, while meeting-api and gateway remain on `e49f3f3`. Image override variables take complete
 references and must remain digest-pinned.
 
 MinIO is pinned to the exact releases running on `ptx-dev`: server
