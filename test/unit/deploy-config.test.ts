@@ -201,7 +201,8 @@ describe("infra/dstack/app-compose.yaml", () => {
       expect(capture).toContain(`${seat.health}:/run/signal-health`);
       expect(capture).toContain(`${seat.control}:/run/signal-control:ro`);
       expect(capture).toContain(`${seat.network}: {}`);
-      expect(capture).toContain("vexa:\n        gw_priority: 1");
+      expect(capture).toContain("vexa: {}");
+      expect(capture).not.toContain("gw_priority");
       expect(capture).not.toContain("signal-capability:");
       expect(capture).not.toContain("signal-runtime:");
     }

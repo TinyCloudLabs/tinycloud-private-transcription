@@ -134,8 +134,7 @@ services:
         condition: service_completed_successfully
     networks:
       signal-seat-1: {}
-      vexa:
-        gw_priority: 1
+      vexa: {}
 
   signal-capture-2:
     image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:ca34ea34255ed8ad43f000e6d4d8114cd70ffc30@sha256:a8cbe368f72c818331d600ecdc23400c1964391f7682bfe0d9536d057dc73b74
@@ -169,8 +168,7 @@ services:
         condition: service_completed_successfully
     networks:
       signal-seat-2: {}
-      vexa:
-        gw_priority: 1
+      vexa: {}
 
   signal-capture-3:
     image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:ca34ea34255ed8ad43f000e6d4d8114cd70ffc30@sha256:a8cbe368f72c818331d600ecdc23400c1964391f7682bfe0d9536d057dc73b74
@@ -204,8 +202,7 @@ services:
         condition: service_completed_successfully
     networks:
       signal-seat-3: {}
-      vexa:
-        gw_priority: 1
+      vexa: {}
 
   signal-control-provision:
     # Per-seat control tokens authenticate PTX without exposing one Desktop's control plane to
