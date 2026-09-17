@@ -13,6 +13,8 @@ import { and, eq, isNull, sql } from "drizzle-orm";
 import { meetings } from "../db/schema.ts";
 import { normalizeSegments } from "../domain/transcript.ts";
 import { openSignalCapability } from "../providers/signal/capability.ts";
+import type { VexaTranscriptionResponse } from "../providers/vexa/types.ts";
+import { VexaNativeProvider } from "../providers/transcription/vexa-native.ts";
 
 const MAX_START_ATTEMPTS = 3;
 
@@ -32,6 +34,8 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
       // Vexa performs transcription, including when its deployment is configured to use Tinfoil.
       // TinyCloud persists the completed Vexa segments and never re-transcribes a recording.
       transcribe_enabled: true,
+      // Preserve the mixed recording for recovery; live Vexa STT remains the normal path.
+      recording_enabled: true,
       // Vexa otherwise applies its ten-minute deployment fallback. Pin every TinyCloud meeting to
       // our configurable audio-silence window. This can expire with humans still connected;
       // participant presence does not veto Vexa's silence verdict.
@@ -138,15 +142,23 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
   const reason = completionReasonOf(vexa);
   const mapped = mapVexaStatus(vexa.status);
 
-  if (vexa.status !== "completed" && mapped !== "failed") {
+  if (mapped === "failed") {
+    const f = mapVexaFailure(reason);
+    const { meeting: failed, changed } = await failMeeting(ctx, meeting, f.code, f.message);
+    if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+    return;
+  }
+
+  if (vexa.status !== "completed") {
     const { meeting: updated } = await transition(ctx, meeting, mapped);
     meeting = updated;
     await ctx.queue.push({ type: "meeting.poll", meetingId }, ctx.config.vexa.pollIntervalMs);
     return;
   }
 
-  // Vexa owns the STT windows and speaker attribution. Private transcription only normalizes and
-  // persists Vexa's completed segments; it must never re-fetch or re-transcribe recordings.
+  // Vexa owns the normal timeline and attribution. A retained recording is only read when that
+  // timeline is materially incomplete, so teardown losses can be recovered without replacing good
+  // Vexa speaker metadata.
   let segments: ReturnType<typeof adaptVexaSegments>;
   try {
     segments = adaptVexaSegments(vexa); // deduped by turn, epoch → meeting-relative seconds
@@ -160,16 +172,21 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
     return;
   }
   const hasLiveWords = segments.some((segment) => segment.text.trim().length > 0);
-  if (!hasLiveWords) {
+  if (!hasLiveWords && reason && reason !== "stopped") {
     const f = reason ? mapVexaFailure(reason) : { code: "capture_failed" as const, message: "No usable audio was captured for this meeting." };
     const { meeting: failed, changed } = await failMeeting(ctx, meeting, f.code, f.message);
+    if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+    return;
+  }
+  if (!hasLiveWords && ctx.transcription.name !== "tinfoil") {
+    const { meeting: failed, changed } = await failMeeting(ctx, meeting, "capture_failed", "No usable audio was captured for this meeting.");
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
     return;
   }
 
   ({ meeting } = await transition(ctx, meeting, "processing"));
   ctx.log.debug("vexa meeting completed; finalizing", { meetingId: meeting.id, vexaSegments: segments.length });
-  await finalize(ctx, meeting, segments);
+  await finalize(ctx, meeting, vexa, segments);
 }
 
 async function handleSignalStart(ctx: AppContext, meeting: MeetingRow, attempt: number) {
@@ -285,19 +302,24 @@ async function handleSignalPoll(ctx: AppContext, meeting: MeetingRow) {
 async function finalize(
   ctx: AppContext,
   meeting: MeetingRow,
+  vexa: VexaTranscriptionResponse,
   vexaSegments: ReturnType<typeof adaptVexaSegments>,
 ) {
   const input = {
     meetingId: meeting.id,
     language: meeting.language,
     vexaSegments,
+    fetchAudio: () => fetchVexaAudio(ctx, vexa),
   };
   try {
-    const transcript = await ctx.transcription.transcribe(input);
+    const nativeComplete = !isMateriallyIncomplete(vexa, vexaSegments);
+    const transcript = nativeComplete
+      ? await new VexaNativeProvider().transcribe(input)
+      : await ctx.transcription.transcribe(input);
     if (!transcript.text.trim()) {
       throw new ApiError("transcription_failed", "Transcription provider returned no words");
     }
-    await storeTranscript(ctx, meeting.id, transcript, "vexa");
+    await storeTranscript(ctx, meeting.id, transcript, nativeComplete ? "vexa" : ctx.transcription.name);
     const { meeting: done, changed } = await transition(ctx, meeting, "completed");
     if (changed) await enqueueMeetingWebhook(ctx, done, "meeting.completed");
   } catch (e) {
@@ -310,4 +332,27 @@ async function finalize(
     );
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
   }
+}
+
+/** Coverage below 80% of the captured meeting duration means Vexa lost material timeline content. */
+function isMateriallyIncomplete(vexa: VexaTranscriptionResponse, segments: ReturnType<typeof adaptVexaSegments>) {
+  if (segments.length === 0) return true;
+  const start = vexa.start_time ? Date.parse(vexa.start_time) : NaN;
+  const end = vexa.end_time ? Date.parse(vexa.end_time) : NaN;
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return false;
+  const duration = (end - start) / 1000;
+  const windows = segments.map((s) => [Math.max(0, s.start), Math.min(duration, s.end)] as const).filter(([from, to]) => to > from).sort((a, b) => a[0] - b[0]);
+  let covered = 0, cursor = 0;
+  for (const [from, to] of windows) { if (to > cursor) { covered += to - Math.max(cursor, from); cursor = to; } }
+  return covered / duration < 0.8;
+}
+
+async function fetchVexaAudio(ctx: AppContext, vexa: VexaTranscriptionResponse) {
+  const recordings = await ctx.vexa.listRecordings();
+  const recording = recordings.recordings.find((candidate) => candidate.meeting_id === vexa.id && candidate.media_files.some((file) => file.type === "audio"));
+  if (!recording) return null;
+  const master = await ctx.vexa.recordingMaster(recording.id);
+  if (!master.raw_url) return null;
+  const { bytes, contentType } = await ctx.vexa.fetchBytes(master.raw_url);
+  return bytes.length ? { bytes, filename: "meeting.webm", contentType } : null;
 }

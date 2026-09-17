@@ -105,7 +105,10 @@ production window. Green 2/2 on 2026-08-17 (~2 min each; evidence in `tmp/e2e-<r
 | `SIGNAL_PULSE_SOURCE` | `ptx_sink.monitor` in dstack | PulseAudio monitor captured by the isolated Signal seat |
 | `SIGNAL_TRANSCRIBER` | bundled dstack adapter | local WAV-to-JSON adapter using the in-CVM Whisper service |
 | `JOIN_TIMEOUT_SECONDS` | `600` | worker-side join deadline: a meeting still `joining`/`waiting_for_admission` this long after bot dispatch is failed (`meeting_join_failed`/`waiting_room_timeout`), its bot stopped, and `meeting.failed` emitted |
-| `TRANSCRIPTION_PROVIDER` | `vexa` | PTX compatibility label (`vexa` or `tinfoil`); both ingest Vexa-produced segments. This does not configure Vexa's STT endpoint; the shipped Compose still uses local Whisper and Tinfoil wiring is deferred. |
+| `TRANSCRIPTION_PROVIDER` | `vexa` | `vexa` preserves a complete native timeline; `tinfoil` enables retained-recording recovery when that timeline is materially incomplete. |
+| `TINFOIL_BASE_URL` | `https://inference.tinfoil.sh` | OpenAI-compatible confidential transcription endpoint used only for recovery. |
+| `TINFOIL_API_KEY` | – | bearer token for recovery transcription. |
+| `TINFOIL_MODEL` | `voxtral-small-24b` | recovery transcription model. |
 | `AUTO_MIGRATE` | `true` | API runs migrations at boot |
 | `LOG_LEVEL` | `info` | JSON logs |
 
@@ -191,16 +194,12 @@ Types in `src/providers/vexa/types.ts`; pure mapping in `src/providers/vexa/adap
 - `GET /bots/status` → `{running:[MeetingResponse…], running_bots:[…same], count}` (non-terminal rows only).
 ## Vexa-native transcript ingestion
 
-Every meeting requests `transcribe_enabled:true`. On completion, TinyCloud validates, de-duplicates,
-rebases, normalizes, and stores Vexa's completed
-speaker-attributed segments. It makes no recording, timeline, audio-decoding, partitioning, or downstream
-transcription request. `POST /v1/meetings/{id}/recover` remains tenant-scoped and retries the same retained
-Vexa transcript row; transcript storage is an upsert and only the winning terminal transition emits a webhook.
-
-`TRANSCRIPTION_PROVIDER=tinfoil` currently selects the same Vexa-native ingestion path for compatibility;
-it does not configure Vexa's STT service. The shipped Compose still points Vexa at local Whisper. A future
-deployment change may wire TinyCloud Tinfoil as Vexa's text-only STT backend; Vexa remains responsible for
-speaker attribution.
+Every meeting requests live Vexa transcription and a retained mixed recording. On completion, TinyCloud
+validates, de-duplicates, rebases, normalizes, and stores a complete Vexa speaker-attributed timeline.
+With `TRANSCRIPTION_PROVIDER=tinfoil`, a timeline covering less than 80% of the captured meeting is recovered
+from that recording through Tinfoil's text-STT endpoint. Tinfoil does no diarization: recovered segments use
+`Unknown` speakers. Complete Vexa timelines are never re-transcribed. `POST /v1/meetings/{id}/recover`
+remains tenant-scoped; transcript storage is an upsert and only the winning terminal transition emits a webhook.
 
 ### Known gaps / risks
 

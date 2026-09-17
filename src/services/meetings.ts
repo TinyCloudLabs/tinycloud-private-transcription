@@ -317,7 +317,10 @@ function transcriptStatus(status: MeetingStatus, hasTranscript: boolean) {
 }
 
 export function serializeTranscript(m: MeetingRow, t: TranscriptRow) {
-  const body = t.segmentsJson as { speakers: unknown[]; segments: unknown[]; text: string };
+  // jsonb drivers return objects for new rows. Earlier writers double-encoded this value, so
+  // accept a legacy JSON string on reads until those rows are naturally replaced.
+  const value = typeof t.segmentsJson === "string" ? JSON.parse(t.segmentsJson) : t.segmentsJson;
+  const body = value as { speakers: unknown[]; segments: unknown[]; text: string };
   return {
     meeting_id: m.id,
     status: "completed",

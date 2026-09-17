@@ -4,6 +4,8 @@ import type {
   VexaMeetingResponse,
   VexaTranscriptionResponse,
   VexaBotStatusResponse,
+  VexaRecordingsResponse,
+  VexaRecordingMasterResponse,
   VexaStopBotResponse,
   VexaDeleteMeetingResponse,
 } from "./types.ts";
@@ -110,6 +112,13 @@ export class VexaClient {
 
   botStatus() {
     return this.request<VexaBotStatusResponse>("GET", "/bots/status");
+  }
+
+  listRecordings() { return this.request<VexaRecordingsResponse>("GET", "/recordings"); }
+  recordingMaster(recordingId: number) { return this.request<VexaRecordingMasterResponse>("GET", `/recordings/${recordingId}/master?type=audio`); }
+  async fetchBytes(path: string): Promise<{ bytes: Uint8Array; contentType: string }> {
+    const res = await this.raw("GET", path, undefined, 60_000);
+    return { bytes: new Uint8Array(await res.arrayBuffer()), contentType: res.headers.get("content-type") ?? "application/octet-stream" };
   }
 
   async health(): Promise<boolean> {
