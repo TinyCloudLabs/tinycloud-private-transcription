@@ -84,13 +84,16 @@ export async function signalRuntimePrerequisites(options: SignalRuntimeOptions):
 }
 
 /** UI evidence only: action attempts never become an in-progress meeting by themselves. */
-export function signalUiState(text: string): SignalCaptureSnapshot["status"] | "ended" {
+export function signalUiState(
+  text: string,
+  hasScopedInCallControl = false,
+): SignalCaptureSnapshot["status"] | "ended" {
   const body = text.toLowerCase();
+  // A standalone `Leave` label is only meaningful when the exact visible control is inside
+  // Signal's calling container. Page text can contain ordinary chat/message prose with that word.
+  if (hasScopedInCallControl) return "in_progress";
   if (/call ended|call has ended|ended this call/.test(body)) return "ended";
   if (/waiting for (someone|the host|admission)|waiting to be admitted|cancel request/.test(body)) return "waiting_for_admission";
-  // Signal 7.x uses both `Leave call` and a standalone `Leave` call-control label. Require the
-  // standalone form to occupy its own UI-evidence line so prose cannot imply an active call.
-  if (/\bleave call\b/.test(body) || /(?:^|\n)\s*leave\s*(?:\n|$)/.test(body)) return "in_progress";
   return "joining";
 }
 
@@ -416,7 +419,10 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
           while (!departed && Date.now() < deadline) {
             await pause(100);
             const ui = leftTarget ? await cdp.evaluate<string>(leftTarget, signalUiText).catch(() => "") : "";
-            const uiState = signalUiState(ui);
+            const inCall = leftTarget
+              ? Boolean(await findSignalAction(cdp, leftTarget, ["leave call", "leave"]))
+              : false;
+            const uiState = signalUiState(ui, inCall);
             departed = (uiState === "ended" || signalDesktopLinkState(ui) === "linked") && uiState !== "in_progress" && uiState !== "waiting_for_admission";
           }
           if (!departed) throw new Error("Signal Desktop departure cannot be verified");
@@ -443,7 +449,8 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
           let observed: SignalCaptureSnapshot["status"] | "ended" = "joining";
           for (const candidate of candidates) {
             const ui = await cdp.evaluate<string>(candidate, signalUiText).catch(() => "");
-            const candidateState = signalUiState(ui);
+            const inCall = Boolean(await findSignalAction(cdp, candidate, ["leave call", "leave"]));
+            const candidateState = signalUiState(ui, inCall);
             // A real call control or admission/ended state is stronger evidence than a blank
             // deep-link target. Keep that target for the next poll.
             if (candidateState !== "joining" || /\b(ask to join|join call|start call|allow access|turn (?:off|on) camera|join)\b/i.test(ui)) {

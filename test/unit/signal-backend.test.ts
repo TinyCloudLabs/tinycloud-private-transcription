@@ -107,6 +107,7 @@ describe("Signal capture boundary", () => {
       expect(locate({ zeroArea: true })).toBeNull();
       expect(locate({ occluded: true })).toBeNull();
       expect(locate({ label: "Join", allowed: ["join"], inCallingContainer: false })).toBeNull();
+      expect(locate({ label: "Leave", allowed: ["leave"], inCallingContainer: false })).toBeNull();
     } finally {
       (globalThis as any).document = original.document;
       (globalThis as any).getComputedStyle = original.getComputedStyle;
