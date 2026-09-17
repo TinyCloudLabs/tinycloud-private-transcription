@@ -122,6 +122,44 @@ const signalUiText = "[document.body?.innerText || '', ...[...document.querySele
 
 const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+interface SignalLauncherProcess {
+  exited: Promise<number>;
+  kill(): void;
+}
+
+/**
+ * Hands a call link to the already-running Signal Desktop instance. Chromium CDP rejects the
+ * `sgnl://` custom scheme with `Not supported`; Signal's own short-lived launcher is the supported
+ * handoff path. The bearer capability exists only in this isolated process argv and is never
+ * logged or retained by the returned call session.
+ */
+export async function launchSignalDesktopCall(options: {
+  callUrl: string;
+  profileDir: string;
+  desktopPath?: string;
+  timeoutMs?: number;
+  spawn?: (argv: string[]) => SignalLauncherProcess;
+}): Promise<void> {
+  const url = new URL(options.callUrl);
+  if (url.protocol !== "https:" || url.hostname.toLowerCase() !== "signal.link" || url.pathname !== "/call/" || url.hash.length <= 1) {
+    throw new Error("Signal Desktop launcher requires a Signal call link");
+  }
+  const argv = [
+    options.desktopPath ?? "signal-desktop",
+    `--user-data-dir=${options.profileDir}`,
+    "--no-sandbox",
+    options.callUrl.replace(/^https:/, "sgnl:"),
+  ];
+  const child = (options.spawn ?? ((args) => Bun.spawn(args, { stdout: "ignore", stderr: "ignore" })))(argv);
+  const exited = await Promise.race([
+    child.exited.then(() => true),
+    pause(options.timeoutMs ?? 10_000).then(() => false),
+  ]);
+  // A forwarded launcher normally exits. If it lingers, reap only that process as Port Call's
+  // proven lane does; the original Desktop instance and its CDP endpoint remain running.
+  if (!exited) child.kill();
+}
+
 /**
  * The production seat. Signal Desktop is driven only through its loopback CDP endpoint and
  * `parec` reads only the explicitly configured PulseAudio monitor source. The optional
@@ -134,6 +172,7 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
   private readonly cdpUrl: URL;
   constructor(private readonly options: {
     cdpUrl: string;
+    profileDir: string;
     pulseSource: string;
     parecPath?: string;
     pactlPath?: string;
@@ -178,9 +217,8 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
     const dir = await mkdtemp(join(tmpdir(), "ptx-signal-"));
     const wav = join(dir, "capture.wav");
     let cdp: CdpConnection | null = null;
-    // `launchTarget` is ours and is safe to close. `callTarget` may be Signal's pre-existing
-    // call window, which belongs to Desktop and must remain open after this session ends.
-    let launchTarget: CdpTarget | null = null;
+    // The call target belongs to the already-running Desktop and must remain open after this
+    // session ends. The short-lived native launcher is reaped separately.
     let callTarget: CdpTarget | null = null;
     let recorder: ReturnType<typeof Bun.spawn> | null = null;
     let state: SignalCaptureSnapshot["status"] = "joining";
@@ -209,7 +247,6 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
         } catch {
           state = "failed";
         } finally {
-          if (launchTarget && cdp) await cdp.closeTarget(launchTarget);
           cdp?.close();
           await rm(dir, { recursive: true, force: true });
         }
@@ -221,13 +258,10 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
       // Start every fallible local resource before opening the bearer deep link. Once Signal has
       // accepted that link, open() cannot abandon a possible remote call without a tracked seat.
       recorder = Bun.spawn([this.options.parecPath ?? "parec", "--device", this.options.pulseSource, "--file-format=wav", wav], { stdout: "ignore", stderr: "ignore" });
-      // This is the only point at which the fragment exists in this worker. Never retain it on a session.
-      // Signal Desktop owns this custom scheme. Opening it in the Desktop CDP target makes the
-      // external call link land in the linked portable profile, rather than a browser tab.
-      launchTarget = await cdp.openTarget(request.callUrl.replace(/^https:/, "sgnl:"));
-      // Signal can hand a sgnl:// link from the ephemeral target to its existing call window.
-      // Wait for that handoff, then rediscover page targets on every poll instead of assuming the
-      // newly-created target owns the call UI.
+      // Chromium CDP cannot open custom schemes. Signal Desktop's own launcher forwards the
+      // `sgnl://` URL to the existing linked instance, which exposes the lobby through CDP.
+      await launchSignalDesktopCall({ callUrl: request.callUrl, profileDir: this.options.profileDir });
+      // Wait for the native handoff, then rediscover page targets on every poll.
       await pause(this.options.joinGraceMs ?? 500);
     } catch {
       await finalize();

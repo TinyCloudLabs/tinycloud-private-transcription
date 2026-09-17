@@ -40,6 +40,7 @@ export const config = {
       bind: env("SIGNAL_CAPTURE_BIND", "127.0.0.1"),
       port: positiveIntegerEnv("SIGNAL_CAPTURE_PORT", "18076"),
       cdpUrl: env("SIGNAL_CDP_URL", "http://127.0.0.1:9222"),
+      profileDir: env("SIGNAL_PROFILE_DIR", "/var/lib/signal"),
       pulseSource: env("SIGNAL_PULSE_SOURCE", ""),
       /** argv prefix; the worker appends a temporary wav path and reads JSON RawSegment[] on stdout. */
       transcriber: env("SIGNAL_TRANSCRIBER", "").split(" ").filter(Boolean),

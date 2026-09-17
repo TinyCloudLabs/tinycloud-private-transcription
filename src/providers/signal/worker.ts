@@ -242,7 +242,7 @@ const isSignalCallUrl = (value: string): boolean => {
  */
 export function createSignalBackend(capture: Config["signal"]["capture"]): SignalCallBackend {
   if (capture.replayScript) return ReplaySignalBackend.fromFile(capture.replayScript);
-  return new DesktopPulseSignalBackend({ cdpUrl: capture.cdpUrl, pulseSource: capture.pulseSource, transcriber: capture.transcriber });
+  return new DesktopPulseSignalBackend({ cdpUrl: capture.cdpUrl, profileDir: capture.profileDir, pulseSource: capture.pulseSource, transcriber: capture.transcriber });
 }
 
 if (import.meta.main) {

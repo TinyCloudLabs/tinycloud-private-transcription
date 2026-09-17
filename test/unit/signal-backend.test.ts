@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseReplayScript, signalRuntimePrerequisites } from "../../src/providers/signal/backend.ts";
+import { launchSignalDesktopCall, parseReplayScript, signalRuntimePrerequisites } from "../../src/providers/signal/backend.ts";
 import { requireLoopbackUrl } from "../../src/providers/signal/cdp.ts";
 
 function executable(dir: string, name: string, body: string): string {
@@ -37,5 +37,36 @@ describe("Signal capture boundary", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  test("uses Signal Desktop's native launcher for call links and reaps a lingering forwarder", async () => {
+    let argv: string[] = [];
+    let killed = false;
+    await launchSignalDesktopCall({
+      callUrl: "https://signal.link/call/#key=unit-test-capability",
+      profileDir: "/var/lib/signal-test",
+      timeoutMs: 1,
+      spawn: (args) => {
+        argv = args;
+        return { exited: new Promise<number>(() => {}), kill: () => { killed = true; } };
+      },
+    });
+    expect(argv).toEqual([
+      "signal-desktop",
+      "--user-data-dir=/var/lib/signal-test",
+      "--no-sandbox",
+      "sgnl://signal.link/call/#key=unit-test-capability",
+    ]);
+    expect(killed).toBe(true);
+  });
+
+  test("rejects non-Signal links before spawning the native launcher", async () => {
+    let spawned = false;
+    await expect(launchSignalDesktopCall({
+      callUrl: "https://example.com/call/#not-signal",
+      profileDir: "/var/lib/signal-test",
+      spawn: () => { spawned = true; throw new Error("must not spawn"); },
+    })).rejects.toThrow("requires a Signal call link");
+    expect(spawned).toBe(false);
   });
 });
