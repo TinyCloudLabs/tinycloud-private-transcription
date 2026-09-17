@@ -19,8 +19,13 @@ const PHRASES: Record<string, string> = {
   bob: "pack my box with five dozen liquor jugs",
   carol: "how vexingly quick daft zebras jump",
 };
-const capabilityFor = (who: string) => `two-seat-${who}-capability-that-must-never-escape`;
-const urlFor = (who: string) => `https://signal.link/call/#${capabilityFor(who)}`;
+const CAPABILITIES: Record<string, string> = {
+  alice: "bcdf-ghkm-npqr-stxz-cbdg-fhkn-mqps-rtzx",
+  bob: "bcdf-ghkm-npqr-stxz-cbdg-fhkn-mqps-rtzs",
+  carol: "bcdf-ghkm-npqr-stxz-cbdg-fhkn-mqps-rtzt",
+};
+const capabilityFor = (who: string) => CAPABILITIES[who];
+const urlFor = (who: string) => `https://signal.link/call/#key=${capabilityFor(who)}`;
 const speakerOf = (callUrl: string) => Object.keys(PHRASES).find((who) => callUrl.endsWith(capabilityFor(who)))!;
 
 // Pseudorandom timing/order keeps the race coverage without making CI flaky or irreproducible.

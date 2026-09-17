@@ -4,8 +4,8 @@ import { ReplaySignalBackend, type SignalCallBackend, type SignalCallSession } f
 import { createSignalWorkerApp } from "../../src/providers/signal/worker.ts";
 import { silentLogger } from "../../src/log.ts";
 
-const CAPABILITY = "worker-boundary-capability-that-must-never-escape";
-const callUrl = `https://signal.link/call/#${CAPABILITY}`;
+const CAPABILITY = "bcdf-ghkm-npqr-stxz-cbdg-fhkn-mqps-rtzx";
+const callUrl = `https://signal.link/call/#key=${CAPABILITY}`;
 
 /** Boots the real worker on a real loopback socket; the adapter under test speaks real HTTP to it. */
 function startWorker(opts: { maxConcurrentCalls?: number; joinTimeoutMs?: number; activeAfterMs?: number; endsAfterMs?: number } = {}) {

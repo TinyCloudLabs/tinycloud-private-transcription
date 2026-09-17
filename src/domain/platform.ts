@@ -14,6 +14,28 @@ const singleSegment = (u: URL): string | null => {
   return parts.length === 1 && !/\s/.test(parts[0]) ? parts[0] : null;
 };
 
+const SIGNAL_KEY_ALPHABET = "bcdfghkmnpqrstxz";
+const signalV0Key = new RegExp(`^[${SIGNAL_KEY_ALPHABET}]{4}(?:-[${SIGNAL_KEY_ALPHABET}]{4}){7}$`);
+const signalV1Key = new RegExp(`^[${SIGNAL_KEY_ALPHABET}]{8}(?:-[${SIGNAL_KEY_ALPHABET}]{8}){3}-[${SIGNAL_KEY_ALPHABET}]{2}-[${SIGNAL_KEY_ALPHABET}]{8}$`);
+
+/** Accept only Signal's current call-link shape without ever echoing the bearer capability. */
+export function isSignalCallUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    const key = url.hash.startsWith("#key=") ? url.hash.slice(5) : "";
+    return url.protocol === "https:"
+      && url.hostname.toLowerCase() === "signal.link"
+      && url.username === ""
+      && url.password === ""
+      && url.port === ""
+      && url.pathname === "/call/"
+      && url.search === ""
+      && (signalV0Key.test(key) || signalV1Key.test(key));
+  } catch {
+    return false;
+  }
+}
+
 export function detectPlatform(meetingUrl: string, override?: string): DetectedPlatform {
   let u: URL;
   try {
@@ -27,10 +49,19 @@ export function detectPlatform(meetingUrl: string, override?: string): DetectedP
   const host = u.hostname.toLowerCase();
   const labels = host.split(".");
 
+  // A caller that explicitly requests Signal must still supply a canonical Signal call link.
+  // Check this before every other platform heuristic so an override cannot silently become Jitsi.
+  if (override === "signal" && !isSignalCallUrl(meetingUrl)) {
+    throw new ApiError("invalid_meeting_url", "Signal call link must use https://signal.link/call/ with a valid key fragment");
+  }
+
   // Signal group-call links put the admission capability in the fragment.  A fragment is never
   // sent in a normal HTTP request, but clients POST the complete URL to us; keep it out of the
   // ordinary meeting URL and hand it only to the Signal capture worker.
-  if (host === "signal.link" && u.pathname === "/call/" && u.hash.length > 1) {
+  if (host === "signal.link" && u.pathname === "/call/") {
+    if (!isSignalCallUrl(meetingUrl)) {
+      throw new ApiError("invalid_meeting_url", "Signal call link must contain a valid key fragment");
+    }
     return { platform: "signal", nativeMeetingId: null };
   }
 
