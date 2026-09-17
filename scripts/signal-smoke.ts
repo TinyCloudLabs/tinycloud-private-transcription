@@ -39,7 +39,7 @@ const TIMEOUT_S = Number(process.env.SMOKE_TIMEOUT_S ?? 120);
 const CAPTURE_SECONDS = Number(process.env.SMOKE_CAPTURE_SECONDS ?? 30);
 const suppliedCallUrl = process.env.SIGNAL_CALL_URL;
 const expectedPhrase = process.env.SIGNAL_EXPECTED_PHRASE?.trim();
-const replayCallUrl = "https://signal.link/call/#key=replay-only";
+const replayCallUrl = "https://signal.link/call/#key=bcdf-ghkm-npqr-stxz-cbdg-fhkn-mqps-rtzx";
 let secretFragments: string[] = [];
 const redact = (value: unknown): unknown => {
   if (typeof value === "string") return secretFragments.reduce((safe, secret) => safe.replaceAll(secret, "[REDACTED]"), value);

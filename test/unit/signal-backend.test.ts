@@ -13,6 +13,7 @@ function executable(dir: string, name: string, body: string): string {
 }
 
 describe("Signal capture boundary", () => {
+  const callUrl = "https://signal.link/call/#key=bcdf-ghkm-npqr-stxz-cbdg-fhkn-mqps-rtzx";
   test("accepts only loopback CDP endpoints", () => {
     expect(requireLoopbackUrl("http://127.0.0.1:9222", "CDP").hostname).toBe("127.0.0.1");
     expect(() => requireLoopbackUrl("http://10.0.0.4:9222", "CDP")).toThrow("loopback-only");
@@ -45,7 +46,7 @@ describe("Signal capture boundary", () => {
     let exitedBeforeReturn = false;
     const exited = new Promise<number>((resolve) => { resolveExit = resolve; });
     await launchSignalDesktopCall({
-      callUrl: "https://signal.link/call/#key=unit-test-capability",
+      callUrl,
       profileDir: "/var/lib/signal-test",
       timeoutMs: 1,
       reapGraceMs: 50,
@@ -64,7 +65,7 @@ describe("Signal capture boundary", () => {
       "signal-desktop",
       "--user-data-dir=/var/lib/signal-test",
       "--no-sandbox",
-      "sgnl://signal.link/call/#key=unit-test-capability",
+      "sgnl://signal.link/call/#key=bcdf-ghkm-npqr-stxz-cbdg-fhkn-mqps-rtzx",
     ]);
     expect(exitedBeforeReturn).toBe(true);
   });
@@ -74,7 +75,7 @@ describe("Signal capture boundary", () => {
     const exited = new Promise<number>((resolve) => { resolveExit = resolve; });
     const signals: Array<number | undefined> = [];
     await launchSignalDesktopCall({
-      callUrl: "https://signal.link/call/#key=unit-test-capability",
+      callUrl,
       profileDir: "/var/lib/signal-test",
       timeoutMs: 1,
       reapGraceMs: 1,
@@ -101,7 +102,7 @@ describe("Signal capture boundary", () => {
 
   test("rejects malformed Signal fragments without disclosing the capability", async () => {
     let spawned = false;
-    const capability = "private-capability";
+    const capability = "bcdf-ghkm-npqr-stxz-cbdg-fhkn-mqps-rtzx";
     const message = await launchSignalDesktopCall({
       callUrl: `https://signal.link/call/#wrong=${capability}`,
       profileDir: "/var/lib/signal-test",
@@ -113,7 +114,7 @@ describe("Signal capture boundary", () => {
   });
 
   test("does not disclose the capability when the native launcher cannot start", async () => {
-    const capability = "private-capability";
+    const capability = "bcdf-ghkm-npqr-stxz-cbdg-fhkn-mqps-rtzx";
     const message = await launchSignalDesktopCall({
       callUrl: `https://signal.link/call/#key=${capability}`,
       profileDir: "/var/lib/signal-test",

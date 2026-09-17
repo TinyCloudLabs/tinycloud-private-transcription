@@ -2,7 +2,8 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { SignalCaptureAdapter, SignalCaptureSnapshot } from "../../src/providers/signal/adapter.ts";
 import { startHarness, type Harness } from "./harness.ts";
 
-const capability = "signal-call-capability-that-must-never-escape";
+const capability = "bcdf-ghkm-npqr-stxz-cbdg-fhkn-mqps-rtzx";
+const stopCapability = "bcdf-ghkm-npqr-stxz-cbdg-fhkn-mqps-rtzs";
 
 class FakeSignalCapture implements SignalCaptureAdapter {
   receivedUrl = "";
@@ -60,7 +61,7 @@ describe("Signal call transcription", () => {
 
   test("stop is idempotent and finalizes an in-progress Signal capture", async () => {
     signal.snapshot = { status: "joining" };
-    const created = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: `https://signal.link/call/#key=${capability}-stop` } });
+    const created = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: `https://signal.link/call/#key=${stopCapability}` } });
     const meeting = await created.json();
     await h.waitFor(async () => {
       const body = await (await h.api(`/v1/meetings/${meeting.id}`)).json();
