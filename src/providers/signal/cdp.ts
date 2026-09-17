@@ -33,6 +33,11 @@ export interface CdpTargetInfo {
   url: string;
 }
 
+export interface CdpPoint {
+  x: number;
+  y: number;
+}
+
 /** One WebSocket to a browser-level CDP endpoint, with flat sessions for attached targets. */
 export class CdpConnection {
   private nextId = 1;
@@ -131,6 +136,41 @@ export class CdpConnection {
     );
     if (result.exceptionDetails) throw new Error(`CDP evaluate failed: ${result.exceptionDetails.text ?? "exception"}`);
     return result.result?.value as T;
+  }
+
+  /**
+   * Sends a trusted left-click to a target. Electron's protected media permission surfaces ignore
+   * synthetic HTMLElement.click() events, so Signal actions that gate a call must use CDP input.
+   */
+  async trustedClick(target: CdpTarget, point: CdpPoint): Promise<void> {
+    if (!Number.isFinite(point.x) || !Number.isFinite(point.y) || point.x < 0 || point.y < 0) {
+      throw new Error("CDP click point is invalid");
+    }
+    await this.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y }, target.sessionId);
+    let pressError: unknown;
+    try {
+      await this.send(
+        "Input.dispatchMouseEvent",
+        { type: "mousePressed", x: point.x, y: point.y, button: "left", clickCount: 1 },
+        target.sessionId,
+      );
+    } catch (error) {
+      pressError = error;
+    }
+    // A timed-out press may still have reached Electron. Always release after attempting it so
+    // the linked Desktop cannot be left with a logically held mouse button.
+    let releaseError: unknown;
+    try {
+      await this.send(
+        "Input.dispatchMouseEvent",
+        { type: "mouseReleased", x: point.x, y: point.y, button: "left", clickCount: 1 },
+        target.sessionId,
+      );
+    } catch (error) {
+      releaseError = error;
+    }
+    if (pressError) throw pressError;
+    if (releaseError) throw releaseError;
   }
 
   async closeTarget(target: CdpTarget): Promise<void> {

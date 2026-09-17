@@ -108,13 +108,87 @@ export function signalDesktopLinkState(text: string): "linked" | "unlinked" | "u
   return "unknown";
 }
 
-const clickSignalAction = `(labels => {
+export type SignalUiAction = "allow access" | "join" | "join call" | "start call" | "turn off camera" | "turn on camera" | "leave call";
+
+interface SignalUiActionPoint {
+  label: SignalUiAction;
+  x: number;
+  y: number;
+}
+
+// Return coordinates only for an exact, enabled, visible, hit-tested Signal control. In
+// particular, this excludes the hidden call-link-details "Join" button behind the real lobby.
+const locateSignalAction = `(labels => {
   const controls = [...document.querySelectorAll('button,[role="button"]')];
   const labelOf = node => (node.getAttribute('aria-label') || node.textContent || '').trim().toLowerCase();
-  const control = controls.find(node => labels.includes(labelOf(node)));
-  if (control) { control.click(); return labelOf(control); }
+  for (const control of controls) {
+    const label = labelOf(control);
+    if (!labels.includes(label) || control.disabled || control.getAttribute('aria-disabled') === 'true') continue;
+    if (['join', 'join call', 'start call', 'turn off camera', 'turn on camera'].includes(label)
+        && !control.closest('.module-calling__modal-container, .module-calling__container')) continue;
+    const style = getComputedStyle(control);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) continue;
+    const rect = control.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) continue;
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) continue;
+    const hit = document.elementFromPoint(x, y);
+    if (!hit || (hit !== control && !control.contains(hit))) continue;
+    return { label, x, y };
+  }
   return null;
 })(`;
+
+/** Exported for deterministic DOM-shape tests; labels remain a compile-time allowlist. */
+export function signalActionLocatorExpression(labels: readonly SignalUiAction[]): string {
+  return `${locateSignalAction}${JSON.stringify(labels)})`;
+}
+
+async function findSignalAction(
+  cdp: CdpConnection,
+  target: CdpTarget,
+  labels: readonly SignalUiAction[],
+): Promise<SignalUiActionPoint | null> {
+  const action = await cdp.evaluate<SignalUiActionPoint | null>(
+    target,
+    signalActionLocatorExpression(labels),
+  ).catch(() => null);
+  if (!action || !labels.includes(action.label) || !Number.isFinite(action.x) || !Number.isFinite(action.y)
+      || action.x < 0 || action.y < 0) return null;
+  return action;
+}
+
+/** Drives at most one pre-join action. Join is fail-closed until camera-off is positively shown. */
+export async function driveSignalJoiningAction(
+  cdp: CdpConnection,
+  target: CdpTarget,
+  onJoinAttempt: () => void,
+): Promise<SignalUiAction | null> {
+  const permission = await findSignalAction(cdp, target, ["allow access"]);
+  if (permission) {
+    await cdp.trustedClick(target, permission);
+    return permission.label;
+  }
+
+  const cameraOn = await findSignalAction(cdp, target, ["turn off camera"]);
+  if (cameraOn) {
+    await cdp.trustedClick(target, cameraOn);
+    return cameraOn.label;
+  }
+
+  // Signal exposes "Turn on camera" only after video is disabled. Absence is unknown state, not
+  // permission to join: renderer transitions and selector drift must fail closed.
+  const cameraOff = await findSignalAction(cdp, target, ["turn on camera"]);
+  if (!cameraOff) return null;
+
+  const join = await findSignalAction(cdp, target, ["join call", "join", "start call"]);
+  if (!join) return null;
+  // The click can reach Signal even if CDP loses its reply, so quarantine semantics begin first.
+  onJoinAttempt();
+  await cdp.trustedClick(target, join);
+  return join.label;
+}
 
 // Signal often renders call controls as icons.  Include their accessible names in the bounded UI
 // evidence we inspect, otherwise a healthy icon-only "Leave call" control looks like a blank page.
@@ -308,8 +382,13 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
         let left = false;
         let leftTarget: CdpTarget | null = null;
         for (const candidate of candidates) {
-          const clicked = await cdp.evaluate<string | null>(candidate, `${clickSignalAction}["leave call"])`).catch(() => null);
-          if (clicked === "leave call") { left = true; leftTarget = candidate; callTarget = candidate; break; }
+          const action = await findSignalAction(cdp, candidate, ["leave call"]);
+          if (action && await cdp.trustedClick(candidate, action).then(() => true, () => false)) {
+            left = true;
+            leftTarget = candidate;
+            callTarget = candidate;
+            break;
+          }
         }
         // Once a join was attempted, a missing control is not proof of departure.
         // Leave the session quarantined so the worker cannot admit a second call on this Desktop.
@@ -349,26 +428,23 @@ export class DesktopPulseSignalBackend implements SignalCallBackend {
             const candidateState = signalUiState(ui);
             // A real call control or admission/ended state is stronger evidence than a blank
             // deep-link target. Keep that target for the next poll.
-            if (candidateState !== "joining" || /\b(join call|allow|join)\b/i.test(ui)) {
+            if (candidateState !== "joining" || /\b(join call|start call|allow access|turn (?:off|on) camera|join)\b/i.test(ui)) {
               callTarget = candidate;
               observed = candidateState;
               break;
             }
           }
-          // Only exact known Signal permission/lobby actions are eligible. Retrying this on
-          // observed joining/waiting states handles surfaces that appear after navigation.
-          if (callTarget && (observed === "joining" || observed === "waiting_for_admission")) {
-            // A CDP request can click and then lose its reply. From this point the physical call
-            // may exist, so cleanup must require positive departure evidence.
-            callMayBeActive = true;
-            await cdp.evaluate<string | null>(callTarget, `${clickSignalAction}["allow", "join call", "join"])`).catch(() => null);
+          // Handle one exact, visible Signal action per poll. Permission and camera-off actions do
+          // not imply a remote call exists; Join does, even if the CDP reply is lost.
+          if (callTarget && observed === "joining") {
+            await driveSignalJoiningAction(cdp, callTarget, () => { callMayBeActive = true; }).catch(() => {});
           }
           if (observed === "ended") {
             await finalize();
             return { status: state === "failed" ? "failed" : "completed", ...(segments ? { segments } : {}) };
           }
           state = observed;
-          if (observed === "in_progress") callMayBeActive = true;
+          if (observed === "waiting_for_admission" || observed === "in_progress") callMayBeActive = true;
         }
         return state === "completed" ? { status: state, segments } : state === "failed" ? { status: state, errorCode: "capture_failed" } : { status: state };
       },

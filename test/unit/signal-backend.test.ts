@@ -2,8 +2,15 @@ import { describe, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { launchSignalDesktopCall, parseReplayScript, signalRuntimePrerequisites } from "../../src/providers/signal/backend.ts";
-import { requireLoopbackUrl } from "../../src/providers/signal/cdp.ts";
+import {
+  driveSignalJoiningAction,
+  launchSignalDesktopCall,
+  parseReplayScript,
+  signalActionLocatorExpression,
+  signalRuntimePrerequisites,
+  type SignalUiAction,
+} from "../../src/providers/signal/backend.ts";
+import { CdpConnection, requireLoopbackUrl } from "../../src/providers/signal/cdp.ts";
 
 function executable(dir: string, name: string, body: string): string {
   const path = join(dir, name);
@@ -17,6 +24,125 @@ describe("Signal capture boundary", () => {
   test("accepts only loopback CDP endpoints", () => {
     expect(requireLoopbackUrl("http://127.0.0.1:9222", "CDP").hostname).toBe("127.0.0.1");
     expect(() => requireLoopbackUrl("http://10.0.0.4:9222", "CDP")).toThrow("loopback-only");
+  });
+
+  test("dispatches a trusted click to the exact target session", async () => {
+    const calls: Array<{ method: string; params: Record<string, unknown>; sessionId?: string }> = [];
+    const cdp = Object.create(CdpConnection.prototype) as CdpConnection;
+    (cdp as any).send = async (method: string, params: Record<string, unknown> = {}, sessionId?: string) => {
+      calls.push({ method, params, sessionId });
+      return {};
+    };
+
+    await cdp.trustedClick({ targetId: "target-1", sessionId: "session-1" }, { x: 42.5, y: 19 });
+
+    expect(calls).toEqual([
+      { method: "Input.dispatchMouseEvent", params: { type: "mouseMoved", x: 42.5, y: 19 }, sessionId: "session-1" },
+      { method: "Input.dispatchMouseEvent", params: { type: "mousePressed", x: 42.5, y: 19, button: "left", clickCount: 1 }, sessionId: "session-1" },
+      { method: "Input.dispatchMouseEvent", params: { type: "mouseReleased", x: 42.5, y: 19, button: "left", clickCount: 1 }, sessionId: "session-1" },
+    ]);
+  });
+
+  test("releases the trusted pointer after an uncertain press", async () => {
+    const types: unknown[] = [];
+    const cdp = Object.create(CdpConnection.prototype) as CdpConnection;
+    (cdp as any).send = async (_method: string, params: Record<string, unknown> = {}) => {
+      types.push(params.type);
+      if (params.type === "mousePressed") throw new Error("reply lost");
+      return {};
+    };
+
+    await expect(cdp.trustedClick({ targetId: "target-1", sessionId: "session-1" }, { x: 1, y: 2 }))
+      .rejects.toThrow("reply lost");
+    expect(types).toEqual(["mouseMoved", "mousePressed", "mouseReleased"]);
+    await expect(cdp.trustedClick({ targetId: "target-1", sessionId: "session-1" }, { x: -1, y: 2 }))
+      .rejects.toThrow("click point is invalid");
+  });
+
+  test("locates only exact visible, enabled, hit-tested Signal controls", () => {
+    const original = {
+      document: (globalThis as any).document,
+      getComputedStyle: (globalThis as any).getComputedStyle,
+      innerWidth: (globalThis as any).innerWidth,
+      innerHeight: (globalThis as any).innerHeight,
+    };
+    const locate = (options: {
+      label?: string;
+      disabled?: boolean;
+      hidden?: boolean;
+      zeroArea?: boolean;
+      occluded?: boolean;
+      inCallingContainer?: boolean;
+      allowed?: SignalUiAction[];
+    }) => {
+      const control = {
+        disabled: options.disabled ?? false,
+        textContent: options.label ?? "Allow Access",
+        getAttribute: (name: string) => name === "aria-disabled" ? "false" : null,
+        closest: () => options.inCallingContainer === false ? null : {},
+        getBoundingClientRect: () => options.zeroArea
+          ? { left: 10, top: 10, width: 0, height: 0 }
+          : { left: 10, top: 10, width: 40, height: 20 },
+        contains: (node: unknown) => node === control,
+      };
+      (globalThis as any).document = {
+        querySelectorAll: () => [control],
+        elementFromPoint: () => options.occluded ? {} : control,
+      };
+      (globalThis as any).getComputedStyle = () => ({
+        display: options.hidden ? "none" : "block",
+        visibility: "visible",
+        opacity: "1",
+      });
+      (globalThis as any).innerWidth = 1280;
+      (globalThis as any).innerHeight = 800;
+      return (0, eval)(signalActionLocatorExpression(options.allowed ?? ["allow access"]));
+    };
+    try {
+      expect(locate({})).toEqual({ label: "allow access", x: 30, y: 20 });
+      expect(locate({ label: "Allow", allowed: ["allow access"] })).toBeNull();
+      expect(locate({ disabled: true })).toBeNull();
+      expect(locate({ hidden: true })).toBeNull();
+      expect(locate({ zeroArea: true })).toBeNull();
+      expect(locate({ occluded: true })).toBeNull();
+      expect(locate({ label: "Join", allowed: ["join"], inCallingContainer: false })).toBeNull();
+    } finally {
+      (globalThis as any).document = original.document;
+      (globalThis as any).getComputedStyle = original.getComputedStyle;
+      (globalThis as any).innerWidth = original.innerWidth;
+      (globalThis as any).innerHeight = original.innerHeight;
+    }
+  });
+
+  test("drives permission and camera-off before a positively confirmed camera-muted join", async () => {
+    const target = { targetId: "target-1", sessionId: "session-1" };
+    const point = (label: SignalUiAction) => ({ label, x: 10, y: 10 });
+    const run = async (visible: Partial<Record<SignalUiAction, boolean>>) => {
+      const events: string[] = [];
+      const cdp = {
+        evaluate: async (_target: unknown, expression: string) => {
+          for (const label of Object.keys(visible) as SignalUiAction[]) {
+            if (visible[label] && expression === signalActionLocatorExpression([label])) return point(label);
+          }
+          if (visible["join"] && expression === signalActionLocatorExpression(["join call", "join", "start call"])) {
+            return point("join");
+          }
+          return null;
+        },
+        trustedClick: async (_target: unknown, action: { label: SignalUiAction }) => { events.push(`click:${action.label}`); },
+      } as unknown as CdpConnection;
+      const action = await driveSignalJoiningAction(cdp, target, () => { events.push("join-armed"); });
+      return { action, events };
+    };
+
+    expect(await run({ "allow access": true, "turn off camera": true, "turn on camera": true, join: true }))
+      .toEqual({ action: "allow access", events: ["click:allow access"] });
+    expect(await run({ "turn off camera": true, "turn on camera": true, join: true }))
+      .toEqual({ action: "turn off camera", events: ["click:turn off camera"] });
+    // Unknown camera state is fail-closed: a visible Join alone cannot arm or enter the call.
+    expect(await run({ join: true })).toEqual({ action: null, events: [] });
+    expect(await run({ "turn on camera": true, join: true }))
+      .toEqual({ action: "join", events: ["join-armed", "click:join"] });
   });
 
   test("rejects empty or malformed replay transcripts", () => {
