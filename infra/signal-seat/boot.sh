@@ -28,6 +28,12 @@ Xvfb "$DISPLAY" -screen 0 1280x800x24 -nolisten tcp &
 x11vnc -display "$DISPLAY" -localhost -forever -shared -nopw -rfbport 5900 &
 websockify --web /usr/share/novnc 6080 localhost:5900 &
 
-# Signal must already be linked in the persistent profile.  No account provisioning occurs here.
-signal-desktop --no-sandbox --user-data-dir="$SIGNAL_PROFILE_DIR" --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 &
+# Signal must already be linked in the persistent profile. No account provisioning occurs here.
+# RingRTC opens PulseAudio natively, while video device enumeration happens in Electron. Provide a
+# synthetic camera so a video-capable call link can render its lobby on a headless CVM; the worker
+# explicitly turns that camera off before joining. Auto-granting media permissions also prevents a
+# first-call Electron permission modal from blocking an unattended seat.
+signal-desktop --no-sandbox --user-data-dir="$SIGNAL_PROFILE_DIR" \
+  --use-fake-ui-for-media-stream --use-fake-device-for-media-stream \
+  --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 &
 exec bun run src/providers/signal/worker.ts

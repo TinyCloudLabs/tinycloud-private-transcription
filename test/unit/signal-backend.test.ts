@@ -3,7 +3,7 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { launchSignalDesktopCall, parseReplayScript, signalRuntimePrerequisites } from "../../src/providers/signal/backend.ts";
-import { requireLoopbackUrl } from "../../src/providers/signal/cdp.ts";
+import { CdpConnection, requireLoopbackUrl } from "../../src/providers/signal/cdp.ts";
 
 function executable(dir: string, name: string, body: string): string {
   const path = join(dir, name);
@@ -17,6 +17,39 @@ describe("Signal capture boundary", () => {
   test("accepts only loopback CDP endpoints", () => {
     expect(requireLoopbackUrl("http://127.0.0.1:9222", "CDP").hostname).toBe("127.0.0.1");
     expect(() => requireLoopbackUrl("http://10.0.0.4:9222", "CDP")).toThrow("loopback-only");
+  });
+
+  test("dispatches a trusted click to the exact target session", async () => {
+    const calls: Array<{ method: string; params: Record<string, unknown>; sessionId?: string }> = [];
+    const cdp = Object.create(CdpConnection.prototype) as CdpConnection;
+    (cdp as any).send = async (method: string, params: Record<string, unknown> = {}, sessionId?: string) => {
+      calls.push({ method, params, sessionId });
+      return {};
+    };
+
+    await cdp.trustedClick({ targetId: "target-1", sessionId: "session-1" }, { x: 42.5, y: 19 });
+
+    expect(calls).toEqual([
+      { method: "Input.dispatchMouseEvent", params: { type: "mouseMoved", x: 42.5, y: 19 }, sessionId: "session-1" },
+      { method: "Input.dispatchMouseEvent", params: { type: "mousePressed", x: 42.5, y: 19, button: "left", clickCount: 1 }, sessionId: "session-1" },
+      { method: "Input.dispatchMouseEvent", params: { type: "mouseReleased", x: 42.5, y: 19, button: "left", clickCount: 1 }, sessionId: "session-1" },
+    ]);
+  });
+
+  test("releases the trusted pointer after an uncertain press", async () => {
+    const types: unknown[] = [];
+    const cdp = Object.create(CdpConnection.prototype) as CdpConnection;
+    (cdp as any).send = async (_method: string, params: Record<string, unknown> = {}) => {
+      types.push(params.type);
+      if (params.type === "mousePressed") throw new Error("reply lost");
+      return {};
+    };
+
+    await expect(cdp.trustedClick({ targetId: "target-1", sessionId: "session-1" }, { x: 1, y: 2 }))
+      .rejects.toThrow("reply lost");
+    expect(types).toEqual(["mouseMoved", "mousePressed", "mouseReleased"]);
+    await expect(cdp.trustedClick({ targetId: "target-1", sessionId: "session-1" }, { x: -1, y: 2 }))
+      .rejects.toThrow("click point is invalid");
   });
 
   test("rejects empty or malformed replay transcripts", () => {

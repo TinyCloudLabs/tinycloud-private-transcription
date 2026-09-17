@@ -183,6 +183,8 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(seatBoot).not.toContain("master=ptx_sink.monitor source_name=ptx_input");
     expect(seatBoot).toContain("mktemp -d /tmp/ptx-signal-runtime");
     expect(seatBoot).toContain('rm -f "/tmp/.X${DISPLAY_NUMBER}-lock" "/tmp/.X11-unix/X${DISPLAY_NUMBER}"');
+    expect(seatBoot).toContain("--use-fake-ui-for-media-stream");
+    expect(seatBoot).toContain("--use-fake-device-for-media-stream");
     expect(compose).toContain("signal-capability-provision:");
     expect(compose).toContain("signal-runtime:/run/signal-capability");
     expect(compose).toContain("signal-health:/run/signal-health");
