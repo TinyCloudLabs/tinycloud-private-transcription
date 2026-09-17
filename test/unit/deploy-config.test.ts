@@ -221,7 +221,9 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(compose).not.toContain("SIGNAL_CAPABILITY_KEY:");
     expect(signalTranscriber).toContain('"${1:-}" = "--check"');
     expect(signalTranscriber).toContain("SIGNAL_WHISPER_HEALTH_URL");
-    expect(signalTranscriber).toContain('model=${SIGNAL_WHISPER_MODEL:-small.en}');
+    expect(signalTranscriber).toContain('model="${SIGNAL_WHISPER_MODEL:-small.en}"');
+    expect(signalTranscriber).toContain('ptx-signal-whisper-model-ready');
+    expect(signalTranscriber).toContain('-F "model=${model}"');
   });
 
   test("publishes and CI-builds the Signal seat image", () => {
