@@ -31,6 +31,7 @@ import { createApiKey } from "../src/api/auth.ts";
 import { config } from "../src/config.ts";
 import { createContext } from "../src/context.ts";
 import { runMigrations } from "../src/db/migrate.ts";
+import { isSignalCallUrl } from "../src/domain/platform.ts";
 import { verifyWebhookSignature } from "../src/webhooks/signature.ts";
 
 const OUT = "tmp";
@@ -38,7 +39,7 @@ const TIMEOUT_S = Number(process.env.SMOKE_TIMEOUT_S ?? 120);
 const CAPTURE_SECONDS = Number(process.env.SMOKE_CAPTURE_SECONDS ?? 30);
 const suppliedCallUrl = process.env.SIGNAL_CALL_URL;
 const expectedPhrase = process.env.SIGNAL_EXPECTED_PHRASE?.trim();
-const replayCallUrl = "https://signal.link/call/#replay-only";
+const replayCallUrl = "https://signal.link/call/#key=replay-only";
 let secretFragments: string[] = [];
 const redact = (value: unknown): unknown => {
   if (typeof value === "string") return secretFragments.reduce((safe, secret) => safe.replaceAll(secret, "[REDACTED]"), value);
@@ -49,17 +50,11 @@ const redact = (value: unknown): unknown => {
 const callUrlFor = (isReplay: boolean) => {
   const callUrl = suppliedCallUrl ?? (isReplay ? replayCallUrl : null);
   if (!callUrl) throw new Error("SIGNAL_CALL_URL is required for a live Signal smoke; supply it privately and do not paste it into logs or evidence.");
-  try {
-    const url = new URL(callUrl);
-    if (url.protocol === "https:" && url.hostname.toLowerCase() === "signal.link" && url.pathname === "/call/" && url.hash.length >= 2) {
-      return { callUrl, capability: url.hash.slice(1) };
-    }
-  } catch {
-    // URL parser errors include their input; never let that bearer capability reach main.catch.
+  if (isSignalCallUrl(callUrl)) {
+    const hash = callUrl.indexOf("#");
+    return { callUrl, capability: callUrl.slice(hash + 1) };
   }
-  {
-    throw new Error("SIGNAL_CALL_URL must be a Signal call link with a fragment.");
-  }
+  throw new Error("SIGNAL_CALL_URL must be a Signal call link with a valid key fragment.");
 };
 if (!Number.isSafeInteger(CAPTURE_SECONDS) || CAPTURE_SECONDS < 1 || CAPTURE_SECONDS > 300) throw new Error("SMOKE_CAPTURE_SECONDS must be an integer from 1 to 300.");
 

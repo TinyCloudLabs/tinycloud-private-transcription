@@ -2,13 +2,14 @@ import { readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { isSignalCallUrl } from "../../domain/platform.ts";
 import type { RawSegment } from "../../domain/transcript.ts";
 import type { SignalCaptureSnapshot } from "./adapter.ts";
 import { CdpConnection, requireLoopbackUrl, type CdpTarget } from "./cdp.ts";
 
 export interface SignalCallRequest {
   meetingId: string;
-  /** Full `https://signal.link/call/#<fragment>` URL. A bearer capability: never log or persist it. */
+  /** Full `https://signal.link/call/#key=<capability>` URL. A bearer capability: never log or persist it. */
   callUrl: string;
   botName?: string;
   language?: string;
@@ -124,7 +125,7 @@ const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 
 interface SignalLauncherProcess {
   exited: Promise<number>;
-  kill(): void;
+  kill(signal?: number): void;
 }
 
 /**
@@ -138,10 +139,10 @@ export async function launchSignalDesktopCall(options: {
   profileDir: string;
   desktopPath?: string;
   timeoutMs?: number;
+  reapGraceMs?: number;
   spawn?: (argv: string[]) => SignalLauncherProcess;
 }): Promise<void> {
-  const url = new URL(options.callUrl);
-  if (url.protocol !== "https:" || url.hostname.toLowerCase() !== "signal.link" || url.pathname !== "/call/" || url.hash.length <= 1) {
+  if (!isSignalCallUrl(options.callUrl)) {
     throw new Error("Signal Desktop launcher requires a Signal call link");
   }
   const argv = [
@@ -150,14 +151,38 @@ export async function launchSignalDesktopCall(options: {
     "--no-sandbox",
     options.callUrl.replace(/^https:/, "sgnl:"),
   ];
-  const child = (options.spawn ?? ((args) => Bun.spawn(args, { stdout: "ignore", stderr: "ignore" })))(argv);
-  const exited = await Promise.race([
-    child.exited.then(() => true),
-    pause(options.timeoutMs ?? 10_000).then(() => false),
+  let child: SignalLauncherProcess;
+  try {
+    child = (options.spawn ?? ((args) => Bun.spawn(args, { stdout: "ignore", stderr: "ignore" })))(argv);
+  } catch {
+    throw new Error("Signal Desktop launcher could not be started");
+  }
+  const waitForExit = async (timeoutMs: number) => await Promise.race([
+    child.exited.then(
+      () => true,
+      () => { throw new Error("Signal Desktop launcher exit could not be observed"); },
+    ),
+    pause(timeoutMs).then(() => false),
   ]);
+  const exited = await waitForExit(options.timeoutMs ?? 10_000);
   // A forwarded launcher normally exits. If it lingers, reap only that process as Port Call's
   // proven lane does; the original Desktop instance and its CDP endpoint remain running.
-  if (!exited) child.kill();
+  if (exited) return;
+  const reapGraceMs = options.reapGraceMs ?? 1_000;
+  try {
+    child.kill();
+  } catch {
+    throw new Error("Signal Desktop launcher could not be reaped");
+  }
+  if (await waitForExit(reapGraceMs)) return;
+  try {
+    child.kill(9);
+  } catch {
+    throw new Error("Signal Desktop launcher could not be reaped");
+  }
+  if (!(await waitForExit(reapGraceMs))) {
+    throw new Error("Signal Desktop launcher could not be reaped");
+  }
 }
 
 /**

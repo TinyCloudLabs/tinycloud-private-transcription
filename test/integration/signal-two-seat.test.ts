@@ -20,7 +20,7 @@ const PHRASES: Record<string, string> = {
   carol: "how vexingly quick daft zebras jump",
 };
 const capabilityFor = (who: string) => `two-seat-${who}-capability-that-must-never-escape`;
-const urlFor = (who: string) => `https://signal.link/call/#${capabilityFor(who)}`;
+const urlFor = (who: string) => `https://signal.link/call/#key=${capabilityFor(who)}`;
 const speakerOf = (callUrl: string) => Object.keys(PHRASES).find((who) => callUrl.endsWith(capabilityFor(who)))!;
 
 // Pseudorandom timing/order keeps the race coverage without making CI flaky or irreproducible.

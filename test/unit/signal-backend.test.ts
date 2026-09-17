@@ -41,14 +41,23 @@ describe("Signal capture boundary", () => {
 
   test("uses Signal Desktop's native launcher for call links and reaps a lingering forwarder", async () => {
     let argv: string[] = [];
-    let killed = false;
+    let resolveExit: ((code: number) => void) | undefined;
+    let exitedBeforeReturn = false;
+    const exited = new Promise<number>((resolve) => { resolveExit = resolve; });
     await launchSignalDesktopCall({
       callUrl: "https://signal.link/call/#key=unit-test-capability",
       profileDir: "/var/lib/signal-test",
       timeoutMs: 1,
+      reapGraceMs: 50,
       spawn: (args) => {
         argv = args;
-        return { exited: new Promise<number>(() => {}), kill: () => { killed = true; } };
+        return {
+          exited,
+          kill: () => setTimeout(() => {
+            exitedBeforeReturn = true;
+            resolveExit?.(143);
+          }, 2),
+        };
       },
     });
     expect(argv).toEqual([
@@ -57,7 +66,27 @@ describe("Signal capture boundary", () => {
       "--no-sandbox",
       "sgnl://signal.link/call/#key=unit-test-capability",
     ]);
-    expect(killed).toBe(true);
+    expect(exitedBeforeReturn).toBe(true);
+  });
+
+  test("escalates to SIGKILL and confirms the native launcher exited", async () => {
+    let resolveExit: ((code: number) => void) | undefined;
+    const exited = new Promise<number>((resolve) => { resolveExit = resolve; });
+    const signals: Array<number | undefined> = [];
+    await launchSignalDesktopCall({
+      callUrl: "https://signal.link/call/#key=unit-test-capability",
+      profileDir: "/var/lib/signal-test",
+      timeoutMs: 1,
+      reapGraceMs: 1,
+      spawn: () => ({
+        exited,
+        kill: (signal) => {
+          signals.push(signal);
+          if (signal === 9) resolveExit?.(137);
+        },
+      }),
+    });
+    expect(signals).toEqual([undefined, 9]);
   });
 
   test("rejects non-Signal links before spawning the native launcher", async () => {
@@ -68,5 +97,29 @@ describe("Signal capture boundary", () => {
       spawn: () => { spawned = true; throw new Error("must not spawn"); },
     })).rejects.toThrow("requires a Signal call link");
     expect(spawned).toBe(false);
+  });
+
+  test("rejects malformed Signal fragments without disclosing the capability", async () => {
+    let spawned = false;
+    const capability = "private-capability";
+    const message = await launchSignalDesktopCall({
+      callUrl: `https://signal.link/call/#wrong=${capability}`,
+      profileDir: "/var/lib/signal-test",
+      spawn: () => { spawned = true; throw new Error("must not spawn"); },
+    }).then(() => "unexpected success", (value) => value instanceof Error ? value.message : String(value));
+    expect(spawned).toBe(false);
+    expect(message).toBe("Signal Desktop launcher requires a Signal call link");
+    expect(message).not.toContain(capability);
+  });
+
+  test("does not disclose the capability when the native launcher cannot start", async () => {
+    const capability = "private-capability";
+    const message = await launchSignalDesktopCall({
+      callUrl: `https://signal.link/call/#key=${capability}`,
+      profileDir: "/var/lib/signal-test",
+      spawn: () => { throw new Error(`failed argv ${capability}`); },
+    }).then(() => "unexpected success", (value) => value instanceof Error ? value.message : String(value));
+    expect(message).toBe("Signal Desktop launcher could not be started");
+    expect(message).not.toContain(capability);
   });
 });

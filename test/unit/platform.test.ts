@@ -20,6 +20,21 @@ describe("detectPlatform", () => {
     expect(r.platform).toBe("microsoft_teams");
     expect(r.nativeMeetingId).toBeNull();
   });
+  test("Signal call link", () => {
+    expect(detectPlatform("https://signal.link/call/#key=alpha-bravo-charlie")).toEqual({
+      platform: "signal",
+      nativeMeetingId: null,
+    });
+    try {
+      detectPlatform("https://signal.link/call/#wrong=private-capability");
+      throw new Error("should throw");
+    } catch (e) {
+      expect((e as ApiError).code).toBe("invalid_meeting_url");
+      expect((e as Error).message).not.toContain("private-capability");
+    }
+    expect(() => detectPlatform("https://example.com/call/#key=private-capability", "signal"))
+      .toThrow("Signal call link must use https://signal.link/call/");
+  });
   test("meet.jit.si", () => {
     expect(detectPlatform("https://meet.jit.si/VexaStandup")).toEqual({
       platform: "jitsi",

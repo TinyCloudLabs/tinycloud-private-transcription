@@ -10,26 +10,28 @@ The worker API is deliberately small:
 - `GET /v1/calls/{session_id}` returns a bounded lifecycle state plus timestamped word segments.
 - `POST /v1/calls/{session_id}/leave` and `DELETE /v1/calls/{session_id}` release the seat.
 
-The service rejects a non-loopback `SIGNAL_CAPTURE_URL`. A `signal.link/call/#…` fragment is an
+The service rejects a non-loopback `SIGNAL_CAPTURE_URL`. A `signal.link/call/#key=…` fragment is an
 admission capability: PTX stores only AES-GCM ciphertext in `meetings.signal_capability`, never
 returns it from meeting reads or webhooks, and clears it at terminal capture. The worker receives
 the reconstructed URL only at dispatch. Do not add it to capture diagnostics, logs, metadata, or
 status payloads.
 
 `bun run signal-capture-worker` provides the local production boundary. It refuses a non-loopback
-CDP URL/bind, opens the Signal URL in an ephemeral CDP target, then rediscovers Signal's call window
-and retries only the exact permission/lobby actions while the observed UI is joining or awaiting
-admission. It records only the configured PulseAudio monitor via `parec`, and invokes the local
+CDP URL/bind, opens the `sgnl://` deep link through a short-lived native Signal Desktop launcher,
+confirms the launcher has exited, then rediscovers Signal's call window and retries only the exact
+permission/lobby actions while the observed UI is joining or awaiting admission. It records only
+the configured PulseAudio monitor via `parec`, and invokes the local
 `SIGNAL_TRANSCRIBER` argv prefix with a temporary WAV filename. The transcriber writes JSON
-`RawSegment[]` to stdout; it has no access to the URL capability. The WAV and ephemeral CDP target
-are removed on leave or delete. A linked Signal Desktop profile, the exact PulseAudio source, and a
+`RawSegment[]` to stdout; it has no access to the URL capability. The WAV and native launcher are
+removed on leave or delete; the persistent linked Desktop remains available for the next call. A
+linked Signal Desktop profile, the exact PulseAudio source, and a
 healthy local transcriber are environment provisioning requirements; without them `/health` reports
 not ready and no live-capture claim may be made.
 
 To run the real-call operator check, attach a linked account to the persistent `signal-profile`
 volume, set `SIGNAL_PULSE_SOURCE` to the seat's playback monitor and provide the in-CVM Whisper
 endpoint through `SIGNAL_TRANSCRIBER`; then reach the loopback-only noVNC port over SSH and run
-`SIGNAL_CALL_URL='https://signal.link/call/#…' bun run scripts/signal-smoke.ts`. The script requires
+`SIGNAL_CALL_URL='https://signal.link/call/#key=…' bun run scripts/signal-smoke.ts`. The script requires
 that operator-supplied link for a live backend, does not log it or write it to its evidence, and
 uses a non-live placeholder only for replay-contract checks. Do not use replay mode as evidence of
 a live call.

@@ -28,7 +28,7 @@ afterAll(async () => { await h.stop(); });
 
 describe("Signal call transcription", () => {
   test("public create/get/transcript path redacts the fragment and yields unknown speakers", async () => {
-    const url = `https://signal.link/call/#${capability}`;
+    const url = `https://signal.link/call/#key=${capability}`;
     const created = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: url, webhook_url: h.webhook.url, metadata: { purpose: "test" } } });
     expect(created.status).toBe(201);
     const meeting = await created.json();
@@ -60,7 +60,7 @@ describe("Signal call transcription", () => {
 
   test("stop is idempotent and finalizes an in-progress Signal capture", async () => {
     signal.snapshot = { status: "joining" };
-    const created = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: `https://signal.link/call/#${capability}-stop` } });
+    const created = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: `https://signal.link/call/#key=${capability}-stop` } });
     const meeting = await created.json();
     await h.waitFor(async () => {
       const body = await (await h.api(`/v1/meetings/${meeting.id}`)).json();

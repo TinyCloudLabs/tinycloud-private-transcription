@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import type { Logger } from "../../log.ts";
+import { isSignalCallUrl } from "../../domain/platform.ts";
 import type { SignalCaptureSnapshot } from "./adapter.ts";
 import type { SignalCallBackend, SignalCallSession } from "./backend.ts";
 import { isLoopbackHost } from "./cdp.ts";
@@ -226,15 +227,6 @@ export function createSignalWorkerApp(opts: SignalWorkerOptions) {
 
   return { app, seats, publishReadiness: readiness };
 }
-
-const isSignalCallUrl = (value: string): boolean => {
-  try {
-    const u = new URL(value);
-    return u.protocol === "https:" && u.hostname.toLowerCase() === "signal.link" && u.pathname === "/call/" && u.hash.length > 1;
-  } catch {
-    return false;
-  }
-};
 
 /**
  * Picks the capture backend. `SIGNAL_REPLAY_SCRIPT` selects the replay timeline used by the rig
