@@ -40,7 +40,7 @@ describe("Vexa-native transcript ingestion", () => {
       native_meeting_id: native,
       transcribe_enabled: true,
     });
-    expect(createRequest?.body).toHaveProperty("recording_enabled", true);
+    expect(createRequest?.body).not.toHaveProperty("recording_enabled");
 
     const before = h.vexa.requests.length;
     await h.vexa.control("jitsi", native, {

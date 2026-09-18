@@ -2,7 +2,7 @@ import { RedisClient } from "bun";
 import { config as defaultConfig, type Config } from "./config.ts";
 import { createDb, type Db } from "./db/client.ts";
 import { VexaClient } from "./providers/vexa/client.ts";
-import { createTranscriptionProvider, type TranscriptionProvider } from "./providers/transcription/index.ts";
+import { createTranscriptRecoveryProvider, createTranscriptionProvider, type TranscriptionProvider } from "./providers/transcription/index.ts";
 import { Queue } from "./worker/queue.ts";
 import { logger, type Logger } from "./log.ts";
 import { LoopbackSignalCaptureAdapter, type SignalCaptureAdapter } from "./providers/signal/adapter.ts";
@@ -14,7 +14,10 @@ export interface AppContext {
   redis: RedisClient;
   queue: Queue;
   vexa: VexaClient;
+  /** Vexa-native primary transcription reported by health. */
   transcription: TranscriptionProvider;
+  /** Optional retained-recording recovery; it never replaces the primary provider globally. */
+  transcriptRecovery: TranscriptionProvider | null;
   signal: SignalCaptureAdapter;
   log: Logger;
   /** Webhook retry schedule (ms after previous attempt). Overridable for tests. */
@@ -34,6 +37,7 @@ export function createContext(overrides: Partial<AppContext> & { config?: Config
     queue: overrides.queue ?? new Queue(redis),
     vexa: overrides.vexa ?? new VexaClient({ baseUrl: cfg.vexa.baseUrl, apiKey: cfg.vexa.apiKey }),
     transcription: overrides.transcription ?? createTranscriptionProvider(cfg),
+    transcriptRecovery: overrides.transcriptRecovery === undefined ? createTranscriptRecoveryProvider(cfg) : overrides.transcriptRecovery,
     signal: overrides.signal ?? new LoopbackSignalCaptureAdapter(
       cfg.signal.captureUrls,
       cfg.signal.controlTokenPaths.map((path) => readFileSync(path, "utf8").trim()),

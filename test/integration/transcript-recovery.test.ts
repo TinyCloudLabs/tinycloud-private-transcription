@@ -6,7 +6,7 @@ import { startHarness, type Harness } from "./harness.ts";
 let h: Harness;
 beforeAll(async () => {
   h = await startHarness({
-    transcription: new TinfoilTranscriptionProvider({
+    transcriptRecovery: new TinfoilTranscriptionProvider({
       baseUrl: "https://tinfoil.test",
       apiKey: "test",
       model: "voxtral-small-24b",

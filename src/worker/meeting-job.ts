@@ -14,7 +14,6 @@ import { meetings } from "../db/schema.ts";
 import { normalizeSegments } from "../domain/transcript.ts";
 import { openSignalCapability } from "../providers/signal/capability.ts";
 import type { VexaTranscriptionResponse } from "../providers/vexa/types.ts";
-import { VexaNativeProvider } from "../providers/transcription/vexa-native.ts";
 
 const MAX_START_ATTEMPTS = 3;
 
@@ -31,11 +30,10 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
       meeting_url: meeting.meetingUrl,
       bot_name: meeting.botName ?? undefined,
       language: meeting.language ?? undefined,
-      // Vexa performs transcription, including when its deployment is configured to use Tinfoil.
-      // TinyCloud persists the completed Vexa segments and never re-transcribes a recording.
+      // Vexa remains the primary transcription provider.
       transcribe_enabled: true,
-      // Preserve the mixed recording for recovery; live Vexa STT remains the normal path.
-      recording_enabled: true,
+      // Retain audio only on deployments which have the recovery provider configured.
+      ...(ctx.transcriptRecovery ? { recording_enabled: true } : {}),
       // Vexa otherwise applies its ten-minute deployment fallback. Pin every TinyCloud meeting to
       // our configurable audio-silence window. This can expire with humans still connected;
       // participant presence does not veto Vexa's silence verdict.
@@ -312,14 +310,13 @@ async function finalize(
     fetchAudio: () => fetchVexaAudio(ctx, vexa),
   };
   try {
-    const nativeComplete = !isMateriallyIncomplete(vexa, vexaSegments);
-    const transcript = nativeComplete
-      ? await new VexaNativeProvider().transcribe(input)
-      : await ctx.transcription.transcribe(input);
+    const recover = !!ctx.transcriptRecovery && isMateriallyIncomplete(vexa, vexaSegments);
+    const provider = recover ? ctx.transcriptRecovery! : ctx.transcription;
+    const transcript = await provider.transcribe(input);
     if (!transcript.text.trim()) {
       throw new ApiError("transcription_failed", "Transcription provider returned no words");
     }
-    await storeTranscript(ctx, meeting.id, transcript, nativeComplete ? "vexa" : ctx.transcription.name);
+    await storeTranscript(ctx, meeting.id, transcript, provider.name);
     const { meeting: done, changed } = await transition(ctx, meeting, "completed");
     if (changed) await enqueueMeetingWebhook(ctx, done, "meeting.completed");
   } catch (e) {
@@ -334,17 +331,22 @@ async function finalize(
   }
 }
 
-/** Coverage below 80% of the captured meeting duration means Vexa lost material timeline content. */
-function isMateriallyIncomplete(vexa: VexaTranscriptionResponse, segments: ReturnType<typeof adaptVexaSegments>) {
-  if (segments.length === 0) return true;
+/**
+ * A large uncovered tail is evidence that Vexa lost its final transcript chunks. We deliberately
+ * use the meeting's terminal timestamps, not summed speech time: silence between turns is not a
+ * missing timeline, and a fixed grace window prevents short complete meetings from being treated
+ * as incomplete merely because their last words precede teardown.
+ */
+export function isMateriallyIncomplete(vexa: VexaTranscriptionResponse, segments: ReturnType<typeof adaptVexaSegments>) {
+  const words = segments.filter((segment) => segment.text.trim().length > 0);
+  if (words.length === 0) return true;
   const start = vexa.start_time ? Date.parse(vexa.start_time) : NaN;
   const end = vexa.end_time ? Date.parse(vexa.end_time) : NaN;
   if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return false;
   const duration = (end - start) / 1000;
-  const windows = segments.map((s) => [Math.max(0, s.start), Math.min(duration, s.end)] as const).filter(([from, to]) => to > from).sort((a, b) => a[0] - b[0]);
-  let covered = 0, cursor = 0;
-  for (const [from, to] of windows) { if (to > cursor) { covered += to - Math.max(cursor, from); cursor = to; } }
-  return covered / duration < 0.8;
+  const finalWordEnd = Math.min(duration, Math.max(...words.map((segment) => segment.end)));
+  const uncoveredTail = duration - finalWordEnd;
+  return uncoveredTail > 15 && finalWordEnd / duration < 0.8;
 }
 
 async function fetchVexaAudio(ctx: AppContext, vexa: VexaTranscriptionResponse) {

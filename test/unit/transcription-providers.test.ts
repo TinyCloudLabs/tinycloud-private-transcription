@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { VexaNativeProvider } from "../../src/providers/transcription/vexa-native.ts";
 import { TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
-import { createTranscriptionProvider } from "../../src/providers/transcription/index.ts";
+import { createTranscriptRecoveryProvider, createTranscriptionProvider } from "../../src/providers/transcription/index.ts";
 import type { TranscriptionProviderName } from "../../src/config.ts";
 
 const vexaSegments = [
@@ -25,8 +25,14 @@ describe("VexaNativeProvider", () => {
 });
 
 describe("createTranscriptionProvider", () => {
-  test("vexa selects native segment ingestion", () => expect(createTranscriptionProvider({ transcriptionProvider: "vexa" })).toBeInstanceOf(VexaNativeProvider));
-  test("tinfoil selects retained-recording recovery", () => expect(createTranscriptionProvider({ transcriptionProvider: "tinfoil" })).toBeInstanceOf(TinfoilTranscriptionProvider));
+  test.each(["vexa", "tinfoil"] as const)("%s keeps Vexa as the primary provider", (transcriptionProvider) => {
+    expect(createTranscriptionProvider({ transcriptionProvider })).toBeInstanceOf(VexaNativeProvider);
+  });
+
+  test("Tinfoil recovery is configured separately from the primary provider", () => {
+    expect(createTranscriptRecoveryProvider({ tinfoil: { baseUrl: "https://tinfoil.test", apiKey: "", model: "test" } })).toBeNull();
+    expect(createTranscriptRecoveryProvider({ tinfoil: { baseUrl: "https://tinfoil.test", apiKey: "secret", model: "test" } })).toBeInstanceOf(TinfoilTranscriptionProvider);
+  });
 
   test("an unknown TRANSCRIPTION_PROVIDER fails at boot instead of silently defaulting", () => {
     expect(() => createTranscriptionProvider({ transcriptionProvider: "whisper" as TranscriptionProviderName })).toThrow(
