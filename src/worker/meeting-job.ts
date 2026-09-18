@@ -148,7 +148,7 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
     failureStage === "active"
     || (failureStage == null && (meeting.status === "in_progress" || meeting.status === "processing"))
   );
-  if (mapped === "failed" && (!failedAfterAdmission || !ctx.transcriptRecovery)) {
+  if (mapped === "failed" && !failedAfterAdmission) {
     const f = mapVexaFailure(reason);
     const { meeting: failed, changed } = await failMeeting(ctx, meeting, f.code, f.message);
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
@@ -181,6 +181,8 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
   // Active-stage failure permits finalization but does not itself replace a complete Vexa-native
   // transcript. The same material-incompleteness test selects recovery for every terminal shape.
   const recover = !!ctx.transcriptRecovery && isMateriallyIncomplete(vexa, segments);
+  // When recovery is unconfigured, nonempty native words remain the loss-preserving fallback even
+  // if their coverage is incomplete. Empty output still retains the mapped terminal failure below.
   if (!hasLiveWords && !recover) {
     const failure = reason
       ? mapVexaFailure(reason)

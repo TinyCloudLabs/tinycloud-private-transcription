@@ -172,6 +172,64 @@ describe("recording recovery and transcript JSON compatibility", () => {
     });
   });
 
+  test("active-stage failure evaluates native evidence when recovery is unconfigured", async () => {
+    const original = h.ctx.transcriptRecovery;
+    const callsBefore = tinfoilCalls.length;
+    h.ctx.transcriptRecovery = null;
+    try {
+      const complete = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/NativeOnlyComplete" } });
+      const { id: completeId } = await complete.json();
+      await waitStatus(completeId, "joining");
+      await h.vexa.control("jitsi", "NativeOnlyComplete@jitsi.local", {
+        status: "failed",
+        failure_stage: "active",
+        completion_reason: "evicted",
+        start_time: "2026-09-18T10:00:00.000Z",
+        end_time: "2026-09-18T10:02:00.000Z",
+        segments: [{ start: 0, end: 120, text: "Complete native evidence.", speaker: "Alice", completed: true }],
+      });
+      await waitStatus(completeId, "completed");
+      expect(await (await h.api(`/v1/meetings/${completeId}/transcript`)).json()).toMatchObject({
+        provider: "vexa",
+        speakers: [{ name: "Alice" }],
+        segments: [{ speaker_name: "Alice", start: 0, end: 120, text: "Complete native evidence." }],
+        text: "Alice: Complete native evidence.",
+      });
+
+      const incomplete = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/NativeOnlyIncomplete" } });
+      const { id: incompleteId } = await incomplete.json();
+      await waitStatus(incompleteId, "joining");
+      await h.vexa.control("jitsi", "NativeOnlyIncomplete@jitsi.local", {
+        status: "failed",
+        failure_stage: "active",
+        completion_reason: "evicted",
+        start_time: "2026-09-18T10:00:00.000Z",
+        end_time: "2026-09-18T10:02:00.000Z",
+        segments: [{ start: 0, end: 10, text: "Preserve remaining native words.", speaker: "Alice", completed: true }],
+      });
+      await waitStatus(incompleteId, "completed");
+      expect(await (await h.api(`/v1/meetings/${incompleteId}/transcript`)).json()).toMatchObject({
+        provider: "vexa",
+        text: "Alice: Preserve remaining native words.",
+      });
+
+      const empty = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/NativeOnlyEmpty" } });
+      const { id: emptyId } = await empty.json();
+      await waitStatus(emptyId, "joining");
+      await h.vexa.control("jitsi", "NativeOnlyEmpty@jitsi.local", {
+        status: "failed",
+        failure_stage: "active",
+        completion_reason: "evicted",
+        segments: [],
+      });
+      const failed = await waitStatus(emptyId, "failed");
+      expect(failed.error.code).toBe("bot_removed");
+      expect(tinfoilCalls).toHaveLength(callsBefore);
+    } finally {
+      h.ctx.transcriptRecovery = original;
+    }
+  });
+
   test("failed active-stage capture is salvaged but a pre-admission failure remains mapped", async () => {
     const active = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/FailedActive" } });
     const { id: activeId } = await active.json();
