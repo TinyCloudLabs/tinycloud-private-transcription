@@ -131,7 +131,7 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
       return;
     }
     ctx.log.warn("vexa poll failed; will retry", { meetingId, error: String(e) });
-    await ctx.queue.push({ type: "meeting.poll", meetingId }, ctx.config.vexa.pollIntervalMs);
+    await ctx.queue.push({ type: "meeting.poll", meetingId, recoveryAttempt }, ctx.config.vexa.pollIntervalMs);
     return;
   }
 
@@ -141,8 +141,12 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
   const reason = completionReasonOf(vexa);
   const mapped = mapVexaStatus(vexa.status);
 
+  const failureStage = vexa.data?.failure_stage;
+  // Explicit provider evidence outranks our local state. Local in_progress/processing is only a
+  // fallback when Vexa omitted failure_stage entirely (including manual recovery of an old row).
   const failedAfterAdmission = mapped === "failed" && (
-    vexa.data?.failure_stage === "active" || meeting.status === "in_progress" || meeting.status === "processing"
+    failureStage === "active"
+    || (failureStage == null && (meeting.status === "in_progress" || meeting.status === "processing"))
   );
   if (mapped === "failed" && (!failedAfterAdmission || !ctx.transcriptRecovery)) {
     const f = mapVexaFailure(reason);
@@ -174,7 +178,9 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
     return;
   }
   const hasLiveWords = segments.some((segment) => segment.text.trim().length > 0);
-  const recover = !!ctx.transcriptRecovery && (failedAfterAdmission || isMateriallyIncomplete(vexa, segments));
+  // Active-stage failure permits finalization but does not itself replace a complete Vexa-native
+  // transcript. The same material-incompleteness test selects recovery for every terminal shape.
+  const recover = !!ctx.transcriptRecovery && isMateriallyIncomplete(vexa, segments);
   if (!hasLiveWords && !recover) {
     const failure = reason
       ? mapVexaFailure(reason)
@@ -359,11 +365,16 @@ async function finalize(
   }
 }
 
+const MATERIAL_GAP_SECONDS = 15;
+const MATERIAL_GAP_RATIO = 0.2;
+const MIN_MATERIAL_COVERAGE_RATIO = 0.2;
+
 /**
- * A large uncovered tail is evidence that Vexa lost its final transcript chunks. We deliberately
- * use the meeting's terminal timestamps, not summed speech time: silence between turns is not a
- * missing timeline, and a fixed grace window prevents short complete meetings from being treated
- * as incomplete merely because their last words precede teardown.
+ * Terminal duration is the coverage boundary. A single uncovered interval is material only when it
+ * exceeds both 15 seconds and 20% of the recording. As a conservative backstop for distributed
+ * loss, merged word intervals covering less than 20% of a recording are also incomplete when more
+ * than 15 seconds are uncovered. This avoids treating ordinary pauses as loss while catching sparse
+ * fragments whose individual gaps remain below the ratio threshold.
  */
 export function isMateriallyIncomplete(vexa: VexaTranscriptionResponse, segments: ReturnType<typeof adaptVexaSegments>) {
   const words = segments.filter((segment) => segment.text.trim().length > 0);
@@ -376,15 +387,29 @@ export function isMateriallyIncomplete(vexa: VexaTranscriptionResponse, segments
   const duration = (end - start) / 1000;
   const ordered = words
     .map((segment) => ({ start: Math.max(0, Math.min(duration, segment.start)), end: Math.max(0, Math.min(duration, segment.end)) }))
+    .filter((segment) => segment.end > segment.start)
     .sort((a, b) => a.start - b.start || a.end - b.end);
-  let previousEnd = ordered[0]!.end;
+  if (ordered.length === 0) return true;
+
+  const merged: { start: number; end: number }[] = [];
+  for (const interval of ordered) {
+    const previous = merged.at(-1);
+    if (previous && interval.start <= previous.end) previous.end = Math.max(previous.end, interval.end);
+    else merged.push({ ...interval });
+  }
+
+  let previousEnd = 0;
   let largestGap = 0;
-  for (const segment of ordered.slice(1)) {
-    largestGap = Math.max(largestGap, segment.start - previousEnd);
-    previousEnd = Math.max(previousEnd, segment.end);
+  let covered = 0;
+  for (const interval of merged) {
+    largestGap = Math.max(largestGap, interval.start - previousEnd);
+    covered += interval.end - interval.start;
+    previousEnd = interval.end;
   }
   largestGap = Math.max(largestGap, duration - previousEnd);
-  return largestGap > 15 && largestGap / duration > 0.2;
+  const uncovered = duration - covered;
+  return (largestGap > MATERIAL_GAP_SECONDS && largestGap / duration > MATERIAL_GAP_RATIO)
+    || (uncovered > MATERIAL_GAP_SECONDS && covered / duration < MIN_MATERIAL_COVERAGE_RATIO);
 }
 
 async function fetchVexaAudio(ctx: AppContext, vexa: VexaTranscriptionResponse) {

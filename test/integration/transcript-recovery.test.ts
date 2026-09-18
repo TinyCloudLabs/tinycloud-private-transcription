@@ -3,6 +3,7 @@ import { sql } from "drizzle-orm";
 import { TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
 import { PCM_RATE, pcmToWav } from "../../src/providers/transcription/audio.ts";
 import { ApiError } from "../../src/domain/errors.ts";
+import { handleMeetingPoll } from "../../src/worker/meeting-job.ts";
 import { startHarness, type Harness } from "./harness.ts";
 
 let h: Harness;
@@ -89,6 +90,35 @@ describe("recording recovery and transcript JSON compatibility", () => {
     expect(tinfoilCalls.at(-1)!.fileSize).toBeGreaterThan(PCM_RATE * 2);
   });
 
+  test.each([
+    ["LeadingOnly", [{ start: 110, end: 120, text: "Only the ending survived.", speaker: "Alice", completed: true }]],
+    ["DistributedSparse", [
+      { start: 0, end: 2, text: "One.", speaker: "Alice", completed: true },
+      { start: 20, end: 22, text: "Two.", speaker: "Alice", completed: true },
+      { start: 40, end: 42, text: "Three.", speaker: "Alice", completed: true },
+      { start: 60, end: 62, text: "Four.", speaker: "Alice", completed: true },
+      { start: 80, end: 82, text: "Five.", speaker: "Alice", completed: true },
+      { start: 100, end: 102, text: "Six.", speaker: "Alice", completed: true },
+      { start: 118, end: 120, text: "Seven.", speaker: "Alice", completed: true },
+    ]],
+  ] as const)("%s sparse native coverage selects recording recovery", async (room, segments) => {
+    const callsBefore = tinfoilCalls.length;
+    const created = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: `https://jitsi.local/${room}` } });
+    const { id } = await created.json();
+    await waitStatus(id, "joining");
+    await h.vexa.control("jitsi", `${room}@jitsi.local`, {
+      status: "completed",
+      completion_reason: "stopped",
+      start_time: "2026-09-18T10:00:00.000Z",
+      end_time: "2026-09-18T10:02:00.000Z",
+      segments: [...segments],
+      recording_base64: recordingBase64,
+    });
+    await waitStatus(id, "completed");
+    expect(await (await h.api(`/v1/meetings/${id}/transcript`)).json()).toMatchObject({ provider: "tinfoil" });
+    expect(tinfoilCalls).toHaveLength(callsBefore + 1);
+  });
+
   test("a scaled long recording is chunked through the public recovery path", async () => {
     const original = h.ctx.transcriptRecovery;
     const names: string[] = [];
@@ -156,6 +186,26 @@ describe("recording recovery and transcript JSON compatibility", () => {
     await waitStatus(activeId, "completed");
     expect(await (await h.api(`/v1/meetings/${activeId}/transcript`)).json()).toMatchObject({ provider: "tinfoil" });
 
+    const completeCallsBefore = tinfoilCalls.length;
+    const complete = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/FailedActiveComplete" } });
+    const { id: completeId } = await complete.json();
+    await waitStatus(completeId, "joining");
+    await h.vexa.control("jitsi", "FailedActiveComplete@jitsi.local", {
+      status: "failed",
+      failure_stage: "active",
+      completion_reason: "evicted",
+      start_time: "2026-09-18T10:00:00.000Z",
+      end_time: "2026-09-18T10:02:00.000Z",
+      segments: [{ start: 0, end: 120, text: "The complete native transcript remains authoritative.", speaker: "Alice", completed: true }],
+      recording_base64: recordingBase64,
+    });
+    await waitStatus(completeId, "completed");
+    expect(await (await h.api(`/v1/meetings/${completeId}/transcript`)).json()).toMatchObject({
+      provider: "vexa",
+      text: "Alice: The complete native transcript remains authoritative.",
+    });
+    expect(tinfoilCalls).toHaveLength(completeCallsBefore);
+
     const callsBefore = tinfoilCalls.length;
     const waiting = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/FailedWaiting" } });
     const { id: waitingId } = await waiting.json();
@@ -169,7 +219,32 @@ describe("recording recovery and transcript JSON compatibility", () => {
     });
     const failed = await waitStatus(waitingId, "failed");
     expect(failed.error.code).toBe("waiting_room_timeout");
+    const recovered = await h.api(`/v1/meetings/${waitingId}/recover`, { method: "POST" });
+    expect(recovered.status).toBe(200);
+    const failedAgain = await waitStatus(waitingId, "failed");
+    expect(failedAgain.error.code).toBe("waiting_room_timeout");
     expect(tinfoilCalls).toHaveLength(callsBefore);
+  });
+
+  test("a transcript-fetch retry preserves the terminal recovery attempt", async () => {
+    const created = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/RetryCounter" } });
+    const { id } = await created.json();
+    await waitStatus(id, "joining");
+    const originalGetTranscript = h.ctx.vexa.getTranscript.bind(h.ctx.vexa);
+    const originalPush = h.ctx.queue.push.bind(h.ctx.queue);
+    const pushed: Array<{ job: Parameters<typeof originalPush>[0]; delayMs: number | undefined }> = [];
+    try {
+      h.ctx.vexa.getTranscript = async () => { throw new ApiError("provider_timeout", "temporary transcript timeout"); };
+      h.ctx.queue.push = async (job, delayMs) => { pushed.push({ job, delayMs }); };
+      await handleMeetingPoll(h.ctx, id, 3);
+    } finally {
+      h.ctx.vexa.getTranscript = originalGetTranscript;
+      h.ctx.queue.push = originalPush;
+    }
+    expect(pushed).toContainEqual({
+      job: { type: "meeting.poll", meetingId: id, recoveryAttempt: 3 },
+      delayMs: h.ctx.config.vexa.pollIntervalMs,
+    });
   });
 
   test("recording readiness is retried and succeeds when the recording appears", async () => {

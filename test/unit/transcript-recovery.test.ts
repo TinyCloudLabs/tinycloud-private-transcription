@@ -22,6 +22,8 @@ const segment = (end: number): VexaTranscriptionSegment => ({
   completed: true,
 });
 
+const interval = (start: number, end: number): VexaTranscriptionSegment => ({ ...segment(end), start });
+
 describe("Vexa terminal timeline coverage", () => {
   test("empty output attempts recovery even without trustworthy duration evidence", () => {
     expect(isMateriallyIncomplete(response(null), [])).toBe(true);
@@ -40,5 +42,22 @@ describe("Vexa terminal timeline coverage", () => {
 
   test("detects a materially large internal gap even when the late tail is present", () => {
     expect(isMateriallyIncomplete(response(120), [segment(20), { ...segment(120), start: 118 }])).toBe(true);
+  });
+
+  test("includes the leading gap before final-only words", () => {
+    expect(isMateriallyIncomplete(response(120), [interval(110, 120)])).toBe(true);
+  });
+
+  test("detects aggregate sparse coverage after merging overlaps", () => {
+    const sparse = [
+      interval(0, 2), interval(1, 3),
+      interval(20, 22), interval(40, 42), interval(60, 62), interval(80, 82), interval(100, 102), interval(118, 120),
+    ];
+    expect(Math.max(...sparse.slice(1).map((current, index) => current.start - sparse[index]!.end))).toBeLessThan(24);
+    expect(isMateriallyIncomplete(response(120), sparse)).toBe(true);
+  });
+
+  test("preserves a normally covered native timeline", () => {
+    expect(isMateriallyIncomplete(response(120), [interval(0, 30), interval(35, 70), interval(75, 120)])).toBe(false);
   });
 });
