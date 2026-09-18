@@ -1,5 +1,10 @@
 node_modules/
 *.log
+.smithers/executions/
+smithers.db
+smithers.db-shm
+smithers.db-wal
+tinfoil.env
 
 # secrets / local env (examples are committed as *.example)
 .env
