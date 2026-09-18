@@ -16,6 +16,7 @@ import { openSignalCapability } from "../providers/signal/capability.ts";
 import type { VexaTranscriptionResponse } from "../providers/vexa/types.ts";
 
 const MAX_START_ATTEMPTS = 3;
+const MAX_RECOVERY_ATTEMPTS = 3;
 
 /** Job: meeting.start — ask Vexa to send a bot. */
 export async function handleMeetingStart(ctx: AppContext, meetingId: string, attempt = 1): Promise<void> {
@@ -112,7 +113,7 @@ export async function handleJoinDeadline(ctx: AppContext, meetingId: string): Pr
 }
 
 /** Job: meeting.poll — sync status from Vexa; finalize when the bot has left. */
-export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Promise<void> {
+export async function handleMeetingPoll(ctx: AppContext, meetingId: string, recoveryAttempt = 1): Promise<void> {
   let meeting = await getMeetingById(ctx, meetingId);
   if (!meeting || isTerminal(meeting.status as MeetingStatus)) return;
   if (meeting.platform === "signal") return handleSignalPoll(ctx, meeting);
@@ -140,14 +141,17 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
   const reason = completionReasonOf(vexa);
   const mapped = mapVexaStatus(vexa.status);
 
-  if (mapped === "failed") {
+  const failedAfterAdmission = mapped === "failed" && (
+    vexa.data?.failure_stage === "active" || meeting.status === "in_progress" || meeting.status === "processing"
+  );
+  if (mapped === "failed" && (!failedAfterAdmission || !ctx.transcriptRecovery)) {
     const f = mapVexaFailure(reason);
     const { meeting: failed, changed } = await failMeeting(ctx, meeting, f.code, f.message);
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
     return;
   }
 
-  if (vexa.status !== "completed") {
+  if (vexa.status !== "completed" && mapped !== "failed") {
     const { meeting: updated } = await transition(ctx, meeting, mapped);
     meeting = updated;
     await ctx.queue.push({ type: "meeting.poll", meetingId }, ctx.config.vexa.pollIntervalMs);
@@ -170,21 +174,19 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
     return;
   }
   const hasLiveWords = segments.some((segment) => segment.text.trim().length > 0);
-  if (!hasLiveWords && reason && reason !== "stopped") {
-    const f = reason ? mapVexaFailure(reason) : { code: "capture_failed" as const, message: "No usable audio was captured for this meeting." };
-    const { meeting: failed, changed } = await failMeeting(ctx, meeting, f.code, f.message);
-    if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
-    return;
-  }
-  if (!hasLiveWords && !ctx.transcriptRecovery) {
-    const { meeting: failed, changed } = await failMeeting(ctx, meeting, "capture_failed", "No usable audio was captured for this meeting.");
+  const recover = !!ctx.transcriptRecovery && (failedAfterAdmission || isMateriallyIncomplete(vexa, segments));
+  if (!hasLiveWords && !recover) {
+    const failure = reason
+      ? mapVexaFailure(reason)
+      : { code: "capture_failed" as const, message: "No usable audio was captured for this meeting." };
+    const { meeting: failed, changed } = await failMeeting(ctx, meeting, failure.code, failure.message);
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
     return;
   }
 
   ({ meeting } = await transition(ctx, meeting, "processing"));
   ctx.log.debug("vexa meeting completed; finalizing", { meetingId: meeting.id, vexaSegments: segments.length });
-  await finalize(ctx, meeting, vexa, segments);
+  await finalize(ctx, meeting, vexa, segments, recover, recoveryAttempt);
 }
 
 async function handleSignalStart(ctx: AppContext, meeting: MeetingRow, attempt: number) {
@@ -302,6 +304,8 @@ async function finalize(
   meeting: MeetingRow,
   vexa: VexaTranscriptionResponse,
   vexaSegments: ReturnType<typeof adaptVexaSegments>,
+  recover: boolean,
+  recoveryAttempt: number,
 ) {
   const input = {
     meetingId: meeting.id,
@@ -310,7 +314,6 @@ async function finalize(
     fetchAudio: () => fetchVexaAudio(ctx, vexa),
   };
   try {
-    const recover = !!ctx.transcriptRecovery && isMateriallyIncomplete(vexa, vexaSegments);
     const provider = recover ? ctx.transcriptRecovery! : ctx.transcription;
     const transcript = await provider.transcribe(input);
     if (!transcript.text.trim()) {
@@ -320,11 +323,36 @@ async function finalize(
     const { meeting: done, changed } = await transition(ctx, meeting, "completed");
     if (changed) await enqueueMeetingWebhook(ctx, done, "meeting.completed");
   } catch (e) {
+    if (recover && e instanceof RecoveryRecordingNotReadyError && recoveryAttempt < MAX_RECOVERY_ATTEMPTS) {
+      ctx.log.warn("vexa recording is not ready; retrying recovery", { meetingId: meeting.id, recoveryAttempt });
+      await ctx.queue.push(
+        { type: "meeting.poll", meetingId: meeting.id, recoveryAttempt: recoveryAttempt + 1 },
+        ctx.config.vexa.pollIntervalMs * recoveryAttempt,
+      );
+      return;
+    }
+    if (recover && vexaSegments.some((segment) => segment.text.trim().length > 0)) {
+      ctx.log.warn("recording recovery exhausted; preserving vexa transcript", { meetingId: meeting.id, recoveryAttempt, error: String(e) });
+      const transcript = await ctx.transcription.transcribe(input);
+      if (transcript.text.trim()) {
+        await storeTranscript(ctx, meeting.id, transcript, ctx.transcription.name);
+        const { meeting: done, changed } = await transition(ctx, meeting, "completed");
+        if (changed) await enqueueMeetingWebhook(ctx, done, "meeting.completed");
+        return;
+      }
+    }
+    if (recover && e instanceof RecoveryRecordingNotReadyError) {
+      const failure = mapVexaFailure(completionReasonOf(vexa));
+      ctx.log.error("recording recovery exhausted without retained audio", { meetingId: meeting.id, recoveryAttempt });
+      const { meeting: failed, changed } = await failMeeting(ctx, meeting, failure.code, failure.message);
+      if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+      return;
+    }
     ctx.log.error("transcription failed", { meetingId: meeting.id, error: String(e) });
     const { meeting: failed, changed } = await failMeeting(
       ctx,
       meeting,
-      e instanceof ApiError ? e.code : "transcription_failed",
+      "transcription_failed",
       "Transcription could not be completed for this meeting.",
     );
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
@@ -338,26 +366,52 @@ async function finalize(
  * as incomplete merely because their last words precede teardown.
  */
 export function isMateriallyIncomplete(vexa: VexaTranscriptionResponse, segments: ReturnType<typeof adaptVexaSegments>) {
+  const words = segments.filter((segment) => segment.text.trim().length > 0);
+  // Empty native output is never evidence of silence. Recovery decodes the actual recording before
+  // making that determination, including for short calls and rows with missing terminal timestamps.
+  if (words.length === 0) return true;
   const start = vexa.start_time ? Date.parse(vexa.start_time) : NaN;
   const end = vexa.end_time ? Date.parse(vexa.end_time) : NaN;
   if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return false;
   const duration = (end - start) / 1000;
-  // A missing/empty transcript alone is not duration evidence. In particular, do not send a short
-  // silent meeting through recovery merely because it has no words.
-  if (duration <= 15) return false;
-  const words = segments.filter((segment) => segment.text.trim().length > 0);
-  if (words.length === 0) return true;
-  const finalWordEnd = Math.min(duration, Math.max(...words.map((segment) => segment.end)));
-  const uncoveredTail = duration - finalWordEnd;
-  return uncoveredTail > 15 && finalWordEnd / duration < 0.8;
+  const ordered = words
+    .map((segment) => ({ start: Math.max(0, Math.min(duration, segment.start)), end: Math.max(0, Math.min(duration, segment.end)) }))
+    .sort((a, b) => a.start - b.start || a.end - b.end);
+  let previousEnd = ordered[0]!.end;
+  let largestGap = 0;
+  for (const segment of ordered.slice(1)) {
+    largestGap = Math.max(largestGap, segment.start - previousEnd);
+    previousEnd = Math.max(previousEnd, segment.end);
+  }
+  largestGap = Math.max(largestGap, duration - previousEnd);
+  return largestGap > 15 && largestGap / duration > 0.2;
 }
 
 async function fetchVexaAudio(ctx: AppContext, vexa: VexaTranscriptionResponse) {
-  const recordings = await ctx.vexa.listRecordings();
-  const recording = recordings.recordings.find((candidate) => candidate.meeting_id === vexa.id && candidate.media_files.some((file) => file.type === "audio"));
-  if (!recording) return null;
-  const master = await ctx.vexa.recordingMaster(recording.id);
-  if (!master.raw_url) return null;
-  const { bytes, contentType } = await ctx.vexa.fetchBytes(master.raw_url);
-  return bytes.length ? { bytes, filename: "meeting.webm", contentType } : null;
+  try {
+    const recordings = await ctx.vexa.listRecordings();
+    const recording = recordings.recordings.find((candidate) => candidate.meeting_id === vexa.id && candidate.media_files.some((file) => file.type === "audio"));
+    if (!recording) throw new RecoveryRecordingNotReadyError();
+    const master = await ctx.vexa.recordingMaster(recording.id);
+    if (!master.raw_url) throw new RecoveryRecordingNotReadyError();
+    const { bytes, contentType } = await ctx.vexa.fetchBytes(master.raw_url);
+    if (!bytes.length) throw new RecoveryRecordingNotReadyError();
+    return { bytes, filename: "meeting.webm", contentType };
+  } catch (error) {
+    if (error instanceof RecoveryRecordingNotReadyError || isRetryableRecordingFetchError(error)) {
+      throw new RecoveryRecordingNotReadyError();
+    }
+    throw error;
+  }
 }
+
+class RecoveryRecordingNotReadyError extends Error {
+  constructor() {
+    super("The retained recording is not ready");
+    this.name = "RecoveryRecordingNotReadyError";
+  }
+}
+
+const isRetryableRecordingFetchError = (error: unknown) =>
+  (error instanceof ApiError && (error.code === "provider_unavailable" || error.code === "provider_timeout"))
+  || (error instanceof VexaHttpError && (error.notFound || error.status === 429 || error.status >= 500));

@@ -158,6 +158,7 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       segments?: VexaTranscriptionSegment[];
       append_segments?: VexaTranscriptionSegment[];
       completion_reason?: VexaCompletionReason | null;
+      failure_stage?: MockMeeting["failure_stage"];
       planned?: boolean;
       recording_base64?: string;
       recording_content_type?: string;
@@ -188,6 +189,7 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       if (body.append_segments) m.segments.push(...body.append_segments.map((s, i) => toReal(s, m.segments.length + i)));
     }
     if (body.completion_reason !== undefined) m.completion_reason = body.completion_reason;
+    if (body.failure_stage !== undefined) m.failure_stage = body.failure_stage;
     if (body.planned !== undefined) m.planned = body.planned;
     if (body.start_time !== undefined) m.start_time = body.start_time;
     if (body.end_time !== undefined) m.end_time = body.end_time;

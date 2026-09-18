@@ -23,12 +23,12 @@ const segment = (end: number): VexaTranscriptionSegment => ({
 });
 
 describe("Vexa terminal timeline coverage", () => {
-  test("requires duration evidence before selecting recording recovery", () => {
-    expect(isMateriallyIncomplete(response(null), [])).toBe(false);
+  test("empty output attempts recovery even without trustworthy duration evidence", () => {
+    expect(isMateriallyIncomplete(response(null), [])).toBe(true);
   });
 
-  test("does not misclassify a short terminal meeting, even when it has no words", () => {
-    expect(isMateriallyIncomplete(response(10), [])).toBe(false);
+  test("recovers an empty native transcript even for a short call", () => {
+    expect(isMateriallyIncomplete(response(10), [])).toBe(true);
     expect(isMateriallyIncomplete(response(10), [segment(2)])).toBe(false);
   });
 
@@ -36,5 +36,9 @@ describe("Vexa terminal timeline coverage", () => {
     expect(isMateriallyIncomplete(response(120), [segment(110)])).toBe(false);
     expect(isMateriallyIncomplete(response(120), [segment(20)])).toBe(true);
     expect(isMateriallyIncomplete(response(120), [])).toBe(true);
+  });
+
+  test("detects a materially large internal gap even when the late tail is present", () => {
+    expect(isMateriallyIncomplete(response(120), [segment(20), { ...segment(120), start: 118 }])).toBe(true);
   });
 });

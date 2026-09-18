@@ -8,7 +8,7 @@ export async function processJob(ctx: AppContext, job: Job): Promise<void> {
     case "meeting.start":
       return handleMeetingStart(ctx, job.meetingId, job.attempt ?? 1);
     case "meeting.poll":
-      return handleMeetingPoll(ctx, job.meetingId);
+      return handleMeetingPoll(ctx, job.meetingId, job.recoveryAttempt ?? 1);
     case "meeting.join_deadline":
       return handleJoinDeadline(ctx, job.meetingId);
     case "webhook.deliver":
