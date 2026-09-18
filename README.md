@@ -213,16 +213,17 @@ transcript storage is an upsert and only the winning terminal transition emits a
   DB/MinIO purge inside the CVM (follow-up).
 - **Jitsi live validation** is marked pending upstream; it works against docker-jitsi-meet stable-11146-2
   (bot needs `https://` + hostname + a trusted cert).
-- **Tinfoil wiring and live two-speaker/late-joiner acceptance remain deferred follow-ups**: the shipped
-  Compose still uses local Whisper inside Vexa. `fixtures/bob.wav` remains for the later live gate.
+- **Live Vexa STT backend wiring and two-speaker/late-joiner acceptance remain deferred follow-ups**:
+  the shipped Compose still uses local Whisper inside Vexa. Tinfoil is wired only for the retained-recording
+  recovery path described above. `fixtures/bob.wav` remains for the later live gate.
 - The capture rig needed a host iptables fix (Docker's FORWARD/NAT chains had been flushed) — see infra/README.md.
 
 ## Vexa fork ([TinyCloudLabs/vexa](https://github.com/TinyCloudLabs/vexa))
 
 The CVM runs commit-addressed bot, meeting-api, and gateway images from our Vexa fork. Vexa performs
-STT and native speaker attribution; this service consumes the completed attributed segments instead
-of downloading and retranscribing recordings. The remaining Vexa components stay on their unchanged
-upstream v0.12 images.
+primary STT and native speaker attribution; this service normally consumes the completed attributed
+segments directly. Only a materially incomplete terminal timeline uses its retained mixed recording
+for Tinfoil recovery. The remaining Vexa components stay on their unchanged upstream v0.12 images.
 
 - **Branches**: `tinycloud` = current upstream (`59e2c413`) + the selected TinyCloud overlay, currently
   at `89c8cf88`. `main` tracks upstream untouched. The separate local rig remains pinned by

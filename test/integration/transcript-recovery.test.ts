@@ -51,6 +51,14 @@ describe("recording recovery and transcript JSON compatibility", () => {
     await waitStatus(id, "completed");
     const transcript = await (await h.api(`/v1/meetings/${id}/transcript`)).json();
     expect(transcript).toMatchObject({ provider: "vexa", speakers: [{ name: "Alice" }], text: "Alice: Native final words." });
+    expect(transcript.segments).toEqual([{
+      id: "seg_001",
+      speaker_id: "speaker_0",
+      speaker_name: "Alice",
+      start: 0,
+      end: 3,
+      text: "Native final words.",
+    }]);
     expect(tinfoilCalls).toHaveLength(callsBefore);
     const [stored] = await h.ctx.db.execute(sql`select jsonb_typeof(segments_json) as type from transcripts where meeting_id = ${id}`);
     expect(stored).toEqual({ type: "object" });

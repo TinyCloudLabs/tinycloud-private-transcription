@@ -130,6 +130,7 @@ export async function startHarness(
       receiver.stop(true);
       vexa.stop();
       redis.close();
+      await db.$client.close();
     },
   };
 }

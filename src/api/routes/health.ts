@@ -27,7 +27,9 @@ export function healthRoutes(ctx: AppContext) {
           vexa: vexa.ok,
           // running = bots Vexa reports as live (null when Vexa is unreachable); max = provisioned ceiling.
           bot_capacity: { running: vexa.running_bots, max: ctx.config.vexa.maxConcurrentBots },
-          transcription_provider: ctx.transcription.name,
+          // Vexa owns the primary speaker-attributed timeline. Recording recovery never changes
+          // the provider advertised by health.
+          transcription_provider: "vexa",
           signal,
         },
       },

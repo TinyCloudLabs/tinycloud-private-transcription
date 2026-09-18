@@ -338,12 +338,15 @@ async function finalize(
  * as incomplete merely because their last words precede teardown.
  */
 export function isMateriallyIncomplete(vexa: VexaTranscriptionResponse, segments: ReturnType<typeof adaptVexaSegments>) {
-  const words = segments.filter((segment) => segment.text.trim().length > 0);
-  if (words.length === 0) return true;
   const start = vexa.start_time ? Date.parse(vexa.start_time) : NaN;
   const end = vexa.end_time ? Date.parse(vexa.end_time) : NaN;
   if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return false;
   const duration = (end - start) / 1000;
+  // A missing/empty transcript alone is not duration evidence. In particular, do not send a short
+  // silent meeting through recovery merely because it has no words.
+  if (duration <= 15) return false;
+  const words = segments.filter((segment) => segment.text.trim().length > 0);
+  if (words.length === 0) return true;
   const finalWordEnd = Math.min(duration, Math.max(...words.map((segment) => segment.end)));
   const uncoveredTail = duration - finalWordEnd;
   return uncoveredTail > 15 && finalWordEnd / duration < 0.8;
