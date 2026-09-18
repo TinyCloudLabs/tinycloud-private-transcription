@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { AppContext } from "../context.ts";
 import { meetings, transcripts, type MeetingRow, type TranscriptRow } from "../db/schema.ts";
@@ -153,10 +153,13 @@ export async function storeTranscript(
   t: NormalizedTranscript,
   provider: string,
 ) {
+  // Bun's SQL driver binds a JavaScript object as a JSON string. Cast that JSON text explicitly so
+  // Postgres stores a jsonb object instead of a jsonb string containing encoded JSON.
+  const segmentsJson = sql`${JSON.stringify({ speakers: t.speakers, segments: t.segments, text: t.text })}::text::jsonb`;
   const row = {
     language: t.language,
     durationSeconds: t.duration_seconds,
-    segmentsJson: { speakers: t.speakers, segments: t.segments, text: t.text },
+    segmentsJson,
     provider,
   };
   await ctx.db

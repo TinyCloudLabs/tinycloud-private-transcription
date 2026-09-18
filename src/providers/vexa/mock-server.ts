@@ -161,6 +161,8 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       planned?: boolean;
       recording_base64?: string;
       recording_content_type?: string;
+      start_time?: string | null;
+      end_time?: string | null;
     };
     if (body.recording_base64 !== undefined) m.recording = { bytes: new Uint8Array(Buffer.from(body.recording_base64, "base64")), contentType: body.recording_content_type ?? "audio/wav" };
     if (body.status) {
@@ -187,6 +189,8 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
     }
     if (body.completion_reason !== undefined) m.completion_reason = body.completion_reason;
     if (body.planned !== undefined) m.planned = body.planned;
+    if (body.start_time !== undefined) m.start_time = body.start_time;
+    if (body.end_time !== undefined) m.end_time = body.end_time;
     m.updated_at = now();
     return c.json(strip(m));
   });

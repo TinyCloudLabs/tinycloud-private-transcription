@@ -176,7 +176,7 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
     return;
   }
-  if (!hasLiveWords && ctx.transcription.name !== "tinfoil") {
+  if (!hasLiveWords && !ctx.transcriptRecovery) {
     const { meeting: failed, changed } = await failMeeting(ctx, meeting, "capture_failed", "No usable audio was captured for this meeting.");
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
     return;
