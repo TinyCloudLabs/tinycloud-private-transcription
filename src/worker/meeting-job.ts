@@ -13,8 +13,10 @@ import { and, eq, isNull, sql } from "drizzle-orm";
 import { meetings } from "../db/schema.ts";
 import { normalizeSegments } from "../domain/transcript.ts";
 import { openSignalCapability } from "../providers/signal/capability.ts";
+import type { VexaTranscriptionResponse } from "../providers/vexa/types.ts";
 
 const MAX_START_ATTEMPTS = 3;
+const MAX_RECOVERY_ATTEMPTS = 3;
 
 /** Job: meeting.start — ask Vexa to send a bot. */
 export async function handleMeetingStart(ctx: AppContext, meetingId: string, attempt = 1): Promise<void> {
@@ -29,9 +31,10 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
       meeting_url: meeting.meetingUrl,
       bot_name: meeting.botName ?? undefined,
       language: meeting.language ?? undefined,
-      // Vexa performs transcription, including when its deployment is configured to use Tinfoil.
-      // TinyCloud persists the completed Vexa segments and never re-transcribes a recording.
+      // Vexa remains the primary transcription provider.
       transcribe_enabled: true,
+      // Retain audio only on deployments which have the recovery provider configured.
+      ...(ctx.transcriptRecovery ? { recording_enabled: true } : {}),
       // Vexa otherwise applies its ten-minute deployment fallback. Pin every TinyCloud meeting to
       // our configurable audio-silence window. This can expire with humans still connected;
       // participant presence does not veto Vexa's silence verdict.
@@ -110,7 +113,7 @@ export async function handleJoinDeadline(ctx: AppContext, meetingId: string): Pr
 }
 
 /** Job: meeting.poll — sync status from Vexa; finalize when the bot has left. */
-export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Promise<void> {
+export async function handleMeetingPoll(ctx: AppContext, meetingId: string, recoveryAttempt = 1): Promise<void> {
   let meeting = await getMeetingById(ctx, meetingId);
   if (!meeting || isTerminal(meeting.status as MeetingStatus)) return;
   if (meeting.platform === "signal") return handleSignalPoll(ctx, meeting);
@@ -128,7 +131,7 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
       return;
     }
     ctx.log.warn("vexa poll failed; will retry", { meetingId, error: String(e) });
-    await ctx.queue.push({ type: "meeting.poll", meetingId }, ctx.config.vexa.pollIntervalMs);
+    await ctx.queue.push({ type: "meeting.poll", meetingId, recoveryAttempt }, ctx.config.vexa.pollIntervalMs);
     return;
   }
 
@@ -138,6 +141,20 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
   const reason = completionReasonOf(vexa);
   const mapped = mapVexaStatus(vexa.status);
 
+  const failureStage = vexa.data?.failure_stage;
+  // Explicit provider evidence outranks our local state. Local in_progress/processing is only a
+  // fallback when Vexa omitted failure_stage entirely (including manual recovery of an old row).
+  const failedAfterAdmission = mapped === "failed" && (
+    failureStage === "active"
+    || (failureStage == null && (meeting.status === "in_progress" || meeting.status === "processing"))
+  );
+  if (mapped === "failed" && !failedAfterAdmission) {
+    const f = mapVexaFailure(reason);
+    const { meeting: failed, changed } = await failMeeting(ctx, meeting, f.code, f.message);
+    if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+    return;
+  }
+
   if (vexa.status !== "completed" && mapped !== "failed") {
     const { meeting: updated } = await transition(ctx, meeting, mapped);
     meeting = updated;
@@ -145,8 +162,9 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
     return;
   }
 
-  // Vexa owns the STT windows and speaker attribution. Private transcription only normalizes and
-  // persists Vexa's completed segments; it must never re-fetch or re-transcribe recordings.
+  // Vexa owns the normal timeline and attribution. A retained recording is only read when that
+  // timeline is materially incomplete, so teardown losses can be recovered without replacing good
+  // Vexa speaker metadata.
   let segments: ReturnType<typeof adaptVexaSegments>;
   try {
     segments = adaptVexaSegments(vexa); // deduped by turn, epoch → meeting-relative seconds
@@ -160,16 +178,23 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string): Pro
     return;
   }
   const hasLiveWords = segments.some((segment) => segment.text.trim().length > 0);
-  if (!hasLiveWords) {
-    const f = reason ? mapVexaFailure(reason) : { code: "capture_failed" as const, message: "No usable audio was captured for this meeting." };
-    const { meeting: failed, changed } = await failMeeting(ctx, meeting, f.code, f.message);
+  // Active-stage failure permits finalization but does not itself replace a complete Vexa-native
+  // transcript. The same material-incompleteness test selects recovery for every terminal shape.
+  const recover = !!ctx.transcriptRecovery && isMateriallyIncomplete(vexa, segments);
+  // When recovery is unconfigured, nonempty native words remain the loss-preserving fallback even
+  // if their coverage is incomplete. Empty output still retains the mapped terminal failure below.
+  if (!hasLiveWords && !recover) {
+    const failure = reason
+      ? mapVexaFailure(reason)
+      : { code: "capture_failed" as const, message: "No usable audio was captured for this meeting." };
+    const { meeting: failed, changed } = await failMeeting(ctx, meeting, failure.code, failure.message);
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
     return;
   }
 
   ({ meeting } = await transition(ctx, meeting, "processing"));
   ctx.log.debug("vexa meeting completed; finalizing", { meetingId: meeting.id, vexaSegments: segments.length });
-  await finalize(ctx, meeting, segments);
+  await finalize(ctx, meeting, vexa, segments, recover, recoveryAttempt);
 }
 
 async function handleSignalStart(ctx: AppContext, meeting: MeetingRow, attempt: number) {
@@ -285,29 +310,135 @@ async function handleSignalPoll(ctx: AppContext, meeting: MeetingRow) {
 async function finalize(
   ctx: AppContext,
   meeting: MeetingRow,
+  vexa: VexaTranscriptionResponse,
   vexaSegments: ReturnType<typeof adaptVexaSegments>,
+  recover: boolean,
+  recoveryAttempt: number,
 ) {
   const input = {
     meetingId: meeting.id,
     language: meeting.language,
     vexaSegments,
+    fetchAudio: () => fetchVexaAudio(ctx, vexa),
   };
   try {
-    const transcript = await ctx.transcription.transcribe(input);
+    const provider = recover ? ctx.transcriptRecovery! : ctx.transcription;
+    const transcript = await provider.transcribe(input);
     if (!transcript.text.trim()) {
       throw new ApiError("transcription_failed", "Transcription provider returned no words");
     }
-    await storeTranscript(ctx, meeting.id, transcript, "vexa");
+    await storeTranscript(ctx, meeting.id, transcript, provider.name);
     const { meeting: done, changed } = await transition(ctx, meeting, "completed");
     if (changed) await enqueueMeetingWebhook(ctx, done, "meeting.completed");
   } catch (e) {
+    if (recover && e instanceof RecoveryRecordingNotReadyError && recoveryAttempt < MAX_RECOVERY_ATTEMPTS) {
+      ctx.log.warn("vexa recording is not ready; retrying recovery", { meetingId: meeting.id, recoveryAttempt });
+      await ctx.queue.push(
+        { type: "meeting.poll", meetingId: meeting.id, recoveryAttempt: recoveryAttempt + 1 },
+        ctx.config.vexa.pollIntervalMs * recoveryAttempt,
+      );
+      return;
+    }
+    if (recover && vexaSegments.some((segment) => segment.text.trim().length > 0)) {
+      ctx.log.warn("recording recovery exhausted; preserving vexa transcript", { meetingId: meeting.id, recoveryAttempt, error: String(e) });
+      const transcript = await ctx.transcription.transcribe(input);
+      if (transcript.text.trim()) {
+        await storeTranscript(ctx, meeting.id, transcript, ctx.transcription.name);
+        const { meeting: done, changed } = await transition(ctx, meeting, "completed");
+        if (changed) await enqueueMeetingWebhook(ctx, done, "meeting.completed");
+        return;
+      }
+    }
+    if (recover && e instanceof RecoveryRecordingNotReadyError) {
+      const failure = mapVexaFailure(completionReasonOf(vexa));
+      ctx.log.error("recording recovery exhausted without retained audio", { meetingId: meeting.id, recoveryAttempt });
+      const { meeting: failed, changed } = await failMeeting(ctx, meeting, failure.code, failure.message);
+      if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+      return;
+    }
     ctx.log.error("transcription failed", { meetingId: meeting.id, error: String(e) });
     const { meeting: failed, changed } = await failMeeting(
       ctx,
       meeting,
-      e instanceof ApiError ? e.code : "transcription_failed",
+      "transcription_failed",
       "Transcription could not be completed for this meeting.",
     );
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
   }
 }
+
+const MATERIAL_GAP_SECONDS = 15;
+const MATERIAL_GAP_RATIO = 0.2;
+const MIN_MATERIAL_COVERAGE_RATIO = 0.2;
+
+/**
+ * Terminal duration is the coverage boundary. A single uncovered interval is material only when it
+ * exceeds both 15 seconds and 20% of the recording. As a conservative backstop for distributed
+ * loss, merged word intervals covering less than 20% of a recording are also incomplete when more
+ * than 15 seconds are uncovered. This avoids treating ordinary pauses as loss while catching sparse
+ * fragments whose individual gaps remain below the ratio threshold.
+ */
+export function isMateriallyIncomplete(vexa: VexaTranscriptionResponse, segments: ReturnType<typeof adaptVexaSegments>) {
+  const words = segments.filter((segment) => segment.text.trim().length > 0);
+  // Empty native output is never evidence of silence. Recovery decodes the actual recording before
+  // making that determination, including for short calls and rows with missing terminal timestamps.
+  if (words.length === 0) return true;
+  const start = vexa.start_time ? Date.parse(vexa.start_time) : NaN;
+  const end = vexa.end_time ? Date.parse(vexa.end_time) : NaN;
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return false;
+  const duration = (end - start) / 1000;
+  const ordered = words
+    .map((segment) => ({ start: Math.max(0, Math.min(duration, segment.start)), end: Math.max(0, Math.min(duration, segment.end)) }))
+    .filter((segment) => segment.end > segment.start)
+    .sort((a, b) => a.start - b.start || a.end - b.end);
+  if (ordered.length === 0) return true;
+
+  const merged: { start: number; end: number }[] = [];
+  for (const interval of ordered) {
+    const previous = merged.at(-1);
+    if (previous && interval.start <= previous.end) previous.end = Math.max(previous.end, interval.end);
+    else merged.push({ ...interval });
+  }
+
+  let previousEnd = 0;
+  let largestGap = 0;
+  let covered = 0;
+  for (const interval of merged) {
+    largestGap = Math.max(largestGap, interval.start - previousEnd);
+    covered += interval.end - interval.start;
+    previousEnd = interval.end;
+  }
+  largestGap = Math.max(largestGap, duration - previousEnd);
+  const uncovered = duration - covered;
+  return (largestGap > MATERIAL_GAP_SECONDS && largestGap / duration > MATERIAL_GAP_RATIO)
+    || (uncovered > MATERIAL_GAP_SECONDS && covered / duration < MIN_MATERIAL_COVERAGE_RATIO);
+}
+
+async function fetchVexaAudio(ctx: AppContext, vexa: VexaTranscriptionResponse) {
+  try {
+    const recordings = await ctx.vexa.listRecordings();
+    const recording = recordings.recordings.find((candidate) => candidate.meeting_id === vexa.id && candidate.media_files.some((file) => file.type === "audio"));
+    if (!recording) throw new RecoveryRecordingNotReadyError();
+    const master = await ctx.vexa.recordingMaster(recording.id);
+    if (!master.raw_url) throw new RecoveryRecordingNotReadyError();
+    const { bytes, contentType } = await ctx.vexa.fetchBytes(master.raw_url);
+    if (!bytes.length) throw new RecoveryRecordingNotReadyError();
+    return { bytes, filename: "meeting.webm", contentType };
+  } catch (error) {
+    if (error instanceof RecoveryRecordingNotReadyError || isRetryableRecordingFetchError(error)) {
+      throw new RecoveryRecordingNotReadyError();
+    }
+    throw error;
+  }
+}
+
+class RecoveryRecordingNotReadyError extends Error {
+  constructor() {
+    super("The retained recording is not ready");
+    this.name = "RecoveryRecordingNotReadyError";
+  }
+}
+
+const isRetryableRecordingFetchError = (error: unknown) =>
+  (error instanceof ApiError && (error.code === "provider_unavailable" || error.code === "provider_timeout"))
+  || (error instanceof VexaHttpError && (error.notFound || error.status === 429 || error.status >= 500));

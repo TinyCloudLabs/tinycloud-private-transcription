@@ -56,7 +56,7 @@ export const transcripts = pgTable("transcripts", {
   language: text("language").notNull(),
   durationSeconds: real("duration_seconds").notNull(),
   segmentsJson: jsonb("segments_json").notNull(),
-  /** Vexa owns attribution and transcription; its configured backend may be Tinfoil. */
+  /** Producer of the stored transcript: normally Vexa, or Tinfoil for recording recovery. */
   provider: text("provider").notNull().default("vexa"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });

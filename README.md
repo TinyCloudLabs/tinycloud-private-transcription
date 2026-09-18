@@ -105,7 +105,10 @@ production window. Green 2/2 on 2026-08-17 (~2 min each; evidence in `tmp/e2e-<r
 | `SIGNAL_PULSE_SOURCE` | `ptx_sink.monitor` in dstack | PulseAudio monitor captured by the isolated Signal seat |
 | `SIGNAL_TRANSCRIBER` | bundled dstack adapter | local WAV-to-JSON adapter using the in-CVM Whisper service |
 | `JOIN_TIMEOUT_SECONDS` | `600` | worker-side join deadline: a meeting still `joining`/`waiting_for_admission` this long after bot dispatch is failed (`meeting_join_failed`/`waiting_room_timeout`), its bot stopped, and `meeting.failed` emitted |
-| `TRANSCRIPTION_PROVIDER` | `vexa` | PTX compatibility label (`vexa` or `tinfoil`); both ingest Vexa-produced segments. This does not configure Vexa's STT endpoint; the shipped Compose still uses local Whisper and Tinfoil wiring is deferred. |
+| `TRANSCRIPTION_PROVIDER` | `vexa` | Compatibility label; Vexa remains the primary provider and is reported by health. |
+| `TINFOIL_BASE_URL` | `https://inference.tinfoil.sh` | OpenAI-compatible confidential transcription endpoint used only for recovery. |
+| `TINFOIL_API_KEY` | – | bearer token; when set, enables recording retention and recovery transcription. |
+| `TINFOIL_MODEL` | `voxtral-small-24b` | recovery transcription model. |
 | `AUTO_MIGRATE` | `true` | API runs migrations at boot |
 | `LOG_LEVEL` | `info` | JSON logs |
 
@@ -191,16 +194,12 @@ Types in `src/providers/vexa/types.ts`; pure mapping in `src/providers/vexa/adap
 - `GET /bots/status` → `{running:[MeetingResponse…], running_bots:[…same], count}` (non-terminal rows only).
 ## Vexa-native transcript ingestion
 
-Every meeting requests `transcribe_enabled:true`. On completion, TinyCloud validates, de-duplicates,
-rebases, normalizes, and stores Vexa's completed
-speaker-attributed segments. It makes no recording, timeline, audio-decoding, partitioning, or downstream
-transcription request. `POST /v1/meetings/{id}/recover` remains tenant-scoped and retries the same retained
-Vexa transcript row; transcript storage is an upsert and only the winning terminal transition emits a webhook.
-
-`TRANSCRIPTION_PROVIDER=tinfoil` currently selects the same Vexa-native ingestion path for compatibility;
-it does not configure Vexa's STT service. The shipped Compose still points Vexa at local Whisper. A future
-deployment change may wire TinyCloud Tinfoil as Vexa's text-only STT backend; Vexa remains responsible for
-speaker attribution.
+Every meeting requests live Vexa transcription. When Tinfoil recovery is configured, it also requests a
+retained mixed recording. On completion, TinyCloud validates, de-duplicates, rebases, normalizes, and stores
+a complete Vexa speaker-attributed timeline unchanged. If terminal timestamps show that Vexa lost a material
+tail, TinyCloud transcribes the retained recording through Tinfoil's text-STT endpoint. Tinfoil does no
+diarization: recovered segments use `Unknown` speakers. `POST /v1/meetings/{id}/recover` remains tenant-scoped;
+transcript storage is an upsert and only the winning terminal transition emits a webhook.
 
 ### Known gaps / risks
 
@@ -214,16 +213,17 @@ speaker attribution.
   DB/MinIO purge inside the CVM (follow-up).
 - **Jitsi live validation** is marked pending upstream; it works against docker-jitsi-meet stable-11146-2
   (bot needs `https://` + hostname + a trusted cert).
-- **Tinfoil wiring and live two-speaker/late-joiner acceptance remain deferred follow-ups**: the shipped
-  Compose still uses local Whisper inside Vexa. `fixtures/bob.wav` remains for the later live gate.
+- **Live Vexa STT backend wiring and two-speaker/late-joiner acceptance remain deferred follow-ups**:
+  the shipped Compose still uses local Whisper inside Vexa. Tinfoil is wired only for the retained-recording
+  recovery path described above. `fixtures/bob.wav` remains for the later live gate.
 - The capture rig needed a host iptables fix (Docker's FORWARD/NAT chains had been flushed) — see infra/README.md.
 
 ## Vexa fork ([TinyCloudLabs/vexa](https://github.com/TinyCloudLabs/vexa))
 
 The CVM runs commit-addressed bot, meeting-api, and gateway images from our Vexa fork. Vexa performs
-STT and native speaker attribution; this service consumes the completed attributed segments instead
-of downloading and retranscribing recordings. The remaining Vexa components stay on their unchanged
-upstream v0.12 images.
+primary STT and native speaker attribution; this service normally consumes the completed attributed
+segments directly. Only a materially incomplete terminal timeline uses its retained mixed recording
+for Tinfoil recovery. The remaining Vexa components stay on their unchanged upstream v0.12 images.
 
 - **Branches**: `tinycloud` = current upstream (`59e2c413`) + the selected TinyCloud overlay, currently
   at `89c8cf88`. `main` tracks upstream untouched. The separate local rig remains pinned by
@@ -315,7 +315,7 @@ cannot re-pull a ttl.sh image.
 
 **Env.** `cp infra/dstack/.env.example infra/dstack/.env` (gitignored) and fill it: random 32-char values for
 `POSTGRES_PASSWORD`, `VEXA_DB_PASSWORD`, `VEXA_ADMIN_TOKEN`, `VEXA_INTERNAL_API_SECRET`, `MINIO_ROOT_PASSWORD`;
-leave `TRANSCRIPTION_PROVIDER=vexa` until Vexa's Tinfoil STT endpoint is explicitly wired.
+keep `TRANSCRIPTION_PROVIDER=vexa`, and set `TINFOIL_API_KEY` to enable retained-recording recovery.
 Everything in that
 file is encrypted client-side and sealed into
 the CVM (`phala deploy -e`); nothing secret lives in `app-compose.yaml`.

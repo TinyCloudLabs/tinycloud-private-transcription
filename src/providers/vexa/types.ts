@@ -43,6 +43,7 @@ export interface VexaMeetingCreate {
   language?: string;
   task?: "transcribe" | "translate";
   transcribe_enabled?: boolean;
+  recording_enabled?: boolean;
   /** Vexa's per-meeting lifecycle limits. `max_time_left_alone` is milliseconds without remote participant audio. */
   automatic_leave?: { max_time_left_alone: number };
   passcode?: string;
@@ -131,6 +132,14 @@ export interface VexaTranscriptionResponse {
   data?: VexaMeetingData | null;
   segments: VexaTranscriptionSegment[];
 }
+
+export interface VexaRecording {
+  id: number;
+  meeting_id: number;
+  media_files: { id: number; type: string }[];
+}
+export interface VexaRecordingsResponse { recordings: VexaRecording[]; }
+export interface VexaRecordingMasterResponse { raw_url: string | null; }
 
 /** GET /bots/status — non-terminal meetings only (`running` and `running_bots` are the same list). */
 export interface VexaBotStatusResponse {

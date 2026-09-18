@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { AppContext } from "../context.ts";
 import { meetings, transcripts, type MeetingRow, type TranscriptRow } from "../db/schema.ts";
@@ -153,10 +153,13 @@ export async function storeTranscript(
   t: NormalizedTranscript,
   provider: string,
 ) {
+  // Bun's SQL driver binds a JavaScript object as a JSON string. Cast that JSON text explicitly so
+  // Postgres stores a jsonb object instead of a jsonb string containing encoded JSON.
+  const segmentsJson = sql`${JSON.stringify({ speakers: t.speakers, segments: t.segments, text: t.text })}::text::jsonb`;
   const row = {
     language: t.language,
     durationSeconds: t.duration_seconds,
-    segmentsJson: { speakers: t.speakers, segments: t.segments, text: t.text },
+    segmentsJson,
     provider,
   };
   await ctx.db
@@ -317,7 +320,10 @@ function transcriptStatus(status: MeetingStatus, hasTranscript: boolean) {
 }
 
 export function serializeTranscript(m: MeetingRow, t: TranscriptRow) {
-  const body = t.segmentsJson as { speakers: unknown[]; segments: unknown[]; text: string };
+  // jsonb drivers return objects for new rows. Earlier writers double-encoded this value, so
+  // accept a legacy JSON string on reads until those rows are naturally replaced.
+  const value = typeof t.segmentsJson === "string" ? JSON.parse(t.segmentsJson) : t.segmentsJson;
+  const body = value as { speakers: unknown[]; segments: unknown[]; text: string };
   return {
     meeting_id: m.id,
     status: "completed",

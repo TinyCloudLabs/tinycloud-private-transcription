@@ -22,6 +22,8 @@ interface MockMeeting extends VexaMeetingResponse {
   meeting_url?: string;
   transcribe_enabled?: boolean;
   automatic_leave?: VexaMeetingCreate["automatic_leave"];
+  recording_enabled?: boolean;
+  recording?: { bytes: Uint8Array; contentType: string };
   /** Deletable via DELETE /meetings (real Vexa: idle/scheduled rows only). */
   planned?: boolean;
 }
@@ -84,6 +86,7 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       language: body.language,
       meeting_url: body.meeting_url,
       transcribe_enabled: body.transcribe_enabled,
+      recording_enabled: body.recording_enabled,
       automatic_leave: body.automatic_leave,
     };
     meetings.set(k, m);
@@ -116,6 +119,17 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
     });
   });
 
+  const recordingsOf = (m: MockMeeting) => m.recording ? [{ id: m.id * 1000, meeting_id: m.id, media_files: [{ id: m.id * 1000 + 1, type: "audio" }] }] : [];
+  app.get("/recordings", (c) => c.json({ recordings: [...meetings.values()].flatMap(recordingsOf) }));
+  app.get("/recordings/:id/master", (c) => {
+    const m = [...meetings.values()].find((meeting) => meeting.id * 1000 === Number(c.req.param("id")));
+    return m?.recording ? c.json({ raw_url: `/recordings/${m.id * 1000}/raw` }) : c.json({ detail: "Recording not found" }, 404);
+  });
+  app.get("/recordings/:id/raw", (c) => {
+    const m = [...meetings.values()].find((meeting) => meeting.id * 1000 === Number(c.req.param("id")));
+    return m?.recording ? new Response(m.recording.bytes as unknown as ArrayBuffer, { headers: { "content-type": m.recording.contentType } }) : c.json({ detail: "Recording not found" }, 404);
+  });
+
   app.delete("/bots/:platform/:native_meeting_id", (c) => {
     const m = meetings.get(key(c.req.param("platform"), c.req.param("native_meeting_id")));
     if (!m || ["completed", "failed"].includes(m.status)) return c.json({ detail: "No active meeting for this bot" }, 404);
@@ -144,8 +158,14 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       segments?: VexaTranscriptionSegment[];
       append_segments?: VexaTranscriptionSegment[];
       completion_reason?: VexaCompletionReason | null;
+      failure_stage?: MockMeeting["failure_stage"];
       planned?: boolean;
+      recording_base64?: string;
+      recording_content_type?: string;
+      start_time?: string | null;
+      end_time?: string | null;
     };
+    if (body.recording_base64 !== undefined) m.recording = { bytes: new Uint8Array(Buffer.from(body.recording_base64, "base64")), contentType: body.recording_content_type ?? "audio/wav" };
     if (body.status) {
       m.status = body.status;
       if (["active", "completed"].includes(body.status) && !m.start_time) m.start_time = now();
@@ -169,7 +189,10 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       if (body.append_segments) m.segments.push(...body.append_segments.map((s, i) => toReal(s, m.segments.length + i)));
     }
     if (body.completion_reason !== undefined) m.completion_reason = body.completion_reason;
+    if (body.failure_stage !== undefined) m.failure_stage = body.failure_stage;
     if (body.planned !== undefined) m.planned = body.planned;
+    if (body.start_time !== undefined) m.start_time = body.start_time;
+    if (body.end_time !== undefined) m.end_time = body.end_time;
     m.updated_at = now();
     return c.json(strip(m));
   });

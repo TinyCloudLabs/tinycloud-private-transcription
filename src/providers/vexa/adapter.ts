@@ -36,8 +36,7 @@ export function dedupeVexaSegments(segments: VexaTranscriptionSegment[]): VexaTr
 
 /**
  * Validate the transcript supplied by Vexa before it reaches normalization/storage. This is the
- * live Vexa boundary (including Vexa deployments backed by Tinfoil), rather than a removed
- * recording-based downstream provider.
+ * live Vexa boundary, before an optional retained-recording recovery decision.
  */
 function validateVexaSegments(segments: VexaTranscriptionSegment[]): VexaTranscriptionSegment[] {
   for (const segment of segments) {

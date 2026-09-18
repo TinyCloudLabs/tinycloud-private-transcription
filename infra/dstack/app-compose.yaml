@@ -82,6 +82,9 @@ services:
       # fallback so an empty or silent meeting releases capacity sooner on Jitsi or Google Meet.
       VEXA_MAX_TIME_LEFT_ALONE_MS: ${VEXA_MAX_TIME_LEFT_ALONE_MS:-300000}
       TRANSCRIPTION_PROVIDER: ${TRANSCRIPTION_PROVIDER:-vexa}
+      TINFOIL_BASE_URL: ${TINFOIL_BASE_URL:-https://inference.tinfoil.sh}
+      TINFOIL_API_KEY: ${TINFOIL_API_KEY:-}
+      TINFOIL_MODEL: ${TINFOIL_MODEL:-voxtral-small-24b}
       # Each seat has a private control network and token. Its unauthenticated CDP remains bound
       # only to that seat's own loopback namespace.
       SIGNAL_CAPTURE_URLS: http://signal-capture:18076,http://signal-capture-2:18077,http://signal-capture-3:18078

@@ -38,6 +38,7 @@ export async function startHarness(
   opts: {
     webhookRetryDelaysMs?: number[];
     transcription?: TranscriptionProvider;
+    transcriptRecovery?: TranscriptionProvider | null;
     log?: Logger;
     enabledPlatforms?: string[];
     joinTimeoutSeconds?: number;
@@ -71,6 +72,7 @@ export async function startHarness(
     queue,
     vexa: new VexaClient({ baseUrl: vexa.baseUrl, apiKey: vexa.apiKey }),
     transcription: opts.transcription ?? createTranscriptionProvider(config),
+    ...(opts.transcriptRecovery !== undefined ? { transcriptRecovery: opts.transcriptRecovery } : {}),
     ...(opts.signal ? { signal: opts.signal } : {}),
     log: opts.log ?? silentLogger,
     webhookRetryDelaysMs: opts.webhookRetryDelaysMs ?? [0, 100, 200],
@@ -128,6 +130,7 @@ export async function startHarness(
       receiver.stop(true);
       vexa.stop();
       redis.close();
+      await db.$client.close();
     },
   };
 }

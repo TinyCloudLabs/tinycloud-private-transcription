@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { VexaNativeProvider } from "../../src/providers/transcription/vexa-native.ts";
-import { createTranscriptionProvider } from "../../src/providers/transcription/index.ts";
+import { TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
+import { createTranscriptRecoveryProvider, createTranscriptionProvider } from "../../src/providers/transcription/index.ts";
 import type { TranscriptionProviderName } from "../../src/config.ts";
 
 const vexaSegments = [
@@ -24,12 +25,13 @@ describe("VexaNativeProvider", () => {
 });
 
 describe("createTranscriptionProvider", () => {
-  // The no-second-transcription invariant at the construction boundary: whichever backend the Vexa
-  // deployment selects, TinyCloud only ever builds the passthrough that normalizes Vexa's segments.
-  test.each(["vexa", "tinfoil"] as const)("%s selects the Vexa-native passthrough", (transcriptionProvider) => {
-    const provider = createTranscriptionProvider({ transcriptionProvider });
-    expect(provider).toBeInstanceOf(VexaNativeProvider);
-    expect(provider.name).toBe("vexa");
+  test.each(["vexa", "tinfoil"] as const)("%s keeps Vexa as the primary provider", (transcriptionProvider) => {
+    expect(createTranscriptionProvider({ transcriptionProvider })).toBeInstanceOf(VexaNativeProvider);
+  });
+
+  test("Tinfoil recovery is configured separately from the primary provider", () => {
+    expect(createTranscriptRecoveryProvider({ tinfoil: { baseUrl: "https://tinfoil.test", apiKey: "", model: "test" } })).toBeNull();
+    expect(createTranscriptRecoveryProvider({ tinfoil: { baseUrl: "https://tinfoil.test", apiKey: "secret", model: "test" } })).toBeInstanceOf(TinfoilTranscriptionProvider);
   });
 
   test("an unknown TRANSCRIPTION_PROVIDER fails at boot instead of silently defaulting", () => {
