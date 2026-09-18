@@ -77,11 +77,11 @@ describe("infra/dstack/app-compose.yaml", () => {
 
   test("pins every deploy and runtime-pulled image to an approved immutable digest", () => {
     const expected = {
-      api: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:ca34ea34255ed8ad43f000e6d4d8114cd70ffc30@sha256:f8cfa56f65682cdc577e82122ad341791548a84d57e6d75840f621810c3dd7c7",
-      worker: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:ca34ea34255ed8ad43f000e6d4d8114cd70ffc30@sha256:f8cfa56f65682cdc577e82122ad341791548a84d57e6d75840f621810c3dd7c7",
-      "signal-capture": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:ca34ea34255ed8ad43f000e6d4d8114cd70ffc30@sha256:a8cbe368f72c818331d600ecdc23400c1964391f7682bfe0d9536d057dc73b74",
-      "signal-capture-2": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:ca34ea34255ed8ad43f000e6d4d8114cd70ffc30@sha256:a8cbe368f72c818331d600ecdc23400c1964391f7682bfe0d9536d057dc73b74",
-      "signal-capture-3": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:ca34ea34255ed8ad43f000e6d4d8114cd70ffc30@sha256:a8cbe368f72c818331d600ecdc23400c1964391f7682bfe0d9536d057dc73b74",
+      api: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:c3cdff63e429720a79903384509337f3e67caf3d@sha256:19407b6b1393a9ef17d867f656631d2d47535c75436cd2aa7c52cb9a94943244",
+      worker: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:c3cdff63e429720a79903384509337f3e67caf3d@sha256:19407b6b1393a9ef17d867f656631d2d47535c75436cd2aa7c52cb9a94943244",
+      "signal-capture": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f",
+      "signal-capture-2": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f",
+      "signal-capture-3": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f",
       "signal-control-provision": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
       "signal-capability-provision": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
       postgres: "postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685",

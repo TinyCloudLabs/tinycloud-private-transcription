@@ -27,7 +27,7 @@
 services:
   # ─── ours ────────────────────────────────────────────────────────────────────────────────────
   api:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:ca34ea34255ed8ad43f000e6d4d8114cd70ffc30@sha256:f8cfa56f65682cdc577e82122ad341791548a84d57e6d75840f621810c3dd7c7
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:c3cdff63e429720a79903384509337f3e67caf3d@sha256:19407b6b1393a9ef17d867f656631d2d47535c75436cd2aa7c52cb9a94943244
     # VEXA_API_KEY is minted at first boot by `vexa-provision` (below) into a shared volume.
     command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal-capability/capability-key); exec bun run src/api/server.ts"]
     restart: unless-stopped
@@ -70,7 +70,7 @@ services:
     networks: [ptx, vexa]
 
   worker:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:ca34ea34255ed8ad43f000e6d4d8114cd70ffc30@sha256:f8cfa56f65682cdc577e82122ad341791548a84d57e6d75840f621810c3dd7c7
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:c3cdff63e429720a79903384509337f3e67caf3d@sha256:19407b6b1393a9ef17d867f656631d2d47535c75436cd2aa7c52cb9a94943244
     command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && [ -s /run/signal-control-1/token ] && [ -s /run/signal-control-2/token ] && [ -s /run/signal-control-3/token ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && [ -s /run/signal-control-1/token ] && [ -s /run/signal-control-2/token ] && [ -s /run/signal-control-3/token ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal-capability/capability-key); exec bun run src/worker/index.ts"]
     restart: unless-stopped
     environment:
@@ -106,7 +106,7 @@ services:
   # unauthenticated CDP endpoint loopback-only and unreachable from sibling Signal containers.
   # Seat 1 retains the original service/volume names so an in-place upgrade preserves its link.
   signal-capture:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:ca34ea34255ed8ad43f000e6d4d8114cd70ffc30@sha256:a8cbe368f72c818331d600ecdc23400c1964391f7682bfe0d9536d057dc73b74
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f
     restart: unless-stopped
     ports:
       - "127.0.0.1:6080:6080"
@@ -140,7 +140,7 @@ services:
       vexa: {}
 
   signal-capture-2:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:ca34ea34255ed8ad43f000e6d4d8114cd70ffc30@sha256:a8cbe368f72c818331d600ecdc23400c1964391f7682bfe0d9536d057dc73b74
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f
     restart: unless-stopped
     ports:
       - "127.0.0.1:6081:6081"
@@ -174,7 +174,7 @@ services:
       vexa: {}
 
   signal-capture-3:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:ca34ea34255ed8ad43f000e6d4d8114cd70ffc30@sha256:a8cbe368f72c818331d600ecdc23400c1964391f7682bfe0d9536d057dc73b74
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f
     restart: unless-stopped
     ports:
       - "127.0.0.1:6082:6082"
