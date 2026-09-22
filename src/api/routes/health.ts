@@ -18,11 +18,11 @@ export function healthRoutes(ctx: AppContext) {
       ctx.config.signal.maxConcurrentCalls,
     );
     const core = postgres && redis;
-    const attributedProviderReady = ctx.transcriptRecovery instanceof TinfoilTranscriptionProvider;
+    const attributedProviderReady = ctx.transcriptRecovery instanceof TinfoilTranscriptionProvider && ctx.attributedReconciliationReady;
     const attributed = {
       enabled: ctx.config.attributedTranscriptionEnabled,
       ready: !ctx.config.attributedTranscriptionEnabled || attributedProviderReady,
-      reason: ctx.config.attributedTranscriptionEnabled && !attributedProviderReady ? "Attributed transcription provider is not configured" : null,
+      reason: ctx.config.attributedTranscriptionEnabled && !attributedProviderReady ? (ctx.transcriptRecovery instanceof TinfoilTranscriptionProvider ? "Attributed transcription reconciliation is incomplete" : "Attributed transcription provider is not configured") : null,
     };
     const status = !core ? "error" : vexa.ok && signal.ready && attributed.ready ? "ok" : "degraded";
     return c.json(

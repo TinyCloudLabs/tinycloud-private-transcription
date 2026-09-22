@@ -18,6 +18,7 @@ import type { VexaTranscriptionResponse } from "../providers/vexa/types.ts";
 
 const MAX_START_ATTEMPTS = 3;
 const MAX_RECOVERY_ATTEMPTS = 3;
+const usesAttributedCapture = (ctx: AppContext, meeting: MeetingRow) => ctx.config.attributedTranscriptionEnabled && meeting.platform === "google_meet";
 
 /** Job: meeting.start — ask Vexa to send a bot. */
 export async function handleMeetingStart(ctx: AppContext, meetingId: string, attempt = 1): Promise<void> {
@@ -34,7 +35,7 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
       language: meeting.language ?? undefined,
       // Keep the established Vexa contract untouched unless the new producer was explicitly
       // selected.  A disabled flag is a compatibility boundary, not a partial rollout.
-      ...(ctx.config.attributedTranscriptionEnabled
+      ...(usesAttributedCapture(ctx, meeting)
         ? { transcribe_enabled: false, recording_enabled: true, attributed_audio_enabled: true }
         : { transcribe_enabled: true, ...(ctx.transcriptRecovery ? { recording_enabled: true } : {}) }),
       // Vexa otherwise applies its ten-minute deployment fallback. Pin every TinyCloud meeting to
@@ -45,12 +46,12 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
     const vexaNativeMeetingId = created.native_meeting_id ?? meeting.vexaNativeMeetingId;
     const dispatched = await recordCapture(ctx, meeting, {
       silence_timeout_ms: ctx.config.vexa.maxTimeLeftAloneMs,
-      live_transcription_requested: !ctx.config.attributedTranscriptionEnabled,
+      live_transcription_requested: !usesAttributedCapture(ctx, meeting),
     });
     const { meeting: updated, changed } = await transition(ctx, dispatched, "joining", {
       vexaPlatform: created.platform ?? vexaPlatform,
       vexaNativeMeetingId,
-      ...(ctx.config.attributedTranscriptionEnabled ? { vexaMeetingId: created.id } : {}),
+      ...(usesAttributedCapture(ctx, meeting) ? { vexaMeetingId: created.id } : {}),
       vexaBotId: created.bot_container_id ?? String(created.id),
     });
     if (changed) {
@@ -72,11 +73,11 @@ async function handleStartError(ctx: AppContext, meeting: MeetingRow, e: unknown
   const retryable = e instanceof ApiError && (e.code === "provider_unavailable" || e.code === "provider_timeout");
   const vexa5xx = e instanceof VexaHttpError && e.status >= 500;
   if ((retryable || vexa5xx) && attempt < MAX_START_ATTEMPTS) {
-    ctx.log.warn("vexa createBot failed, retrying", { meetingId: meeting.id, attempt, error: String(e) });
+    ctx.log.warn("vexa createBot failed, retrying", usesAttributedCapture(ctx, meeting) ? { meetingId: meeting.id, attempt, stage: "create" } : { meetingId: meeting.id, attempt, error: String(e) });
     await ctx.queue.push({ type: "meeting.start", meetingId: meeting.id, attempt: attempt + 1 }, 1_000 * attempt);
     return;
   }
-  ctx.log.error("vexa createBot failed", { meetingId: meeting.id, error: String(e), detail: e instanceof VexaHttpError ? e.detail : undefined });
+  ctx.log.error("vexa createBot failed", usesAttributedCapture(ctx, meeting) ? { meetingId: meeting.id, stage: "create", code: e instanceof ApiError ? e.code : "provider_error" } : { meetingId: meeting.id, error: String(e), detail: e instanceof VexaHttpError ? e.detail : undefined });
   const code = e instanceof ApiError ? e.code : e instanceof VexaHttpError && e.status === 409 ? "meeting_join_failed" : "provider_unavailable";
   const message =
     code === "meeting_join_failed"
@@ -133,7 +134,7 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
       await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
       return;
     }
-    ctx.log.warn("vexa poll failed; will retry", { meetingId, error: String(e) });
+    ctx.log.warn("vexa poll failed; will retry", usesAttributedCapture(ctx, meeting) ? { meetingId, stage: "poll", code: e instanceof ApiError ? e.code : "provider_error" } : { meetingId, error: String(e) });
     await ctx.queue.push({ type: "meeting.poll", meetingId, recoveryAttempt }, ctx.config.vexa.pollIntervalMs);
     return;
   }
@@ -165,7 +166,7 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
     return;
   }
 
-  if (ctx.config.attributedTranscriptionEnabled) {
+  if (usesAttributedCapture(ctx, meeting)) {
     const vexaMeetingId = meeting.vexaMeetingId;
     if (!vexaMeetingId) {
       const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Attributed capture identity is unavailable.");
@@ -175,7 +176,7 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
     ({ meeting } = await transition(ctx, meeting, "processing"));
     try {
       // Sealed producer evidence is the only enabled-path source of canonical text.
-      await stageAttributedManifest(ctx, meeting.id, vexaMeetingId, await ctx.vexa.getAttributedAudio(vexaMeetingId));
+      await stageAttributedManifest(ctx, meeting.id, vexaMeetingId, await ctx.vexa.getAttributedAudio(vexaMeetingId), vexa.data?.attributed_audio_capability);
     } catch {
       const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Attributed source evidence could not be reconciled.");
       if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");

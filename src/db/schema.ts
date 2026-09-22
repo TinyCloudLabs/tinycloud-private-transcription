@@ -105,16 +105,6 @@ export const attributedAttempts = pgTable("attributed_attempts", {
 }, (t) => [uniqueIndex("attributed_attempts_batch_ordinal_idx").on(t.batchId, t.ordinal)]);
 
 /** Durable queue intent; Redis only wakes work and is never the source of truth. */
-export const attributedJobs = pgTable("attributed_jobs", {
-  id: text("id").primaryKey(),
-  meetingId: text("meeting_id").notNull().references(() => meetings.id, { onDelete: "cascade" }),
-  batchId: text("batch_id").references(() => attributedBatches.id, { onDelete: "cascade" }),
-  kind: text("kind").notNull(), // batch | finalize
-  status: text("status").notNull().default("pending"),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-}, (t) => [index("attributed_jobs_status_idx").on(t.status)]);
-
 export const webhookDeliveries = pgTable(
   "webhook_deliveries",
   {

@@ -33,8 +33,10 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number } = 
       // Durable attributed state is authoritative, so do not consume queue wakeups until it has
       // been reconciled.  Error details can contain SQL values or transcript text; log only stage.
       await reconcileAttributedRuns(ctx);
+      ctx.attributedReconciliationReady = true;
     } catch {
       ctx.log.error("attributed reconciliation failed", { stage: "startup_reconciliation" });
+      ctx.attributedReconciliationReady = false;
       return;
     }
     while (running) {
@@ -43,7 +45,7 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number } = 
         job = await ctx.queue.pop(opts.popTimeoutSec ?? 1);
         if (job) await processJob(ctx, job);
       } catch (e) {
-        if (job?.type.startsWith("attributed.")) ctx.log.error("attributed job failed", { stage: job.type });
+        if (job?.type.startsWith("attributed.") || (ctx.config.attributedTranscriptionEnabled && (job?.type === "meeting.poll" || job?.type === "meeting.start"))) ctx.log.error("attributed job failed", { stage: job.type });
         else ctx.log.error("job failed", { job, error: String(e) });
         await Bun.sleep(250);
       }

@@ -22,6 +22,8 @@ export interface AppContext {
   log: Logger;
   /** Webhook retry schedule (ms after previous attempt). Overridable for tests. */
   webhookRetryDelaysMs: number[];
+  /** Set only after worker startup has reconciled durable attributed claims. */
+  attributedReconciliationReady: boolean;
 }
 
 export const DEFAULT_WEBHOOK_RETRY_DELAYS_MS = [0, 60_000, 5 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
@@ -44,5 +46,6 @@ export function createContext(overrides: Partial<AppContext> & { config?: Config
     ),
     log,
     webhookRetryDelaysMs: overrides.webhookRetryDelaysMs ?? DEFAULT_WEBHOOK_RETRY_DELAYS_MS,
+    attributedReconciliationReady: overrides.attributedReconciliationReady ?? !cfg.attributedTranscriptionEnabled,
   };
 }

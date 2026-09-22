@@ -48,7 +48,7 @@ CREATE TABLE "attributed_transcription_runs" (
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-ALTER TABLE "meetings" ADD COLUMN "vexa_meeting_id" integer;--> statement-breakpoint
+ALTER TABLE "meetings" ADD COLUMN IF NOT EXISTS "vexa_meeting_id" integer;--> statement-breakpoint
 ALTER TABLE "attributed_attempts" ADD CONSTRAINT "attributed_attempts_batch_id_attributed_batches_id_fk" FOREIGN KEY ("batch_id") REFERENCES "public"."attributed_batches"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "attributed_batches" ADD CONSTRAINT "attributed_batches_meeting_id_meetings_id_fk" FOREIGN KEY ("meeting_id") REFERENCES "public"."meetings"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "attributed_jobs" ADD CONSTRAINT "attributed_jobs_meeting_id_meetings_id_fk" FOREIGN KEY ("meeting_id") REFERENCES "public"."meetings"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint

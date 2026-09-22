@@ -77,14 +77,8 @@ export interface VexaMeetingData {
   constructed_meeting_url?: string;
   last_error?: { reason?: string; exit_code?: number | null; error_details?: string } | null;
   sessions?: string[];
+  attributed_audio_capability?: { requested_version: 1; supported_version?: 1; status: "pending" | "supported" | "unsupported" };
   /** v1 durable, capture-owned evidence. PTX may consume it only after closure. */
-  attributed_audio_manifest?: {
-    version: 1; meeting_id: string; state: "open" | "closed"; clock_origin: "meeting_start"; clock_origin_ms: number; capabilities: { attributed_audio_enabled: true }; ranges: Array<{
-      version: 1; meeting_id: string; sequence: number; idempotency_key: string; speaker_key: string; speaker_name: string;
-      attribution: { source: "glow-bound" | "provisional" | "unresolved"; confidence: number }; start_ms: number; end_ms: number;
-      codec: "pcm_f32le"; sample_rate: number; channels: 1; channel: number; turn_generation: number; audio_duration_ms: number; byte_count: number; sha256: string; state: "sealed" | "uploaded" | "failed"; path?: string;
-    }>;
-  };
   [k: string]: unknown;
 }
 
@@ -147,10 +141,13 @@ export interface VexaAttributedAudioManifest {
   version: 1;
   meeting_id: string;
   state: "open" | "closed";
-  clock_origin: "meeting_start";
+  clock_origin: "first_admitted_capture_epoch_ms";
   clock_origin_ms: number;
-  capabilities: { attributed_audio_enabled: true };
-  ranges: VexaMeetingData extends { attributed_audio_manifest?: infer M } ? M extends { ranges: infer R } ? R : never : never;
+  ranges: Array<{
+    version: 1; meeting_id: string; sequence: number; idempotency_key: string; speaker_key: string; speaker_name: string; channel: number; turn_generation: number;
+    attribution: { source: "glow-bound" | "provisional" | "unresolved"; confidence: number }; clock_origin_ms: number; start_ms: number; end_ms: number; audio_duration_ms: number;
+    codec: "pcm_f32le"; sample_rate: number; channels: 1; byte_count: number; sha256: string; state: "sealed" | "uploaded" | "failed"; path?: string;
+  }>;
 }
 
 export interface VexaRecording {

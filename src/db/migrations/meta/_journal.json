@@ -64,6 +64,13 @@
       "when": 1790097646603,
       "tag": "0008_attributed_transcription",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1790097646604,
+      "tag": "0009_remove_attributed_jobs",
+      "breakpoints": true
     }
   ]
 }
