@@ -19,6 +19,12 @@ import type { VexaTranscriptionResponse } from "../providers/vexa/types.ts";
 const MAX_START_ATTEMPTS = 3;
 const MAX_RECOVERY_ATTEMPTS = 3;
 const usesAttributedCapture = (ctx: AppContext, meeting: MeetingRow) => ctx.config.attributedTranscriptionEnabled && meeting.platform === "google_meet";
+// The only Vexa container shape we retain is its documented opaque runtime handle. Provider
+// responses are untrusted: URLs, text, and arbitrary identifiers must never become SQL data.
+const safeVexaBotId = (value: unknown): string | undefined =>
+  typeof value === "string" && /^mtg-[0-9]+-[a-f0-9]{8}$/i.test(value) ? value : undefined;
+const safeProviderNativeId = (value: unknown): string | undefined =>
+  typeof value === "string" && /^[a-z0-9][a-z0-9.@-]{0,127}$/.test(value) ? value : undefined;
 
 /** Job: meeting.start — ask Vexa to send a bot. */
 export async function handleMeetingStart(ctx: AppContext, meetingId: string, attempt = 1): Promise<void> {
@@ -43,7 +49,11 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
       // participant presence does not veto Vexa's silence verdict.
       automatic_leave: { max_time_left_alone: ctx.config.vexa.maxTimeLeftAloneMs },
     });
-    const vexaNativeMeetingId = created.native_meeting_id ?? meeting.vexaNativeMeetingId;
+    // Prefer our already-validated, request-derived identity. A provider-derived replacement is
+    // retained only when it is a narrow opaque identifier, never arbitrary returned text/URLs.
+    const vexaNativeMeetingId = created.native_meeting_id === meeting.vexaNativeMeetingId
+      ? meeting.vexaNativeMeetingId
+      : safeProviderNativeId(created.native_meeting_id) ?? meeting.vexaNativeMeetingId;
     const dispatched = await recordCapture(ctx, meeting, {
       silence_timeout_ms: ctx.config.vexa.maxTimeLeftAloneMs,
       live_transcription_requested: !usesAttributedCapture(ctx, meeting),
@@ -52,7 +62,7 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
       vexaPlatform: created.platform ?? vexaPlatform,
       vexaNativeMeetingId,
       ...(usesAttributedCapture(ctx, meeting) ? { vexaMeetingId: created.id } : {}),
-      vexaBotId: created.bot_container_id ?? String(created.id),
+      ...(safeVexaBotId(created.bot_container_id) ? { vexaBotId: safeVexaBotId(created.bot_container_id) } : {}),
     });
     if (changed) {
       ctx.log.info("bot dispatched", { meetingId, stage: "dispatch_admitted" });

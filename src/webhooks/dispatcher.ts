@@ -9,7 +9,7 @@ export type WebhookEventType = "meeting.completed" | "meeting.failed";
 // A queue wakeup may sit behind unrelated work. The lease is therefore refreshed immediately
 // before I/O and outlives the request timeout, rather than being measured from enqueue time.
 const WEBHOOK_REQUEST_TIMEOUT_MS = 10_000;
-const WEBHOOK_LEASE_MS = WEBHOOK_REQUEST_TIMEOUT_MS + 5_000;
+const WEBHOOK_LEASE_MS = WEBHOOK_REQUEST_TIMEOUT_MS + 20_000;
 
 /** The immutable event is constructed before its transaction commits. */
 export function webhookDeliveryValues(meeting: MeetingRow, type: WebhookEventType, transcript: TranscriptRow | null) {
@@ -52,12 +52,9 @@ export async function enqueueMeetingWebhook(ctx: AppContext, meeting: MeetingRow
 /** Redis is only a wakeup mechanism; this can be called repeatedly after a crash. */
 export async function wakeWebhookDelivery(ctx: AppContext, deliveryId: string, due: Date | null): Promise<void> {
   const claimToken = crypto.randomUUID();
-  const [claimed] = await ctx.db.update(webhookDeliveries)
-    .set({ status: "claimed", claimToken, claimedAt: new Date(), updatedAt: new Date() })
-    .where(and(eq(webhookDeliveries.id, deliveryId), eq(webhookDeliveries.status, "pending")))
-    .returning({ id: webhookDeliveries.id, nextAttemptAt: webhookDeliveries.nextAttemptAt });
-  if (!claimed) return;
-  await ctx.queue.push({ type: "webhook.deliver", deliveryId, claimToken }, Math.max(0, (claimed.nextAttemptAt?.getTime() ?? due?.getTime() ?? Date.now()) - Date.now()));
+  // This is only a wakeup. Ownership is deliberately not acquired until after secret lookup and
+  // immediately before POST, so a slow lookup cannot age a lease or replace another executor.
+  await ctx.queue.push({ type: "webhook.deliver", deliveryId, claimToken }, Math.max(0, (due?.getTime() ?? Date.now()) - Date.now()));
 }
 
 /** Recreates missing terminal intent and re-wakes every pending intent from durable PostgreSQL state. */
@@ -78,22 +75,27 @@ export async function reconcileWebhookDeliveries(ctx: AppContext): Promise<void>
 
 /** One delivery attempt; schedules the next per the retry schedule. Never touches meeting status. */
 export async function deliverWebhook(ctx: AppContext, deliveryId: string, claimToken: string): Promise<void> {
-  // Atomically take (or refresh) ownership at the actual POST boundary. A reconciliation scan
-  // and an aged queue job race on this CAS, so exactly one can begin an HTTP attempt.
-  const [d] = await ctx.db.update(webhookDeliveries).set({ claimedAt: new Date(), updatedAt: new Date() })
+  // Secret lookup can be slow (KMS/HSM-backed deployments). It happens before execution ownership
+  // so an overlapping scanner merely creates another contender, not a replacement lease.
+  const [candidate] = await ctx.db.select().from(webhookDeliveries)
+    .where(and(eq(webhookDeliveries.id, deliveryId), eq(webhookDeliveries.status, "pending"), lte(webhookDeliveries.nextAttemptAt, new Date())))
+    .limit(1);
+  if (!candidate) return;
+  const secret = await lookupSecret(ctx, candidate.meetingId);
+  if (secret === null) {
+    await ctx.db.update(webhookDeliveries).set({ status: "failed", updatedAt: new Date() })
+      .where(and(eq(webhookDeliveries.id, deliveryId), eq(webhookDeliveries.status, "pending")));
+    return;
+  }
+  // Atomically claim immediately before POST. Even callers with the same token are single-flight:
+  // only one pending row can transition to claimed, and this lease exceeds the HTTP timeout.
+  const [d] = await ctx.db.update(webhookDeliveries).set({ status: "claimed", claimToken, claimedAt: new Date(), updatedAt: new Date() })
     .where(and(
       eq(webhookDeliveries.id, deliveryId),
-      eq(webhookDeliveries.status, "claimed"),
-      eq(webhookDeliveries.claimToken, claimToken),
+      eq(webhookDeliveries.status, "pending"),
       lte(webhookDeliveries.nextAttemptAt, new Date()),
     )).returning();
   if (!d) return;
-  const secret = await lookupSecret(ctx, d.meetingId);
-  if (secret === null) {
-    await ctx.db.update(webhookDeliveries).set({ status: "failed", claimToken: null, claimedAt: null, updatedAt: new Date() })
-      .where(and(eq(webhookDeliveries.id, deliveryId), eq(webhookDeliveries.status, "claimed"), eq(webhookDeliveries.claimToken, claimToken)));
-    return;
-  }
 
   const attempt = d.attempt + 1;
   let responseCode: number | null = null;

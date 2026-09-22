@@ -70,137 +70,139 @@ async function claimBatch(ctx: AppContext, batchId: string) {
     .where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "pending"), sql`${batchesTable.attempts} < ${ATTEMPT_LIMIT}`)).returning();
   return batch ? { batch, token } : null;
 }
-async function withTinfoilSlot<T>(ctx: AppContext, work: () => Promise<T>): Promise<{ acquired: true; value: T } | { acquired: false }> {
-  const token = crypto.randomUUID();
-  const acquired = await ctx.db.transaction(async (tx) => {
-    // FOR UPDATE SKIP LOCKED makes concurrent workers choose at most one of the two durable slots.
-    const rows = await tx.execute<{ id: number }>(sql`
-      select id from tinfoil_dispatch_slots
-      where claim_token is null or claimed_at < ${new Date(Date.now() - SLOT_CLAIM_MS)}
-      order by id for update skip locked limit 1
-    `);
-    const slot = rows[0];
-    if (!slot) return null;
-    const [claimed] = await tx.update(tinfoilDispatchSlots).set({ claimToken: token, claimedAt: new Date() })
-      .where(and(eq(tinfoilDispatchSlots.id, slot.id), sql`${tinfoilDispatchSlots.claimToken} is null or ${tinfoilDispatchSlots.claimedAt} < ${new Date(Date.now() - SLOT_CLAIM_MS)}`)).returning();
-    return claimed?.id ?? null;
-  });
-  if (acquired === null) return { acquired: false };
-  try {
-    return { acquired: true, value: await work() };
-  } finally {
-    await ctx.db.update(tinfoilDispatchSlots).set({ claimToken: null, claimedAt: null })
-      .where(and(eq(tinfoilDispatchSlots.id, acquired), eq(tinfoilDispatchSlots.claimToken, token)));
-  }
-}
 const sequences = (spec: AttributedBatch) => spec.ranges.map((range) => range.sequence);
 
 /** All batch/range/attempt writes are fenced by the durable claim token. */
 async function settle(ctx: AppContext, batchId: string, token: string, status: "completed" | "silence" | "failed" | "ambiguous", meetingId: string, spec: AttributedBatch, result?: unknown, attemptId?: string, outcome?: string) {
   await ctx.db.transaction(async (tx) => {
-    const [won] = await tx.update(batchesTable).set({ status, claimToken: null, dispatchToken: null, dispatchedAt: null, ...(result === undefined ? {} : { resultJson: json(result) }), updatedAt: new Date() })
+    const [won] = await tx.update(batchesTable).set({ status, claimToken: null, dispatchToken: null, dispatchOwnerId: null, dispatchedAt: null, ...(result === undefined ? {} : { resultJson: json(result) }), updatedAt: new Date() })
       .where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "claimed"), eq(batchesTable.claimToken, token))).returning();
     if (!won) return;
+    await tx.update(tinfoilDispatchSlots).set({ claimToken: null, claimedAt: null, ownerId: null })
+      .where(eq(tinfoilDispatchSlots.claimToken, token));
     const rangeStatus = status === "completed" ? "completed" : status === "silence" ? "silence" : status === "failed" ? "failed" : "unresolved";
     await tx.update(attributedRanges).set({ status: rangeStatus }).where(and(eq(attributedRanges.meetingId, meetingId), inArray(attributedRanges.sequence, sequences(spec))));
     if (attemptId) await tx.update(attributedAttempts).set({ status: status === "completed" ? "succeeded" : status === "failed" ? "failed" : "ambiguous", outcome: outcome ?? null, completedAt: new Date() }).where(eq(attributedAttempts.id, attemptId));
   });
 }
-async function startAttempt(ctx: AppContext, batchId: string, token: string) {
-  return ctx.db.transaction(async (tx) => {
-    const [batch] = await tx.update(batchesTable).set({ attempts: sql`${batchesTable.attempts} + 1`, updatedAt: new Date() }).where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "claimed"), eq(batchesTable.claimToken, token))).returning();
-    if (!batch) return null;
-    const id = `${batchId}:attempt:${batch.attempts}`;
-    await tx.insert(attributedAttempts).values({ id, batchId, ordinal: batch.attempts, status: "started" });
-    return id;
-  });
-}
-
 /**
- * Atomically admits one paid request. Terminal transitions take the same meeting row lock and
- * wait for dispatchToken to clear, so they either commit first (and this returns null) or commit
- * after this external call is settled. The provider request itself remains outside the transaction.
+ * Atomically admits one paid request at the provider-call boundary. A stale slot is reusable only
+ * after its named worker's durable heartbeat has died; a paused live continuation keeps its slot.
  */
-async function admitTinfoilDispatch(ctx: AppContext, meetingId: string, batchId: string, token: string): Promise<{ language: string | null } | null> {
+type DispatchAdmission =
+  | { kind: "admitted"; language: string | null; attemptId: string }
+  | { kind: "capacity" }
+  | { kind: "ineligible" };
+
+async function admitTinfoilDispatch(ctx: AppContext, meetingId: string, batchId: string, token: string): Promise<DispatchAdmission> {
   return ctx.db.transaction(async (tx) => {
     const [meeting] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
     const [run] = await tx.select().from(attributedTranscriptionRuns).where(eq(attributedTranscriptionRuns.meetingId, meetingId)).for("update");
     const [batch] = await tx.select().from(batchesTable).where(eq(batchesTable.id, batchId)).for("update");
     if (!meeting || meeting.status !== "processing" || meeting.dispatchBlocked || !run || run.status !== "processing"
-        || !batch || batch.meetingId !== meetingId || batch.status !== "claimed" || batch.claimToken !== token) return null;
-    const [admitted] = await tx.update(batchesTable).set({ dispatchToken: token, dispatchedAt: new Date(), updatedAt: new Date() })
-      .where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "claimed"), eq(batchesTable.claimToken, token), sql`${batchesTable.dispatchToken} is null`)).returning();
-    if (!admitted) return null;
-    return { language: meeting.language };
+        || !batch || batch.meetingId !== meetingId || batch.status !== "claimed" || batch.claimToken !== token) return { kind: "ineligible" };
+    // FOR UPDATE SKIP LOCKED makes concurrent workers choose at most one of two slots.  Expiry
+    // alone is never authority to steal a slot from a heartbeat-live process.
+    const slots = await tx.execute<{ id: number }>(sql`
+      select s.id from tinfoil_dispatch_slots s
+      where s.claim_token is null
+         or (s.claimed_at < ${new Date(Date.now() - SLOT_CLAIM_MS)} and not exists (
+           select 1 from attributed_worker_readiness w
+           where w.id = s.owner_id and w.observed_at >= ${new Date(Date.now() - READINESS_STALE_MS)}
+         ))
+      order by s.id for update skip locked limit 1
+    `);
+    const slot = slots[0];
+    if (!slot) return { kind: "capacity" };
+    const [slotClaimed] = await tx.update(tinfoilDispatchSlots).set({ claimToken: token, claimedAt: new Date(), ownerId: ctx.attributedWorkerId })
+      .where(eq(tinfoilDispatchSlots.id, slot.id)).returning();
+    if (!slotClaimed) return { kind: "capacity" };
+    const [admitted] = await tx.update(batchesTable).set({ attempts: sql`${batchesTable.attempts} + 1`, dispatchToken: token, dispatchOwnerId: ctx.attributedWorkerId, dispatchedAt: new Date(), updatedAt: new Date() })
+      .where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "claimed"), eq(batchesTable.claimToken, token), sql`${batchesTable.dispatchToken} is null`, sql`${batchesTable.attempts} < ${ATTEMPT_LIMIT}`)).returning();
+    if (!admitted) {
+      await tx.update(tinfoilDispatchSlots).set({ claimToken: null, claimedAt: null, ownerId: null }).where(and(eq(tinfoilDispatchSlots.id, slot.id), eq(tinfoilDispatchSlots.claimToken, token)));
+      return { kind: "ineligible" };
+    }
+    const attemptId = `${batchId}:attempt:${admitted.attempts}`;
+    await tx.insert(attributedAttempts).values({ id: attemptId, batchId, ordinal: admitted.attempts, status: "started" });
+    return { kind: "admitted", language: meeting.language, attemptId };
   });
 }
 
-/**
- * This is intentionally adjacent to the provider invocation below. It consumes neither the
- * ownership token nor the fence: terminal/deletion writers see the token until settle().
- */
-async function confirmTinfoilDispatch(ctx: AppContext, meetingId: string, batchId: string, token: string): Promise<boolean> {
-  return ctx.db.transaction(async (tx) => {
-    const [meeting] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
-    const [batch] = await tx.select().from(batchesTable).where(eq(batchesTable.id, batchId)).for("update");
-    return !!meeting && meeting.status === "processing" && !meeting.dispatchBlocked
-      && !!batch && batch.status === "claimed" && batch.claimToken === token && batch.dispatchToken === token;
-  });
+async function releaseBatchClaim(ctx: AppContext, batchId: string, token: string): Promise<boolean> {
+  const [released] = await ctx.db.update(batchesTable).set({ status: "pending", claimToken: null, claimedAt: null, updatedAt: new Date() })
+    .where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "claimed"), eq(batchesTable.claimToken, token), sql`${batchesTable.dispatchToken} is null`)).returning();
+  return !!released;
 }
 
-export async function processAttributedBatch(ctx: AppContext, meetingId: string, batchId: string): Promise<void> {
+export type AttributedJobOutcome = "processed" | "noop" | "deferred";
+
+export async function processAttributedBatch(ctx: AppContext, meetingId: string, batchId: string): Promise<AttributedJobOutcome> {
   const [stored] = await ctx.db.select().from(batchesTable).where(and(eq(batchesTable.id, batchId), eq(batchesTable.meetingId, meetingId)));
-  if (!stored || stored.status !== "pending") return;
+  if (!stored || stored.status !== "pending") return "noop";
   // Readiness is checked before any claim, fetch, or attempt; an operator can configure Tinfoil later.
   const provider = ctx.transcriptRecovery;
-  if (!(provider instanceof TinfoilTranscriptionProvider)) { await ctx.queue.push({ type: "attributed.batch", meetingId, batchId }, ctx.config.vexa.pollIntervalMs); return; }
-  const result = await withTinfoilSlot(ctx, async () => {
-    const claimed = await claimBatch(ctx, batchId); if (!claimed) return;
-    const spec = object<AttributedBatch>(claimed.batch.batchJson);
+  if (!(provider instanceof TinfoilTranscriptionProvider)) { await ctx.queue.push({ type: "attributed.batch", meetingId, batchId }, ctx.config.vexa.pollIntervalMs); return "deferred"; }
+  const claimed = await claimBatch(ctx, batchId); if (!claimed) return "noop";
+  const spec = object<AttributedBatch>(claimed.batch.batchJson);
+    const done = async (outcome: AttributedJobOutcome) => {
+      await ctx.queue.push({ type: "attributed.finalize", meetingId });
+      return outcome;
+    };
     let prepared;
     try { prepared = await readAttributedBatch(spec, async (range) => (await ctx.vexa.fetchBytes(range.path!)).bytes); }
-    catch { await settle(ctx, batchId, claimed.token, "failed", meetingId, spec); return; }
-    if (prepared.silent) { await settle(ctx, batchId, claimed.token, "silence", meetingId, spec, { text: "", language: null }); return; }
-    const attemptId = await startAttempt(ctx, batchId, claimed.token); if (!attemptId) return;
+    catch { await settle(ctx, batchId, claimed.token, "failed", meetingId, spec); return done("processed"); }
+    if (prepared.silent) { await settle(ctx, batchId, claimed.token, "silence", meetingId, spec, { text: "", language: null }); return done("processed"); }
+    // Make the process identity durable before it can own a paid request. This also lets a
+    // recovery scanner distinguish a paused continuation from a dead worker.
+    await recordAttributedWorkerReadiness(ctx, ctx.attributedWorkerHealthy, "heartbeat");
     const eligibility = await admitTinfoilDispatch(ctx, meetingId, batchId, claimed.token);
-    if (!eligibility) {
+    if (eligibility.kind === "capacity") {
+      if (await releaseBatchClaim(ctx, batchId, claimed.token)) await ctx.queue.push({ type: "attributed.batch", meetingId, batchId }, ctx.config.vexa.pollIntervalMs);
+      return done("deferred");
+    }
+    if (eligibility.kind === "ineligible") {
       // The durable owner went terminal while this job was queued/fetching.  Preserve the
       // one-attempt ledger without sending an ineligible request outside the process.
-      await settle(ctx, batchId, claimed.token, "ambiguous", meetingId, spec, undefined, attemptId, "ineligible_dispatch");
-      return;
-    }
-    if (!await confirmTinfoilDispatch(ctx, meetingId, batchId, claimed.token)) {
-      await settle(ctx, batchId, claimed.token, "ambiguous", meetingId, spec, undefined, attemptId, "ineligible_dispatch");
-      return;
+      await settle(ctx, batchId, claimed.token, "ambiguous", meetingId, spec, undefined, undefined, "ineligible_dispatch");
+      return done("processed");
     }
     try {
+      // No await is permitted between the durable admission above and invoking the paid provider.
       const response = await provider.transcribeAttributedPcm(prepared.pcm, spec, eligibility.language);
       // A voiced request that returned no words is evidence failure, not a silent meeting.
-      await settle(ctx, batchId, claimed.token, response.text.trim() ? "completed" : "failed", meetingId, spec, response, attemptId, response.text.trim() ? undefined : "empty_transcript");
-    } catch { await settle(ctx, batchId, claimed.token, "ambiguous", meetingId, spec, undefined, attemptId, "external_call_uncertain"); }
-  });
-  if (!result.acquired) await ctx.queue.push({ type: "attributed.batch", meetingId, batchId }, ctx.config.vexa.pollIntervalMs);
+      await settle(ctx, batchId, claimed.token, response.text.trim() ? "completed" : "failed", meetingId, spec, response, eligibility.attemptId, response.text.trim() ? undefined : "empty_transcript");
+    } catch { await settle(ctx, batchId, claimed.token, "ambiguous", meetingId, spec, undefined, eligibility.attemptId, "external_call_uncertain"); }
   await ctx.queue.push({ type: "attributed.finalize", meetingId });
+  return "processed";
 }
 
 async function reconcileClaim(ctx: AppContext, batchId: string): Promise<boolean> {
   return ctx.db.transaction(async (tx) => {
     const [batch] = await tx.select().from(batchesTable).where(eq(batchesTable.id, batchId)).for("update");
-    if (!batch || batch.status !== "claimed" || !batch.claimedAt || batch.claimedAt.getTime() > Date.now() - CLAIM_MS) return false;
-    // An admitted request is a paid, in-process ownership lease. Never turn it into an expired
-    // queue claim: a paused continuation could otherwise issue its provider call after a terminal
-    // transition has won. It is settled only by its owner (or operator recovery), not a scanner.
-    if (batch.dispatchToken) return false;
+    if (!batch || batch.status !== "claimed" || !batch.claimedAt) return false;
+    const expired = batch.claimedAt.getTime() <= Date.now() - CLAIM_MS;
+    if (batch.dispatchToken) {
+      // An admitted call is never retried. Its slot and continuation stay fenced while the named
+      // owner is live; once that owner's heartbeat is stale, terminalize the ambiguous attempt so
+      // finalization/deletion can proceed without issuing a second paid request.
+      const [owner] = batch.dispatchOwnerId
+        ? await tx.select().from(attributedWorkerReadiness).where(and(eq(attributedWorkerReadiness.id, batch.dispatchOwnerId), sql`${attributedWorkerReadiness.observedAt} >= ${new Date(Date.now() - READINESS_STALE_MS)}`)).limit(1)
+        : [];
+      if (owner) return false;
+    } else if (!expired) return false;
     const spec = object<AttributedBatch>(batch.batchJson);
-    const [won] = await tx.update(batchesTable).set({ status: "ambiguous", claimToken: null, dispatchToken: null, dispatchedAt: null, updatedAt: new Date() }).where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "claimed"), eq(batchesTable.claimToken, batch.claimToken ?? ""))).returning();
+    const [won] = await tx.update(batchesTable).set({ status: "ambiguous", claimToken: null, dispatchToken: null, dispatchOwnerId: null, dispatchedAt: null, updatedAt: new Date() }).where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "claimed"), eq(batchesTable.claimToken, batch.claimToken ?? ""))).returning();
     if (!won) return false;
+    if (batch.dispatchToken) await tx.update(tinfoilDispatchSlots).set({ claimToken: null, claimedAt: null, ownerId: null })
+      .where(eq(tinfoilDispatchSlots.claimToken, batch.dispatchToken));
     await tx.update(attributedRanges).set({ status: "unresolved" }).where(and(eq(attributedRanges.meetingId, batch.meetingId), inArray(attributedRanges.sequence, sequences(spec))));
     await tx.update(attributedAttempts).set({ status: "ambiguous", outcome: "external_call_uncertain", completedAt: new Date() }).where(and(eq(attributedAttempts.batchId, batchId), eq(attributedAttempts.status, "started")));
     return true;
   });
 }
 
-export async function finalizeAttributedRun(ctx: AppContext, meetingId: string): Promise<void> {
+export async function finalizeAttributedRun(ctx: AppContext, meetingId: string): Promise<boolean> {
   let rows = await ctx.db.select().from(batchesTable).where(eq(batchesTable.meetingId, meetingId)).orderBy(batchesTable.ordinal);
   const live = rows.filter((row) => row.status === "claimed");
   if (live.length) {
@@ -208,14 +210,16 @@ export async function finalizeAttributedRun(ctx: AppContext, meetingId: string):
     // Re-read after reconciliation.  The prior snapshot may contain a claim we just settled;
     // returning from it would strand a processing meeting without a further wakeup.
     rows = await ctx.db.select().from(batchesTable).where(eq(batchesTable.meetingId, meetingId)).orderBy(batchesTable.ordinal);
-    const remaining = rows.filter((row) => row.status === "claimed" && row.claimedAt && row.claimedAt.getTime() > Date.now() - CLAIM_MS);
-    if (remaining.length) await ctx.queue.push({ type: "attributed.finalize", meetingId }, Math.max(1_000, Math.min(...remaining.map((row) => row.claimedAt!.getTime() + CLAIM_MS - Date.now()))));
-    if (remaining.length) return;
+    const remaining = rows.filter((row) => row.status === "claimed");
+    if (remaining.length) await ctx.queue.push({ type: "attributed.finalize", meetingId }, Math.max(1_000, Math.min(...remaining.map((row) =>
+      row.dispatchToken ? READINESS_STALE_MS : row.claimedAt ? row.claimedAt.getTime() + CLAIM_MS - Date.now() : CLAIM_MS,
+    ))));
+    if (remaining.length) return false;
   }
-  if (rows.some((row) => row.status === "pending")) return;
+  if (rows.some((row) => row.status === "pending")) return false;
   const ranges = await ctx.db.select().from(attributedRanges).where(eq(attributedRanges.meetingId, meetingId));
   const meeting = await getMeetingById(ctx, meetingId);
-  if (!meeting || meeting.status === "completed" || meeting.status === "failed") return;
+  if (!meeting || meeting.status === "completed" || meeting.status === "failed") return false;
   if (rows.some((row) => !["completed", "silence"].includes(row.status)) || ranges.some((row) => !["completed", "silence"].includes(row.status))) {
     await ctx.db.update(attributedTranscriptionRuns).set({ status: "partial", updatedAt: new Date() }).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
     const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Attributed evidence is unresolved; canonical transcript was not published.");
@@ -223,9 +227,9 @@ export async function finalizeAttributedRun(ctx: AppContext, meetingId: string):
       ctx.attributedWorkerHealthy = false;
       await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
     }
-    return;
+    return changed;
   }
-  await publish(ctx, meetingId);
+  return publish(ctx, meetingId);
 }
 
 type Publication = { meeting: typeof meetings.$inferSelect; webhook: boolean; deliveryId: string | null } | null;
@@ -235,7 +239,7 @@ type Publication = { meeting: typeof meetings.$inferSelect; webhook: boolean; de
  * transaction are merely hints: only locked ledger rows and the immutable closed manifest may
  * produce the canonical transcript.
  */
-async function publish(ctx: AppContext, meetingId: string) {
+async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
   const published = await ctx.db.transaction(async (tx) => {
     const [meeting] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
     const [run] = await tx.select().from(attributedTranscriptionRuns).where(eq(attributedTranscriptionRuns.meetingId, meetingId)).for("update");
@@ -325,13 +329,16 @@ async function publish(ctx: AppContext, meetingId: string) {
     });
     else await enqueueMeetingWebhook(ctx, published.meeting, published.webhook && published.meeting.status === "completed" ? "meeting.completed" : "meeting.failed");
   }
+  return !!published;
 }
 
 export async function reconcileAttributedRuns(ctx: AppContext): Promise<void> {
   const claimed = await ctx.db.select().from(batchesTable).where(eq(batchesTable.status, "claimed"));
   for (const row of claimed) {
     await reconcileClaim(ctx, row.id);
-    if (row.claimedAt && row.claimedAt.getTime() > Date.now() - CLAIM_MS) await ctx.queue.push({ type: "attributed.finalize", meetingId: row.meetingId }, Math.max(1_000, row.claimedAt.getTime() + CLAIM_MS - Date.now()));
+    if (row.claimedAt) await ctx.queue.push({ type: "attributed.finalize", meetingId: row.meetingId }, Math.max(1_000,
+      row.dispatchToken ? READINESS_STALE_MS : row.claimedAt.getTime() + CLAIM_MS - Date.now(),
+    ));
   }
   const pending = await ctx.db.select().from(batchesTable).where(eq(batchesTable.status, "pending"));
   for (const row of pending) await ctx.queue.push({ type: "attributed.batch", meetingId: row.meetingId, batchId: row.id });

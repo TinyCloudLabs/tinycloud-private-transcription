@@ -18,14 +18,10 @@ export interface VexaClientOptions {
   fetch?: typeof fetch;
 }
 
-/** Thrown for any non-2xx from Vexa; carries status + raw detail for logs only (never surfaced to clients). */
+/** Thrown for any non-2xx from Vexa. Provider paths and bodies are deliberately never retained. */
 export class VexaHttpError extends Error {
-  constructor(
-    readonly status: number,
-    readonly detail: string,
-    readonly path: string,
-  ) {
-    super(`Vexa ${path} -> ${status}`);
+  constructor(readonly status: number) {
+    super(`Vexa request failed with HTTP ${status}`);
   }
   get notFound() {
     return this.status === 404;
@@ -69,8 +65,10 @@ export class VexaClient {
       );
     }
     if (!res.ok) {
-      const detail = await res.text().catch(() => "");
-      throw new VexaHttpError(res.status, detail, path);
+      // Error pages regularly echo meeting URLs, native IDs, and authorization failures. Do not
+      // place any provider-controlled response or request identity on an Error object/stack.
+      await res.body?.cancel().catch(() => {});
+      throw new VexaHttpError(res.status);
     }
     return res;
   }

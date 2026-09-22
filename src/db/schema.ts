@@ -94,6 +94,8 @@ export const attributedBatches = pgTable("attributed_batches", {
   claimToken: text("claim_token"),
   /** Present only while this batch has been durably admitted to an external Tinfoil request. */
   dispatchToken: text("dispatch_token"),
+  /** Worker identity which owns an admitted paid request; stale owners are terminalized, never retried. */
+  dispatchOwnerId: text("dispatch_owner_id"),
   /** The external-call lease starts at admission, not when a queue message was claimed. */
   dispatchedAt: timestamp("dispatched_at", { withTimezone: true }),
   claimedAt: timestamp("claimed_at", { withTimezone: true }),
@@ -117,6 +119,7 @@ export const tinfoilDispatchSlots = pgTable("tinfoil_dispatch_slots", {
   id: integer("id").primaryKey(),
   claimToken: text("claim_token"),
   claimedAt: timestamp("claimed_at", { withTimezone: true }),
+  ownerId: text("owner_id"),
 });
 
 /** A PostgreSQL-backed worker heartbeat; API and worker commonly run in separate processes. */

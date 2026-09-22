@@ -4,20 +4,22 @@ import { handleJoinDeadline, handleMeetingPoll, handleMeetingStart } from "./mee
 import { finalizeAttributedRun, processAttributedBatch, reconcileAttributedRuns, recordAttributedWorkerReadiness } from "../services/attributed-transcription.ts";
 import type { Job } from "./queue.ts";
 
-export async function processJob(ctx: AppContext, job: Job): Promise<void> {
+export type JobOutcome = "processed" | "noop" | "deferred";
+
+export async function processJob(ctx: AppContext, job: Job): Promise<JobOutcome> {
   switch (job.type) {
     case "meeting.start":
-      return handleMeetingStart(ctx, job.meetingId, job.attempt ?? 1);
+      await handleMeetingStart(ctx, job.meetingId, job.attempt ?? 1); return "processed";
     case "meeting.poll":
-      return handleMeetingPoll(ctx, job.meetingId, job.recoveryAttempt ?? 1);
+      await handleMeetingPoll(ctx, job.meetingId, job.recoveryAttempt ?? 1); return "processed";
     case "meeting.join_deadline":
-      return handleJoinDeadline(ctx, job.meetingId);
+      await handleJoinDeadline(ctx, job.meetingId); return "processed";
     case "attributed.batch":
       return processAttributedBatch(ctx, job.meetingId, job.batchId);
     case "attributed.finalize":
-      return finalizeAttributedRun(ctx, job.meetingId);
+      return (await finalizeAttributedRun(ctx, job.meetingId)) ? "processed" : "noop";
     case "webhook.deliver":
-      return deliverWebhook(ctx, job.deliveryId, job.claimToken);
+      await deliverWebhook(ctx, job.deliveryId, job.claimToken); return "processed";
   }
 }
 
@@ -107,12 +109,16 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number } = 
         if (attributedEnabled && !ctx.attributedReconciliationReady && job.type.startsWith("attributed.")) {
           await ctx.queue.push(job, 1_000);
         } else {
-          await processJob(ctx, job);
+          const outcome = await processJob(ctx, job);
           if (job.type.startsWith("attributed.")) {
-            const recovered = attributedJobFailures >= 3;
-            attributedJobFailures = 0;
-            if (recovered && attributedEnabled && ctx.attributedReconciliationReady) {
-              await recordAttributedWorkerReadiness(ctx, ctx.attributedWorkerHealthy, "heartbeat");
+            // Only a real durable batch/finalization result can heal a failing publisher. Queue
+            // duplicates, missing meetings, and deferred configuration are intentionally neutral.
+            if (outcome === "processed") {
+              const recovered = attributedJobFailures >= 3;
+              attributedJobFailures = 0;
+              if (recovered && attributedEnabled && ctx.attributedReconciliationReady) {
+                await recordAttributedWorkerReadiness(ctx, ctx.attributedWorkerHealthy, "heartbeat");
+              }
             }
           }
         }
