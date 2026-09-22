@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
+import { attributedWorkerReadiness } from "../../src/db/schema.ts";
 import { startHarness, type Harness } from "./harness.ts";
 
 let h: Harness;
@@ -38,4 +40,13 @@ test("only closed authenticated attributed ranges become canonical", async () =>
   expect(transcript).toMatchObject({ provider: "tinfoil-attributed", text: "Alice: sealed words" });
   expect(transcript.text).not.toContain("diagnostic only");
   expect(h.vexa.requests.map((request) => request.path).some((path) => path.startsWith("/recordings"))).toBe(false);
+});
+
+test("attributed readiness is a stale-safe PostgreSQL worker heartbeat", async () => {
+  const healthy = await (await h.api("/health")).json();
+  expect(healthy.checks.attributed_transcription).toMatchObject({ enabled: true, ready: true });
+  await h.ctx.db.update(attributedWorkerReadiness).set({ observedAt: new Date(Date.now() - 16_000) })
+    .where(eq(attributedWorkerReadiness.id, "attributed-worker"));
+  const stale = await (await h.api("/health")).json();
+  expect(stale).toMatchObject({ status: "degraded", checks: { attributed_transcription: { enabled: true, ready: false } } });
 });

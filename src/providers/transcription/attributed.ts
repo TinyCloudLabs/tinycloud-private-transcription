@@ -31,6 +31,7 @@ const sameAttribution = (a: AttributedRange, b: AttributedRange) => a.attributio
 function validateRange(manifest: AttributedManifest, range: AttributedRange, index: number, vexaMeetingId: number): void {
   const duration = range.end_ms - range.start_ms;
   const expectedBytes = range.audio_duration_ms * range.sample_rate * PCM_FLOAT_BYTES / 1000;
+  const sampleDuration = range.byte_count * 1000 / (range.sample_rate * PCM_FLOAT_BYTES);
   const allowedClockSkew = CLOCK_JITTER_MS + 1000 / range.sample_rate;
   const failedPathIsValid = range.path === undefined || relativePath(range.path, vexaMeetingId, range.sequence);
   if (
@@ -39,7 +40,7 @@ function validateRange(manifest: AttributedManifest, range: AttributedRange, ind
     || typeof range.speaker_name !== "string" || !Number.isSafeInteger(range.channel) || range.channel < 0 || !Number.isSafeInteger(range.turn_generation) || range.turn_generation < 1
     || !Number.isFinite(range.clock_origin_ms) || range.clock_origin_ms !== manifest.clock_origin_ms
     || !Number.isFinite(range.start_ms) || !Number.isFinite(range.end_ms) || range.start_ms < 0 || duration < 0 || duration >= MAX_MS
-    || !Number.isFinite(range.audio_duration_ms) || range.audio_duration_ms < 0 || Math.abs(duration - range.audio_duration_ms) > allowedClockSkew
+    || !Number.isFinite(range.audio_duration_ms) || range.audio_duration_ms < 0 || range.audio_duration_ms >= MAX_MS || sampleDuration >= MAX_MS || Math.abs(duration - range.audio_duration_ms) > allowedClockSkew
     || range.codec !== "pcm_f32le" || range.channels !== 1 || !Number.isInteger(range.sample_rate) || range.sample_rate < 1
     || !Number.isSafeInteger(range.byte_count) || range.byte_count < 0 || range.byte_count % PCM_FLOAT_BYTES !== 0 || Math.abs(expectedBytes - range.byte_count) > PCM_FLOAT_BYTES
     || !/^[a-f0-9]{64}$/i.test(range.sha256) || !["uploaded", "failed"].includes(range.state)
@@ -53,7 +54,7 @@ function validateRange(manifest: AttributedManifest, range: AttributedRange, ind
 /** Keep each speaker's stream independent while retaining the producer sequence in each batch. */
 export function attributedBatches(manifest: AttributedManifest, vexaMeetingId: number): AttributedBatch[] {
   if (manifest.version !== 1 || manifest.state !== "closed" || !manifest.meeting_id || manifest.clock_origin !== "first_admitted_capture_epoch_ms"
-      || !Number.isFinite(manifest.clock_origin_ms) || manifest.clock_origin_ms < 0 || !Array.isArray(manifest.ranges)) {
+      || manifest.meeting_id !== String(vexaMeetingId) || !Number.isFinite(manifest.clock_origin_ms) || manifest.clock_origin_ms < 0 || !Array.isArray(manifest.ranges)) {
     invalid("Attributed audio manifest is not a closed v1 manifest for this Vexa meeting");
   }
   manifest.ranges.forEach((range, index) => validateRange(manifest, range, index, vexaMeetingId));
@@ -79,13 +80,23 @@ export function attributedBatches(manifest: AttributedManifest, vexaMeetingId: n
     if (current.audioMs >= TARGET_MS) flush(key);
   }
   for (const key of [...active.keys()]) flush(key);
+  for (const batch of done) {
+    const audioMs = batch.ranges.reduce((sum, range) => sum + range.byte_count * 1000 / (range.sample_rate * PCM_FLOAT_BYTES), 0);
+    if (batch.end_ms - batch.start_ms >= MAX_MS || audioMs >= MAX_MS) invalid("Attributed audio batch exceeds the maximum duration");
+  }
   return done.sort((a, b) => a.ranges[0]!.sequence - b.ranges[0]!.sequence);
 }
 
 function silentPcm(bytes: Uint8Array): boolean {
   if (!bytes.byteLength) return true;
   const view = new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / PCM_FLOAT_BYTES);
-  let energy = 0; for (const value of view) energy += value * value;
+  let energy = 0;
+  for (const value of view) {
+    // A checksum only proves the bytes arrived intact.  Non-finite PCM is not silence and
+    // must never turn a malformed producer stream into an empty completed transcript.
+    if (!Number.isFinite(value)) invalid("Attributed audio contains non-finite PCM samples");
+    energy += value * value;
+  }
   return 20 * Math.log10(Math.sqrt(energy / view.length) || 0) < -60;
 }
 

@@ -10,7 +10,9 @@ export function createApp(ctx: AppContext) {
 
   app.onError((err, c) => {
     if (err instanceof ApiError) return c.json(err.toBody(), err.status as 400);
-    ctx.log.error("unhandled error", { path: c.req.path, error: String(err), stack: (err as Error).stack });
+    // Request errors can contain SQL, request bodies, provider data, or Signal fragments.  Keep
+    // lifecycle telemetry intentionally finite and content-free.
+    ctx.log.error("api request failed", { stage: "api_unhandled", code: "internal_error" });
     return c.json(new ApiError("internal_error", "An internal error occurred").toBody(), 500);
   });
   app.notFound((c) => c.json({ error: { type: "not_found_error", code: "not_found", message: `No route for ${c.req.method} ${c.req.path}` } }, 404));

@@ -49,7 +49,11 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     const input = new Float32Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 4));
     let energy = 0;
     const pcm16 = new Int16Array(input.length);
-    for (let i = 0; i < input.length; i++) { const value = Math.max(-1, Math.min(1, input[i]!)); energy += value * value; pcm16[i] = value * 32767; }
+    for (let i = 0; i < input.length; i++) {
+      const sample = input[i]!;
+      if (!Number.isFinite(sample)) throw new ApiError("transcription_failed", "Attributed audio contains non-finite PCM samples");
+      const value = Math.max(-1, Math.min(1, sample)); energy += value * value; pcm16[i] = value * 32767;
+    }
     if (!input.length || 20 * Math.log10(Math.sqrt(energy / input.length) || 0) < (this.opts.silenceDbfs ?? -60)) throw new ApiError("transcription_failed", "Attributed audio is silent");
     // An attributed request is durably claimed before this method is entered.  Retrying after a
     // transport error can create a second billed request whose result cannot be attributed to the

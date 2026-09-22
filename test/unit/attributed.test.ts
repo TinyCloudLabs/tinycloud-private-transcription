@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { attributedBatches, transcribeAttributedManifest, type AttributedManifest } from "../../src/providers/transcription/attributed.ts";
+import { attributedBatches, readAttributedBatch, transcribeAttributedManifest, type AttributedManifest } from "../../src/providers/transcription/attributed.ts";
 import { createHash } from "node:crypto";
 import golden from "../fixtures/vexa-attributed-audio-v1-manifest.closed.json";
 
@@ -51,4 +51,27 @@ test("open, failed, absolute, and oversized evidence are rejected before fetch",
   expect(attributedBatches(manifest([({ ...one, state: "failed", path: undefined } as unknown as typeof one)]), 1)).toEqual([]);
   expect(() => attributedBatches(manifest([{ ...one, path: "s3://bucket/x" }]), 1)).toThrow();
   expect(() => attributedBatches(manifest([range(0, "a", "Alice", 0, 120000)]), 1)).toThrow();
+});
+
+test("requires the exact numeric Vexa meeting identity even for empty evidence", () => {
+  expect(() => attributedBatches({ ...manifest([]), meeting_id: "2" }, 1)).toThrow();
+  const one = range(0, "a", "Alice", 0, 1_000);
+  expect(() => attributedBatches({ ...manifest([one]), meeting_id: "2" }, 1)).toThrow();
+});
+
+test("checksum-valid non-finite PCM is rejected before silence classification", async () => {
+  const bytes = new Uint8Array(new Float32Array([Number.NaN, 0]).buffer);
+  const corrupted = { ...range(0, "a", "Alice", 0, 1), byte_count: bytes.byteLength, audio_duration_ms: .125,
+    sha256: createHash("sha256").update(bytes).digest("hex"), bytes };
+  const batch = attributedBatches(manifest([corrupted]), 1)[0]!;
+  await expect(readAttributedBatch(batch, async () => bytes)).rejects.toThrow();
+});
+
+test("rejects exact 120-second sample durations and splits exact batch wall spans", () => {
+  const one = range(0, "a", "Alice", 0, 1_000);
+  expect(() => attributedBatches(manifest([{ ...one, audio_duration_ms: 120_000 }]), 1)).toThrow();
+  const left = range(0, "a", "Alice", 0, 60_000), right = range(1, "a", "Alice", 60_000, 120_000);
+  const batches = attributedBatches(manifest([left, right]), 1);
+  expect(batches).toHaveLength(2);
+  expect(batches.every((batch) => batch.end_ms - batch.start_ms < 120_000)).toBe(true);
 });

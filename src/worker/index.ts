@@ -1,7 +1,7 @@
 import { createContext, type AppContext } from "../context.ts";
 import { deliverWebhook } from "../webhooks/dispatcher.ts";
 import { handleJoinDeadline, handleMeetingPoll, handleMeetingStart } from "./meeting-job.ts";
-import { finalizeAttributedRun, processAttributedBatch, reconcileAttributedRuns } from "../services/attributed-transcription.ts";
+import { finalizeAttributedRun, processAttributedBatch, reconcileAttributedRuns, recordAttributedWorkerReadiness } from "../services/attributed-transcription.ts";
 import type { Job } from "./queue.ts";
 
 export async function processJob(ctx: AppContext, job: Job): Promise<void> {
@@ -30,15 +30,19 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number } = 
   let running = true;
   const loop = (async () => {
     try {
+      await recordAttributedWorkerReadiness(ctx, false, "startup");
       // Durable attributed state is authoritative, so do not consume queue wakeups until it has
       // been reconciled.  Error details can contain SQL values or transcript text; log only stage.
       await reconcileAttributedRuns(ctx);
       ctx.attributedReconciliationReady = true;
+      await recordAttributedWorkerReadiness(ctx, true, "reconciled");
     } catch {
       ctx.log.error("attributed reconciliation failed", { stage: "startup_reconciliation" });
       ctx.attributedReconciliationReady = false;
+      await recordAttributedWorkerReadiness(ctx, false, "reconciliation_failed").catch(() => {});
       return;
     }
+    let lastHeartbeat = Date.now();
     while (running) {
       let job: Job | null = null;
       try {
@@ -49,7 +53,13 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number } = 
         else ctx.log.error("job failed", { job, error: String(e) });
         await Bun.sleep(250);
       }
+      if (Date.now() - lastHeartbeat >= 5_000) {
+        try { await recordAttributedWorkerReadiness(ctx, true, "heartbeat"); }
+        catch { ctx.log.error("attributed readiness heartbeat failed", { stage: "readiness_heartbeat" }); }
+        lastHeartbeat = Date.now();
+      }
     }
+    await recordAttributedWorkerReadiness(ctx, false, "stopped").catch(() => {});
   })();
   return {
     async stop() {

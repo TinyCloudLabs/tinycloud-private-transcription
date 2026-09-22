@@ -155,7 +155,7 @@ test("0004-0007 retain production retry and fallback state for rollback", async 
     expect(signalColumns).toEqual({ count: 2 });
 
     const [migrationCount] = await db.execute(sql`SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`);
-    expect(migrationCount).toEqual({ count: 9 });
+    expect(migrationCount).toEqual({ count: 10 });
 
     const app = createApp({ db, log: silentLogger } as AppContext);
     const response = await app.request("/v1/meetings/mtg_legacy_1", {

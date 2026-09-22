@@ -1,17 +1,37 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
 import type { AppContext } from "../context.ts";
-import { attributedAttempts, attributedBatches as batchesTable, attributedRanges, attributedTranscriptionRuns, meetings, transcripts } from "../db/schema.ts";
-import { normalizeSegments, type NormalizedTranscript } from "../domain/transcript.ts";
+import { attributedAttempts, attributedBatches as batchesTable, attributedRanges, attributedTranscriptionRuns, attributedWorkerReadiness, meetings, transcripts } from "../db/schema.ts";
+import { normalizeSegments } from "../domain/transcript.ts";
 import { attributedBatches, readAttributedBatch, type AttributedBatch, type AttributedCapability, type AttributedManifest } from "../providers/transcription/attributed.ts";
 import { TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
 import { failMeeting, getMeetingById } from "./meetings.ts";
 import { enqueueMeetingWebhook } from "../webhooks/dispatcher.ts";
 
-const ATTEMPT_LIMIT = 3, CLAIM_MS = 5 * 60_000;
+const ATTEMPT_LIMIT = 1, CLAIM_MS = 5 * 60_000;
+const READINESS_ID = "attributed-worker";
+const READINESS_STALE_MS = 15_000;
 const json = (value: unknown) => sql`${JSON.stringify(value)}::text::jsonb`;
 const object = <T>(value: unknown): T => typeof value === "string" ? JSON.parse(value) as T : value as T;
 const canonical = (value: unknown): string => Array.isArray(value) ? `[${value.map(canonical).join(",")}]` : value && typeof value === "object" ? `{${Object.keys(value as object).sort().map((key) => `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`).join(",")}}` : JSON.stringify(value);
 const capabilityOk = (value: unknown): value is AttributedCapability => canonical(value) === canonical({ requested_version: 1, supported_version: 1, status: "supported" });
+
+/** Persisted independently of queue wakeups so API processes can observe worker startup safely. */
+export async function recordAttributedWorkerReadiness(ctx: AppContext, ready: boolean, stage: "startup" | "reconciled" | "reconciliation_failed" | "heartbeat" | "stopped"): Promise<void> {
+  // 0009 creates this on fresh/normal upgrades.  The guard also makes an already-applied draft
+  // 0009 safe to upgrade without changing migration history.
+  await ctx.db.execute(sql`CREATE TABLE IF NOT EXISTS attributed_worker_readiness (id text PRIMARY KEY NOT NULL, ready boolean NOT NULL, stage text NOT NULL, observed_at timestamp with time zone NOT NULL)`);
+  await ctx.db.insert(attributedWorkerReadiness).values({ id: READINESS_ID, ready, stage, observedAt: new Date() })
+    .onConflictDoUpdate({ target: attributedWorkerReadiness.id, set: { ready, stage, observedAt: new Date() } });
+}
+
+export async function attributedWorkerReady(ctx: AppContext): Promise<boolean> {
+  try {
+    const [record] = await ctx.db.select().from(attributedWorkerReadiness).where(eq(attributedWorkerReadiness.id, READINESS_ID)).limit(1);
+    return !!record && record.ready && Date.now() - record.observedAt.getTime() >= 0 && Date.now() - record.observedAt.getTime() <= READINESS_STALE_MS;
+  } catch {
+    return false;
+  }
+}
 
 /** Immutable insert is serialized even when no run row exists yet. */
 export async function stageAttributedManifest(ctx: AppContext, meetingId: string, vexaMeetingId: number, manifest: AttributedManifest, capability: unknown): Promise<void> {
@@ -111,13 +131,16 @@ async function reconcileClaim(ctx: AppContext, batchId: string): Promise<boolean
 }
 
 export async function finalizeAttributedRun(ctx: AppContext, meetingId: string): Promise<void> {
-  const rows = await ctx.db.select().from(batchesTable).where(eq(batchesTable.meetingId, meetingId)).orderBy(batchesTable.ordinal);
+  let rows = await ctx.db.select().from(batchesTable).where(eq(batchesTable.meetingId, meetingId)).orderBy(batchesTable.ordinal);
   const live = rows.filter((row) => row.status === "claimed");
   if (live.length) {
     for (const row of live) await reconcileClaim(ctx, row.id);
-    const remaining = live.filter((row) => row.claimedAt && row.claimedAt.getTime() > Date.now() - CLAIM_MS);
+    // Re-read after reconciliation.  The prior snapshot may contain a claim we just settled;
+    // returning from it would strand a processing meeting without a further wakeup.
+    rows = await ctx.db.select().from(batchesTable).where(eq(batchesTable.meetingId, meetingId)).orderBy(batchesTable.ordinal);
+    const remaining = rows.filter((row) => row.status === "claimed" && row.claimedAt && row.claimedAt.getTime() > Date.now() - CLAIM_MS);
     if (remaining.length) await ctx.queue.push({ type: "attributed.finalize", meetingId }, Math.max(1_000, Math.min(...remaining.map((row) => row.claimedAt!.getTime() + CLAIM_MS - Date.now()))));
-    return;
+    if (remaining.length) return;
   }
   if (rows.some((row) => row.status === "pending")) return;
   const ranges = await ctx.db.select().from(attributedRanges).where(eq(attributedRanges.meetingId, meetingId));
@@ -128,41 +151,90 @@ export async function finalizeAttributedRun(ctx: AppContext, meetingId: string):
     const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Attributed evidence is unresolved; canonical transcript was not published.");
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed"); return;
   }
-  const raw = rows.flatMap((row) => { const batch = object<AttributedBatch>(row.batchJson), value = object<{ text?: string; language?: string }>(row.resultJson ?? {}); return value.text?.trim() ? [{ start: batch.start_ms / 1000, end: batch.end_ms / 1000, text: value.text, speaker: batch.speaker_name, speakerKey: batch.speaker_key, attribution: batch.attribution.source === "glow-bound" && batch.attribution.confidence > 0 ? "identified" as const : "provisional" as const, language: value.language ?? null }] : []; });
-  await publish(ctx, meetingId, normalizeSegments(raw.sort((a, b) => a.start - b.start || a.end - b.end), meeting.language));
+  await publish(ctx, meetingId);
 }
 
-async function publish(ctx: AppContext, meetingId: string, transcript: NormalizedTranscript) {
-  const payload = { speakers: transcript.speakers, segments: transcript.segments, text: transcript.text };
+type Publication = { meeting: typeof meetings.$inferSelect; webhook: boolean } | null;
+
+/**
+ * Publication is deliberately a second, complete verification pass.  Results fetched before this
+ * transaction are merely hints: only locked ledger rows and the immutable closed manifest may
+ * produce the canonical transcript.
+ */
+async function publish(ctx: AppContext, meetingId: string) {
   const published = await ctx.db.transaction(async (tx) => {
+    const [meeting] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
     const [run] = await tx.select().from(attributedTranscriptionRuns).where(eq(attributedTranscriptionRuns.meetingId, meetingId)).for("update");
     const ranges = await tx.select().from(attributedRanges).where(eq(attributedRanges.meetingId, meetingId)).for("update");
-    const batches = await tx.select().from(batchesTable).where(eq(batchesTable.meetingId, meetingId)).for("update");
-    if (!run || canonical(run.manifestJson) === "undefined") return null;
-    const manifest = object<AttributedManifest>(run.manifestJson);
-    // A partial ledger must never turn an empty result into a completed transcript.
-    const stagedBySequence = new Map(manifest.ranges.map((range) => [range.sequence, range]));
-    const batchRanges = batches.flatMap((batch) => object<AttributedBatch>(batch.batchJson).ranges);
-    if (ranges.length !== manifest.ranges.length || new Set(ranges.map((r) => r.sequence)).size !== manifest.ranges.length
-        || ranges.some((r) => canonical(r.rangeJson) !== canonical(stagedBySequence.get(r.sequence)))
-        || batchRanges.length !== manifest.ranges.length || new Set(batchRanges.map((r) => r.sequence)).size !== manifest.ranges.length
-        || batchRanges.some((range) => canonical(range) !== canonical(stagedBySequence.get(range.sequence)))
-        || ranges.some((r) => !["completed", "silence"].includes(r.status)) || batches.some((b) => !["completed", "silence"].includes(b.status))) return null;
-    const existing = await tx.select().from(transcripts).where(eq(transcripts.meetingId, meetingId)).for("update");
-    // A competing finalizer may have committed the canonical object first.  Preserve that winner
-    // and make this run terminal too; never overwrite it or leave the meeting processing forever.
-    if (existing[0]) {
-      const [winner] = await tx.update(meetings).set({ status: "completed", completedAt: new Date() }).where(and(eq(meetings.id, meetingId), eq(meetings.status, "processing"))).returning();
-      if (winner) await tx.update(attributedTranscriptionRuns).set({ status: "completed", updatedAt: new Date() }).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
-      return winner ?? null;
+    const batches = await tx.select().from(batchesTable).where(eq(batchesTable.meetingId, meetingId)).orderBy(batchesTable.ordinal).for("update");
+    const attempts = await tx.select().from(attributedAttempts).innerJoin(batchesTable, eq(attributedAttempts.batchId, batchesTable.id)).where(eq(batchesTable.meetingId, meetingId)).for("update");
+    if (!meeting || meeting.status === "failed" || meeting.status === "cancelled" || !run || !meeting.vexaMeetingId) return null;
+    const reject = async (): Promise<Publication> => {
+      const [failed] = await tx.update(meetings).set({ status: "failed", errorCode: "transcription_failed", errorMessage: "Attributed evidence could not be verified for publication.", endedAt: new Date() })
+        .where(and(eq(meetings.id, meetingId), eq(meetings.status, "processing"))).returning();
+      if (failed) await tx.update(attributedTranscriptionRuns).set({ status: "partial", updatedAt: new Date() }).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
+      return failed ? { meeting: failed, webhook: true } : null;
+    };
+    let manifest: AttributedManifest, expected: AttributedBatch[];
+    try {
+      manifest = object<AttributedManifest>(run.manifestJson);
+      // Revalidates closure, meeting identity, paths, bounds, and independently rebuilds batches.
+      expected = attributedBatches(manifest, meeting.vexaMeetingId);
+    } catch {
+      return reject();
     }
-    const [meeting] = await tx.update(meetings).set({ status: "completed", completedAt: new Date() }).where(and(eq(meetings.id, meetingId), eq(meetings.status, "processing"))).returning();
-    if (!meeting) return null;
+    const stagedBySequence = new Map(manifest.ranges.map((range) => [range.sequence, range]));
+    const attemptByBatch = new Map<string, typeof attempts>();
+    for (const attempt of attempts) {
+      const list = attemptByBatch.get(attempt.attributed_attempts.batchId) ?? [];
+      list.push(attempt); attemptByBatch.set(attempt.attributed_attempts.batchId, list);
+    }
+    const expectedByOrdinal = new Map(expected.map((batch, ordinal) => [ordinal, batch]));
+    const invalidLedger = ranges.length !== manifest.ranges.length || new Set(ranges.map((r) => r.sequence)).size !== manifest.ranges.length
+      || ranges.some((r) => canonical(r.rangeJson) !== canonical(stagedBySequence.get(r.sequence)))
+      || batches.length !== expected.length || batches.some((batch) => canonical(batch.batchJson) !== canonical(expectedByOrdinal.get(batch.ordinal)))
+      || batches.some((batch) => batch.ordinal < 0 || !expectedByOrdinal.has(batch.ordinal));
+    if (invalidLedger) return reject();
+    const raw: Array<{ start: number; end: number; text: string; speaker: string; speakerKey: string; attribution: "identified" | "provisional"; language: string | null }> = [];
+    for (const batch of batches) {
+      const spec = expectedByOrdinal.get(batch.ordinal)!;
+      const batchRanges = spec.ranges;
+      const ledgerRanges = batchRanges.map((range) => ranges.find((row) => row.sequence === range.sequence));
+      if (ledgerRanges.some((row) => !row || row.status !== batch.status) || !["completed", "silence"].includes(batch.status)) return reject();
+      const rowsForBatch = attemptByBatch.get(batch.id) ?? [];
+      const result = object<{ text?: unknown; language?: unknown }>(batch.resultJson ?? {});
+      if (batch.status === "completed") {
+        if (batch.attempts !== 1 || rowsForBatch.length !== 1 || rowsForBatch[0]!.attributed_attempts.ordinal !== 1
+            || rowsForBatch[0]!.attributed_attempts.status !== "succeeded" || !rowsForBatch[0]!.attributed_attempts.completedAt
+            || typeof result.text !== "string" || !result.text.trim() || (result.language !== null && result.language !== undefined && typeof result.language !== "string")) return reject();
+        raw.push({ start: spec.start_ms / 1000, end: spec.end_ms / 1000, text: result.text, speaker: spec.speaker_name, speakerKey: spec.speaker_key,
+          attribution: spec.attribution.source === "glow-bound" && spec.attribution.confidence > 0 ? "identified" : "provisional", language: typeof result.language === "string" ? result.language : null });
+      } else if (batch.attempts !== 0 || rowsForBatch.length !== 0 || result.text !== "") return reject();
+    }
+    if (ranges.some((row) => !["completed", "silence"].includes(row.status))) return reject();
+    const transcript = normalizeSegments(raw.sort((a, b) => a.start - b.start || a.end - b.end), meeting.language);
+    const payload = { speakers: transcript.speakers, segments: transcript.segments, text: transcript.text };
+    const existing = await tx.select().from(transcripts).where(eq(transcripts.meetingId, meetingId)).for("update");
+    if (existing[0] && (existing[0].provider !== "tinfoil-attributed" || canonical(existing[0].segmentsJson) !== canonical(payload)
+        || existing[0].language !== transcript.language || existing[0].durationSeconds !== transcript.duration_seconds)) {
+      const [failed] = await tx.update(meetings).set({ status: "failed", errorCode: "transcription_failed", errorMessage: "Attributed transcript conflicts with an existing transcript.", endedAt: new Date() })
+        .where(and(eq(meetings.id, meetingId), eq(meetings.status, "processing"))).returning();
+      if (failed) await tx.update(attributedTranscriptionRuns).set({ status: "partial", updatedAt: new Date() }).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
+      return failed ? { meeting: failed, webhook: true } satisfies Publication : null;
+    }
+    if (existing[0]) {
+      if (meeting.status !== "completed") return null;
+      await tx.update(attributedTranscriptionRuns).set({ status: "completed", updatedAt: new Date() }).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
+      return null;
+    }
+    if (meeting.status !== "processing") return null;
+    const [completed] = await tx.update(meetings).set({ status: "completed", completedAt: new Date() }).where(and(eq(meetings.id, meetingId), eq(meetings.status, "processing"))).returning();
+    if (!completed) return null;
     await tx.insert(transcripts).values({ meetingId, language: transcript.language, durationSeconds: transcript.duration_seconds, segmentsJson: json(payload), provider: "tinfoil-attributed" });
     await tx.update(attributedTranscriptionRuns).set({ status: "completed", updatedAt: new Date() }).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
-    return meeting;
+    return { meeting: completed, webhook: true } satisfies Publication;
   });
-  if (published) await enqueueMeetingWebhook(ctx, published, "meeting.completed");
+  if (published) await enqueueMeetingWebhook(ctx, published.meeting, published.webhook && published.meeting.status === "completed" ? "meeting.completed" : "meeting.failed");
 }
 
 export async function reconcileAttributedRuns(ctx: AppContext): Promise<void> {

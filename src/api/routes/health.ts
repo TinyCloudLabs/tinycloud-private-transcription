@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { Hono } from "hono";
 import type { AppContext } from "../../context.ts";
 import { TinfoilTranscriptionProvider } from "../../providers/transcription/tinfoil.ts";
+import { attributedWorkerReady } from "../../services/attributed-transcription.ts";
 
 export function healthRoutes(ctx: AppContext) {
   const r = new Hono();
@@ -18,7 +19,7 @@ export function healthRoutes(ctx: AppContext) {
       ctx.config.signal.maxConcurrentCalls,
     );
     const core = postgres && redis;
-    const attributedProviderReady = ctx.transcriptRecovery instanceof TinfoilTranscriptionProvider && ctx.attributedReconciliationReady;
+    const attributedProviderReady = ctx.transcriptRecovery instanceof TinfoilTranscriptionProvider && await attributedWorkerReady(ctx);
     const attributed = {
       enabled: ctx.config.attributedTranscriptionEnabled,
       ready: !ctx.config.attributedTranscriptionEnabled || attributedProviderReady,

@@ -1,5 +1,5 @@
 import type { CaptureDiagnostics } from "../domain/capture.ts";
-import { pgTable, text, timestamp, integer, jsonb, real, index, uniqueIndex } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, integer, jsonb, real, boolean, index, uniqueIndex } from "drizzle-orm/pg-core";
 
 export const projects = pgTable("projects", {
   id: text("id").primaryKey(),
@@ -103,6 +103,14 @@ export const attributedAttempts = pgTable("attributed_attempts", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   completedAt: timestamp("completed_at", { withTimezone: true }),
 }, (t) => [uniqueIndex("attributed_attempts_batch_ordinal_idx").on(t.batchId, t.ordinal)]);
+
+/** A PostgreSQL-backed worker heartbeat; API and worker commonly run in separate processes. */
+export const attributedWorkerReadiness = pgTable("attributed_worker_readiness", {
+  id: text("id").primaryKey(),
+  ready: boolean("ready").notNull(),
+  stage: text("stage").notNull(),
+  observedAt: timestamp("observed_at", { withTimezone: true }).notNull(),
+});
 
 /** Durable queue intent; Redis only wakes work and is never the source of truth. */
 export const webhookDeliveries = pgTable(

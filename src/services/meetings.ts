@@ -242,14 +242,14 @@ async function stopInVexa(ctx: AppContext, meeting: MeetingRow) {
     await ctx.vexa.stopBot(meeting.vexaPlatform, meeting.vexaNativeMeetingId);
   } catch (e) {
     if (e instanceof VexaHttpError && e.notFound) return;
-    ctx.log.warn("vexa stopBot failed", { meetingId: meeting.id, error: String(e) });
+    ctx.log.warn("vexa stopBot failed", { stage: "stop_provider", code: "provider_unavailable" });
   }
 }
 
 async function stopInSignal(ctx: AppContext, meeting: MeetingRow) {
   if (!meeting.signalSessionId) return;
   try { await ctx.signal.leave(meeting.signalSessionId); }
-  catch (e) { ctx.log.warn("signal leave failed", { meetingId: meeting.id, error: String(e) }); }
+  catch { ctx.log.warn("signal leave failed", { stage: "stop_signal", code: "provider_unavailable" }); }
 }
 
 /**
@@ -274,9 +274,9 @@ export async function deleteMeeting(ctx: AppContext, meeting: MeetingRow): Promi
         // Vexa confirms deletion so a retry cannot silently orphan or destroy that evidence.
         throw new ApiError("provider_unavailable", "Could not confirm deletion from the capture provider");
       } else if (e instanceof VexaHttpError && e.conflict) {
-        ctx.log.warn("vexa retains meeting row (409: bot lifecycle owns it)", { meetingId: meeting.id, vexaNativeMeetingId: meeting.vexaNativeMeetingId });
+        ctx.log.warn("vexa retains meeting row (409: bot lifecycle owns it)", { stage: "delete_provider", code: "provider_conflict" });
       } else if (!(e instanceof VexaHttpError && e.notFound)) {
-        ctx.log.warn("vexa deleteMeeting failed", { meetingId: meeting.id, error: String(e) });
+        ctx.log.warn("vexa deleteMeeting failed", { stage: "delete_provider", code: "provider_unavailable" });
         throw new ApiError("provider_unavailable", "Could not delete the meeting from the capture provider");
       }
     }
