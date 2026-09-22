@@ -13,6 +13,7 @@ import { and, eq, isNull, sql } from "drizzle-orm";
 import { meetings } from "../db/schema.ts";
 import { normalizeSegments } from "../domain/transcript.ts";
 import { openSignalCapability } from "../providers/signal/capability.ts";
+import { stageAttributedManifest } from "../services/attributed-transcription.ts";
 import type { VexaTranscriptionResponse } from "../providers/vexa/types.ts";
 import { transcribeAttributedManifest, type AttributedManifest } from "../providers/transcription/attributed.ts";
 import { TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
@@ -33,11 +34,10 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
       meeting_url: meeting.meetingUrl,
       bot_name: meeting.botName ?? undefined,
       language: meeting.language ?? undefined,
-      // The attributed-audio producer/API is not deployed in this fork yet. Keep Vexa's proven
-      // live path enabled until a capability-negotiated durable manifest path exists; disabling it
-      // here would guarantee transcript loss.
-      transcribe_enabled: true,
+      // Live native text is diagnostic only; canonical text can only come from sealed ranges.
+      transcribe_enabled: false,
       recording_enabled: true,
+      ...(ctx.config.attributedTranscriptionEnabled ? { attributed_audio_enabled: true } : {}),
       // Vexa otherwise applies its ten-minute deployment fallback. Pin every TinyCloud meeting to
       // our configurable audio-silence window. This can expire with humans still connected;
       // participant presence does not veto Vexa's silence verdict.
@@ -51,6 +51,7 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
     const { meeting: updated, changed } = await transition(ctx, dispatched, "joining", {
       vexaPlatform: created.platform ?? vexaPlatform,
       vexaNativeMeetingId,
+      vexaMeetingId: created.id,
       vexaBotId: created.bot_container_id ?? String(created.id),
     });
     if (changed) {
@@ -165,39 +166,19 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
     return;
   }
 
-  // Vexa owns the normal timeline and attribution. A retained recording is only read when that
-  // timeline is materially incomplete, so teardown losses can be recovered without replacing good
-  // Vexa speaker metadata.
-  let segments: ReturnType<typeof adaptVexaSegments>;
-  try {
-    segments = adaptVexaSegments(vexa); // deduped by turn, epoch → meeting-relative seconds
-  } catch (e) {
-    // A malformed Vexa transcript has to end the meeting here. The worker loop logs and drops a
-    // thrown job without re-queueing it, so letting this escape would strand the meeting in a
-    // non-terminal state with no webhook, forever.
-    ctx.log.error("vexa returned an invalid transcript", { meetingId, error: String(e) });
-    const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "The capture provider returned an invalid transcript.");
-    if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
-    return;
-  }
-  const hasLiveWords = segments.some((segment) => segment.text.trim().length > 0);
-  // Active-stage failure permits finalization but does not itself replace a complete Vexa-native
-  // transcript. The same material-incompleteness test selects recovery for every terminal shape.
-  const recover = !!ctx.transcriptRecovery && isMateriallyIncomplete(vexa, segments);
-  // When recovery is unconfigured, nonempty native words remain the loss-preserving fallback even
-  // if their coverage is incomplete. Empty output still retains the mapped terminal failure below.
-  if (!hasLiveWords && !recover) {
-    const failure = reason
-      ? mapVexaFailure(reason)
-      : { code: "capture_failed" as const, message: "No usable audio was captured for this meeting." };
-    const { meeting: failed, changed } = await failMeeting(ctx, meeting, failure.code, failure.message);
-    if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
-    return;
-  }
-
   ({ meeting } = await transition(ctx, meeting, "processing"));
-  ctx.log.debug("vexa meeting completed; finalizing", { meetingId: meeting.id, vexaSegments: segments.length });
-  await finalize(ctx, meeting, vexa, segments, recover, recoveryAttempt);
+  if (!ctx.config.attributedTranscriptionEnabled || !meeting.vexaMeetingId) {
+    const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Durable attributed transcription is not enabled for this meeting.");
+    if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+    return;
+  }
+  try {
+    // This is the only producer read used to make canonical text; transcript segments stay diagnostics.
+    await stageAttributedManifest(ctx, meeting.id, await ctx.vexa.getAttributedAudio(meeting.vexaMeetingId));
+  } catch {
+    const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Attributed source evidence could not be reconciled.");
+    if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+  }
 }
 
 async function handleSignalStart(ctx: AppContext, meeting: MeetingRow, attempt: number) {

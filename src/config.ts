@@ -26,6 +26,8 @@ export const config = {
     /** Provisioned bot ceiling (matches `max_concurrent_bots` in infra/dstack/app-compose.yaml). Reported in /health. */
     maxConcurrentBots: Number(env("VEXA_MAX_CONCURRENT_BOTS", "5")),
   },
+  /** Opt-in until the Vexa producer contract is deployed everywhere. */
+  attributedTranscriptionEnabled: env("ATTRIBUTED_TRANSCRIPTION_ENABLED", "false") === "true",
   /** Isolated capture workers which own Signal Desktop CDP and PulseAudio capture. */
   signal: {
     /** One loopback capture endpoint per independently linked Signal Desktop seat. */

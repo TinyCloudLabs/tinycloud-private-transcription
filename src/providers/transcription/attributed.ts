@@ -80,6 +80,24 @@ function silentPcm(bytes: Uint8Array): boolean {
   return 20 * Math.log10(Math.sqrt(energy / view.length) || 0) < -60;
 }
 
+/** Read a bounded, validated batch once. The caller owns the resulting PCM lifetime. */
+export async function readAttributedBatch(
+  batch: AttributedBatch,
+  read: (range: AttributedRange) => Promise<Uint8Array>,
+): Promise<{ pcm: Uint8Array; silent: boolean }> {
+  const total = batch.ranges.reduce((sum, range) => sum + range.byte_count, 0);
+  if (!Number.isSafeInteger(total)) invalid("Attributed batch exceeds memory ceiling");
+  const pcm = new Uint8Array(total);
+  let offset = 0;
+  for (const range of batch.ranges) {
+    const bytes = await read(range);
+    if (bytes.byteLength !== range.byte_count || createHash("sha256").update(bytes).digest("hex") !== range.sha256) invalid("Attributed audio integrity check failed");
+    pcm.set(bytes, offset);
+    offset += bytes.byteLength;
+  }
+  return { pcm, silent: silentPcm(pcm) };
+}
+
 export async function transcribeAttributedManifest(
   manifest: AttributedManifest,
   read: (range: AttributedRange) => Promise<Uint8Array>,
@@ -89,21 +107,8 @@ export async function transcribeAttributedManifest(
   const batches = attributedBatches(manifest);
   const raw = [];
   for (const batch of batches) {
-    const total = batch.ranges.reduce((sum, range) => sum + range.byte_count, 0);
-    if (!Number.isSafeInteger(total)) invalid("Attributed batch exceeds memory ceiling");
-    // One bounded destination, and one range at a time. Do not retain a Promise.all of range
-    // downloads or construct a second whole-batch copy.
-    const pcm = new Uint8Array(total);
-    let offset = 0;
-    for (const range of batch.ranges) {
-      const bytes = await read(range);
-      if (bytes.byteLength !== range.byte_count || createHash("sha256").update(bytes).digest("hex") !== range.sha256) {
-        invalid("Attributed audio integrity check failed");
-      }
-      pcm.set(bytes, offset);
-      offset += bytes.byteLength;
-    }
-    const response = silentPcm(pcm) ? { text: "" } : await textOnly(pcm, batch);
+    const prepared = await readAttributedBatch(batch, read);
+    const response = prepared.silent ? { text: "" } : await textOnly(prepared.pcm, batch);
     if (response.text.trim()) raw.push({
       start: batch.start_ms / 1000, end: batch.end_ms / 1000, text: response.text,
       speaker: batch.speaker_name, speakerKey: batch.speaker_key,

@@ -17,7 +17,12 @@ export function healthRoutes(ctx: AppContext) {
       ctx.config.signal.maxConcurrentCalls,
     );
     const core = postgres && redis;
-    const status = !core ? "error" : vexa.ok && signal.ready ? "ok" : "degraded";
+    const attributed = {
+      enabled: ctx.config.attributedTranscriptionEnabled,
+      ready: !ctx.config.attributedTranscriptionEnabled || Boolean(ctx.config.tinfoil.apiKey),
+      reason: ctx.config.attributedTranscriptionEnabled && !ctx.config.tinfoil.apiKey ? "Tinfoil transcription is not configured" : null,
+    };
+    const status = !core ? "error" : vexa.ok && signal.ready && attributed.ready ? "ok" : "degraded";
     return c.json(
       {
         status,
@@ -28,6 +33,7 @@ export function healthRoutes(ctx: AppContext) {
           // running = bots Vexa reports as live (null when Vexa is unreachable); max = provisioned ceiling.
           bot_capacity: { running: vexa.running_bots, max: ctx.config.vexa.maxConcurrentBots },
           transcription_provider: ctx.transcription.name,
+          attributed_transcription: attributed,
           signal,
         },
       },

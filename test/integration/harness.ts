@@ -47,6 +47,7 @@ export async function startHarness(
     signalCapabilityKey?: string;
     signalMaxConcurrentCalls?: number;
     transcriptionProvider?: TranscriptionProviderName;
+    attributedTranscriptionEnabled?: boolean;
   } = {},
 ): Promise<Harness> {
   const vexa = startMockVexa(0);
@@ -60,6 +61,7 @@ export async function startHarness(
       ? { signal: { ...baseConfig.signal, ...(opts.signalCapabilityKey ? { capabilityKey: opts.signalCapabilityKey } : {}), ...(opts.signalMaxConcurrentCalls !== undefined ? { maxConcurrentCalls: opts.signalMaxConcurrentCalls } : {}) } }
       : {}),
     ...(opts.transcriptionProvider ? { transcriptionProvider: opts.transcriptionProvider } : {}),
+    ...(opts.attributedTranscriptionEnabled !== undefined ? { attributedTranscriptionEnabled: opts.attributedTranscriptionEnabled } : {}),
   };
   const db = await runMigrations(config.databaseUrl);
   await db.execute(sql`truncate table webhook_deliveries, transcripts, meetings, api_keys, projects cascade`);

@@ -57,6 +57,13 @@
       "when": 1790020000000,
       "tag": "0007_retain_legacy_transcript_state",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1790097646603,
+      "tag": "0008_attributed_transcription",
+      "breakpoints": true
     }
   ]
 }

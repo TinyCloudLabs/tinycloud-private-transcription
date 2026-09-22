@@ -43,6 +43,7 @@ export interface VexaMeetingCreate {
   language?: string;
   task?: "transcribe" | "translate";
   transcribe_enabled?: boolean;
+  attributed_audio_enabled?: boolean;
   recording_enabled?: boolean;
   /** Vexa's per-meeting lifecycle limits. `max_time_left_alone` is milliseconds without remote participant audio. */
   automatic_leave?: { max_time_left_alone: number };
@@ -139,6 +140,14 @@ export interface VexaTranscriptionResponse {
   notes?: string | null;
   data?: VexaMeetingData | null;
   segments: VexaTranscriptionSegment[];
+}
+
+/** GET /meetings/{numeric_id}/attributed-audio, producer contract v1. */
+export interface VexaAttributedAudioManifest {
+  version: 1;
+  meeting_id: string;
+  state: "open" | "closed";
+  ranges: VexaMeetingData extends { attributed_audio_manifest?: infer M } ? M extends { ranges: infer R } ? R : never : never;
 }
 
 export interface VexaRecording {

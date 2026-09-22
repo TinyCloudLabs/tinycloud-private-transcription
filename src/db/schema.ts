@@ -29,6 +29,8 @@ export const meetings = pgTable(
     webhookUrl: text("webhook_url"),
     vexaPlatform: text("vexa_platform"),
     vexaNativeMeetingId: text("vexa_native_meeting_id"),
+    /** Numeric Vexa row ID used exclusively for durable attributed-audio retrieval. */
+    vexaMeetingId: integer("vexa_meeting_id"),
     vexaBotId: text("vexa_bot_id"),
     /** Signal worker session ID; unlike a call fragment this is safe operational metadata. */
     signalSessionId: text("signal_session_id"),
@@ -60,6 +62,58 @@ export const transcripts = pgTable("transcripts", {
   provider: text("provider").notNull().default("vexa"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
+
+/** One immutable producer manifest per meeting. Its rows are retained until meeting deletion. */
+export const attributedTranscriptionRuns = pgTable("attributed_transcription_runs", {
+  meetingId: text("meeting_id").primaryKey().references(() => meetings.id, { onDelete: "cascade" }),
+  status: text("status").notNull().default("pending"), // pending | processing | partial | failed | completed
+  manifestJson: jsonb("manifest_json").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const attributedRanges = pgTable("attributed_ranges", {
+  meetingId: text("meeting_id").notNull().references(() => meetings.id, { onDelete: "cascade" }),
+  sequence: integer("sequence").notNull(),
+  rangeJson: jsonb("range_json").notNull(),
+  status: text("status").notNull().default("pending"), // pending | silence | completed | unresolved | failed
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [uniqueIndex("attributed_ranges_meeting_sequence_idx").on(t.meetingId, t.sequence)]);
+
+export const attributedBatches = pgTable("attributed_batches", {
+  id: text("id").primaryKey(),
+  meetingId: text("meeting_id").notNull().references(() => meetings.id, { onDelete: "cascade" }),
+  ordinal: integer("ordinal").notNull(),
+  batchJson: jsonb("batch_json").notNull(),
+  status: text("status").notNull().default("pending"), // pending | claimed | completed | silence | unresolved | failed | ambiguous
+  attempts: integer("attempts").notNull().default(0),
+  claimToken: text("claim_token"),
+  claimedAt: timestamp("claimed_at", { withTimezone: true }),
+  resultJson: jsonb("result_json"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [uniqueIndex("attributed_batches_meeting_ordinal_idx").on(t.meetingId, t.ordinal), index("attributed_batches_status_idx").on(t.status)]);
+
+export const attributedAttempts = pgTable("attributed_attempts", {
+  id: text("id").primaryKey(),
+  batchId: text("batch_id").notNull().references(() => attributedBatches.id, { onDelete: "cascade" }),
+  ordinal: integer("ordinal").notNull(),
+  status: text("status").notNull(), // started | succeeded | failed | ambiguous
+  outcome: text("outcome"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+}, (t) => [uniqueIndex("attributed_attempts_batch_ordinal_idx").on(t.batchId, t.ordinal)]);
+
+/** Durable queue intent; Redis only wakes work and is never the source of truth. */
+export const attributedJobs = pgTable("attributed_jobs", {
+  id: text("id").primaryKey(),
+  meetingId: text("meeting_id").notNull().references(() => meetings.id, { onDelete: "cascade" }),
+  batchId: text("batch_id").references(() => attributedBatches.id, { onDelete: "cascade" }),
+  kind: text("kind").notNull(), // batch | finalize
+  status: text("status").notNull().default("pending"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [index("attributed_jobs_status_idx").on(t.status)]);
 
 export const webhookDeliveries = pgTable(
   "webhook_deliveries",

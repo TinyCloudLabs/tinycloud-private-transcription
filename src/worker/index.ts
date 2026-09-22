@@ -1,6 +1,7 @@
 import { createContext, type AppContext } from "../context.ts";
 import { deliverWebhook } from "../webhooks/dispatcher.ts";
 import { handleJoinDeadline, handleMeetingPoll, handleMeetingStart } from "./meeting-job.ts";
+import { finalizeAttributedRun, processAttributedBatch, reconcileAttributedRuns } from "../services/attributed-transcription.ts";
 import type { Job } from "./queue.ts";
 
 export async function processJob(ctx: AppContext, job: Job): Promise<void> {
@@ -11,6 +12,10 @@ export async function processJob(ctx: AppContext, job: Job): Promise<void> {
       return handleMeetingPoll(ctx, job.meetingId, job.recoveryAttempt ?? 1);
     case "meeting.join_deadline":
       return handleJoinDeadline(ctx, job.meetingId);
+    case "attributed.batch":
+      return processAttributedBatch(ctx, job.meetingId, job.batchId);
+    case "attributed.finalize":
+      return finalizeAttributedRun(ctx, job.meetingId);
     case "webhook.deliver":
       return deliverWebhook(ctx, job.deliveryId);
   }
@@ -23,6 +28,7 @@ export interface WorkerHandle {
 /** Runs the queue loop until stopped. Errors in a job are logged and never crash the loop. */
 export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number } = {}): WorkerHandle {
   let running = true;
+  void reconcileAttributedRuns(ctx).catch((e) => ctx.log.error("attributed reconciliation failed", { error: String(e) }));
   const loop = (async () => {
     while (running) {
       let job: Job | null = null;

@@ -8,6 +8,7 @@ import type {
   VexaRecordingMasterResponse,
   VexaStopBotResponse,
   VexaDeleteMeetingResponse,
+  VexaAttributedAudioManifest,
 } from "./types.ts";
 
 export interface VexaClientOptions {
@@ -89,6 +90,12 @@ export class VexaClient {
       "GET",
       `/transcripts/${encodeURIComponent(platform)}/${encodeURIComponent(nativeMeetingId)}`,
     );
+  }
+
+  /** Contract endpoint. Range URLs are deliberately resolved only by this authenticated client. */
+  getAttributedAudio(meetingId: number) {
+    if (!Number.isSafeInteger(meetingId) || meetingId <= 0) throw new ApiError("transcription_failed", "Invalid Vexa meeting identifier");
+    return this.request<VexaAttributedAudioManifest>("GET", `/meetings/${meetingId}/attributed-audio`);
   }
 
   /** DELETE /bots/{p}/{id} → {status:"stopping", meeting_id, native_meeting_id}; 404 once no bot is active. */
