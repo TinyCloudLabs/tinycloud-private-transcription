@@ -28,15 +28,23 @@ export interface WorkerHandle {
 /** Runs the queue loop until stopped. Errors in a job are logged and never crash the loop. */
 export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number } = {}): WorkerHandle {
   let running = true;
-  void reconcileAttributedRuns(ctx).catch((e) => ctx.log.error("attributed reconciliation failed", { error: String(e) }));
   const loop = (async () => {
+    try {
+      // Durable attributed state is authoritative, so do not consume queue wakeups until it has
+      // been reconciled.  Error details can contain SQL values or transcript text; log only stage.
+      await reconcileAttributedRuns(ctx);
+    } catch {
+      ctx.log.error("attributed reconciliation failed", { stage: "startup_reconciliation" });
+      return;
+    }
     while (running) {
       let job: Job | null = null;
       try {
         job = await ctx.queue.pop(opts.popTimeoutSec ?? 1);
         if (job) await processJob(ctx, job);
       } catch (e) {
-        ctx.log.error("job failed", { job, error: String(e) });
+        if (job?.type.startsWith("attributed.")) ctx.log.error("attributed job failed", { stage: job.type });
+        else ctx.log.error("job failed", { job, error: String(e) });
         await Bun.sleep(250);
       }
     }

@@ -269,7 +269,11 @@ export async function deleteMeeting(ctx: AppContext, meeting: MeetingRow): Promi
     try {
       await ctx.vexa.deleteMeeting(meeting.vexaPlatform, meeting.vexaNativeMeetingId);
     } catch (e) {
-      if (e instanceof VexaHttpError && e.conflict) {
+      if (e instanceof VexaHttpError && e.conflict && meeting.vexaMeetingId != null) {
+        // Attributed ranges are provider-owned evidence.  Retain the complete local ledger until
+        // Vexa confirms deletion so a retry cannot silently orphan or destroy that evidence.
+        throw new ApiError("provider_unavailable", "Could not confirm deletion from the capture provider");
+      } else if (e instanceof VexaHttpError && e.conflict) {
         ctx.log.warn("vexa retains meeting row (409: bot lifecycle owns it)", { meetingId: meeting.id, vexaNativeMeetingId: meeting.vexaNativeMeetingId });
       } else if (!(e instanceof VexaHttpError && e.notFound)) {
         ctx.log.warn("vexa deleteMeeting failed", { meetingId: meeting.id, error: String(e) });

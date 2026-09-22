@@ -2,6 +2,7 @@ import { sql } from "drizzle-orm";
 import { readFileSync } from "node:fs";
 import { Hono } from "hono";
 import type { AppContext } from "../../context.ts";
+import { TinfoilTranscriptionProvider } from "../../providers/transcription/tinfoil.ts";
 
 export function healthRoutes(ctx: AppContext) {
   const r = new Hono();
@@ -17,10 +18,11 @@ export function healthRoutes(ctx: AppContext) {
       ctx.config.signal.maxConcurrentCalls,
     );
     const core = postgres && redis;
+    const attributedProviderReady = ctx.transcriptRecovery instanceof TinfoilTranscriptionProvider;
     const attributed = {
       enabled: ctx.config.attributedTranscriptionEnabled,
-      ready: !ctx.config.attributedTranscriptionEnabled || Boolean(ctx.config.tinfoil.apiKey),
-      reason: ctx.config.attributedTranscriptionEnabled && !ctx.config.tinfoil.apiKey ? "Tinfoil transcription is not configured" : null,
+      ready: !ctx.config.attributedTranscriptionEnabled || attributedProviderReady,
+      reason: ctx.config.attributedTranscriptionEnabled && !attributedProviderReady ? "Attributed transcription provider is not configured" : null,
     };
     const status = !core ? "error" : vexa.ok && signal.ready && attributed.ready ? "ok" : "degraded";
     return c.json(

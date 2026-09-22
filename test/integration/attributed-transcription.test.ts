@@ -27,7 +27,7 @@ test("only closed authenticated attributed ranges become canonical", async () =>
     status: "completed", completion_reason: "stopped",
     // Deliberately include native text: it must not be canonical.
     segments: [{ start: 0, end: 1, text: "diagnostic only", language: "en", speaker: "Unknown", completed: true }],
-    attributed_audio_manifest: { version: 1, meeting_id: "producer-1", state: "closed", ranges: [{ version: 1, meeting_id: "producer-1", sequence: 0, idempotency_key: "r0", speaker_key: "alice", speaker_name: "Alice", attribution: { source: "glow-bound", confidence: .9 }, start_ms: 0, end_ms: 1000, codec: "pcm_f32le", sample_rate: 16000, channels: 1, byte_count: pcm.byteLength, sha256, state: "uploaded", url: path }] },
+    attributed_audio_manifest: { version: 1, meeting_id: String(bot.id), state: "closed", clock_origin: "meeting_start", clock_origin_ms: 0, capabilities: { attributed_audio_enabled: true }, ranges: [{ version: 1, meeting_id: String(bot.id), sequence: 0, idempotency_key: "r0", speaker_key: "alice", speaker_name: "Alice", attribution: { source: "glow-bound", confidence: .9 }, start_ms: 0, end_ms: 1000, audio_duration_ms: 1000, channel: 0, turn_generation: 0, codec: "pcm_f32le", sample_rate: 16000, channels: 1, byte_count: pcm.byteLength, sha256, state: "uploaded", path }] },
     attributed_audio_base64: { [path]: Buffer.from(pcm).toString("base64") },
   });
   await h.waitFor(async () => {

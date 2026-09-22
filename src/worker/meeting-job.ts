@@ -15,8 +15,6 @@ import { normalizeSegments } from "../domain/transcript.ts";
 import { openSignalCapability } from "../providers/signal/capability.ts";
 import { stageAttributedManifest } from "../services/attributed-transcription.ts";
 import type { VexaTranscriptionResponse } from "../providers/vexa/types.ts";
-import { transcribeAttributedManifest, type AttributedManifest } from "../providers/transcription/attributed.ts";
-import { TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
 
 const MAX_START_ATTEMPTS = 3;
 const MAX_RECOVERY_ATTEMPTS = 3;
@@ -34,10 +32,11 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
       meeting_url: meeting.meetingUrl,
       bot_name: meeting.botName ?? undefined,
       language: meeting.language ?? undefined,
-      // Live native text is diagnostic only; canonical text can only come from sealed ranges.
-      transcribe_enabled: false,
-      recording_enabled: true,
-      ...(ctx.config.attributedTranscriptionEnabled ? { attributed_audio_enabled: true } : {}),
+      // Keep the established Vexa contract untouched unless the new producer was explicitly
+      // selected.  A disabled flag is a compatibility boundary, not a partial rollout.
+      ...(ctx.config.attributedTranscriptionEnabled
+        ? { transcribe_enabled: false, recording_enabled: true, attributed_audio_enabled: true }
+        : { transcribe_enabled: true, ...(ctx.transcriptRecovery ? { recording_enabled: true } : {}) }),
       // Vexa otherwise applies its ten-minute deployment fallback. Pin every TinyCloud meeting to
       // our configurable audio-silence window. This can expire with humans still connected;
       // participant presence does not veto Vexa's silence verdict.
@@ -46,12 +45,12 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
     const vexaNativeMeetingId = created.native_meeting_id ?? meeting.vexaNativeMeetingId;
     const dispatched = await recordCapture(ctx, meeting, {
       silence_timeout_ms: ctx.config.vexa.maxTimeLeftAloneMs,
-      live_transcription_requested: false,
+      live_transcription_requested: !ctx.config.attributedTranscriptionEnabled,
     });
     const { meeting: updated, changed } = await transition(ctx, dispatched, "joining", {
       vexaPlatform: created.platform ?? vexaPlatform,
       vexaNativeMeetingId,
-      vexaMeetingId: created.id,
+      ...(ctx.config.attributedTranscriptionEnabled ? { vexaMeetingId: created.id } : {}),
       vexaBotId: created.bot_container_id ?? String(created.id),
     });
     if (changed) {
@@ -166,19 +165,43 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
     return;
   }
 
-  ({ meeting } = await transition(ctx, meeting, "processing"));
-  if (!ctx.config.attributedTranscriptionEnabled || !meeting.vexaMeetingId) {
-    const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Durable attributed transcription is not enabled for this meeting.");
+  if (ctx.config.attributedTranscriptionEnabled) {
+    const vexaMeetingId = meeting.vexaMeetingId;
+    if (!vexaMeetingId) {
+      const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Attributed capture identity is unavailable.");
+      if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+      return;
+    }
+    ({ meeting } = await transition(ctx, meeting, "processing"));
+    try {
+      // Sealed producer evidence is the only enabled-path source of canonical text.
+      await stageAttributedManifest(ctx, meeting.id, vexaMeetingId, await ctx.vexa.getAttributedAudio(vexaMeetingId));
+    } catch {
+      const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Attributed source evidence could not be reconciled.");
+      if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+    }
+    return;
+  }
+
+  // Feature-off is the pre-existing native/recovery finalization path.
+  let segments: ReturnType<typeof adaptVexaSegments>;
+  try {
+    segments = adaptVexaSegments(vexa);
+  } catch {
+    const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "The capture provider returned an invalid transcript.");
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
     return;
   }
-  try {
-    // This is the only producer read used to make canonical text; transcript segments stay diagnostics.
-    await stageAttributedManifest(ctx, meeting.id, await ctx.vexa.getAttributedAudio(meeting.vexaMeetingId));
-  } catch {
-    const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Attributed source evidence could not be reconciled.");
+  const hasLiveWords = segments.some((segment) => segment.text.trim().length > 0);
+  const recover = !!ctx.transcriptRecovery && isMateriallyIncomplete(vexa, segments);
+  if (!hasLiveWords && !recover) {
+    const failure = reason ? mapVexaFailure(reason) : { code: "capture_failed" as const, message: "No usable audio was captured for this meeting." };
+    const { meeting: failed, changed } = await failMeeting(ctx, meeting, failure.code, failure.message);
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+    return;
   }
+  ({ meeting } = await transition(ctx, meeting, "processing"));
+  await finalize(ctx, meeting, vexa, segments, recover, recoveryAttempt);
 }
 
 async function handleSignalStart(ctx: AppContext, meeting: MeetingRow, attempt: number) {
@@ -299,39 +322,6 @@ async function finalize(
   recover: boolean,
   recoveryAttempt: number,
 ) {
-  const manifest = vexa.data?.attributed_audio_manifest as AttributedManifest | undefined;
-  if (manifest?.state === "closed" && manifest.ranges.every((range) => range.state === "uploaded")) {
-    const attributedProvider = ctx.transcriptRecovery;
-    if (!(attributedProvider instanceof TinfoilTranscriptionProvider)) {
-      const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Attributed audio requires a configured Tinfoil worker.");
-      if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
-      return;
-    }
-    try {
-      const transcript = await transcribeAttributedManifest(
-        manifest,
-        async (range) => (await ctx.vexa.fetchBytes(range.url!)).bytes,
-        (pcm, batch) => attributedProvider.transcribeAttributedPcm(pcm, batch, meeting.language),
-        meeting.language,
-      );
-      await storeTranscript(ctx, meeting.id, transcript, "tinfoil-attributed");
-      const { meeting: done, changed } = await transition(ctx, meeting, "completed");
-      if (changed) await enqueueMeetingWebhook(ctx, done, "meeting.completed");
-      return;
-    } catch (error) {
-      const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Attributed transcription could not be completed.");
-      if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
-      return;
-    }
-  }
-  if (manifest && recoveryAttempt < MAX_RECOVERY_ATTEMPTS) {
-      // A Vexa implementation that advertises a manifest but has not published every durable
-      // range gets a bounded readiness window. It can never poll forever.
-      await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id, recoveryAttempt: recoveryAttempt + 1 }, ctx.config.vexa.pollIntervalMs);
-      return;
-  }
-  // Fall back to the already-proven Vexa-native path after the bounded manifest-readiness window.
-  // This keeps the branch safe while the producer contract is not available in deployed Vexa.
   const input = {
     meetingId: meeting.id,
     language: meeting.language,

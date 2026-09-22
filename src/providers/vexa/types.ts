@@ -79,10 +79,10 @@ export interface VexaMeetingData {
   sessions?: string[];
   /** v1 durable, capture-owned evidence. PTX may consume it only after closure. */
   attributed_audio_manifest?: {
-    version: 1; meeting_id: string; state: "open" | "closed"; ranges: Array<{
+    version: 1; meeting_id: string; state: "open" | "closed"; clock_origin: "meeting_start"; clock_origin_ms: number; capabilities: { attributed_audio_enabled: true }; ranges: Array<{
       version: 1; meeting_id: string; sequence: number; idempotency_key: string; speaker_key: string; speaker_name: string;
-      attribution: { source: "glow-bound" | "provisional"; confidence: number }; start_ms: number; end_ms: number;
-      codec: "pcm_f32le"; sample_rate: number; channels: 1; byte_count: number; sha256: string; state: "sealed" | "uploaded" | "failed"; url?: string;
+      attribution: { source: "glow-bound" | "provisional" | "unresolved"; confidence: number }; start_ms: number; end_ms: number;
+      codec: "pcm_f32le"; sample_rate: number; channels: 1; channel: number; turn_generation: number; audio_duration_ms: number; byte_count: number; sha256: string; state: "sealed" | "uploaded" | "failed"; path?: string;
     }>;
   };
   [k: string]: unknown;
@@ -147,6 +147,9 @@ export interface VexaAttributedAudioManifest {
   version: 1;
   meeting_id: string;
   state: "open" | "closed";
+  clock_origin: "meeting_start";
+  clock_origin_ms: number;
+  capabilities: { attributed_audio_enabled: true };
   ranges: VexaMeetingData extends { attributed_audio_manifest?: infer M } ? M extends { ranges: infer R } ? R : never : never;
 }
 

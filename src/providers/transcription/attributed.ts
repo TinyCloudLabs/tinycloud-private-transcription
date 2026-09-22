@@ -5,12 +5,19 @@ import { normalizeSegments, type NormalizedTranscript } from "../../domain/trans
 export interface AttributedRange {
   version: 1; meeting_id: string; sequence: number; idempotency_key: string;
   speaker_key: string; speaker_name: string;
-  attribution: { source: "glow-bound" | "provisional"; confidence: number };
+  attribution: { source: "glow-bound" | "provisional" | "unresolved"; confidence: number };
   /** Milliseconds relative to the capture-start clock in the manifest, never epoch time. */
   start_ms: number; end_ms: number; codec: "pcm_f32le"; sample_rate: number; channels: 1;
-  byte_count: number; sha256: string; state: "sealed" | "uploaded" | "failed"; url?: string;
+  /** Producer sample-clock duration. Wall-clock spans may contain bounded scheduling jitter. */
+  audio_duration_ms: number; channel: number; turn_generation: number;
+  byte_count: number; sha256: string; state: "sealed" | "uploaded" | "failed"; path?: string;
 }
-export interface AttributedManifest { version: 1; meeting_id: string; state: "open" | "closed"; ranges: AttributedRange[]; }
+export interface AttributedManifest {
+  version: 1; meeting_id: string; state: "open" | "closed"; ranges: AttributedRange[];
+  clock_origin: "meeting_start"; clock_origin_ms: number;
+  /** Echoed only when Vexa accepted attributed_audio_enabled on the bot request. */
+  capabilities: { attributed_audio_enabled: true };
+}
 export interface AttributedBatch {
   idempotency_key: string; speaker_key: string; speaker_name: string;
   attribution: AttributedRange["attribution"]; start_ms: number; end_ms: number; ranges: AttributedRange[];
@@ -24,28 +31,37 @@ const invalid = (message: string): never => { throw new ApiError("transcription_
 const sameAttribution = (a: AttributedRange, b: AttributedRange) =>
   a.attribution.source === b.attribution.source && a.attribution.confidence === b.attribution.confidence;
 const relativePath = (path: string | undefined) => typeof path === "string" && /^\/(?!\/)/.test(path);
+const isUnknown = (value: string) => !value.trim() || /^unknown$/i.test(value.trim());
+const CLOCK_JITTER_MS = 250;
 
 /** Validate producer evidence before any fetch/allocation. This is the Vexa/PTX trust boundary. */
-function validateRange(manifest: AttributedManifest, range: AttributedRange, sequence: number): void {
+function validateRange(manifest: AttributedManifest, range: AttributedRange, sequence: number, vexaMeetingId?: number): void {
   const duration = range.end_ms - range.start_ms;
-  const expectedBytes = duration * range.sample_rate * range.channels * PCM_FLOAT_BYTES / 1000;
+  const expectedBytes = range.audio_duration_ms * range.sample_rate * range.channels * PCM_FLOAT_BYTES / 1000;
+  const expectedPath = vexaMeetingId === undefined ? undefined : `/attributed-audio/${vexaMeetingId}/${range.sequence}`;
   if (
     range.version !== 1 || range.meeting_id !== manifest.meeting_id || range.sequence !== sequence
-    || !range.idempotency_key || !range.speaker_key || !range.speaker_name.trim()
+    || !range.idempotency_key || isUnknown(range.speaker_key) || isUnknown(range.speaker_name)
     || !Number.isFinite(range.start_ms) || !Number.isFinite(range.end_ms) || range.start_ms < 0 || duration < 0
-    || duration > MAX_MS || range.codec !== "pcm_f32le" || range.channels !== 1
+    || duration > MAX_MS || !Number.isSafeInteger(range.channel) || range.channel < 0 || !Number.isSafeInteger(range.turn_generation) || range.turn_generation < 0
+    || !Number.isSafeInteger(range.audio_duration_ms) || range.audio_duration_ms < 0 || Math.abs(duration - range.audio_duration_ms) > CLOCK_JITTER_MS
+    || range.codec !== "pcm_f32le" || range.channels !== 1
     || !Number.isInteger(range.sample_rate) || range.sample_rate <= 0 || !Number.isSafeInteger(range.byte_count) || range.byte_count < 0
     || expectedBytes !== range.byte_count || !/^[a-f0-9]{64}$/i.test(range.sha256)
-    || range.state !== "uploaded" || !relativePath(range.url)
+    || !["uploaded", "failed"].includes(range.state)
+    || (range.state === "uploaded" && (!relativePath(range.path) || (expectedPath !== undefined && range.path !== expectedPath)))
+    || (range.state === "failed" && range.path !== undefined)
     || !range.attribution || !Number.isFinite(range.attribution.confidence) || range.attribution.confidence < 0 || range.attribution.confidence > 1
+    || !["glow-bound", "provisional", "unresolved"].includes(range.attribution.source)
   ) invalid("Attributed audio manifest contains invalid or non-relative evidence");
 }
 
 /** Batch only adjacent, single-speaker, homogeneous evidence. Oversized evidence is rejected before bytes are fetched. */
-export function attributedBatches(manifest: AttributedManifest): AttributedBatch[] {
-  if (manifest.version !== 1 || !manifest.meeting_id || manifest.state !== "closed") invalid("Attributed audio manifest is not a closed v1 manifest");
+export function attributedBatches(manifest: AttributedManifest, vexaMeetingId?: number): AttributedBatch[] {
+  if (manifest.version !== 1 || !manifest.meeting_id || manifest.state !== "closed" || manifest.clock_origin !== "meeting_start" || !Number.isSafeInteger(manifest.clock_origin_ms) || manifest.clock_origin_ms < 0 || manifest.capabilities?.attributed_audio_enabled !== true) invalid("Attributed audio manifest is not a closed acknowledged v1 manifest");
+  if (vexaMeetingId !== undefined && manifest.meeting_id !== String(vexaMeetingId)) invalid("Attributed audio manifest does not belong to this Vexa meeting");
   const ranges = [...manifest.ranges].sort((a, b) => a.sequence - b.sequence);
-  ranges.forEach((range, sequence) => validateRange(manifest, range, sequence));
+  ranges.forEach((range, sequence) => validateRange(manifest, range, sequence, vexaMeetingId));
   const batches: AttributedBatch[] = [];
   let current: AttributedRange[] = [];
   const flush = () => {
@@ -59,11 +75,13 @@ export function attributedBatches(manifest: AttributedManifest): AttributedBatch
     current = [];
   };
   for (const range of ranges) {
+    // Failed and unresolved evidence is durable negative evidence, never a fetch candidate.
+    if (range.state !== "uploaded" || range.attribution.source === "unresolved") { flush(); continue; }
     const first = current[0];
     const compatible = !!first && first.speaker_key === range.speaker_key && first.speaker_name === range.speaker_name
       && sameAttribution(first, range) && first.codec === range.codec && first.sample_rate === range.sample_rate
-      && first.channels === range.channels && current.at(-1)!.end_ms === range.start_ms
-      && range.end_ms - first.start_ms <= MAX_MS;
+      && first.channels === range.channels && first.channel === range.channel
+      && current.at(-1)!.end_ms <= range.start_ms && range.end_ms - first.start_ms < MAX_MS;
     if (current.length && !compatible) flush();
     current.push(range);
     if (range.end_ms - current[0]!.start_ms >= TARGET_MS) flush();
