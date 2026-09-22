@@ -129,7 +129,12 @@ export const webhookDeliveries = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [index("webhook_deliveries_meeting_idx").on(t.meetingId)],
+  (t) => [
+    index("webhook_deliveries_meeting_idx").on(t.meetingId),
+    // A terminal transition has one durable delivery intent.  It makes a post-commit crash
+    // recoverable without minting a second completion event.
+    uniqueIndex("webhook_deliveries_meeting_event_idx").on(t.meetingId, t.eventType),
+  ],
 );
 
 export type MeetingRow = typeof meetings.$inferSelect;

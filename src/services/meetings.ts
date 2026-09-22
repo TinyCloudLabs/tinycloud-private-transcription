@@ -10,6 +10,7 @@ import type { NormalizedTranscript } from "../domain/transcript.ts";
 import { recordCapture } from "./capture.ts";
 import { VexaHttpError } from "../providers/vexa/client.ts";
 import { sealSignalCapability } from "../providers/signal/capability.ts";
+import { wakeWebhookDelivery, webhookDeliveryValues } from "../webhooks/dispatcher.ts";
 
 export interface CreateMeetingInput {
   meeting_url: string;
@@ -166,6 +167,42 @@ export async function storeTranscript(
     .insert(transcripts)
     .values({ meetingId, ...row })
     .onConflictDoUpdate({ target: transcripts.meetingId, set: row });
+}
+
+/** Commit canonical text, terminal state, and completion delivery intent together. */
+export async function completeMeetingWithTranscript(
+  ctx: AppContext,
+  meetingId: string,
+  t: NormalizedTranscript,
+  provider: string,
+  extra: Partial<typeof meetings.$inferInsert> = {},
+): Promise<{ meeting: MeetingRow | null; changed: boolean }> {
+  const result = await ctx.db.transaction(async (tx) => {
+    const [current] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
+    if (!current || current.status !== "processing") return { meeting: current ?? null, changed: false, deliveryId: null };
+    const payload = { speakers: t.speakers, segments: t.segments, text: t.text };
+    const segmentsJson = sql`${JSON.stringify(payload)}::text::jsonb`;
+    await tx.insert(transcripts).values({ meetingId, language: t.language, durationSeconds: t.duration_seconds, segmentsJson, provider })
+      .onConflictDoUpdate({ target: transcripts.meetingId, set: { language: t.language, durationSeconds: t.duration_seconds, segmentsJson, provider } });
+    const [completed] = await tx.update(meetings).set({ status: "completed", completedAt: new Date(), ...extra })
+      .where(and(eq(meetings.id, meetingId), eq(meetings.status, "processing"))).returning();
+    if (!completed) return { meeting: null, changed: false, deliveryId: null };
+    const intent = webhookDeliveryValues(completed, "meeting.completed", {
+      meetingId, language: t.language, durationSeconds: t.duration_seconds, segmentsJson: payload, provider, createdAt: new Date(),
+    });
+    if (intent) await tx.execute(sql`
+      INSERT INTO webhook_deliveries (id, meeting_id, event_id, event_type, endpoint, payload, attempt, status, next_attempt_at)
+      VALUES (${intent.id}, ${intent.meetingId}, ${intent.eventId}, ${intent.eventType}, ${intent.endpoint}, ${intent.payload}, 0, 'pending', ${intent.nextAttemptAt})
+      ON CONFLICT (meeting_id, event_type) DO NOTHING
+    `);
+    return { meeting: completed, changed: true, deliveryId: intent?.id ?? null };
+  });
+  // The intent is already committed; a Redis outage must not turn completed canonical text into a
+  // failed meeting.  Worker reconciliation will wake this pending delivery later.
+  if (result.deliveryId) await wakeWebhookDelivery(ctx, result.deliveryId, new Date()).catch(() => {
+    ctx.log.warn("completion webhook wakeup deferred", { meetingId, stage: "webhook_wakeup" });
+  });
+  return result;
 }
 
 /** Idempotent stop: cancels before admission, otherwise asks Vexa to leave and moves to processing. */

@@ -1,16 +1,15 @@
-import { eq } from "drizzle-orm";
+import { and, eq, inArray, isNotNull } from "drizzle-orm";
 import type { AppContext } from "../context.ts";
-import { meetings, projects, webhookDeliveries, type MeetingRow } from "../db/schema.ts";
+import { meetings, projects, webhookDeliveries, type MeetingRow, type TranscriptRow } from "../db/schema.ts";
 import { newDeliveryId, newEventId } from "../domain/ids.ts";
 import { getTranscript, transcriptProviderFields } from "../services/meetings.ts";
 import { signWebhookBody, WEBHOOK_SIGNATURE_HEADER } from "./signature.ts";
 
 export type WebhookEventType = "meeting.completed" | "meeting.failed";
 
-/** Builds the event, persists a pending delivery row, and enqueues the first attempt. No-op without webhook_url. */
-export async function enqueueMeetingWebhook(ctx: AppContext, meeting: MeetingRow, type: WebhookEventType) {
+/** The immutable event is constructed before its transaction commits. */
+export function webhookDeliveryValues(meeting: MeetingRow, type: WebhookEventType, transcript: TranscriptRow | null) {
   if (!meeting.webhookUrl) return null;
-  const transcript = type === "meeting.completed" ? await getTranscript(ctx, meeting.id) : null;
   const event = {
     id: newEventId(),
     type,
@@ -26,20 +25,40 @@ export async function enqueueMeetingWebhook(ctx: AppContext, meeting: MeetingRow
         : {}),
     },
   };
-  const id = newDeliveryId();
-  await ctx.db.insert(webhookDeliveries).values({
-    id,
-    meetingId: meeting.id,
-    eventId: event.id,
-    eventType: type,
-    endpoint: meeting.webhookUrl,
-    payload: JSON.stringify(event),
-    attempt: 0,
-    status: "pending",
+  return {
+    id: newDeliveryId(), meetingId: meeting.id, eventId: event.id, eventType: type,
+    endpoint: meeting.webhookUrl, payload: JSON.stringify(event), attempt: 0, status: "pending" as const,
     nextAttemptAt: new Date(),
-  });
-  await ctx.queue.push({ type: "webhook.deliver", deliveryId: id });
-  return id;
+  };
+}
+
+/** Builds the event, persists a pending delivery intent, and wakes the first attempt. No-op without webhook_url. */
+export async function enqueueMeetingWebhook(ctx: AppContext, meeting: MeetingRow, type: WebhookEventType) {
+  const transcript = type === "meeting.completed" ? await getTranscript(ctx, meeting.id) : null;
+  const values = webhookDeliveryValues(meeting, type, transcript);
+  if (!values) return null;
+  await ctx.db.insert(webhookDeliveries).values(values)
+    .onConflictDoNothing({ target: [webhookDeliveries.meetingId, webhookDeliveries.eventType] });
+  const [delivery] = await ctx.db.select().from(webhookDeliveries)
+    .where(and(eq(webhookDeliveries.meetingId, meeting.id), eq(webhookDeliveries.eventType, type))).limit(1);
+  if (delivery?.status === "pending") await wakeWebhookDelivery(ctx, delivery.id, delivery.nextAttemptAt);
+  return delivery?.id ?? null;
+}
+
+/** Redis is only a wakeup mechanism; this can be called repeatedly after a crash. */
+export async function wakeWebhookDelivery(ctx: AppContext, deliveryId: string, due: Date | null): Promise<void> {
+  await ctx.queue.push({ type: "webhook.deliver", deliveryId }, Math.max(0, (due?.getTime() ?? Date.now()) - Date.now()));
+}
+
+/** Recreates missing terminal intent and re-wakes every pending intent from durable PostgreSQL state. */
+export async function reconcileWebhookDeliveries(ctx: AppContext): Promise<void> {
+  const terminal = await ctx.db.select().from(meetings)
+    .where(and(inArray(meetings.status, ["completed", "failed"]), isNotNull(meetings.webhookUrl)));
+  for (const meeting of terminal) {
+    await enqueueMeetingWebhook(ctx, meeting, meeting.status === "completed" ? "meeting.completed" : "meeting.failed");
+  }
+  const pending = await ctx.db.select().from(webhookDeliveries).where(eq(webhookDeliveries.status, "pending"));
+  for (const delivery of pending) await wakeWebhookDelivery(ctx, delivery.id, delivery.nextAttemptAt);
 }
 
 /** One delivery attempt; schedules the next per the retry schedule. Never touches meeting status. */

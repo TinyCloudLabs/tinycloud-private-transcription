@@ -1,5 +1,5 @@
 import { createContext, type AppContext } from "../context.ts";
-import { deliverWebhook } from "../webhooks/dispatcher.ts";
+import { deliverWebhook, reconcileWebhookDeliveries } from "../webhooks/dispatcher.ts";
 import { handleJoinDeadline, handleMeetingPoll, handleMeetingStart } from "./meeting-job.ts";
 import { finalizeAttributedRun, processAttributedBatch, reconcileAttributedRuns, recordAttributedWorkerReadiness } from "../services/attributed-transcription.ts";
 import type { Job } from "./queue.ts";
@@ -25,41 +25,97 @@ export interface WorkerHandle {
   stop(): Promise<void>;
 }
 
-/** Runs the queue loop until stopped. Errors in a job are logged and never crash the loop. */
+/** Runs the queue loop until stopped. Errors are retried without turning this process into an idle worker. */
 export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number } = {}): WorkerHandle {
   let running = true;
-  const loop = (async () => {
+  const attributedEnabled = ctx.config.attributedTranscriptionEnabled;
+  let reconciliationInFlight = false;
+  let nextReconciliationAt = 0;
+  let reconciliationFailures = 0;
+  let queueFailures = 0;
+  let heartbeatInFlight = false;
+  let lastWebhookReconciliation = 0;
+
+  const reconcileAttributed = async () => {
+    if (!attributedEnabled || reconciliationInFlight || Date.now() < nextReconciliationAt) return;
+    reconciliationInFlight = true;
     try {
-      await recordAttributedWorkerReadiness(ctx, false, "startup");
-      // Durable attributed state is authoritative, so do not consume queue wakeups until it has
-      // been reconciled.  Error details can contain SQL values or transcript text; log only stage.
+      if (!ctx.attributedReconciliationReady) await recordAttributedWorkerReadiness(ctx, false, reconciliationFailures ? "reconciliation_failed" : "startup");
       await reconcileAttributedRuns(ctx);
       ctx.attributedReconciliationReady = true;
-      await recordAttributedWorkerReadiness(ctx, true, "reconciled");
+      reconciliationFailures = 0;
+      nextReconciliationAt = 0;
+      await recordAttributedWorkerReadiness(ctx, queueFailures < 3, "reconciled");
     } catch {
-      ctx.log.error("attributed reconciliation failed", { stage: "startup_reconciliation" });
+      reconciliationFailures++;
       ctx.attributedReconciliationReady = false;
+      // Keep consuming independent Signal/feature-off work.  The exponential bound prevents a
+      // bad database from becoming a hot loop while guaranteeing a future recovery attempt.
+      nextReconciliationAt = Date.now() + Math.min(30_000, 250 * 2 ** Math.min(reconciliationFailures, 7));
+      ctx.log.error("attributed reconciliation failed", { stage: "startup_reconciliation", attempt: reconciliationFailures });
       await recordAttributedWorkerReadiness(ctx, false, "reconciliation_failed").catch(() => {});
-      return;
+    } finally {
+      reconciliationInFlight = false;
     }
-    let lastHeartbeat = Date.now();
+  };
+
+  const heartbeat = async () => {
+    if (!running || heartbeatInFlight) return;
+    heartbeatInFlight = true;
+    try {
+      await reconcileAttributed();
+      if (attributedEnabled) {
+        await recordAttributedWorkerReadiness(ctx, ctx.attributedReconciliationReady && queueFailures < 3, "heartbeat");
+      }
+      if (Date.now() - lastWebhookReconciliation >= 5_000) {
+        await reconcileWebhookDeliveries(ctx);
+        lastWebhookReconciliation = Date.now();
+      }
+    } catch {
+      // A failed durable heartbeat is itself fail-closed: its timestamp cannot be refreshed.
+      if (attributedEnabled) await recordAttributedWorkerReadiness(ctx, false, "reconciliation_failed").catch(() => {});
+      ctx.log.error("worker heartbeat failed", { stage: "heartbeat" });
+    } finally {
+      heartbeatInFlight = false;
+    }
+  };
+
+  const loop = (async () => {
+    if (attributedEnabled) ctx.attributedReconciliationReady = false;
+    // Do not await startup reconciliation: a transient attributed failure must never prevent
+    // feature-off or Signal jobs from being consumed by this same worker.
+    void reconcileAttributed();
+    void heartbeat();
+    // 5 seconds leaves generous margin under the 15-second API staleness window while this timer
+    // remains independent of a long-running queue job.
+    const heartbeatTimer = setInterval(() => { void heartbeat(); }, 5_000);
     while (running) {
       let job: Job | null = null;
       try {
         job = await ctx.queue.pop(opts.popTimeoutSec ?? 1);
-        if (job) await processJob(ctx, job);
+        queueFailures = 0;
       } catch (e) {
-        if (job?.type.startsWith("attributed.") || (ctx.config.attributedTranscriptionEnabled && (job?.type === "meeting.poll" || job?.type === "meeting.start"))) ctx.log.error("attributed job failed", { stage: job.type });
+        queueFailures++;
+        if (attributedEnabled && queueFailures >= 3) await recordAttributedWorkerReadiness(ctx, false, "reconciliation_failed").catch(() => {});
+        ctx.log.error("queue pop failed", { stage: "queue_pop", attempt: queueFailures });
+        await Bun.sleep(250);
+        continue;
+      }
+      if (!job) continue;
+      try {
+        if (attributedEnabled && !ctx.attributedReconciliationReady && job.type.startsWith("attributed.")) {
+          await ctx.queue.push(job, 1_000);
+        } else {
+          await processJob(ctx, job);
+        }
+      } catch (e) {
+        if (job.type.startsWith("attributed.") || (attributedEnabled && (job.type === "meeting.poll" || job.type === "meeting.start"))) ctx.log.error("attributed job failed", { stage: job.type });
         else ctx.log.error("job failed", { job, error: String(e) });
         await Bun.sleep(250);
       }
-      if (Date.now() - lastHeartbeat >= 5_000) {
-        try { await recordAttributedWorkerReadiness(ctx, true, "heartbeat"); }
-        catch { ctx.log.error("attributed readiness heartbeat failed", { stage: "readiness_heartbeat" }); }
-        lastHeartbeat = Date.now();
-      }
     }
-    await recordAttributedWorkerReadiness(ctx, false, "stopped").catch(() => {});
+    clearInterval(heartbeatTimer);
+    if (attributedEnabled) await recordAttributedWorkerReadiness(ctx, false, "stopped").catch(() => {});
   })();
   return {
     async stop() {

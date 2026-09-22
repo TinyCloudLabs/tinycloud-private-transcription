@@ -1,10 +1,18 @@
 import { expect, test } from "bun:test";
 import { attributedBatches, readAttributedBatch, transcribeAttributedManifest, type AttributedManifest } from "../../src/providers/transcription/attributed.ts";
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import golden from "../fixtures/vexa-attributed-audio-v1-manifest.closed.json";
+import numericGolden from "../fixtures/vexa-attributed-audio-v1-manifest.numeric.closed.json";
 
-test("accepts the exact Vexa attributed-audio.v1 golden manifest", () => {
-  expect(attributedBatches(golden as AttributedManifest, 1)).toHaveLength(1);
+test("keeps the cross-repo Vexa attributed-audio.v1 producer artifact byte-exact", async () => {
+  const bytes = await readFile(new URL("../fixtures/vexa-attributed-audio-v1-manifest.closed.json", import.meta.url));
+  expect(createHash("sha256").update(bytes).digest("hex")).toBe("5f11706d8b54911515d0a95bd1f741815ad8ac6ef17ea6470f3a4ebd95e40d14");
+  expect(golden).toMatchObject({ meeting_id: "meeting-1", clock_origin: "first_admitted_capture_epoch_ms", state: "closed" });
+});
+
+test("uses a separate numeric fixture for runtime Vexa meeting-id binding", () => {
+  expect(attributedBatches(numericGolden as AttributedManifest, 1)).toHaveLength(1);
 });
 
 const bytesFor = (start: number, end: number, voiced = true) => {

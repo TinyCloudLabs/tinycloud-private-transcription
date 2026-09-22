@@ -1,11 +1,11 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
 import type { AppContext } from "../context.ts";
-import { attributedAttempts, attributedBatches as batchesTable, attributedRanges, attributedTranscriptionRuns, attributedWorkerReadiness, meetings, transcripts } from "../db/schema.ts";
+import { attributedAttempts, attributedBatches as batchesTable, attributedRanges, attributedTranscriptionRuns, attributedWorkerReadiness, meetings, transcripts, webhookDeliveries } from "../db/schema.ts";
 import { normalizeSegments } from "../domain/transcript.ts";
 import { attributedBatches, readAttributedBatch, type AttributedBatch, type AttributedCapability, type AttributedManifest } from "../providers/transcription/attributed.ts";
 import { TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
 import { failMeeting, getMeetingById } from "./meetings.ts";
-import { enqueueMeetingWebhook } from "../webhooks/dispatcher.ts";
+import { enqueueMeetingWebhook, webhookDeliveryValues, wakeWebhookDelivery } from "../webhooks/dispatcher.ts";
 
 const ATTEMPT_LIMIT = 1, CLAIM_MS = 5 * 60_000;
 const READINESS_ID = "attributed-worker";
@@ -49,8 +49,13 @@ export async function stageAttributedManifest(ctx: AppContext, meetingId: string
     for (const [ordinal, batch] of specs.entries()) await tx.insert(batchesTable).values({ id: `${meetingId}:batch:${ordinal}`, meetingId, ordinal, batchJson: json(batch) });
     return true;
   });
-  if (!staged) return;
-  for (const [ordinal] of specs.entries()) await ctx.queue.push({ type: "attributed.batch", meetingId, batchId: `${meetingId}:batch:${ordinal}` });
+  // A staging transaction can commit just before its Redis wakeup is lost.  Existing immutable
+  // state is therefore resumed explicitly, rather than treated as a no-op.
+  const pending = staged
+    ? specs.map((_, ordinal) => `${meetingId}:batch:${ordinal}`)
+    : (await ctx.db.select({ id: batchesTable.id }).from(batchesTable)
+      .where(and(eq(batchesTable.meetingId, meetingId), eq(batchesTable.status, "pending")))).map((row) => row.id);
+  for (const batchId of pending) await ctx.queue.push({ type: "attributed.batch", meetingId, batchId });
   await ctx.queue.push({ type: "attributed.finalize", meetingId });
 }
 
@@ -92,6 +97,21 @@ async function startAttempt(ctx: AppContext, batchId: string, token: string) {
   });
 }
 
+/**
+ * The last durable fence immediately before an external request.  A terminal/deleted meeting or
+ * a run which is no longer processing must never consume a Tinfoil slot or make a paid request.
+ */
+async function eligibleForTinfoilDispatch(ctx: AppContext, meetingId: string, batchId: string, token: string): Promise<{ language: string | null } | null> {
+  return ctx.db.transaction(async (tx) => {
+    const [meeting] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
+    const [run] = await tx.select().from(attributedTranscriptionRuns).where(eq(attributedTranscriptionRuns.meetingId, meetingId)).for("update");
+    const [batch] = await tx.select().from(batchesTable).where(eq(batchesTable.id, batchId)).for("update");
+    if (!meeting || meeting.status !== "processing" || !run || run.status !== "processing"
+        || !batch || batch.meetingId !== meetingId || batch.status !== "claimed" || batch.claimToken !== token) return null;
+    return { language: meeting.language };
+  });
+}
+
 export async function processAttributedBatch(ctx: AppContext, meetingId: string, batchId: string): Promise<void> {
   const [stored] = await ctx.db.select().from(batchesTable).where(and(eq(batchesTable.id, batchId), eq(batchesTable.meetingId, meetingId)));
   if (!stored || stored.status !== "pending") return;
@@ -106,9 +126,15 @@ export async function processAttributedBatch(ctx: AppContext, meetingId: string,
     catch { await settle(ctx, batchId, claimed.token, "failed", meetingId, spec); return; }
     if (prepared.silent) { await settle(ctx, batchId, claimed.token, "silence", meetingId, spec, { text: "", language: null }); return; }
     const attemptId = await startAttempt(ctx, batchId, claimed.token); if (!attemptId) return;
-    const language = (await getMeetingById(ctx, meetingId))?.language ?? null;
+    const eligibility = await eligibleForTinfoilDispatch(ctx, meetingId, batchId, claimed.token);
+    if (!eligibility) {
+      // The durable owner went terminal while this job was queued/fetching.  Preserve the
+      // one-attempt ledger without sending an ineligible request outside the process.
+      await settle(ctx, batchId, claimed.token, "ambiguous", meetingId, spec, undefined, attemptId, "ineligible_dispatch");
+      return;
+    }
     try {
-      const response = await provider.transcribeAttributedPcm(prepared.pcm, spec, language);
+      const response = await provider.transcribeAttributedPcm(prepared.pcm, spec, eligibility.language);
       // A voiced request that returned no words is evidence failure, not a silent meeting.
       await settle(ctx, batchId, claimed.token, response.text.trim() ? "completed" : "failed", meetingId, spec, response, attemptId, response.text.trim() ? undefined : "empty_transcript");
     } catch { await settle(ctx, batchId, claimed.token, "ambiguous", meetingId, spec, undefined, attemptId, "external_call_uncertain"); }
@@ -154,7 +180,7 @@ export async function finalizeAttributedRun(ctx: AppContext, meetingId: string):
   await publish(ctx, meetingId);
 }
 
-type Publication = { meeting: typeof meetings.$inferSelect; webhook: boolean } | null;
+type Publication = { meeting: typeof meetings.$inferSelect; webhook: boolean; deliveryId: string | null } | null;
 
 /**
  * Publication is deliberately a second, complete verification pass.  Results fetched before this
@@ -173,7 +199,7 @@ async function publish(ctx: AppContext, meetingId: string) {
       const [failed] = await tx.update(meetings).set({ status: "failed", errorCode: "transcription_failed", errorMessage: "Attributed evidence could not be verified for publication.", endedAt: new Date() })
         .where(and(eq(meetings.id, meetingId), eq(meetings.status, "processing"))).returning();
       if (failed) await tx.update(attributedTranscriptionRuns).set({ status: "partial", updatedAt: new Date() }).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
-      return failed ? { meeting: failed, webhook: true } : null;
+      return failed ? { meeting: failed, webhook: true, deliveryId: null } : null;
     };
     let manifest: AttributedManifest, expected: AttributedBatch[];
     try {
@@ -220,7 +246,7 @@ async function publish(ctx: AppContext, meetingId: string) {
       const [failed] = await tx.update(meetings).set({ status: "failed", errorCode: "transcription_failed", errorMessage: "Attributed transcript conflicts with an existing transcript.", endedAt: new Date() })
         .where(and(eq(meetings.id, meetingId), eq(meetings.status, "processing"))).returning();
       if (failed) await tx.update(attributedTranscriptionRuns).set({ status: "partial", updatedAt: new Date() }).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
-      return failed ? { meeting: failed, webhook: true } satisfies Publication : null;
+      return failed ? { meeting: failed, webhook: true, deliveryId: null } satisfies Publication : null;
     }
     if (existing[0]) {
       if (meeting.status !== "completed") return null;
@@ -232,9 +258,22 @@ async function publish(ctx: AppContext, meetingId: string) {
     if (!completed) return null;
     await tx.insert(transcripts).values({ meetingId, language: transcript.language, durationSeconds: transcript.duration_seconds, segmentsJson: json(payload), provider: "tinfoil-attributed" });
     await tx.update(attributedTranscriptionRuns).set({ status: "completed", updatedAt: new Date() }).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
-    return { meeting: completed, webhook: true } satisfies Publication;
+    // Canonical transcript, terminal state, and completion-delivery intent commit together.
+    // Redis is deliberately only a wakeup; a later reconciliation safely resumes this row.
+    const intent = webhookDeliveryValues(completed, "meeting.completed", {
+      meetingId, language: transcript.language, durationSeconds: transcript.duration_seconds,
+      segmentsJson: payload, provider: "tinfoil-attributed", createdAt: new Date(),
+    });
+    if (intent) await tx.insert(webhookDeliveries).values(intent)
+      .onConflictDoNothing({ target: [webhookDeliveries.meetingId, webhookDeliveries.eventType] });
+    return { meeting: completed, webhook: true, deliveryId: intent?.id ?? null } satisfies Publication;
   });
-  if (published) await enqueueMeetingWebhook(ctx, published.meeting, published.webhook && published.meeting.status === "completed" ? "meeting.completed" : "meeting.failed");
+  if (published) {
+    if (published.deliveryId) await wakeWebhookDelivery(ctx, published.deliveryId, new Date()).catch(() => {
+      ctx.log.warn("completion webhook wakeup deferred", { meetingId, stage: "webhook_wakeup" });
+    });
+    else await enqueueMeetingWebhook(ctx, published.meeting, published.webhook && published.meeting.status === "completed" ? "meeting.completed" : "meeting.failed");
+  }
 }
 
 export async function reconcileAttributedRuns(ctx: AppContext): Promise<void> {
@@ -247,4 +286,13 @@ export async function reconcileAttributedRuns(ctx: AppContext): Promise<void> {
   for (const row of pending) await ctx.queue.push({ type: "attributed.batch", meetingId: row.meetingId, batchId: row.id });
   const runs = await ctx.db.select().from(attributedTranscriptionRuns).where(inArray(attributedTranscriptionRuns.status, ["processing", "partial"]));
   for (const run of runs) await ctx.queue.push({ type: "attributed.finalize", meetingId: run.meetingId });
+  // If a process died after moving the meeting to processing but before staging its immutable
+  // producer manifest, Vexa remains the retained source of truth.  Polling it reconstructs the
+  // manifest; an existing run instead takes the explicit resume path above.
+  const processing = await ctx.db.select().from(meetings)
+    .where(and(eq(meetings.status, "processing"), eq(meetings.platform, "google_meet")));
+  const staged = new Set(runs.map((run) => run.meetingId));
+  for (const meeting of processing) if (!staged.has(meeting.id) && meeting.vexaMeetingId != null) {
+    await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id });
+  }
 }

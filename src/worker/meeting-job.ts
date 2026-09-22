@@ -6,7 +6,7 @@ import { isTerminal, mapVexaFailure, mapVexaStatus, type MeetingStatus } from ".
 import { VexaHttpError } from "../providers/vexa/client.ts";
 import { adaptVexaSegments, completionReasonOf } from "../providers/vexa/adapter.ts";
 import { toVexaPlatform } from "../providers/vexa/platform-map.ts";
-import { failMeeting, getMeetingById, storeTranscript, transition } from "../services/meetings.ts";
+import { completeMeetingWithTranscript, failMeeting, getMeetingById, transition } from "../services/meetings.ts";
 import { enqueueMeetingWebhook } from "../webhooks/dispatcher.ts";
 import { observeCapture, recordCapture } from "../services/capture.ts";
 import { and, eq, isNull, sql } from "drizzle-orm";
@@ -304,9 +304,7 @@ async function handleSignalPoll(ctx: AppContext, meeting: MeetingRow) {
     // when Signal Desktop joined and left between polls.
     if (meeting.status === "joining" || meeting.status === "waiting_for_admission") ({ meeting } = await transition(ctx, meeting, "in_progress"));
     ({ meeting } = await transition(ctx, meeting, "processing"));
-    await storeTranscript(ctx, meeting.id, transcript, "signal");
-    const { meeting: done, changed } = await transition(ctx, meeting, "completed", { signalCapability: null });
-    if (changed) await enqueueMeetingWebhook(ctx, done, "meeting.completed");
+    await completeMeetingWithTranscript(ctx, meeting.id, transcript, "signal", { signalCapability: null });
   } catch (error) {
     // Do not stringify worker errors here: a malformed local-worker error can include the call URL.
     ctx.log.warn("signal capture finalization failed", { meetingId: meeting.id });
@@ -335,9 +333,7 @@ async function finalize(
     if (!transcript.text.trim()) {
       throw new ApiError("transcription_failed", "Transcription provider returned no words");
     }
-    await storeTranscript(ctx, meeting.id, transcript, provider.name);
-    const { meeting: done, changed } = await transition(ctx, meeting, "completed");
-    if (changed) await enqueueMeetingWebhook(ctx, done, "meeting.completed");
+    await completeMeetingWithTranscript(ctx, meeting.id, transcript, provider.name);
   } catch (e) {
     if (recover && e instanceof RecoveryRecordingNotReadyError && recoveryAttempt < MAX_RECOVERY_ATTEMPTS) {
       ctx.log.warn("vexa recording is not ready; retrying recovery", { meetingId: meeting.id, recoveryAttempt });
@@ -351,9 +347,7 @@ async function finalize(
       ctx.log.warn("recording recovery exhausted; preserving vexa transcript", { meetingId: meeting.id, recoveryAttempt, error: String(e) });
       const transcript = await ctx.transcription.transcribe(input);
       if (transcript.text.trim()) {
-        await storeTranscript(ctx, meeting.id, transcript, ctx.transcription.name);
-        const { meeting: done, changed } = await transition(ctx, meeting, "completed");
-        if (changed) await enqueueMeetingWebhook(ctx, done, "meeting.completed");
+        await completeMeetingWithTranscript(ctx, meeting.id, transcript, ctx.transcription.name);
         return;
       }
     }
