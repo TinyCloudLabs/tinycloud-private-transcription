@@ -73,11 +73,11 @@ async function handleStartError(ctx: AppContext, meeting: MeetingRow, e: unknown
   const retryable = e instanceof ApiError && (e.code === "provider_unavailable" || e.code === "provider_timeout");
   const vexa5xx = e instanceof VexaHttpError && e.status >= 500;
   if ((retryable || vexa5xx) && attempt < MAX_START_ATTEMPTS) {
-    ctx.log.warn("vexa createBot failed, retrying", usesAttributedCapture(ctx, meeting) ? { meetingId: meeting.id, attempt, stage: "create" } : { meetingId: meeting.id, attempt, error: String(e) });
+    ctx.log.warn("vexa createBot failed, retrying", { meetingId: meeting.id, attempt, stage: "create", code: e instanceof ApiError ? e.code : "provider_error" });
     await ctx.queue.push({ type: "meeting.start", meetingId: meeting.id, attempt: attempt + 1 }, 1_000 * attempt);
     return;
   }
-  ctx.log.error("vexa createBot failed", usesAttributedCapture(ctx, meeting) ? { meetingId: meeting.id, stage: "create", code: e instanceof ApiError ? e.code : "provider_error" } : { meetingId: meeting.id, error: String(e), detail: e instanceof VexaHttpError ? e.detail : undefined });
+  ctx.log.error("vexa createBot failed", { meetingId: meeting.id, stage: "create", code: e instanceof ApiError ? e.code : "provider_error" });
   const code = e instanceof ApiError ? e.code : e instanceof VexaHttpError && e.status === 409 ? "meeting_join_failed" : "provider_unavailable";
   const message =
     code === "meeting_join_failed"
@@ -105,7 +105,7 @@ export async function handleJoinDeadline(ctx: AppContext, meetingId: string): Pr
     await ctx.signal.leave(meeting.signalSessionId).catch(() => {});
   } else if (meeting.vexaPlatform && meeting.vexaNativeMeetingId) {
     await ctx.vexa.stopBot(meeting.vexaPlatform, meeting.vexaNativeMeetingId).catch((e) => {
-      if (!(e instanceof VexaHttpError && e.notFound)) ctx.log.warn("vexa stopBot failed at join deadline", { meetingId, error: String(e) });
+      if (!(e instanceof VexaHttpError && e.notFound)) ctx.log.warn("vexa stopBot failed at join deadline", { meetingId, stage: "join_deadline_stop", code: "provider_error" });
     });
   }
   const f =
@@ -134,7 +134,7 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
       await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
       return;
     }
-    ctx.log.warn("vexa poll failed; will retry", usesAttributedCapture(ctx, meeting) ? { meetingId, stage: "poll", code: e instanceof ApiError ? e.code : "provider_error" } : { meetingId, error: String(e) });
+    ctx.log.warn("vexa poll failed; will retry", { meetingId, stage: "poll", code: e instanceof ApiError ? e.code : "provider_error" });
     await ctx.queue.push({ type: "meeting.poll", meetingId, recoveryAttempt }, ctx.config.vexa.pollIntervalMs);
     return;
   }
@@ -344,7 +344,7 @@ async function finalize(
       return;
     }
     if (recover && vexaSegments.some((segment) => segment.text.trim().length > 0)) {
-      ctx.log.warn("recording recovery exhausted; preserving vexa transcript", { meetingId: meeting.id, recoveryAttempt, error: String(e) });
+      ctx.log.warn("recording recovery exhausted; preserving vexa transcript", { meetingId: meeting.id, recoveryAttempt, stage: "recording_recovery", code: "provider_error" });
       const transcript = await ctx.transcription.transcribe(input);
       if (transcript.text.trim()) {
         await completeMeetingWithTranscript(ctx, meeting.id, transcript, ctx.transcription.name);
@@ -358,7 +358,7 @@ async function finalize(
       if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
       return;
     }
-    ctx.log.error("transcription failed", { meetingId: meeting.id, error: String(e) });
+    ctx.log.error("transcription failed", { meetingId: meeting.id, stage: "transcription", code: e instanceof ApiError ? e.code : "provider_error" });
     const { meeting: failed, changed } = await failMeeting(
       ctx,
       meeting,

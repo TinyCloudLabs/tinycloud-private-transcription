@@ -1,13 +1,13 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
 import type { AppContext } from "../context.ts";
-import { attributedAttempts, attributedBatches as batchesTable, attributedRanges, attributedTranscriptionRuns, attributedWorkerReadiness, meetings, transcripts, webhookDeliveries } from "../db/schema.ts";
+import { attributedAttempts, attributedBatches as batchesTable, attributedRanges, attributedTranscriptionRuns, attributedWorkerReadiness, meetings, tinfoilDispatchSlots, transcripts, webhookDeliveries } from "../db/schema.ts";
 import { normalizeSegments } from "../domain/transcript.ts";
 import { attributedBatches, readAttributedBatch, type AttributedBatch, type AttributedCapability, type AttributedManifest } from "../providers/transcription/attributed.ts";
 import { TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
 import { failMeeting, getMeetingById } from "./meetings.ts";
 import { enqueueMeetingWebhook, webhookDeliveryValues, wakeWebhookDelivery } from "../webhooks/dispatcher.ts";
 
-const ATTEMPT_LIMIT = 1, CLAIM_MS = 5 * 60_000;
+const ATTEMPT_LIMIT = 1, CLAIM_MS = 5 * 60_000, SLOT_CLAIM_MS = 10 * 60_000;
 const READINESS_ID = "attributed-worker";
 const READINESS_STALE_MS = 15_000;
 const json = (value: unknown) => sql`${JSON.stringify(value)}::text::jsonb`;
@@ -39,6 +39,8 @@ export async function stageAttributedManifest(ctx: AppContext, meetingId: string
   const specs = attributedBatches(manifest, vexaMeetingId);
   const staged = await ctx.db.transaction(async (tx) => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`attributed:${meetingId}`}))`);
+    const [meeting] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
+    if (!meeting || meeting.status !== "processing" || meeting.dispatchBlocked) return false;
     const existing = await tx.select().from(attributedTranscriptionRuns).where(eq(attributedTranscriptionRuns.meetingId, meetingId)).for("update");
     if (existing[0]) {
       if (canonical(existing[0].manifestJson) !== canonical(manifest)) throw new Error("attributed_manifest_conflict");
@@ -66,20 +68,34 @@ async function claimBatch(ctx: AppContext, batchId: string) {
   return batch ? { batch, token } : null;
 }
 async function withTinfoilSlot<T>(ctx: AppContext, work: () => Promise<T>): Promise<{ acquired: true; value: T } | { acquired: false }> {
-  return ctx.db.transaction(async (tx) => {
-    for (const slot of [0, 1]) {
-      const rows = await tx.execute<{ locked: boolean }>(sql`select pg_try_advisory_xact_lock(81273, ${slot}) as locked`);
-      if (rows[0]?.locked) return { acquired: true as const, value: await work() };
-    }
-    return { acquired: false as const };
+  const token = crypto.randomUUID();
+  const acquired = await ctx.db.transaction(async (tx) => {
+    // FOR UPDATE SKIP LOCKED makes concurrent workers choose at most one of the two durable slots.
+    const rows = await tx.execute<{ id: number }>(sql`
+      select id from tinfoil_dispatch_slots
+      where claim_token is null or claimed_at < ${new Date(Date.now() - SLOT_CLAIM_MS)}
+      order by id for update skip locked limit 1
+    `);
+    const slot = rows[0];
+    if (!slot) return null;
+    const [claimed] = await tx.update(tinfoilDispatchSlots).set({ claimToken: token, claimedAt: new Date() })
+      .where(and(eq(tinfoilDispatchSlots.id, slot.id), sql`${tinfoilDispatchSlots.claimToken} is null or ${tinfoilDispatchSlots.claimedAt} < ${new Date(Date.now() - SLOT_CLAIM_MS)}`)).returning();
+    return claimed?.id ?? null;
   });
+  if (acquired === null) return { acquired: false };
+  try {
+    return { acquired: true, value: await work() };
+  } finally {
+    await ctx.db.update(tinfoilDispatchSlots).set({ claimToken: null, claimedAt: null })
+      .where(and(eq(tinfoilDispatchSlots.id, acquired), eq(tinfoilDispatchSlots.claimToken, token)));
+  }
 }
 const sequences = (spec: AttributedBatch) => spec.ranges.map((range) => range.sequence);
 
 /** All batch/range/attempt writes are fenced by the durable claim token. */
 async function settle(ctx: AppContext, batchId: string, token: string, status: "completed" | "silence" | "failed" | "ambiguous", meetingId: string, spec: AttributedBatch, result?: unknown, attemptId?: string, outcome?: string) {
   await ctx.db.transaction(async (tx) => {
-    const [won] = await tx.update(batchesTable).set({ status, claimToken: null, ...(result === undefined ? {} : { resultJson: json(result) }), updatedAt: new Date() })
+    const [won] = await tx.update(batchesTable).set({ status, claimToken: null, dispatchToken: null, ...(result === undefined ? {} : { resultJson: json(result) }), updatedAt: new Date() })
       .where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "claimed"), eq(batchesTable.claimToken, token))).returning();
     if (!won) return;
     const rangeStatus = status === "completed" ? "completed" : status === "silence" ? "silence" : status === "failed" ? "failed" : "unresolved";
@@ -98,16 +114,20 @@ async function startAttempt(ctx: AppContext, batchId: string, token: string) {
 }
 
 /**
- * The last durable fence immediately before an external request.  A terminal/deleted meeting or
- * a run which is no longer processing must never consume a Tinfoil slot or make a paid request.
+ * Atomically admits one paid request. Terminal transitions take the same meeting row lock and
+ * wait for dispatchToken to clear, so they either commit first (and this returns null) or commit
+ * after this external call is settled. The provider request itself remains outside the transaction.
  */
-async function eligibleForTinfoilDispatch(ctx: AppContext, meetingId: string, batchId: string, token: string): Promise<{ language: string | null } | null> {
+async function admitTinfoilDispatch(ctx: AppContext, meetingId: string, batchId: string, token: string): Promise<{ language: string | null } | null> {
   return ctx.db.transaction(async (tx) => {
     const [meeting] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
     const [run] = await tx.select().from(attributedTranscriptionRuns).where(eq(attributedTranscriptionRuns.meetingId, meetingId)).for("update");
     const [batch] = await tx.select().from(batchesTable).where(eq(batchesTable.id, batchId)).for("update");
-    if (!meeting || meeting.status !== "processing" || !run || run.status !== "processing"
+    if (!meeting || meeting.status !== "processing" || meeting.dispatchBlocked || !run || run.status !== "processing"
         || !batch || batch.meetingId !== meetingId || batch.status !== "claimed" || batch.claimToken !== token) return null;
+    const [admitted] = await tx.update(batchesTable).set({ dispatchToken: token, updatedAt: new Date() })
+      .where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "claimed"), eq(batchesTable.claimToken, token), sql`${batchesTable.dispatchToken} is null`)).returning();
+    if (!admitted) return null;
     return { language: meeting.language };
   });
 }
@@ -126,7 +146,7 @@ export async function processAttributedBatch(ctx: AppContext, meetingId: string,
     catch { await settle(ctx, batchId, claimed.token, "failed", meetingId, spec); return; }
     if (prepared.silent) { await settle(ctx, batchId, claimed.token, "silence", meetingId, spec, { text: "", language: null }); return; }
     const attemptId = await startAttempt(ctx, batchId, claimed.token); if (!attemptId) return;
-    const eligibility = await eligibleForTinfoilDispatch(ctx, meetingId, batchId, claimed.token);
+    const eligibility = await admitTinfoilDispatch(ctx, meetingId, batchId, claimed.token);
     if (!eligibility) {
       // The durable owner went terminal while this job was queued/fetching.  Preserve the
       // one-attempt ledger without sending an ineligible request outside the process.
@@ -148,7 +168,7 @@ async function reconcileClaim(ctx: AppContext, batchId: string): Promise<boolean
     const [batch] = await tx.select().from(batchesTable).where(eq(batchesTable.id, batchId)).for("update");
     if (!batch || batch.status !== "claimed" || !batch.claimedAt || batch.claimedAt.getTime() > Date.now() - CLAIM_MS) return false;
     const spec = object<AttributedBatch>(batch.batchJson);
-    const [won] = await tx.update(batchesTable).set({ status: "ambiguous", claimToken: null, updatedAt: new Date() }).where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "claimed"), eq(batchesTable.claimToken, batch.claimToken ?? ""))).returning();
+    const [won] = await tx.update(batchesTable).set({ status: "ambiguous", claimToken: null, dispatchToken: null, updatedAt: new Date() }).where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "claimed"), eq(batchesTable.claimToken, batch.claimToken ?? ""))).returning();
     if (!won) return false;
     await tx.update(attributedRanges).set({ status: "unresolved" }).where(and(eq(attributedRanges.meetingId, batch.meetingId), inArray(attributedRanges.sequence, sequences(spec))));
     await tx.update(attributedAttempts).set({ status: "ambiguous", outcome: "external_call_uncertain", completedAt: new Date() }).where(and(eq(attributedAttempts.batchId, batchId), eq(attributedAttempts.status, "started")));
@@ -194,7 +214,7 @@ async function publish(ctx: AppContext, meetingId: string) {
     const ranges = await tx.select().from(attributedRanges).where(eq(attributedRanges.meetingId, meetingId)).for("update");
     const batches = await tx.select().from(batchesTable).where(eq(batchesTable.meetingId, meetingId)).orderBy(batchesTable.ordinal).for("update");
     const attempts = await tx.select().from(attributedAttempts).innerJoin(batchesTable, eq(attributedAttempts.batchId, batchesTable.id)).where(eq(batchesTable.meetingId, meetingId)).for("update");
-    if (!meeting || meeting.status === "failed" || meeting.status === "cancelled" || !run || !meeting.vexaMeetingId) return null;
+    if (!meeting || meeting.status === "failed" || meeting.status === "cancelled" || meeting.dispatchBlocked || !run || run.status !== "processing" || !meeting.vexaMeetingId) return null;
     const reject = async (): Promise<Publication> => {
       const [failed] = await tx.update(meetings).set({ status: "failed", errorCode: "transcription_failed", errorMessage: "Attributed evidence could not be verified for publication.", endedAt: new Date() })
         .where(and(eq(meetings.id, meetingId), eq(meetings.status, "processing"))).returning();

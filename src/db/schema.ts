@@ -46,6 +46,8 @@ export const meetings = pgTable(
     errorMessage: text("error_message"),
     idempotencyKey: text("idempotency_key"),
     requestHash: text("request_hash"),
+    /** Durable deletion fence; prevents new attributed dispatch while provider deletion is in flight. */
+    dispatchBlocked: boolean("dispatch_blocked").notNull().default(false),
   },
   (t) => [
     uniqueIndex("meetings_project_idempotency_idx").on(t.projectId, t.idempotencyKey),
@@ -88,6 +90,8 @@ export const attributedBatches = pgTable("attributed_batches", {
   status: text("status").notNull().default("pending"), // pending | claimed | completed | silence | unresolved | failed | ambiguous
   attempts: integer("attempts").notNull().default(0),
   claimToken: text("claim_token"),
+  /** Present only while this batch has been durably admitted to an external Tinfoil request. */
+  dispatchToken: text("dispatch_token"),
   claimedAt: timestamp("claimed_at", { withTimezone: true }),
   resultJson: jsonb("result_json"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -103,6 +107,13 @@ export const attributedAttempts = pgTable("attributed_attempts", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   completedAt: timestamp("completed_at", { withTimezone: true }),
 }, (t) => [uniqueIndex("attributed_attempts_batch_ordinal_idx").on(t.batchId, t.ordinal)]);
+
+/** Two durable, expiring leases preserve global attributed-provider capacity without a long transaction. */
+export const tinfoilDispatchSlots = pgTable("tinfoil_dispatch_slots", {
+  id: integer("id").primaryKey(),
+  claimToken: text("claim_token"),
+  claimedAt: timestamp("claimed_at", { withTimezone: true }),
+});
 
 /** A PostgreSQL-backed worker heartbeat; API and worker commonly run in separate processes. */
 export const attributedWorkerReadiness = pgTable("attributed_worker_readiness", {
@@ -123,9 +134,12 @@ export const webhookDeliveries = pgTable(
     endpoint: text("endpoint").notNull(),
     payload: text("payload").notNull(),
     attempt: integer("attempt").notNull().default(0),
-    status: text("status").notNull(), // pending | delivered | failed
+    status: text("status").notNull(), // pending | claimed | delivered | failed
     responseCode: integer("response_code"),
     nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }),
+    /** A durable queue/worker lease makes one due attempt single-delivery across worker processes. */
+    claimToken: text("claim_token"),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

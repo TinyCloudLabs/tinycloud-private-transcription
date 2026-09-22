@@ -17,7 +17,7 @@ export async function processJob(ctx: AppContext, job: Job): Promise<void> {
     case "attributed.finalize":
       return finalizeAttributedRun(ctx, job.meetingId);
     case "webhook.deliver":
-      return deliverWebhook(ctx, job.deliveryId);
+      return deliverWebhook(ctx, job.deliveryId, job.claimToken);
   }
 }
 
@@ -33,6 +33,7 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number } = 
   let nextReconciliationAt = 0;
   let reconciliationFailures = 0;
   let queueFailures = 0;
+  let attributedJobFailures = 0;
   let heartbeatInFlight = false;
   let lastWebhookReconciliation = 0;
 
@@ -45,7 +46,7 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number } = 
       ctx.attributedReconciliationReady = true;
       reconciliationFailures = 0;
       nextReconciliationAt = 0;
-      await recordAttributedWorkerReadiness(ctx, queueFailures < 3, "reconciled");
+      await recordAttributedWorkerReadiness(ctx, queueFailures < 3 && attributedJobFailures < 3, "reconciled");
     } catch {
       reconciliationFailures++;
       ctx.attributedReconciliationReady = false;
@@ -65,7 +66,7 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number } = 
     try {
       await reconcileAttributed();
       if (attributedEnabled) {
-        await recordAttributedWorkerReadiness(ctx, ctx.attributedReconciliationReady && queueFailures < 3, "heartbeat");
+        await recordAttributedWorkerReadiness(ctx, ctx.attributedReconciliationReady && queueFailures < 3 && attributedJobFailures < 3, "heartbeat");
       }
       if (Date.now() - lastWebhookReconciliation >= 5_000) {
         await reconcileWebhookDeliveries(ctx);
@@ -107,10 +108,23 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number } = 
           await ctx.queue.push(job, 1_000);
         } else {
           await processJob(ctx, job);
+          if (job.type.startsWith("attributed.")) {
+            const recovered = attributedJobFailures >= 3;
+            attributedJobFailures = 0;
+            if (recovered && attributedEnabled && ctx.attributedReconciliationReady) {
+              await recordAttributedWorkerReadiness(ctx, true, "heartbeat");
+            }
+          }
         }
       } catch (e) {
-        if (job.type.startsWith("attributed.") || (attributedEnabled && (job.type === "meeting.poll" || job.type === "meeting.start"))) ctx.log.error("attributed job failed", { stage: job.type });
-        else ctx.log.error("job failed", { job, error: String(e) });
+        if (job.type.startsWith("attributed.") || (attributedEnabled && (job.type === "meeting.poll" || job.type === "meeting.start"))) {
+          if (job.type.startsWith("attributed.")) {
+            attributedJobFailures++;
+            if (attributedJobFailures >= 3) await recordAttributedWorkerReadiness(ctx, false, "reconciliation_failed").catch(() => {});
+          }
+          ctx.log.error("attributed job failed", { stage: job.type, code: "job_error" });
+        }
+        else ctx.log.error("job failed", { stage: job.type, code: "job_error" });
         await Bun.sleep(250);
       }
     }

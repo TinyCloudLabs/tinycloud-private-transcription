@@ -155,7 +155,7 @@ test("0004-0010 retain production retry, fallback, and terminal delivery state f
     expect(signalColumns).toEqual({ count: 2 });
 
     const [migrationCount] = await db.execute(sql`SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`);
-    expect(migrationCount).toEqual({ count: 11 });
+    expect(migrationCount).toEqual({ count: 12 });
 
     const app = createApp({ db, log: silentLogger } as AppContext);
     const response = await app.request("/v1/meetings/mtg_legacy_1", {

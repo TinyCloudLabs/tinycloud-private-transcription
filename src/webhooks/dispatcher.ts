@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNotNull } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, lte, lt } from "drizzle-orm";
 import type { AppContext } from "../context.ts";
 import { meetings, projects, webhookDeliveries, type MeetingRow, type TranscriptRow } from "../db/schema.ts";
 import { newDeliveryId, newEventId } from "../domain/ids.ts";
@@ -47,7 +47,13 @@ export async function enqueueMeetingWebhook(ctx: AppContext, meeting: MeetingRow
 
 /** Redis is only a wakeup mechanism; this can be called repeatedly after a crash. */
 export async function wakeWebhookDelivery(ctx: AppContext, deliveryId: string, due: Date | null): Promise<void> {
-  await ctx.queue.push({ type: "webhook.deliver", deliveryId }, Math.max(0, (due?.getTime() ?? Date.now()) - Date.now()));
+  const claimToken = crypto.randomUUID();
+  const [claimed] = await ctx.db.update(webhookDeliveries)
+    .set({ status: "claimed", claimToken, claimedAt: new Date(), updatedAt: new Date() })
+    .where(and(eq(webhookDeliveries.id, deliveryId), eq(webhookDeliveries.status, "pending")))
+    .returning({ id: webhookDeliveries.id, nextAttemptAt: webhookDeliveries.nextAttemptAt });
+  if (!claimed) return;
+  await ctx.queue.push({ type: "webhook.deliver", deliveryId, claimToken }, Math.max(0, (claimed.nextAttemptAt?.getTime() ?? due?.getTime() ?? Date.now()) - Date.now()));
 }
 
 /** Recreates missing terminal intent and re-wakes every pending intent from durable PostgreSQL state. */
@@ -57,16 +63,26 @@ export async function reconcileWebhookDeliveries(ctx: AppContext): Promise<void>
   for (const meeting of terminal) {
     await enqueueMeetingWebhook(ctx, meeting, meeting.status === "completed" ? "meeting.completed" : "meeting.failed");
   }
-  const pending = await ctx.db.select().from(webhookDeliveries).where(eq(webhookDeliveries.status, "pending"));
+  // A worker may die after claiming a wakeup but before Redis receives it. Reclaim only an expired,
+  // already-due lease; scheduled retries retain their delay and active HTTP calls retain ownership.
+  await ctx.db.update(webhookDeliveries).set({ status: "pending", claimToken: null, claimedAt: null, updatedAt: new Date() })
+    .where(and(eq(webhookDeliveries.status, "claimed"), lt(webhookDeliveries.claimedAt, new Date(Date.now() - 30_000)), lte(webhookDeliveries.nextAttemptAt, new Date())));
+  const pending = await ctx.db.select().from(webhookDeliveries)
+    .where(and(eq(webhookDeliveries.status, "pending"), lte(webhookDeliveries.nextAttemptAt, new Date())));
   for (const delivery of pending) await wakeWebhookDelivery(ctx, delivery.id, delivery.nextAttemptAt);
 }
 
 /** One delivery attempt; schedules the next per the retry schedule. Never touches meeting status. */
-export async function deliverWebhook(ctx: AppContext, deliveryId: string): Promise<void> {
-  const [d] = await ctx.db.select().from(webhookDeliveries).where(eq(webhookDeliveries.id, deliveryId)).limit(1);
-  if (!d || d.status !== "pending") return;
+export async function deliverWebhook(ctx: AppContext, deliveryId: string, claimToken: string): Promise<void> {
+  const [d] = await ctx.db.select().from(webhookDeliveries)
+    .where(and(eq(webhookDeliveries.id, deliveryId), eq(webhookDeliveries.status, "claimed"), eq(webhookDeliveries.claimToken, claimToken))).limit(1);
+  if (!d || !d.nextAttemptAt || d.nextAttemptAt.getTime() > Date.now()) return;
   const secret = await lookupSecret(ctx, d.meetingId);
-  if (secret === null) return; // meeting deleted; nothing to sign for
+  if (secret === null) {
+    await ctx.db.update(webhookDeliveries).set({ status: "failed", claimToken: null, claimedAt: null, updatedAt: new Date() })
+      .where(and(eq(webhookDeliveries.id, deliveryId), eq(webhookDeliveries.status, "claimed"), eq(webhookDeliveries.claimToken, claimToken)));
+    return;
+  }
 
   const attempt = d.attempt + 1;
   let responseCode: number | null = null;
@@ -83,8 +99,8 @@ export async function deliverWebhook(ctx: AppContext, deliveryId: string): Promi
       signal: AbortSignal.timeout(10_000),
     });
     responseCode = res.status;
-  } catch (e) {
-    ctx.log.warn("webhook delivery error", { deliveryId, attempt, error: String(e) });
+  } catch {
+    ctx.log.warn("webhook delivery error", { deliveryId, attempt, stage: "webhook_post", code: "transport_error" });
   }
 
   const ok = responseCode !== null && responseCode >= 200 && responseCode < 300;
@@ -97,11 +113,13 @@ export async function deliverWebhook(ctx: AppContext, deliveryId: string): Promi
       responseCode,
       status: ok ? "delivered" : exhausted ? "failed" : "pending",
       nextAttemptAt: ok || exhausted ? null : new Date(Date.now() + nextDelay),
+      claimToken: null,
+      claimedAt: null,
       updatedAt: new Date(),
     })
-    .where(eq(webhookDeliveries.id, deliveryId));
+    .where(and(eq(webhookDeliveries.id, deliveryId), eq(webhookDeliveries.status, "claimed"), eq(webhookDeliveries.claimToken, claimToken)));
   if (!ok && !exhausted) {
-    await ctx.queue.push({ type: "webhook.deliver", deliveryId }, nextDelay);
+    await wakeWebhookDelivery(ctx, deliveryId, new Date(Date.now() + nextDelay));
   }
 }
 

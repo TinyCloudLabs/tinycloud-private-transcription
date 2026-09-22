@@ -1,7 +1,7 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, isNotNull, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { AppContext } from "../context.ts";
-import { meetings, transcripts, type MeetingRow, type TranscriptRow } from "../db/schema.ts";
+import { attributedBatches, attributedTranscriptionRuns, meetings, transcripts, type MeetingRow, type TranscriptRow } from "../db/schema.ts";
 import { ApiError, type ErrorCode, errorTypeFor } from "../domain/errors.ts";
 import { newMeetingId } from "../domain/ids.ts";
 import { detectPlatform, type Platform } from "../domain/platform.ts";
@@ -133,6 +133,7 @@ export async function transition(
   if (to === "completed") patch.completedAt = now;
   // The Signal fragment is only needed until a terminal worker result. It must not outlive capture.
   if (isTerminal(to) && meeting.platform === "signal") patch.signalCapability = null;
+  if (isTerminal(to)) return terminalTransition(ctx, meeting, to, patch);
   const [row] = await ctx.db
     .update(meetings)
     .set(patch)
@@ -142,6 +143,44 @@ export async function transition(
   if (!row) return { meeting: (await getMeetingById(ctx, meeting.id)) ?? meeting, changed: false };
   ctx.log.info("meeting status changed", { meetingId: row.id, from: meeting.status, to, completionReason: row.captureDiagnostics?.completion_reason ?? null });
   return { meeting: row, changed: true };
+}
+
+/**
+ * A paid attributed request is durably marked on its batch before it leaves PostgreSQL. Terminal
+ * transitions serialize on the meeting row and wait for that marker to settle. This gives a real
+ * ordering fence without holding a database transaction open around a provider request.
+ */
+async function terminalTransition(
+  ctx: AppContext,
+  meeting: MeetingRow,
+  to: MeetingStatus,
+  patch: Partial<typeof meetings.$inferInsert>,
+): Promise<{ meeting: MeetingRow; changed: boolean }> {
+  for (;;) {
+    const result = await ctx.db.transaction(async (tx) => {
+      const [current] = await tx.select().from(meetings).where(eq(meetings.id, meeting.id)).for("update");
+      if (!current || current.status !== meeting.status || !canTransition(current.status as MeetingStatus, to)) {
+        return { meeting: current ?? meeting, changed: false, waiting: false };
+      }
+      const [run] = await tx.select().from(attributedTranscriptionRuns)
+        .where(eq(attributedTranscriptionRuns.meetingId, meeting.id)).for("update");
+      if (run) {
+        const active = await tx.select({ id: attributedBatches.id }).from(attributedBatches)
+          .where(and(eq(attributedBatches.meetingId, meeting.id), isNotNull(attributedBatches.dispatchToken))).for("update");
+        if (active.length) return { meeting: current, changed: false, waiting: true };
+      }
+      const [row] = await tx.update(meetings).set(patch)
+        .where(and(eq(meetings.id, meeting.id), eq(meetings.status, meeting.status))).returning();
+      return row ? { meeting: row, changed: true, waiting: false } : { meeting: current, changed: false, waiting: false };
+    });
+    if (!result.waiting) {
+      if (result.changed) ctx.log.info("meeting status changed", { meetingId: result.meeting.id, from: meeting.status, to, completionReason: result.meeting.captureDiagnostics?.completion_reason ?? null });
+      return result;
+    }
+    // No transaction is held while a provider call is in flight. A settled request clears its
+    // marker atomically; an abandoned process is recovered by the durable claim reconciler.
+    await Bun.sleep(10);
+  }
 }
 
 export async function failMeeting(ctx: AppContext, meeting: MeetingRow, code: ErrorCode, message: string) {
@@ -295,30 +334,53 @@ async function stopInSignal(ctx: AppContext, meeting: MeetingRow) {
  * by capture provider") and still remove our data; purging Vexa's copy is a documented gap.
  */
 export async function deleteMeeting(ctx: AppContext, meeting: MeetingRow): Promise<void> {
-  if (meeting.platform === "signal") {
-    if (!isTerminal(meeting.status as MeetingStatus)) await stopInSignal(ctx, meeting);
-    if (meeting.signalSessionId) await ctx.signal.remove(meeting.signalSessionId).catch(() => {});
-    await ctx.db.delete(meetings).where(eq(meetings.id, meeting.id));
-    return;
-  }
-  if (meeting.vexaPlatform && meeting.vexaNativeMeetingId) {
-    if (!isTerminal(meeting.status as MeetingStatus)) await stopInVexa(ctx, meeting);
-    try {
-      await ctx.vexa.deleteMeeting(meeting.vexaPlatform, meeting.vexaNativeMeetingId);
-    } catch (e) {
-      if (e instanceof VexaHttpError && e.conflict && meeting.vexaMeetingId != null) {
-        // Attributed ranges are provider-owned evidence.  Retain the complete local ledger until
-        // Vexa confirms deletion so a retry cannot silently orphan or destroy that evidence.
-        throw new ApiError("provider_unavailable", "Could not confirm deletion from the capture provider");
-      } else if (e instanceof VexaHttpError && e.conflict) {
-        ctx.log.warn("vexa retains meeting row (409: bot lifecycle owns it)", { stage: "delete_provider", code: "provider_conflict" });
-      } else if (!(e instanceof VexaHttpError && e.notFound)) {
-        ctx.log.warn("vexa deleteMeeting failed", { stage: "delete_provider", code: "provider_unavailable" });
-        throw new ApiError("provider_unavailable", "Could not delete the meeting from the capture provider");
+  await fenceAttributedDeletion(ctx, meeting.id);
+  try {
+    if (meeting.platform === "signal") {
+      if (!isTerminal(meeting.status as MeetingStatus)) await stopInSignal(ctx, meeting);
+      if (meeting.signalSessionId) await ctx.signal.remove(meeting.signalSessionId).catch(() => {});
+      await ctx.db.delete(meetings).where(eq(meetings.id, meeting.id));
+      return;
+    }
+    if (meeting.vexaPlatform && meeting.vexaNativeMeetingId) {
+      if (!isTerminal(meeting.status as MeetingStatus)) await stopInVexa(ctx, meeting);
+      try {
+        await ctx.vexa.deleteMeeting(meeting.vexaPlatform, meeting.vexaNativeMeetingId);
+      } catch (e) {
+        if (e instanceof VexaHttpError && e.conflict && meeting.vexaMeetingId != null) {
+          // Attributed ranges are provider-owned evidence.  Retain the complete local ledger until
+          // Vexa confirms deletion so a retry cannot silently orphan or destroy that evidence.
+          throw new ApiError("provider_unavailable", "Could not confirm deletion from the capture provider");
+        } else if (e instanceof VexaHttpError && e.conflict) {
+          ctx.log.warn("vexa retains meeting row (409: bot lifecycle owns it)", { stage: "delete_provider", code: "provider_conflict" });
+        } else if (!(e instanceof VexaHttpError && e.notFound)) {
+          ctx.log.warn("vexa deleteMeeting failed", { stage: "delete_provider", code: "provider_unavailable" });
+          throw new ApiError("provider_unavailable", "Could not delete the meeting from the capture provider");
+        }
       }
     }
+    await ctx.db.delete(meetings).where(eq(meetings.id, meeting.id));
+  } catch (error) {
+    await ctx.db.update(meetings).set({ dispatchBlocked: false }).where(eq(meetings.id, meeting.id));
+    throw error;
   }
-  await ctx.db.delete(meetings).where(eq(meetings.id, meeting.id));
+}
+
+/** Claim deletion only after any admitted attributed request has settled. */
+async function fenceAttributedDeletion(ctx: AppContext, meetingId: string): Promise<void> {
+  for (;;) {
+    const waiting = await ctx.db.transaction(async (tx) => {
+      const [current] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
+      if (!current || current.dispatchBlocked) return false;
+      const active = await tx.select({ id: attributedBatches.id }).from(attributedBatches)
+        .where(and(eq(attributedBatches.meetingId, meetingId), isNotNull(attributedBatches.dispatchToken))).for("update");
+      if (active.length) return true;
+      await tx.update(meetings).set({ dispatchBlocked: true }).where(eq(meetings.id, meetingId));
+      return false;
+    });
+    if (!waiting) return;
+    await Bun.sleep(10);
+  }
 }
 
 // ---- serialization ----
