@@ -149,7 +149,13 @@ async function publish(ctx: AppContext, meetingId: string, transcript: Normalize
         || batchRanges.some((range) => canonical(range) !== canonical(stagedBySequence.get(range.sequence)))
         || ranges.some((r) => !["completed", "silence"].includes(r.status)) || batches.some((b) => !["completed", "silence"].includes(b.status))) return null;
     const existing = await tx.select().from(transcripts).where(eq(transcripts.meetingId, meetingId)).for("update");
-    if (existing[0]) return null;
+    // A competing finalizer may have committed the canonical object first.  Preserve that winner
+    // and make this run terminal too; never overwrite it or leave the meeting processing forever.
+    if (existing[0]) {
+      const [winner] = await tx.update(meetings).set({ status: "completed", completedAt: new Date() }).where(and(eq(meetings.id, meetingId), eq(meetings.status, "processing"))).returning();
+      if (winner) await tx.update(attributedTranscriptionRuns).set({ status: "completed", updatedAt: new Date() }).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
+      return winner ?? null;
+    }
     const [meeting] = await tx.update(meetings).set({ status: "completed", completedAt: new Date() }).where(and(eq(meetings.id, meetingId), eq(meetings.status, "processing"))).returning();
     if (!meeting) return null;
     await tx.insert(transcripts).values({ meetingId, language: transcript.language, durationSeconds: transcript.duration_seconds, segmentsJson: json(payload), provider: "tinfoil-attributed" });
