@@ -16,6 +16,8 @@ export interface TinfoilOptions {
   concurrency?: number;
   maxRetries?: number;
   retryDelayMs?: number;
+  /** Optional process-local cost ceiling for a dedicated attributed-audio worker. */
+  maxCalls?: number;
 }
 
 interface TinfoilResponse {
@@ -37,9 +39,11 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
   calls = 0;
   lastStats: TinfoilStats | null = null;
   private readonly fetchImpl: typeof fetch;
+  private readonly maxCalls: number;
 
   constructor(private readonly opts: TinfoilOptions) {
     this.fetchImpl = opts.fetch ?? fetch;
+    this.maxCalls = opts.maxCalls === undefined ? Number.POSITIVE_INFINITY : Math.max(0, opts.maxCalls);
   }
 
   /** Text-only operation for a Vexa-owned, already-attributed PCM batch. */
@@ -118,6 +122,9 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
   }
 
   private async post(bytes: Uint8Array, filename: string, language: string | null): Promise<TinfoilResponse> {
+    if (this.calls >= this.maxCalls) {
+      throw new ApiError("transcription_failed", "Tinfoil attempt budget exhausted");
+    }
     const form = new FormData();
     form.set("model", this.opts.model);
     form.set("response_format", "json");

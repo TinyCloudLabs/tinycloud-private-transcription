@@ -1,4 +1,6 @@
-export type SpeakerAttribution = "identified" | "unknown" | "overlap";
+/** `provisional` is capture evidence with a supplied name but no identity confidence; it must
+ * never be silently promoted to `identified` by a text-only transcription provider. */
+export type SpeakerAttribution = "identified" | "provisional" | "unknown" | "overlap";
 
 export interface RawSegment {
   start: number;
