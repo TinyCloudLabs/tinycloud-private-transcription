@@ -11,6 +11,12 @@ infra/dstack/.env
 # scratch + evidence from local runs
 tmp/
 
+# local Smithers execution state
+.smithers/
+smithers.db
+smithers.db-shm
+smithers.db-wal
+
 # generated dev PKI (infra/certs/gen.sh) and its copies
 infra/certs/out/
 infra/vexa/bot/ca.crt
