@@ -76,6 +76,14 @@ export interface VexaMeetingData {
   constructed_meeting_url?: string;
   last_error?: { reason?: string; exit_code?: number | null; error_details?: string } | null;
   sessions?: string[];
+  /** v1 durable, capture-owned evidence. PTX may consume it only after closure. */
+  attributed_audio_manifest?: {
+    version: 1; meeting_id: string; state: "open" | "closed"; ranges: Array<{
+      version: 1; meeting_id: string; sequence: number; idempotency_key: string; speaker_key: string; speaker_name: string;
+      attribution: { source: "glow-bound" | "provisional"; confidence: number }; start_ms: number; end_ms: number;
+      codec: "pcm_f32le"; sample_rate: number; channels: 1; byte_count: number; sha256: string; state: "sealed" | "uploaded" | "failed"; url?: string;
+    }>;
+  };
   [k: string]: unknown;
 }
 

@@ -1,6 +1,7 @@
 import { ApiError } from "../../domain/errors.ts";
 import { normalizeSegments, type NormalizedTranscript } from "../../domain/transcript.ts";
-import { decodeToPcm, rmsDbfs, sliceToWav, type Pcm16 } from "./audio.ts";
+import { decodeToPcm, rmsDbfs, sliceToWav, pcmToWav, type Pcm16 } from "./audio.ts";
+import type { AttributedBatch } from "./attributed.ts";
 import type { TranscriptionInput, TranscriptionProvider } from "./types.ts";
 
 export interface TinfoilOptions {
@@ -39,6 +40,19 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
 
   constructor(private readonly opts: TinfoilOptions) {
     this.fetchImpl = opts.fetch ?? fetch;
+  }
+
+  /** Text-only operation for a Vexa-owned, already-attributed PCM batch. */
+  async transcribeAttributedPcm(bytes: Uint8Array, batch: AttributedBatch, language: string | null) {
+    const first = batch.ranges[0];
+    if (!first || first.codec !== "pcm_f32le" || first.channels !== 1) throw new ApiError("transcription_failed", "Unsupported attributed audio codec");
+    const input = new Float32Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 4));
+    let energy = 0;
+    const pcm16 = new Int16Array(input.length);
+    for (let i = 0; i < input.length; i++) { const value = Math.max(-1, Math.min(1, input[i]!)); energy += value * value; pcm16[i] = value * 32767; }
+    if (!input.length || 20 * Math.log10(Math.sqrt(energy / input.length) || 0) < (this.opts.silenceDbfs ?? -60)) throw new ApiError("transcription_failed", "Attributed audio is silent");
+    const body = await this.postWithRetry(pcmToWav(pcm16, first.sample_rate), `${batch.idempotency_key}.wav`, language);
+    return { text: body.text, language: body.language };
   }
 
   async transcribe(input: TranscriptionInput): Promise<NormalizedTranscript> {

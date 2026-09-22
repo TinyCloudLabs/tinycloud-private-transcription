@@ -14,6 +14,8 @@ import { meetings } from "../db/schema.ts";
 import { normalizeSegments } from "../domain/transcript.ts";
 import { openSignalCapability } from "../providers/signal/capability.ts";
 import type { VexaTranscriptionResponse } from "../providers/vexa/types.ts";
+import { transcribeAttributedManifest, type AttributedManifest } from "../providers/transcription/attributed.ts";
+import { TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
 
 const MAX_START_ATTEMPTS = 3;
 const MAX_RECOVERY_ATTEMPTS = 3;
@@ -31,10 +33,9 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
       meeting_url: meeting.meetingUrl,
       bot_name: meeting.botName ?? undefined,
       language: meeting.language ?? undefined,
-      // Vexa remains the primary transcription provider.
-      transcribe_enabled: true,
-      // Retain audio only on deployments which have the recovery provider configured.
-      ...(ctx.transcriptRecovery ? { recording_enabled: true } : {}),
+      // PTX owns no live STT. Vexa captures identity/timing and seals attributed evidence first.
+      transcribe_enabled: false,
+      recording_enabled: true,
       // Vexa otherwise applies its ten-minute deployment fallback. Pin every TinyCloud meeting to
       // our configurable audio-silence window. This can expire with humans still connected;
       // participant presence does not veto Vexa's silence verdict.
@@ -315,6 +316,43 @@ async function finalize(
   recover: boolean,
   recoveryAttempt: number,
 ) {
+  const manifest = vexa.data?.attributed_audio_manifest as AttributedManifest | undefined;
+  if (manifest) {
+    if (manifest.state !== "closed" || manifest.ranges.some((range) => range.state !== "uploaded")) {
+      // Completion is earned only once Vexa closes every required durable range.
+      await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id, recoveryAttempt }, ctx.config.vexa.pollIntervalMs);
+      return;
+    }
+    const attributedProvider = ctx.transcriptRecovery;
+    if (!(attributedProvider instanceof TinfoilTranscriptionProvider)) {
+      const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Attributed audio requires a configured Tinfoil worker.");
+      if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+      return;
+    }
+    try {
+      const transcript = await transcribeAttributedManifest(
+        manifest,
+        async (range) => (await ctx.vexa.fetchBytes(range.url!)).bytes,
+        (pcm, batch) => attributedProvider.transcribeAttributedPcm(pcm, batch, meeting.language),
+        meeting.language,
+      );
+      await storeTranscript(ctx, meeting.id, transcript, "tinfoil-attributed");
+      const { meeting: done, changed } = await transition(ctx, meeting, "completed");
+      if (changed) await enqueueMeetingWebhook(ctx, done, "meeting.completed");
+      return;
+    } catch (error) {
+      const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Attributed transcription could not be completed.");
+      if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+      return;
+    }
+  }
+  // Mixed recordings and Vexa live words are intentionally not a PTX canonical fallback.  They
+  // remain truthful partial capture evidence until the capture-owned artifact contract is present.
+  const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "No closed attributed-audio manifest was supplied by Vexa.");
+  if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+  return;
+  /* Legacy recording recovery is retained below only for source compatibility during migration.
+     It is unreachable for PTX-created Vexa meetings. */
   const input = {
     meetingId: meeting.id,
     language: meeting.language,
