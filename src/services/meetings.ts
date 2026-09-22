@@ -141,7 +141,7 @@ export async function transition(
     .returning();
   // If another writer moved it first, re-read and report unchanged.
   if (!row) return { meeting: (await getMeetingById(ctx, meeting.id)) ?? meeting, changed: false };
-  ctx.log.info("meeting status changed", { meetingId: row.id, from: meeting.status, to, completionReason: row.captureDiagnostics?.completion_reason ?? null });
+  ctx.log.info("meeting status changed", { meetingId: row.id, stage: "status_transition" });
   return { meeting: row, changed: true };
 }
 
@@ -174,7 +174,7 @@ async function terminalTransition(
       return row ? { meeting: row, changed: true, waiting: false } : { meeting: current, changed: false, waiting: false };
     });
     if (!result.waiting) {
-      if (result.changed) ctx.log.info("meeting status changed", { meetingId: result.meeting.id, from: meeting.status, to, completionReason: result.meeting.captureDiagnostics?.completion_reason ?? null });
+      if (result.changed) ctx.log.info("meeting status changed", { meetingId: result.meeting.id, stage: "status_transition" });
       return result;
     }
     // No transaction is held while a provider call is in flight. A settled request clears its
@@ -249,7 +249,7 @@ export async function stopMeeting(ctx: AppContext, meeting: MeetingRow): Promise
   const status = meeting.status as MeetingStatus;
   if (isTerminal(status) || status === "processing") return meeting;
   meeting = await recordCapture(ctx, meeting, { stop_requested_at: new Date().toISOString(), stop_requested_by: "user" });
-  ctx.log.info("bot stop requested", { meetingId: meeting.id, status, botId: meeting.vexaBotId });
+  ctx.log.info("bot stop requested", { meetingId: meeting.id, stage: "stop_requested" });
   if (meeting.platform === "signal") await stopInSignal(ctx, meeting);
   else await stopInVexa(ctx, meeting);
   if (status === "in_progress") {
@@ -296,17 +296,8 @@ export async function recoverMeeting(ctx: AppContext, meeting: MeetingRow): Prom
   try {
     await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id });
   } catch (error) {
-    // Do not strand a meeting in processing when Redis is unavailable. A queue write is atomic; in
-    // the ambiguous response-lost case, a delivered poll sees the restored terminal state and exits,
-    // while the caller can safely retry recovery later.
-    await ctx.db
-      .update(meetings)
-      .set({
-        status: "failed",
-        errorCode: meeting.errorCode,
-        errorMessage: meeting.errorMessage,
-      })
-      .where(and(eq(meetings.id, meeting.id), eq(meetings.projectId, meeting.projectId), eq(meetings.status, "processing")));
+    // A Redis acknowledgement can be lost after its message was accepted. Do not restore failed:
+    // that message may already admit a paid dispatch. Durable reconciliation resumes processing.
     throw error;
   }
   return updated;
@@ -334,7 +325,8 @@ async function stopInSignal(ctx: AppContext, meeting: MeetingRow) {
  * by capture provider") and still remove our data; purging Vexa's copy is a documented gap.
  */
 export async function deleteMeeting(ctx: AppContext, meeting: MeetingRow): Promise<void> {
-  await fenceAttributedDeletion(ctx, meeting.id);
+  const deletionToken = await fenceAttributedDeletion(ctx, meeting.id);
+  if (!deletionToken) return;
   try {
     if (meeting.platform === "signal") {
       if (!isTerminal(meeting.status as MeetingStatus)) await stopInSignal(ctx, meeting);
@@ -361,24 +353,31 @@ export async function deleteMeeting(ctx: AppContext, meeting: MeetingRow): Promi
     }
     await ctx.db.delete(meetings).where(eq(meetings.id, meeting.id));
   } catch (error) {
-    await ctx.db.update(meetings).set({ dispatchBlocked: false }).where(eq(meetings.id, meeting.id));
+    // Compare the owner token: a failed overlapping deletion must not lower another deletion's
+    // fence and admit a later attributed request.
+    await ctx.db.update(meetings).set({ dispatchBlocked: false, deletionToken: null })
+      .where(and(eq(meetings.id, meeting.id), eq(meetings.deletionToken, deletionToken)));
     throw error;
   }
 }
 
 /** Claim deletion only after any admitted attributed request has settled. */
-async function fenceAttributedDeletion(ctx: AppContext, meetingId: string): Promise<void> {
+async function fenceAttributedDeletion(ctx: AppContext, meetingId: string): Promise<string | null> {
+  const token = crypto.randomUUID();
   for (;;) {
-    const waiting = await ctx.db.transaction(async (tx) => {
+    const result = await ctx.db.transaction(async (tx) => {
       const [current] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
-      if (!current || current.dispatchBlocked) return false;
+      if (!current) return { token: null, waiting: false };
+      // Another deletion owns the provider call. Wait for its outcome rather than becoming a
+      // second owner; on failure its token is cleared conditionally and this loop can claim next.
+      if (current.deletionToken || current.dispatchBlocked) return { token: null, waiting: true };
       const active = await tx.select({ id: attributedBatches.id }).from(attributedBatches)
         .where(and(eq(attributedBatches.meetingId, meetingId), isNotNull(attributedBatches.dispatchToken))).for("update");
-      if (active.length) return true;
-      await tx.update(meetings).set({ dispatchBlocked: true }).where(eq(meetings.id, meetingId));
-      return false;
+      if (active.length) return { token: null, waiting: true };
+      await tx.update(meetings).set({ dispatchBlocked: true, deletionToken: token }).where(eq(meetings.id, meetingId));
+      return { token, waiting: false };
     });
-    if (!waiting) return;
+    if (!result.waiting) return result.token;
     await Bun.sleep(10);
   }
 }

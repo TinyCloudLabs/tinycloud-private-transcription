@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
 import { attributedWorkerReadiness } from "../../src/db/schema.ts";
+import { attributedWorkerReady, recordAttributedWorkerReadiness } from "../../src/services/attributed-transcription.ts";
 import { startHarness, type Harness } from "./harness.ts";
 
 let h: Harness;
@@ -46,7 +47,21 @@ test("attributed readiness is a stale-safe PostgreSQL worker heartbeat", async (
   const healthy = await (await h.api("/health")).json();
   expect(healthy.checks.attributed_transcription).toMatchObject({ enabled: true, ready: true });
   await h.ctx.db.update(attributedWorkerReadiness).set({ observedAt: new Date(Date.now() - 16_000) })
-    .where(eq(attributedWorkerReadiness.id, "attributed-worker"));
+    .where(eq(attributedWorkerReadiness.id, h.ctx.attributedWorkerId));
   const stale = await (await h.api("/health")).json();
   expect(stale).toMatchObject({ status: "degraded", checks: { attributed_transcription: { enabled: true, ready: false } } });
+});
+
+test("live worker readiness is conjunctive and a no-op peer cannot heal a failed worker", async () => {
+  const failed = { ...h.ctx, attributedWorkerId: `attributed-worker:test-failed:${crypto.randomUUID()}` };
+  const healthy = { ...h.ctx, attributedWorkerId: `attributed-worker:test-healthy:${crypto.randomUUID()}` };
+  await recordAttributedWorkerReadiness(failed, false, "reconciliation_failed");
+  await recordAttributedWorkerReadiness(healthy, true, "heartbeat");
+  expect(await attributedWorkerReady(h.ctx)).toBe(false);
+  // A successful no-op heartbeat for another worker leaves the failed identity authoritative.
+  await recordAttributedWorkerReadiness(healthy, true, "reconciled");
+  expect(await attributedWorkerReady(h.ctx)).toBe(false);
+  await h.ctx.db.update(attributedWorkerReadiness).set({ observedAt: new Date(Date.now() - 16_000) })
+    .where(eq(attributedWorkerReadiness.id, failed.attributedWorkerId));
+  expect(await attributedWorkerReady(h.ctx)).toBe(true);
 });

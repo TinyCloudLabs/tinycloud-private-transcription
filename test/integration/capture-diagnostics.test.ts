@@ -52,7 +52,9 @@ describe("capture evidence survives transcript finalization", () => {
     expect(t.capture.completion_reason).toBe(reason);
     const hook = await h.waitFor(async () => h.webhook.received.find((w) => w.body.data.meeting_id === id));
     expect(hook.body.data.capture.completion_reason).toBe(reason);
-    expect(logs.some((l) => l.msg === "capture status observed" && l.data?.meetingId === id && l.data?.completion_reason === reason)).toBe(true);
+    const lifecycle = logs.find((l) => l.msg === "capture status observed" && l.data?.meetingId === id);
+    expect(lifecycle?.data).toMatchObject({ stage: "capture_status" });
+    expect(JSON.stringify(lifecycle?.data)).not.toContain(reason);
     expect(logs.some((l) => l.msg === "bot dispatched" && l.data?.meetingId === id)).toBe(true);
   });
 

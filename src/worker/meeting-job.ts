@@ -55,7 +55,7 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
       vexaBotId: created.bot_container_id ?? String(created.id),
     });
     if (changed) {
-      ctx.log.info("bot dispatched", { meetingId, botId: updated.vexaBotId, vexaMeetingId: created.id, platform: meeting.platform, provider: ctx.transcription.name, ...updated.captureDiagnostics });
+      ctx.log.info("bot dispatched", { meetingId, stage: "dispatch_admitted" });
       await ctx.queue.push({ type: "meeting.poll", meetingId }, ctx.config.vexa.pollIntervalMs);
       // Worker-side join deadline: Vexa's own awaiting_admission timeout is opaque; without this a
       // never-admitted bot leaves the meeting in joining/waiting_for_admission forever.
@@ -129,7 +129,7 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
   } catch (e) {
     if (e instanceof VexaHttpError && e.notFound) {
       meeting = await recordCapture(ctx, meeting, { provider_record_missing_at: new Date().toISOString() });
-      ctx.log.warn("capture provider record missing", { meetingId, botId: meeting.vexaBotId });
+      ctx.log.warn("capture provider record missing", { meetingId, stage: "poll", code: "provider_not_found" });
       const { meeting: failed } = await failMeeting(ctx, meeting, "capture_failed", "The capture provider lost track of this meeting.");
       await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
       return;
@@ -233,7 +233,7 @@ async function handleSignalStart(ctx: AppContext, meeting: MeetingRow, attempt: 
       await ctx.signal.remove(created.sessionId).catch(() => {});
       return;
     }
-    ctx.log.info("signal capture dispatched", { meetingId: meeting.id, sessionId: created.sessionId, platform: "signal" });
+    ctx.log.info("signal capture dispatched", { meetingId: meeting.id, stage: "dispatch_admitted" });
     await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id }, ctx.config.vexa.pollIntervalMs);
     await ctx.queue.push({ type: "meeting.join_deadline", meetingId: meeting.id }, ctx.config.joinTimeoutSeconds * 1000);
   } catch (error) {

@@ -34,7 +34,9 @@ export async function observeCapture(ctx: AppContext, meeting: MeetingRow, vexa:
   if (!changed && !heartbeatDue) return meeting;
   const updated = await recordCapture(ctx, meeting, next);
   ctx.log.info(changed ? "capture status observed" : "capture heartbeat", {
-    meetingId: meeting.id, botId: meeting.vexaBotId, ...updated.captureDiagnostics,
+    // Provider diagnostics can contain arbitrary identifiers and error text. They remain in the
+    // protected meeting record/API contract, but lifecycle logs are intentionally bounded.
+    meetingId: meeting.id, stage: changed ? "capture_status" : "capture_heartbeat",
   });
   return updated;
 }

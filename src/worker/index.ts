@@ -46,7 +46,7 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number } = 
       ctx.attributedReconciliationReady = true;
       reconciliationFailures = 0;
       nextReconciliationAt = 0;
-      await recordAttributedWorkerReadiness(ctx, queueFailures < 3 && attributedJobFailures < 3, "reconciled");
+      await recordAttributedWorkerReadiness(ctx, ctx.attributedWorkerHealthy && queueFailures < 3 && attributedJobFailures < 3, "reconciled");
     } catch {
       reconciliationFailures++;
       ctx.attributedReconciliationReady = false;
@@ -66,7 +66,7 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number } = 
     try {
       await reconcileAttributed();
       if (attributedEnabled) {
-        await recordAttributedWorkerReadiness(ctx, ctx.attributedReconciliationReady && queueFailures < 3 && attributedJobFailures < 3, "heartbeat");
+        await recordAttributedWorkerReadiness(ctx, ctx.attributedWorkerHealthy && ctx.attributedReconciliationReady && queueFailures < 3 && attributedJobFailures < 3, "heartbeat");
       }
       if (Date.now() - lastWebhookReconciliation >= 5_000) {
         await reconcileWebhookDeliveries(ctx);
@@ -112,7 +112,7 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number } = 
             const recovered = attributedJobFailures >= 3;
             attributedJobFailures = 0;
             if (recovered && attributedEnabled && ctx.attributedReconciliationReady) {
-              await recordAttributedWorkerReadiness(ctx, true, "heartbeat");
+              await recordAttributedWorkerReadiness(ctx, ctx.attributedWorkerHealthy, "heartbeat");
             }
           }
         }

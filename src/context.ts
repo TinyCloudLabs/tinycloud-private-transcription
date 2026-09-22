@@ -24,6 +24,10 @@ export interface AppContext {
   webhookRetryDelaysMs: number[];
   /** Set only after worker startup has reconciled durable attributed claims. */
   attributedReconciliationReady: boolean;
+  /** A process-local durable heartbeat identity. */
+  attributedWorkerId: string;
+  /** Publication failures are sticky until this worker performs a real successful recovery. */
+  attributedWorkerHealthy: boolean;
 }
 
 export const DEFAULT_WEBHOOK_RETRY_DELAYS_MS = [0, 60_000, 5 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
@@ -47,5 +51,7 @@ export function createContext(overrides: Partial<AppContext> & { config?: Config
     log,
     webhookRetryDelaysMs: overrides.webhookRetryDelaysMs ?? DEFAULT_WEBHOOK_RETRY_DELAYS_MS,
     attributedReconciliationReady: overrides.attributedReconciliationReady ?? !cfg.attributedTranscriptionEnabled,
+    attributedWorkerId: overrides.attributedWorkerId ?? `attributed-worker:${process.pid}:${crypto.randomUUID()}`,
+    attributedWorkerHealthy: overrides.attributedWorkerHealthy ?? true,
   };
 }

@@ -6,6 +6,10 @@ import { getTranscript, transcriptProviderFields } from "../services/meetings.ts
 import { signWebhookBody, WEBHOOK_SIGNATURE_HEADER } from "./signature.ts";
 
 export type WebhookEventType = "meeting.completed" | "meeting.failed";
+// A queue wakeup may sit behind unrelated work. The lease is therefore refreshed immediately
+// before I/O and outlives the request timeout, rather than being measured from enqueue time.
+const WEBHOOK_REQUEST_TIMEOUT_MS = 10_000;
+const WEBHOOK_LEASE_MS = WEBHOOK_REQUEST_TIMEOUT_MS + 5_000;
 
 /** The immutable event is constructed before its transaction commits. */
 export function webhookDeliveryValues(meeting: MeetingRow, type: WebhookEventType, transcript: TranscriptRow | null) {
@@ -66,7 +70,7 @@ export async function reconcileWebhookDeliveries(ctx: AppContext): Promise<void>
   // A worker may die after claiming a wakeup but before Redis receives it. Reclaim only an expired,
   // already-due lease; scheduled retries retain their delay and active HTTP calls retain ownership.
   await ctx.db.update(webhookDeliveries).set({ status: "pending", claimToken: null, claimedAt: null, updatedAt: new Date() })
-    .where(and(eq(webhookDeliveries.status, "claimed"), lt(webhookDeliveries.claimedAt, new Date(Date.now() - 30_000)), lte(webhookDeliveries.nextAttemptAt, new Date())));
+    .where(and(eq(webhookDeliveries.status, "claimed"), lt(webhookDeliveries.claimedAt, new Date(Date.now() - WEBHOOK_LEASE_MS)), lte(webhookDeliveries.nextAttemptAt, new Date())));
   const pending = await ctx.db.select().from(webhookDeliveries)
     .where(and(eq(webhookDeliveries.status, "pending"), lte(webhookDeliveries.nextAttemptAt, new Date())));
   for (const delivery of pending) await wakeWebhookDelivery(ctx, delivery.id, delivery.nextAttemptAt);
@@ -74,9 +78,16 @@ export async function reconcileWebhookDeliveries(ctx: AppContext): Promise<void>
 
 /** One delivery attempt; schedules the next per the retry schedule. Never touches meeting status. */
 export async function deliverWebhook(ctx: AppContext, deliveryId: string, claimToken: string): Promise<void> {
-  const [d] = await ctx.db.select().from(webhookDeliveries)
-    .where(and(eq(webhookDeliveries.id, deliveryId), eq(webhookDeliveries.status, "claimed"), eq(webhookDeliveries.claimToken, claimToken))).limit(1);
-  if (!d || !d.nextAttemptAt || d.nextAttemptAt.getTime() > Date.now()) return;
+  // Atomically take (or refresh) ownership at the actual POST boundary. A reconciliation scan
+  // and an aged queue job race on this CAS, so exactly one can begin an HTTP attempt.
+  const [d] = await ctx.db.update(webhookDeliveries).set({ claimedAt: new Date(), updatedAt: new Date() })
+    .where(and(
+      eq(webhookDeliveries.id, deliveryId),
+      eq(webhookDeliveries.status, "claimed"),
+      eq(webhookDeliveries.claimToken, claimToken),
+      lte(webhookDeliveries.nextAttemptAt, new Date()),
+    )).returning();
+  if (!d) return;
   const secret = await lookupSecret(ctx, d.meetingId);
   if (secret === null) {
     await ctx.db.update(webhookDeliveries).set({ status: "failed", claimToken: null, claimedAt: null, updatedAt: new Date() })
@@ -96,7 +107,7 @@ export async function deliverWebhook(ctx: AppContext, deliveryId: string, claimT
         "X-Webhook-Delivery": d.id,
       },
       body: d.payload,
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(WEBHOOK_REQUEST_TIMEOUT_MS),
     });
     responseCode = res.status;
   } catch {

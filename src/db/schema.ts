@@ -48,6 +48,8 @@ export const meetings = pgTable(
     requestHash: text("request_hash"),
     /** Durable deletion fence; prevents new attributed dispatch while provider deletion is in flight. */
     dispatchBlocked: boolean("dispatch_blocked").notNull().default(false),
+    /** Ownership token for the deletion fence. A loser must never clear a winner's fence. */
+    deletionToken: text("deletion_token"),
   },
   (t) => [
     uniqueIndex("meetings_project_idempotency_idx").on(t.projectId, t.idempotencyKey),
@@ -92,6 +94,8 @@ export const attributedBatches = pgTable("attributed_batches", {
   claimToken: text("claim_token"),
   /** Present only while this batch has been durably admitted to an external Tinfoil request. */
   dispatchToken: text("dispatch_token"),
+  /** The external-call lease starts at admission, not when a queue message was claimed. */
+  dispatchedAt: timestamp("dispatched_at", { withTimezone: true }),
   claimedAt: timestamp("claimed_at", { withTimezone: true }),
   resultJson: jsonb("result_json"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
