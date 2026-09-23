@@ -220,20 +220,23 @@ transcript storage is an upsert and only the winning terminal transition emits a
 
 ## Vexa fork ([TinyCloudLabs/vexa](https://github.com/TinyCloudLabs/vexa))
 
-The CVM runs commit-addressed bot, meeting-api, and gateway images from our Vexa fork. Vexa performs
-primary STT and native speaker attribution; this service normally consumes the completed attributed
-segments directly. Only a materially incomplete terminal timeline uses its retained mixed recording
-for Tinfoil recovery. The remaining Vexa components stay on their unchanged upstream v0.12 images.
+The CVM runs commit-addressed bot, meeting-api, and gateway images from our Vexa fork. For Google Meet,
+Vexa durably captures bounded speaker-attributed audio ranges and timing while live STT is disabled.
+After the meeting, this service sends speech-sized attributed ranges to Tinfoil for text only, then
+publishes the transcript with Vexa's speaker ownership and timestamps. A mixed whole-recording Tinfoil
+transcript is never promoted as the canonical diarized result. The remaining Vexa components stay on
+their unchanged upstream v0.12 images.
 
 - **Branches**: `tinycloud` = current upstream (`59e2c413`) + the selected TinyCloud overlay, currently
-  at `89c8cf88`. `main` tracks upstream untouched. The separate local rig remains pinned by
+  at `36f03047`. `main` tracks upstream untouched. The separate local rig remains pinned by
   `infra/vexa/upstream` and `infra/vexa/UPSTREAM_PIN` until that fixture is refreshed.
 - **The patch**: `core/meetings/modules/record-chunker` — `createRecordingTap` builds a dynamic mix
   (`DynamicElementMixer`): the recorder starts immediately (even with zero audio elements) and a 2 s
   rescan (live-mixer parity) attaches new elements / detaches ended ones. Pinned by the module's
   `dynamic-tap.smoke.test.ts`.
-- **Images**: the bot uses `ghcr.io/tinycloudlabs/vexa/bot:tc-be83d6c`; meeting-api and gateway remain on
-  `ghcr.io/tinycloudlabs/vexa/<component>:tc-e49f3f3`. All are pinned by digest in
+- **Images**: bot, meeting-api, and gateway use
+  `ghcr.io/tinycloudlabs/vexa/<component>:tc-36f0304`. The release commit includes the accepted runtime
+  changes plus the workflow's missing pnpm toolchain correction. All are pinned by digest in
   `infra/dstack/app-compose.yaml`. The bot workflow is `tinycloud-bot-image`; the older
   `ghcr.io/tinycloudlabs/vexa-bot` package was created while the fork was private, is stuck private,
   and is deprecated — nothing pushes to it);
@@ -279,8 +282,8 @@ Every image referenced by the dstack compose file, including the bot and agent i
 runtime, has an immutable digest. Postgres, Redis, Valkey, unchanged Vexa v0.12 components, CPU whisper, and the curl
 helper use the exact public linux/amd64 image configs already running on `ptx-dev`. The configured-but-unused
 Vexa agent images use the public `v012` manifest digests because no agent image is cached on the CVM. The
-accepted API and Signal defaults come from main commit `c3cdff63`; the accepted Vexa bot default comes
-from `be83d6cb`, while meeting-api and gateway remain on `e49f3f3`. Image override variables take complete
+accepted API default comes from main commit `0c5b5ae1`; the unchanged Signal-seat default remains at
+`c3cdff63`. The accepted Vexa images come from `36f03047`. Image override variables take complete
 references and must remain digest-pinned.
 
 MinIO is pinned to the exact releases running on `ptx-dev`: server

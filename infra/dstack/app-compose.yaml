@@ -27,7 +27,7 @@
 services:
   # ─── ours ────────────────────────────────────────────────────────────────────────────────────
   api:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:c3cdff63e429720a79903384509337f3e67caf3d@sha256:19407b6b1393a9ef17d867f656631d2d47535c75436cd2aa7c52cb9a94943244
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:0c5b5ae12a1ea417d39e55e2291963393480222b@sha256:574e7106f93cb1bf730a816ada12a2e3d2fa545b149a8dce2308b09ddb303005
     # VEXA_API_KEY is minted at first boot by `vexa-provision` (below) into a shared volume.
     command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal-capability/capability-key); exec bun run src/api/server.ts"]
     restart: unless-stopped
@@ -47,6 +47,10 @@ services:
       REDIS_URL: redis://redis:6379
       VEXA_BASE_URL: http://gateway:8000
       TRANSCRIPTION_PROVIDER: ${TRANSCRIPTION_PROVIDER:-vexa}
+      ATTRIBUTED_TRANSCRIPTION_ENABLED: "true"
+      TINFOIL_BASE_URL: ${TINFOIL_BASE_URL:-https://inference.tinfoil.sh}
+      TINFOIL_API_KEY: ${TINFOIL_API_KEY:-}
+      TINFOIL_MODEL: ${TINFOIL_MODEL:-voxtral-small-24b}
       # Platforms POST /v1/meetings accepts in the production stack. Keep this explicit so a
       # stale sealed environment cannot silently disable a shipped capture backend.
       ENABLED_PLATFORMS: jitsi,google_meet,signal
@@ -71,7 +75,7 @@ services:
     networks: [ptx, vexa]
 
   worker:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:c3cdff63e429720a79903384509337f3e67caf3d@sha256:19407b6b1393a9ef17d867f656631d2d47535c75436cd2aa7c52cb9a94943244
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:0c5b5ae12a1ea417d39e55e2291963393480222b@sha256:574e7106f93cb1bf730a816ada12a2e3d2fa545b149a8dce2308b09ddb303005
     command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && [ -s /run/signal-control-1/token ] && [ -s /run/signal-control-2/token ] && [ -s /run/signal-control-3/token ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && [ -s /run/signal-control-1/token ] && [ -s /run/signal-control-2/token ] && [ -s /run/signal-control-3/token ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal-capability/capability-key); exec bun run src/worker/index.ts"]
     restart: unless-stopped
     environment:
@@ -83,6 +87,7 @@ services:
       # fallback so an empty or silent meeting releases capacity sooner on Jitsi or Google Meet.
       VEXA_MAX_TIME_LEFT_ALONE_MS: ${VEXA_MAX_TIME_LEFT_ALONE_MS:-300000}
       TRANSCRIPTION_PROVIDER: ${TRANSCRIPTION_PROVIDER:-vexa}
+      ATTRIBUTED_TRANSCRIPTION_ENABLED: "true"
       TINFOIL_BASE_URL: ${TINFOIL_BASE_URL:-https://inference.tinfoil.sh}
       TINFOIL_API_KEY: ${TINFOIL_API_KEY:-}
       TINFOIL_MODEL: ${TINFOIL_MODEL:-voxtral-small-24b}
@@ -373,7 +378,7 @@ services:
   # image no container references. This no-op service makes compose pull the fork bot image at boot (~1.6 GB
   # compressed) and its exited container pins the image so the prune keeps it.
   bot-image-keeper:
-    image: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-be83d6c@sha256:b917c6ad56a26af34b78c0d4792c61953acb6f020a16758b6d860e68a0e733b6}
+    image: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-36f0304@sha256:2c6393d4cdb3b5b6172569e3c8b33b902c841beed5e1a548fddb8d9358200857}
     entrypoint: ["/bin/true"]
     restart: "no"
     network_mode: none
@@ -382,7 +387,7 @@ services:
     image: ${VEXA_RUNTIME_IMAGE:-vexaai/v012-runtime:v012@sha256:a1f6448fbb380b9433364e8b572ec25a12aa4f274bf403f1d83a89cbf5812f2d}
     group_add: ["0"]
     environment:
-      BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-be83d6c@sha256:b917c6ad56a26af34b78c0d4792c61953acb6f020a16758b6d860e68a0e733b6}
+      BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-36f0304@sha256:2c6393d4cdb3b5b6172569e3c8b33b902c841beed5e1a548fddb8d9358200857}
       AGENT_IMAGE: ${VEXA_AGENT_IMAGE:-vexaai/v012-agent-api:v012@sha256:6eb37574b33aab233aabbe5907e06e106bae44a403e5df781a436da8201a928d}
       AGENT_WORKER_IMAGE: ${VEXA_AGENT_WORKER_IMAGE:-vexaai/v012-agent-worker:v012@sha256:a1120b24765ff6b1c86c5f9ddee35b5e71fdbb9543a23b918b278373ad705022}
       REDIS_URL: redis://redis:6379/0
@@ -424,7 +429,7 @@ services:
     restart: unless-stopped
 
   meeting-api:
-    image: ghcr.io/tinycloudlabs/vexa/meeting-api:tc-e49f3f3@sha256:8cedc5943d943bee0dcb42a1be0478225b4ce9f4e9e6c53cd7a10507a2f794d3
+    image: ghcr.io/tinycloudlabs/vexa/meeting-api:tc-36f0304@sha256:2f6f0c162402f13b72569d1a9f5bfb792af75f88b60b9178db85d468405d19e2
     environment:
       DB_HOST: vexa-postgres
       DB_PORT: "5432"
@@ -440,7 +445,8 @@ services:
       TRANSCRIPTION_SERVICE_URL: http://whisper:8000
       TRANSCRIPTION_SERVICE_TOKEN: local-stt        # faster-whisper-server ignores auth; non-empty marks STT "configured"
       TRANSCRIPTION_MODEL: ""
-      TRANSCRIBE_ENABLED: "true"
+      TRANSCRIBE_ENABLED: "false"
+      ATTRIBUTED_AUDIO_ENABLED: "true"
       RECORDING_ENABLED: "true"                     # preserves Vexa recording playback; PTX does not re-transcribe it
       MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
@@ -470,7 +476,7 @@ services:
     restart: unless-stopped
 
   gateway:
-    image: ghcr.io/tinycloudlabs/vexa/gateway:tc-e49f3f3@sha256:01d9ecd1f126eb8e7943017bfff1e5fb6329c37ced46924925e73bb90630756d
+    image: ghcr.io/tinycloudlabs/vexa/gateway:tc-36f0304@sha256:0e82c34a3f5838d6f592c71d6e8bebe4e79d3d0414160261def07a57971ef238
     environment:
       ADMIN_API_URL: http://admin-api:8001
       MEETING_API_URL: http://meeting-api:8080
