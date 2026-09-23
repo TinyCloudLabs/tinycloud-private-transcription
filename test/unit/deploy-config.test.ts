@@ -91,7 +91,7 @@ describe("infra/dstack/app-compose.yaml", () => {
       minio: "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
       "minio-init": "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727",
       "admin-api": "vexaai/v012-admin-api:v012@sha256:4c702354384eafe3a933cd537a106b7c15067cfd368a5f6da1a6e675e7e03e04",
-      "bot-image-keeper": "ghcr.io/tinycloudlabs/vexa/bot:tc-e5482a8@sha256:3331c4ea30fa52c2070d5dc9e2887070df0c1ed17fa4be4cbb03e15afdd09ff9",
+      "bot-image-keeper": "ghcr.io/tinycloudlabs/vexa/bot:tc-36f0304@sha256:2c6393d4cdb3b5b6172569e3c8b33b902c841beed5e1a548fddb8d9358200857",
       runtime: "vexaai/v012-runtime:v012@sha256:a1f6448fbb380b9433364e8b572ec25a12aa4f274bf403f1d83a89cbf5812f2d",
       whisper: "fedirz/faster-whisper-server:latest-cpu@sha256:760e5e43d427dc6cfbbc4731934b908b7de9c7e6d5309c6a1f0c8c923a5b6030",
       "meeting-api": "ghcr.io/tinycloudlabs/vexa/meeting-api:tc-36f0304@sha256:2f6f0c162402f13b72569d1a9f5bfb792af75f88b60b9178db85d468405d19e2",
@@ -106,7 +106,7 @@ describe("infra/dstack/app-compose.yaml", () => {
 
     const runtime = serviceEnv("runtime");
     expect(runtime).toContain(
-      "BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-e5482a8@sha256:3331c4ea30fa52c2070d5dc9e2887070df0c1ed17fa4be4cbb03e15afdd09ff9}",
+      "BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-36f0304@sha256:2c6393d4cdb3b5b6172569e3c8b33b902c841beed5e1a548fddb8d9358200857}",
     );
     expect(runtime).toContain(
       "AGENT_IMAGE: ${VEXA_AGENT_IMAGE:-vexaai/v012-agent-api:v012@sha256:6eb37574b33aab233aabbe5907e06e106bae44a403e5df781a436da8201a928d}",
@@ -129,7 +129,7 @@ describe("infra/dstack/app-compose.yaml", () => {
 
   test("pins the Vexa bot, meeting-api, and gateway to the accepted fork commits and digests", () => {
     expect(compose).toContain(
-      "ghcr.io/tinycloudlabs/vexa/bot:tc-e5482a8@sha256:3331c4ea30fa52c2070d5dc9e2887070df0c1ed17fa4be4cbb03e15afdd09ff9",
+      "ghcr.io/tinycloudlabs/vexa/bot:tc-36f0304@sha256:2c6393d4cdb3b5b6172569e3c8b33b902c841beed5e1a548fddb8d9358200857",
     );
     expect(compose).toContain(
       "ghcr.io/tinycloudlabs/vexa/meeting-api:tc-36f0304@sha256:2f6f0c162402f13b72569d1a9f5bfb792af75f88b60b9178db85d468405d19e2",

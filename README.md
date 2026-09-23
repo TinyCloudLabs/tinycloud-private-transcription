@@ -234,9 +234,9 @@ their unchanged upstream v0.12 images.
   (`DynamicElementMixer`): the recorder starts immediately (even with zero audio elements) and a 2 s
   rescan (live-mixer parity) attaches new elements / detaches ended ones. Pinned by the module's
   `dynamic-tap.smoke.test.ts`.
-- **Images**: the validated bot uses `ghcr.io/tinycloudlabs/vexa/bot:tc-e5482a8`; meeting-api and
-  gateway use `ghcr.io/tinycloudlabs/vexa/<component>:tc-36f0304`, whose follow-up commit only fixes
-  the release workflow's missing pnpm toolchain. All are pinned by digest in
+- **Images**: bot, meeting-api, and gateway use
+  `ghcr.io/tinycloudlabs/vexa/<component>:tc-36f0304`. The release commit includes the accepted runtime
+  changes plus the workflow's missing pnpm toolchain correction. All are pinned by digest in
   `infra/dstack/app-compose.yaml`. The bot workflow is `tinycloud-bot-image`; the older
   `ghcr.io/tinycloudlabs/vexa-bot` package was created while the fork was private, is stuck private,
   and is deprecated — nothing pushes to it);
@@ -283,8 +283,7 @@ runtime, has an immutable digest. Postgres, Redis, Valkey, unchanged Vexa v0.12 
 helper use the exact public linux/amd64 image configs already running on `ptx-dev`. The configured-but-unused
 Vexa agent images use the public `v012` manifest digests because no agent image is cached on the CVM. The
 accepted API default comes from main commit `0c5b5ae1`; the unchanged Signal-seat default remains at
-`c3cdff63`. The accepted Vexa bot comes from `e5482a84`, while meeting-api and gateway come from the
-workflow-only follow-up `36f03047`. Image override variables take complete
+`c3cdff63`. The accepted Vexa images come from `36f03047`. Image override variables take complete
 references and must remain digest-pinned.
 
 MinIO is pinned to the exact releases running on `ptx-dev`: server
