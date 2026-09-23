@@ -6,17 +6,27 @@ import { isTerminal, mapVexaFailure, mapVexaStatus, type MeetingStatus } from ".
 import { VexaHttpError } from "../providers/vexa/client.ts";
 import { adaptVexaSegments, completionReasonOf } from "../providers/vexa/adapter.ts";
 import { toVexaPlatform } from "../providers/vexa/platform-map.ts";
-import { failMeeting, getMeetingById, storeTranscript, transition } from "../services/meetings.ts";
+import { completeMeetingWithTranscript, failMeeting, getMeetingById, transition } from "../services/meetings.ts";
 import { enqueueMeetingWebhook } from "../webhooks/dispatcher.ts";
 import { observeCapture, recordCapture } from "../services/capture.ts";
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { meetings } from "../db/schema.ts";
 import { normalizeSegments } from "../domain/transcript.ts";
 import { openSignalCapability } from "../providers/signal/capability.ts";
+import { stageAttributedManifest } from "../services/attributed-transcription.ts";
 import type { VexaTranscriptionResponse } from "../providers/vexa/types.ts";
 
 const MAX_START_ATTEMPTS = 3;
 const MAX_RECOVERY_ATTEMPTS = 3;
+const usesAttributedCapture = (ctx: AppContext, meeting: MeetingRow) => ctx.config.attributedTranscriptionEnabled && meeting.platform === "google_meet";
+// The only Vexa container shape we retain is its documented opaque runtime handle. Provider
+// responses are untrusted: URLs, text, and arbitrary identifiers must never become SQL data.
+const safeVexaBotId = (value: unknown): string | undefined =>
+  typeof value === "string" && value.length <= 128 && /^[a-z0-9][a-z0-9._:-]*$/i.test(value) && !/private|credential|secret|token|https?:/i.test(value) ? value : undefined;
+const safeProviderNativeId = (value: unknown): string | undefined =>
+  typeof value === "string" && /^[a-z0-9][a-z0-9.@-]{0,127}$/i.test(value) && !/private|credential|secret|token|https?:/i.test(value) ? value : undefined;
+const safeVexaMeetingId = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isSafeInteger(value) && value > 0 && value <= 2_147_483_647 ? value : undefined;
 
 /** Job: meeting.start — ask Vexa to send a bot. */
 export async function handleMeetingStart(ctx: AppContext, meetingId: string, attempt = 1): Promise<void> {
@@ -31,34 +41,45 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
       meeting_url: meeting.meetingUrl,
       bot_name: meeting.botName ?? undefined,
       language: meeting.language ?? undefined,
-      // Vexa remains the primary transcription provider.
-      transcribe_enabled: true,
-      // Retain audio only on deployments which have the recovery provider configured.
-      ...(ctx.transcriptRecovery ? { recording_enabled: true } : {}),
+      // Keep the established Vexa contract untouched unless the new producer was explicitly
+      // selected.  A disabled flag is a compatibility boundary, not a partial rollout.
+      ...(usesAttributedCapture(ctx, meeting)
+        ? { transcribe_enabled: false, recording_enabled: true, attributed_audio_enabled: true }
+        : { transcribe_enabled: true, ...(ctx.transcriptRecovery ? { recording_enabled: true } : {}) }),
       // Vexa otherwise applies its ten-minute deployment fallback. Pin every TinyCloud meeting to
       // our configurable audio-silence window. This can expire with humans still connected;
       // participant presence does not veto Vexa's silence verdict.
       automatic_leave: { max_time_left_alone: ctx.config.vexa.maxTimeLeftAloneMs },
     });
-    const vexaNativeMeetingId = created.native_meeting_id ?? meeting.vexaNativeMeetingId;
+    // Prefer our already-validated, request-derived identity. A provider-derived replacement is
+    // retained only when it is a narrow opaque identifier, never arbitrary returned text/URLs.
+    const vexaNativeMeetingId = created.native_meeting_id === meeting.vexaNativeMeetingId
+      ? meeting.vexaNativeMeetingId
+      : safeProviderNativeId(created.native_meeting_id) ?? meeting.vexaNativeMeetingId;
+    // Attributed audio is addressed by Vexa's numeric row id.  Do not put an untrusted provider
+    // handle in SQL and never fall back to a value which can later enter an API/webhook payload.
+    const vexaMeetingId = usesAttributedCapture(ctx, meeting) ? safeVexaMeetingId(created.id) : undefined;
+    if (usesAttributedCapture(ctx, meeting) && !vexaMeetingId) throw new ApiError("provider_unavailable", "Capture provider returned an invalid meeting identity.");
     const dispatched = await recordCapture(ctx, meeting, {
       silence_timeout_ms: ctx.config.vexa.maxTimeLeftAloneMs,
-      live_transcription_requested: true,
+      live_transcription_requested: !usesAttributedCapture(ctx, meeting),
     });
     const { meeting: updated, changed } = await transition(ctx, dispatched, "joining", {
-      vexaPlatform: created.platform ?? vexaPlatform,
+      // Platform is request-derived and allowlisted. A provider response must not replace it.
+      vexaPlatform,
       vexaNativeMeetingId,
-      vexaBotId: created.bot_container_id ?? String(created.id),
+      ...(vexaMeetingId ? { vexaMeetingId } : {}),
+      ...(safeVexaBotId(created.bot_container_id) ? { vexaBotId: safeVexaBotId(created.bot_container_id) } : {}),
     });
     if (changed) {
-      ctx.log.info("bot dispatched", { meetingId, botId: updated.vexaBotId, vexaMeetingId: created.id, platform: meeting.platform, provider: ctx.transcription.name, ...updated.captureDiagnostics });
+      ctx.log.info("bot dispatched", { meetingId, stage: "dispatch_admitted" });
       await ctx.queue.push({ type: "meeting.poll", meetingId }, ctx.config.vexa.pollIntervalMs);
       // Worker-side join deadline: Vexa's own awaiting_admission timeout is opaque; without this a
       // never-admitted bot leaves the meeting in joining/waiting_for_admission forever.
       await ctx.queue.push({ type: "meeting.join_deadline", meetingId }, ctx.config.joinTimeoutSeconds * 1000);
     } else if (updated.status === "cancelled" && vexaNativeMeetingId) {
       // Stopped while we were dispatching the bot: don't leave it orphaned in Vexa.
-      await ctx.vexa.stopBot(created.platform ?? vexaPlatform, vexaNativeMeetingId).catch(() => {});
+      await ctx.vexa.stopBot(vexaPlatform, vexaNativeMeetingId).catch(() => {});
     }
   } catch (e) {
     await handleStartError(ctx, meeting, e, attempt);
@@ -69,11 +90,11 @@ async function handleStartError(ctx: AppContext, meeting: MeetingRow, e: unknown
   const retryable = e instanceof ApiError && (e.code === "provider_unavailable" || e.code === "provider_timeout");
   const vexa5xx = e instanceof VexaHttpError && e.status >= 500;
   if ((retryable || vexa5xx) && attempt < MAX_START_ATTEMPTS) {
-    ctx.log.warn("vexa createBot failed, retrying", { meetingId: meeting.id, attempt, error: String(e) });
+    ctx.log.warn("vexa createBot failed, retrying", { meetingId: meeting.id, attempt, stage: "create", code: e instanceof ApiError ? e.code : "provider_error" });
     await ctx.queue.push({ type: "meeting.start", meetingId: meeting.id, attempt: attempt + 1 }, 1_000 * attempt);
     return;
   }
-  ctx.log.error("vexa createBot failed", { meetingId: meeting.id, error: String(e), detail: e instanceof VexaHttpError ? e.detail : undefined });
+  ctx.log.error("vexa createBot failed", { meetingId: meeting.id, stage: "create", code: e instanceof ApiError ? e.code : "provider_error" });
   const code = e instanceof ApiError ? e.code : e instanceof VexaHttpError && e.status === 409 ? "meeting_join_failed" : "provider_unavailable";
   const message =
     code === "meeting_join_failed"
@@ -101,7 +122,7 @@ export async function handleJoinDeadline(ctx: AppContext, meetingId: string): Pr
     await ctx.signal.leave(meeting.signalSessionId).catch(() => {});
   } else if (meeting.vexaPlatform && meeting.vexaNativeMeetingId) {
     await ctx.vexa.stopBot(meeting.vexaPlatform, meeting.vexaNativeMeetingId).catch((e) => {
-      if (!(e instanceof VexaHttpError && e.notFound)) ctx.log.warn("vexa stopBot failed at join deadline", { meetingId, error: String(e) });
+      if (!(e instanceof VexaHttpError && e.notFound)) ctx.log.warn("vexa stopBot failed at join deadline", { meetingId, stage: "join_deadline_stop", code: "provider_error" });
     });
   }
   const f =
@@ -125,12 +146,12 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
   } catch (e) {
     if (e instanceof VexaHttpError && e.notFound) {
       meeting = await recordCapture(ctx, meeting, { provider_record_missing_at: new Date().toISOString() });
-      ctx.log.warn("capture provider record missing", { meetingId, botId: meeting.vexaBotId });
+      ctx.log.warn("capture provider record missing", { meetingId, stage: "poll", code: "provider_not_found" });
       const { meeting: failed } = await failMeeting(ctx, meeting, "capture_failed", "The capture provider lost track of this meeting.");
       await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
       return;
     }
-    ctx.log.warn("vexa poll failed; will retry", { meetingId, error: String(e) });
+    ctx.log.warn("vexa poll failed; will retry", { meetingId, stage: "poll", code: e instanceof ApiError ? e.code : "provider_error" });
     await ctx.queue.push({ type: "meeting.poll", meetingId, recoveryAttempt }, ctx.config.vexa.pollIntervalMs);
     return;
   }
@@ -162,38 +183,42 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
     return;
   }
 
-  // Vexa owns the normal timeline and attribution. A retained recording is only read when that
-  // timeline is materially incomplete, so teardown losses can be recovered without replacing good
-  // Vexa speaker metadata.
+  if (usesAttributedCapture(ctx, meeting)) {
+    const vexaMeetingId = meeting.vexaMeetingId;
+    if (!vexaMeetingId) {
+      const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Attributed capture identity is unavailable.");
+      if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+      return;
+    }
+    ({ meeting } = await transition(ctx, meeting, "processing"));
+    try {
+      // Sealed producer evidence is the only enabled-path source of canonical text.
+      await stageAttributedManifest(ctx, meeting.id, vexaMeetingId, await ctx.vexa.getAttributedAudio(vexaMeetingId), vexa.data?.attributed_audio_capability);
+    } catch {
+      const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Attributed source evidence could not be reconciled.");
+      if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+    }
+    return;
+  }
+
+  // Feature-off is the pre-existing native/recovery finalization path.
   let segments: ReturnType<typeof adaptVexaSegments>;
   try {
-    segments = adaptVexaSegments(vexa); // deduped by turn, epoch → meeting-relative seconds
-  } catch (e) {
-    // A malformed Vexa transcript has to end the meeting here. The worker loop logs and drops a
-    // thrown job without re-queueing it, so letting this escape would strand the meeting in a
-    // non-terminal state with no webhook, forever.
-    ctx.log.error("vexa returned an invalid transcript", { meetingId, error: String(e) });
+    segments = adaptVexaSegments(vexa);
+  } catch {
     const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "The capture provider returned an invalid transcript.");
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
     return;
   }
   const hasLiveWords = segments.some((segment) => segment.text.trim().length > 0);
-  // Active-stage failure permits finalization but does not itself replace a complete Vexa-native
-  // transcript. The same material-incompleteness test selects recovery for every terminal shape.
   const recover = !!ctx.transcriptRecovery && isMateriallyIncomplete(vexa, segments);
-  // When recovery is unconfigured, nonempty native words remain the loss-preserving fallback even
-  // if their coverage is incomplete. Empty output still retains the mapped terminal failure below.
   if (!hasLiveWords && !recover) {
-    const failure = reason
-      ? mapVexaFailure(reason)
-      : { code: "capture_failed" as const, message: "No usable audio was captured for this meeting." };
+    const failure = reason ? mapVexaFailure(reason) : { code: "capture_failed" as const, message: "No usable audio was captured for this meeting." };
     const { meeting: failed, changed } = await failMeeting(ctx, meeting, failure.code, failure.message);
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
     return;
   }
-
   ({ meeting } = await transition(ctx, meeting, "processing"));
-  ctx.log.debug("vexa meeting completed; finalizing", { meetingId: meeting.id, vexaSegments: segments.length });
   await finalize(ctx, meeting, vexa, segments, recover, recoveryAttempt);
 }
 
@@ -225,7 +250,7 @@ async function handleSignalStart(ctx: AppContext, meeting: MeetingRow, attempt: 
       await ctx.signal.remove(created.sessionId).catch(() => {});
       return;
     }
-    ctx.log.info("signal capture dispatched", { meetingId: meeting.id, sessionId: created.sessionId, platform: "signal" });
+    ctx.log.info("signal capture dispatched", { meetingId: meeting.id, stage: "dispatch_admitted" });
     await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id }, ctx.config.vexa.pollIntervalMs);
     await ctx.queue.push({ type: "meeting.join_deadline", meetingId: meeting.id }, ctx.config.joinTimeoutSeconds * 1000);
   } catch (error) {
@@ -296,9 +321,7 @@ async function handleSignalPoll(ctx: AppContext, meeting: MeetingRow) {
     // when Signal Desktop joined and left between polls.
     if (meeting.status === "joining" || meeting.status === "waiting_for_admission") ({ meeting } = await transition(ctx, meeting, "in_progress"));
     ({ meeting } = await transition(ctx, meeting, "processing"));
-    await storeTranscript(ctx, meeting.id, transcript, "signal");
-    const { meeting: done, changed } = await transition(ctx, meeting, "completed", { signalCapability: null });
-    if (changed) await enqueueMeetingWebhook(ctx, done, "meeting.completed");
+    await completeMeetingWithTranscript(ctx, meeting.id, transcript, "signal", { signalCapability: null });
   } catch (error) {
     // Do not stringify worker errors here: a malformed local-worker error can include the call URL.
     ctx.log.warn("signal capture finalization failed", { meetingId: meeting.id });
@@ -327,9 +350,7 @@ async function finalize(
     if (!transcript.text.trim()) {
       throw new ApiError("transcription_failed", "Transcription provider returned no words");
     }
-    await storeTranscript(ctx, meeting.id, transcript, provider.name);
-    const { meeting: done, changed } = await transition(ctx, meeting, "completed");
-    if (changed) await enqueueMeetingWebhook(ctx, done, "meeting.completed");
+    await completeMeetingWithTranscript(ctx, meeting.id, transcript, provider.name);
   } catch (e) {
     if (recover && e instanceof RecoveryRecordingNotReadyError && recoveryAttempt < MAX_RECOVERY_ATTEMPTS) {
       ctx.log.warn("vexa recording is not ready; retrying recovery", { meetingId: meeting.id, recoveryAttempt });
@@ -340,12 +361,10 @@ async function finalize(
       return;
     }
     if (recover && vexaSegments.some((segment) => segment.text.trim().length > 0)) {
-      ctx.log.warn("recording recovery exhausted; preserving vexa transcript", { meetingId: meeting.id, recoveryAttempt, error: String(e) });
+      ctx.log.warn("recording recovery exhausted; preserving vexa transcript", { meetingId: meeting.id, recoveryAttempt, stage: "recording_recovery", code: "provider_error" });
       const transcript = await ctx.transcription.transcribe(input);
       if (transcript.text.trim()) {
-        await storeTranscript(ctx, meeting.id, transcript, ctx.transcription.name);
-        const { meeting: done, changed } = await transition(ctx, meeting, "completed");
-        if (changed) await enqueueMeetingWebhook(ctx, done, "meeting.completed");
+        await completeMeetingWithTranscript(ctx, meeting.id, transcript, ctx.transcription.name);
         return;
       }
     }
@@ -356,7 +375,7 @@ async function finalize(
       if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
       return;
     }
-    ctx.log.error("transcription failed", { meetingId: meeting.id, error: String(e) });
+    ctx.log.error("transcription failed", { meetingId: meeting.id, stage: "transcription", code: e instanceof ApiError ? e.code : "provider_error" });
     const { meeting: failed, changed } = await failMeeting(
       ctx,
       meeting,

@@ -1,7 +1,7 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, isNotNull, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { AppContext } from "../context.ts";
-import { meetings, transcripts, type MeetingRow, type TranscriptRow } from "../db/schema.ts";
+import { attributedBatches, attributedTranscriptionRuns, meetings, transcripts, type MeetingRow, type TranscriptRow } from "../db/schema.ts";
 import { ApiError, type ErrorCode, errorTypeFor } from "../domain/errors.ts";
 import { newMeetingId } from "../domain/ids.ts";
 import { detectPlatform, type Platform } from "../domain/platform.ts";
@@ -10,6 +10,7 @@ import type { NormalizedTranscript } from "../domain/transcript.ts";
 import { recordCapture } from "./capture.ts";
 import { VexaHttpError } from "../providers/vexa/client.ts";
 import { sealSignalCapability } from "../providers/signal/capability.ts";
+import { wakeWebhookDelivery, webhookDeliveryValues } from "../webhooks/dispatcher.ts";
 
 export interface CreateMeetingInput {
   meeting_url: string;
@@ -90,7 +91,11 @@ export async function createMeeting(
     // Lost a race on the idempotency key; return the winner.
     return createMeeting(ctx, projectId, input, idempotencyKey);
   }
-  await ctx.queue.push({ type: "meeting.start", meetingId: row.id });
+  // Redis is only a wakeup. The worker's durable meeting scanner will resume this queued row if
+  // the acknowledgement is lost or Redis is briefly unavailable.
+  await ctx.queue.push({ type: "meeting.start", meetingId: row.id }).catch(() => {
+    ctx.log.warn("meeting start wakeup deferred", { meetingId: row.id, stage: "queue_wakeup" });
+  });
   return { meeting: row, created: true };
 }
 
@@ -132,6 +137,7 @@ export async function transition(
   if (to === "completed") patch.completedAt = now;
   // The Signal fragment is only needed until a terminal worker result. It must not outlive capture.
   if (isTerminal(to) && meeting.platform === "signal") patch.signalCapability = null;
+  if (isTerminal(to)) return terminalTransition(ctx, meeting, to, patch);
   const [row] = await ctx.db
     .update(meetings)
     .set(patch)
@@ -139,8 +145,46 @@ export async function transition(
     .returning();
   // If another writer moved it first, re-read and report unchanged.
   if (!row) return { meeting: (await getMeetingById(ctx, meeting.id)) ?? meeting, changed: false };
-  ctx.log.info("meeting status changed", { meetingId: row.id, from: meeting.status, to, completionReason: row.captureDiagnostics?.completion_reason ?? null });
+  ctx.log.info("meeting status changed", { meetingId: row.id, stage: "status_transition" });
   return { meeting: row, changed: true };
+}
+
+/**
+ * A paid attributed request is durably marked on its batch before it leaves PostgreSQL. Terminal
+ * transitions serialize on the meeting row and wait for that marker to settle. This gives a real
+ * ordering fence without holding a database transaction open around a provider request.
+ */
+async function terminalTransition(
+  ctx: AppContext,
+  meeting: MeetingRow,
+  to: MeetingStatus,
+  patch: Partial<typeof meetings.$inferInsert>,
+): Promise<{ meeting: MeetingRow; changed: boolean }> {
+  for (;;) {
+    const result = await ctx.db.transaction(async (tx) => {
+      const [current] = await tx.select().from(meetings).where(eq(meetings.id, meeting.id)).for("update");
+      if (!current || current.status !== meeting.status || !canTransition(current.status as MeetingStatus, to)) {
+        return { meeting: current ?? meeting, changed: false, waiting: false };
+      }
+      const [run] = await tx.select().from(attributedTranscriptionRuns)
+        .where(eq(attributedTranscriptionRuns.meetingId, meeting.id)).for("update");
+      if (run) {
+        const active = await tx.select({ id: attributedBatches.id }).from(attributedBatches)
+          .where(and(eq(attributedBatches.meetingId, meeting.id), isNotNull(attributedBatches.dispatchToken))).for("update");
+        if (active.length) return { meeting: current, changed: false, waiting: true };
+      }
+      const [row] = await tx.update(meetings).set(patch)
+        .where(and(eq(meetings.id, meeting.id), eq(meetings.status, meeting.status))).returning();
+      return row ? { meeting: row, changed: true, waiting: false } : { meeting: current, changed: false, waiting: false };
+    });
+    if (!result.waiting) {
+      if (result.changed) ctx.log.info("meeting status changed", { meetingId: result.meeting.id, stage: "status_transition" });
+      return result;
+    }
+    // No transaction is held while a provider call is in flight. A settled request clears its
+    // marker atomically; an abandoned process is recovered by the durable claim reconciler.
+    await Bun.sleep(10);
+  }
 }
 
 export async function failMeeting(ctx: AppContext, meeting: MeetingRow, code: ErrorCode, message: string) {
@@ -168,17 +212,55 @@ export async function storeTranscript(
     .onConflictDoUpdate({ target: transcripts.meetingId, set: row });
 }
 
+/** Commit canonical text, terminal state, and completion delivery intent together. */
+export async function completeMeetingWithTranscript(
+  ctx: AppContext,
+  meetingId: string,
+  t: NormalizedTranscript,
+  provider: string,
+  extra: Partial<typeof meetings.$inferInsert> = {},
+): Promise<{ meeting: MeetingRow | null; changed: boolean }> {
+  const result = await ctx.db.transaction(async (tx) => {
+    const [current] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
+    if (!current || current.status !== "processing") return { meeting: current ?? null, changed: false, deliveryId: null };
+    const payload = { speakers: t.speakers, segments: t.segments, text: t.text };
+    const segmentsJson = sql`${JSON.stringify(payload)}::text::jsonb`;
+    await tx.insert(transcripts).values({ meetingId, language: t.language, durationSeconds: t.duration_seconds, segmentsJson, provider })
+      .onConflictDoUpdate({ target: transcripts.meetingId, set: { language: t.language, durationSeconds: t.duration_seconds, segmentsJson, provider } });
+    const [completed] = await tx.update(meetings).set({ status: "completed", completedAt: new Date(), ...extra })
+      .where(and(eq(meetings.id, meetingId), eq(meetings.status, "processing"))).returning();
+    if (!completed) return { meeting: null, changed: false, deliveryId: null };
+    const intent = webhookDeliveryValues(completed, "meeting.completed", {
+      meetingId, language: t.language, durationSeconds: t.duration_seconds, segmentsJson: payload, provider, createdAt: new Date(),
+    });
+    if (intent) await tx.execute(sql`
+      INSERT INTO webhook_deliveries (id, meeting_id, event_id, event_type, endpoint, payload, attempt, status, next_attempt_at)
+      VALUES (${intent.id}, ${intent.meetingId}, ${intent.eventId}, ${intent.eventType}, ${intent.endpoint}, ${intent.payload}, 0, 'pending', ${intent.nextAttemptAt})
+      ON CONFLICT (meeting_id, event_type) DO NOTHING
+    `);
+    return { meeting: completed, changed: true, deliveryId: intent?.id ?? null };
+  });
+  // The intent is already committed; a Redis outage must not turn completed canonical text into a
+  // failed meeting.  Worker reconciliation will wake this pending delivery later.
+  if (result.deliveryId) await wakeWebhookDelivery(ctx, result.deliveryId, new Date()).catch(() => {
+    ctx.log.warn("completion webhook wakeup deferred", { meetingId, stage: "webhook_wakeup" });
+  });
+  return result;
+}
+
 /** Idempotent stop: cancels before admission, otherwise asks Vexa to leave and moves to processing. */
 export async function stopMeeting(ctx: AppContext, meeting: MeetingRow): Promise<MeetingRow> {
   const status = meeting.status as MeetingStatus;
   if (isTerminal(status) || status === "processing") return meeting;
   meeting = await recordCapture(ctx, meeting, { stop_requested_at: new Date().toISOString(), stop_requested_by: "user" });
-  ctx.log.info("bot stop requested", { meetingId: meeting.id, status, botId: meeting.vexaBotId });
+  ctx.log.info("bot stop requested", { meetingId: meeting.id, stage: "stop_requested" });
   if (meeting.platform === "signal") await stopInSignal(ctx, meeting);
   else await stopInVexa(ctx, meeting);
   if (status === "in_progress") {
     const { meeting: updated } = await transition(ctx, meeting, "processing");
-    await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id });
+    await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id }).catch(() => {
+      ctx.log.warn("meeting poll wakeup deferred", { meetingId: meeting.id, stage: "queue_wakeup" });
+    });
     return updated;
   }
   const { meeting: updated } = await transition(ctx, meeting, "cancelled");
@@ -197,7 +279,9 @@ export async function recoverMeeting(ctx: AppContext, meeting: MeetingRow): Prom
     // Repairs the crash window between the failed → processing commit and Redis delivery. A
     // duplicate poll is safe: transcript storage is an upsert and webhooks require the winning
     // terminal state transition.
-    await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id });
+    await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id }).catch(() => {
+      ctx.log.warn("meeting recovery wakeup deferred", { meetingId: meeting.id, stage: "queue_wakeup" });
+    });
     return meeting;
   }
   if (status !== "failed") {
@@ -217,22 +301,11 @@ export async function recoverMeeting(ctx: AppContext, meeting: MeetingRow): Prom
     .where(and(eq(meetings.id, meeting.id), eq(meetings.projectId, meeting.projectId), eq(meetings.status, "failed")))
     .returning();
   if (!updated) return (await getMeetingById(ctx, meeting.id)) ?? meeting;
-  try {
-    await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id });
-  } catch (error) {
-    // Do not strand a meeting in processing when Redis is unavailable. A queue write is atomic; in
-    // the ambiguous response-lost case, a delivered poll sees the restored terminal state and exits,
-    // while the caller can safely retry recovery later.
-    await ctx.db
-      .update(meetings)
-      .set({
-        status: "failed",
-        errorCode: meeting.errorCode,
-        errorMessage: meeting.errorMessage,
-      })
-      .where(and(eq(meetings.id, meeting.id), eq(meetings.projectId, meeting.projectId), eq(meetings.status, "processing")));
-    throw error;
-  }
+  await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id }).catch(() => {
+    // The processing row is durable and the worker scanner handles both lost acknowledgements and
+    // a Redis outage. Returning it avoids falsely reporting a failed recovery to the caller.
+    ctx.log.warn("meeting recovery wakeup deferred", { meetingId: meeting.id, stage: "queue_wakeup" });
+  });
   return updated;
 }
 
@@ -242,14 +315,14 @@ async function stopInVexa(ctx: AppContext, meeting: MeetingRow) {
     await ctx.vexa.stopBot(meeting.vexaPlatform, meeting.vexaNativeMeetingId);
   } catch (e) {
     if (e instanceof VexaHttpError && e.notFound) return;
-    ctx.log.warn("vexa stopBot failed", { meetingId: meeting.id, error: String(e) });
+    ctx.log.warn("vexa stopBot failed", { stage: "stop_provider", code: "provider_unavailable" });
   }
 }
 
 async function stopInSignal(ctx: AppContext, meeting: MeetingRow) {
   if (!meeting.signalSessionId) return;
   try { await ctx.signal.leave(meeting.signalSessionId); }
-  catch (e) { ctx.log.warn("signal leave failed", { meetingId: meeting.id, error: String(e) }); }
+  catch { ctx.log.warn("signal leave failed", { stage: "stop_signal", code: "provider_unavailable" }); }
 }
 
 /**
@@ -257,27 +330,131 @@ async function stopInSignal(ctx: AppContext, meeting: MeetingRow) {
  * deletes PLANNED rows and answers 409 for anything the bot lifecycle touched — we log that ("retained
  * by capture provider") and still remove our data; purging Vexa's copy is a documented gap.
  */
+const DELETION_LEASE_MS = 15_000;
+
 export async function deleteMeeting(ctx: AppContext, meeting: MeetingRow): Promise<void> {
-  if (meeting.platform === "signal") {
-    if (!isTerminal(meeting.status as MeetingStatus)) await stopInSignal(ctx, meeting);
-    if (meeting.signalSessionId) await ctx.signal.remove(meeting.signalSessionId).catch(() => {});
-    await ctx.db.delete(meetings).where(eq(meetings.id, meeting.id));
-    return;
-  }
-  if (meeting.vexaPlatform && meeting.vexaNativeMeetingId) {
-    if (!isTerminal(meeting.status as MeetingStatus)) await stopInVexa(ctx, meeting);
+  const fenced = await fenceAttributedDeletion(ctx, meeting.id);
+  if (!fenced) return;
+  const { token: deletionToken, providerAlreadyAdmitted } = fenced;
+  let owns = true;
+  const renewLease = async () => {
+    if (!owns) return false;
     try {
-      await ctx.vexa.deleteMeeting(meeting.vexaPlatform, meeting.vexaNativeMeetingId);
-    } catch (e) {
-      if (e instanceof VexaHttpError && e.conflict) {
-        ctx.log.warn("vexa retains meeting row (409: bot lifecycle owns it)", { meetingId: meeting.id, vexaNativeMeetingId: meeting.vexaNativeMeetingId });
-      } else if (!(e instanceof VexaHttpError && e.notFound)) {
-        ctx.log.warn("vexa deleteMeeting failed", { meetingId: meeting.id, error: String(e) });
-        throw new ApiError("provider_unavailable", "Could not delete the meeting from the capture provider");
+      const renewed = await ctx.db.update(meetings).set({ deletionLeaseAt: new Date() })
+        .where(and(eq(meetings.id, meeting.id), eq(meetings.deletionToken, deletionToken), eq(meetings.deletionOwnerId, ctx.attributedWorkerId)))
+        .returning({ id: meetings.id });
+      owns = renewed.length === 1;
+    } catch {
+      // A failed renewal cannot prove ownership. Stop rather than letting a stale caller perform
+      // a provider operation or remove the successor's local row.
+      owns = false;
+    }
+    return owns;
+  };
+  const leaseTimer = setInterval(() => { void renewLease(); }, Math.max(1_000, Math.floor(DELETION_LEASE_MS / 3)));
+  try {
+    if (meeting.platform === "signal") {
+      if (!await renewLease()) return;
+      if (!isTerminal(meeting.status as MeetingStatus)) await stopInSignal(ctx, meeting);
+      if (!await renewLease()) return;
+      if (meeting.signalSessionId && !providerAlreadyAdmitted) {
+        const admitted = await admitProviderDeletion(ctx, meeting.id, deletionToken);
+        if (admitted === "lost") return;
+        if (admitted === "new") await ctx.signal.remove(meeting.signalSessionId);
+      }
+      await deleteLocalMeetingIfOwned(ctx, meeting.id, deletionToken);
+      return;
+    }
+    if (meeting.vexaPlatform && meeting.vexaNativeMeetingId) {
+      if (!await renewLease()) return;
+      if (!isTerminal(meeting.status as MeetingStatus)) await stopInVexa(ctx, meeting);
+      if (!await renewLease()) return;
+      if (!providerAlreadyAdmitted) {
+        const admitted = await admitProviderDeletion(ctx, meeting.id, deletionToken);
+        if (admitted === "lost") return;
+        if (admitted === "new") {
+          try {
+            await ctx.vexa.deleteMeeting(meeting.vexaPlatform, meeting.vexaNativeMeetingId);
+          } catch (e) {
+            if (e instanceof VexaHttpError && e.conflict && meeting.vexaMeetingId != null) {
+              // Attributed ranges are provider-owned evidence. Retain them until Vexa confirms
+              // deletion. A received conflict proves this request was rejected, so it is safe to
+              // release the admission rather than strand later attributed dispatches.
+              await releaseRejectedProviderDeletion(ctx, meeting.id, deletionToken);
+              throw new ApiError("provider_unavailable", "Could not confirm deletion from the capture provider");
+            } else if (e instanceof VexaHttpError && e.conflict) {
+              ctx.log.warn("vexa retains meeting row (409: bot lifecycle owns it)", { stage: "delete_provider", code: "provider_conflict" });
+            } else if (!(e instanceof VexaHttpError && e.notFound)) {
+              ctx.log.warn("vexa deleteMeeting failed", { stage: "delete_provider", code: "provider_unavailable" });
+              // A received non-409/404 HTTP response is an explicit rejection, unlike a timeout
+              // or transport loss. It is safe for this owner to release the unperformed delete
+              // fence so a later dispatch is not stranded.
+              if (e instanceof VexaHttpError) await releaseRejectedProviderDeletion(ctx, meeting.id, deletionToken);
+              throw new ApiError("provider_unavailable", "Could not delete the meeting from the capture provider");
+            }
+          }
+        }
       }
     }
+    await deleteLocalMeetingIfOwned(ctx, meeting.id, deletionToken);
+  } catch (error) {
+    // Unknown provider outcomes retain the admission marker and therefore stay fail-closed. A
+    // stale owner cannot clear its successor's fence, and a later owner reconciles the admitted
+    // deletion without sending it again.
+    if (!providerAlreadyAdmitted) await releaseUnadmittedDeletion(ctx, meeting.id, deletionToken);
+    throw error;
+  } finally {
+    clearInterval(leaseTimer);
   }
-  await ctx.db.delete(meetings).where(eq(meetings.id, meeting.id));
+}
+
+async function admitProviderDeletion(ctx: AppContext, meetingId: string, token: string): Promise<"new" | "already" | "lost"> {
+  return ctx.db.transaction(async (tx) => {
+    const [current] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
+    if (!current || current.deletionToken !== token || current.deletionOwnerId !== ctx.attributedWorkerId) return "lost";
+    if (current.deletionProviderAdmittedAt) return "already";
+    await tx.update(meetings).set({ deletionProviderAdmittedAt: new Date(), deletionLeaseAt: new Date() })
+      .where(and(eq(meetings.id, meetingId), eq(meetings.deletionToken, token), eq(meetings.deletionOwnerId, ctx.attributedWorkerId)));
+    return "new";
+  });
+}
+
+async function deleteLocalMeetingIfOwned(ctx: AppContext, meetingId: string, token: string): Promise<boolean> {
+  const deleted = await ctx.db.delete(meetings).where(and(eq(meetings.id, meetingId), eq(meetings.deletionToken, token), eq(meetings.deletionOwnerId, ctx.attributedWorkerId))).returning({ id: meetings.id });
+  return deleted.length === 1;
+}
+
+async function releaseUnadmittedDeletion(ctx: AppContext, meetingId: string, token: string): Promise<void> {
+  await ctx.db.update(meetings).set({ dispatchBlocked: false, deletionToken: null, deletionOwnerId: null, deletionLeaseAt: null })
+    .where(and(eq(meetings.id, meetingId), eq(meetings.deletionToken, token), eq(meetings.deletionOwnerId, ctx.attributedWorkerId), sql`${meetings.deletionProviderAdmittedAt} is null`));
+}
+
+async function releaseRejectedProviderDeletion(ctx: AppContext, meetingId: string, token: string): Promise<void> {
+  await ctx.db.update(meetings).set({ deletionProviderAdmittedAt: null })
+    .where(and(eq(meetings.id, meetingId), eq(meetings.deletionToken, token), eq(meetings.deletionOwnerId, ctx.attributedWorkerId)));
+}
+
+/** Claim deletion only after any admitted attributed request has settled. */
+async function fenceAttributedDeletion(ctx: AppContext, meetingId: string): Promise<{ token: string; providerAlreadyAdmitted: boolean } | null> {
+  const token = crypto.randomUUID();
+  for (;;) {
+    const result = await ctx.db.transaction(async (tx) => {
+      const [current] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
+      if (!current) return { token: null, waiting: false, providerAlreadyAdmitted: false };
+      // Another deletion owns the provider call while its renewable lease is fresh. A dead owner
+      // that crashed immediately after fencing is safely replaced under this row lock.
+      const leaseLive = !!current.deletionLeaseAt && current.deletionLeaseAt.getTime() > Date.now() - DELETION_LEASE_MS;
+      if (current.deletionToken && leaseLive) return { token: null, waiting: true, providerAlreadyAdmitted: false };
+      if (current.dispatchBlocked && !current.deletionToken) return { token: null, waiting: true, providerAlreadyAdmitted: false };
+      const active = await tx.select({ id: attributedBatches.id }).from(attributedBatches)
+        .where(and(eq(attributedBatches.meetingId, meetingId), isNotNull(attributedBatches.dispatchToken))).for("update");
+      if (active.length) return { token: null, waiting: true, providerAlreadyAdmitted: false };
+      await tx.update(meetings).set({ dispatchBlocked: true, deletionToken: token, deletionOwnerId: ctx.attributedWorkerId, deletionLeaseAt: new Date() }).where(eq(meetings.id, meetingId));
+      return { token, waiting: false, providerAlreadyAdmitted: !!current.deletionProviderAdmittedAt };
+    });
+    if (!result.waiting) return result.token ? { token: result.token, providerAlreadyAdmitted: result.providerAlreadyAdmitted } : null;
+    await Bun.sleep(10);
+  }
 }
 
 // ---- serialization ----

@@ -43,6 +43,7 @@ export interface VexaMeetingCreate {
   language?: string;
   task?: "transcribe" | "translate";
   transcribe_enabled?: boolean;
+  attributed_audio_enabled?: boolean;
   recording_enabled?: boolean;
   /** Vexa's per-meeting lifecycle limits. `max_time_left_alone` is milliseconds without remote participant audio. */
   automatic_leave?: { max_time_left_alone: number };
@@ -76,6 +77,8 @@ export interface VexaMeetingData {
   constructed_meeting_url?: string;
   last_error?: { reason?: string; exit_code?: number | null; error_details?: string } | null;
   sessions?: string[];
+  attributed_audio_capability?: { requested_version: 1; supported_version?: 1; status: "pending" | "supported" | "unsupported" };
+  /** v1 durable, capture-owned evidence. PTX may consume it only after closure. */
   [k: string]: unknown;
 }
 
@@ -131,6 +134,20 @@ export interface VexaTranscriptionResponse {
   notes?: string | null;
   data?: VexaMeetingData | null;
   segments: VexaTranscriptionSegment[];
+}
+
+/** GET /meetings/{numeric_id}/attributed-audio, producer contract v1. */
+export interface VexaAttributedAudioManifest {
+  version: 1;
+  meeting_id: string;
+  state: "open" | "closed";
+  clock_origin: "first_admitted_capture_epoch_ms";
+  clock_origin_ms: number;
+  ranges: Array<{
+    version: 1; meeting_id: string; sequence: number; idempotency_key: string; speaker_key: string; speaker_name: string; channel: number; turn_generation: number;
+    attribution: { source: "glow-bound" | "provisional" | "unresolved"; confidence: number }; clock_origin_ms: number; start_ms: number; end_ms: number; audio_duration_ms: number;
+    codec: "pcm_f32le"; sample_rate: number; channels: 1; byte_count: number; sha256: string; state: "sealed" | "uploaded" | "failed"; path?: string;
+  }>;
 }
 
 export interface VexaRecording {

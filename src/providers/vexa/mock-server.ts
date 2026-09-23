@@ -14,6 +14,7 @@ import type {
   VexaTranscriptionSegment,
   VexaCompletionReason,
 } from "./types.ts";
+import type { AttributedManifest } from "../transcription/attributed.ts";
 
 interface MockMeeting extends VexaMeetingResponse {
   segments: VexaTranscriptionSegment[];
@@ -24,6 +25,8 @@ interface MockMeeting extends VexaMeetingResponse {
   automatic_leave?: VexaMeetingCreate["automatic_leave"];
   recording_enabled?: boolean;
   recording?: { bytes: Uint8Array; contentType: string };
+  attributed_audio_manifest?: AttributedManifest;
+  attributed_audio?: Map<string, Uint8Array>;
   /** Deletable via DELETE /meetings (real Vexa: idle/scheduled rows only). */
   planned?: boolean;
 }
@@ -78,7 +81,8 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       end_time: null,
       completion_reason: null,
       failure_stage: null,
-      data: {},
+      data: body.attributed_audio_enabled && body.platform === "google_meet"
+        ? { attributed_audio_capability: { requested_version: 1, status: "pending" } } : {},
       created_at: now(),
       updated_at: now(),
       segments: [],
@@ -87,6 +91,7 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       meeting_url: body.meeting_url,
       transcribe_enabled: body.transcribe_enabled,
       recording_enabled: body.recording_enabled,
+      attributed_audio_manifest: undefined,
       automatic_leave: body.automatic_leave,
     };
     meetings.set(k, m);
@@ -101,6 +106,17 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
   });
 
   app.get("/meetings", (c) => c.json({ meetings: [...meetings.values()].map(strip) }));
+
+  app.get("/meetings/:id/attributed-audio", (c) => {
+    const m = [...meetings.values()].find((meeting) => meeting.id === Number(c.req.param("id")));
+    return m?.attributed_audio_manifest ? c.json(m.attributed_audio_manifest) : c.json({ detail: "Attributed audio not found" }, 404);
+  });
+  app.get("/meetings/:id/attributed-audio/ranges/:sequence", (c) => {
+    const m = [...meetings.values()].find((meeting) => meeting.id === Number(c.req.param("id")));
+    const path = c.req.path;
+    const bytes = m?.attributed_audio?.get(path);
+    return bytes ? new Response(bytes as unknown as ArrayBuffer, { headers: { "content-type": "application/octet-stream" } }) : c.json({ detail: "range not found" }, 404);
+  });
 
   app.get("/transcripts/:platform/:native_meeting_id", (c) => {
     const m = meetings.get(key(c.req.param("platform"), c.req.param("native_meeting_id")));
@@ -164,6 +180,9 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       recording_content_type?: string;
       start_time?: string | null;
       end_time?: string | null;
+      attributed_audio_manifest?: AttributedManifest;
+      attributed_audio_base64?: Record<string, string>;
+      attributed_audio_capability?: { requested_version: 1; supported_version: 1; status: "supported" };
     };
     if (body.recording_base64 !== undefined) m.recording = { bytes: new Uint8Array(Buffer.from(body.recording_base64, "base64")), contentType: body.recording_content_type ?? "audio/wav" };
     if (body.status) {
@@ -193,6 +212,11 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
     if (body.planned !== undefined) m.planned = body.planned;
     if (body.start_time !== undefined) m.start_time = body.start_time;
     if (body.end_time !== undefined) m.end_time = body.end_time;
+    if (body.attributed_audio_manifest !== undefined) m.attributed_audio_manifest = body.attributed_audio_manifest;
+    if (body.attributed_audio_capability !== undefined) m.data = { ...m.data, attributed_audio_capability: body.attributed_audio_capability };
+    if (body.attributed_audio_base64 !== undefined) {
+      m.attributed_audio = new Map(Object.entries(body.attributed_audio_base64).map(([path, data]) => [path, new Uint8Array(Buffer.from(data, "base64"))]));
+    }
     m.updated_at = now();
     return c.json(strip(m));
   });

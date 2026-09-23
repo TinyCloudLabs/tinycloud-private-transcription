@@ -60,3 +60,21 @@ test("bad api key -> VexaHttpError 401", async () => {
   const bad = new VexaClient({ baseUrl: mock.baseUrl, apiKey: "nope" });
   await expect(bad.botStatus()).rejects.toMatchObject({ status: 401 });
 });
+
+test("provider identifiers and bodies never enter Vexa errors or stacks", async () => {
+  const marker = "PRIVATE_TRANSCRIPT https://private.example/token";
+  const hostile = new VexaClient({
+    baseUrl: "http://127.0.0.1:1",
+    apiKey: "PRIVATE_AUTHORIZATION",
+    fetch: (async () => new Response(marker, { status: 502 })) as unknown as typeof fetch,
+  });
+  try {
+    await hostile.getTranscript("jitsi", marker);
+    throw new Error("expected Vexa request to fail");
+  } catch (error) {
+    expect(error).toBeInstanceOf(VexaHttpError);
+    expect(String(error)).not.toContain("PRIVATE_TRANSCRIPT");
+    expect((error as Error).stack ?? "").not.toContain("PRIVATE_TRANSCRIPT");
+    expect(String(error)).not.toContain("PRIVATE_AUTHORIZATION");
+  }
+});

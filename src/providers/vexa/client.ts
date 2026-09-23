@@ -8,6 +8,7 @@ import type {
   VexaRecordingMasterResponse,
   VexaStopBotResponse,
   VexaDeleteMeetingResponse,
+  VexaAttributedAudioManifest,
 } from "./types.ts";
 
 export interface VexaClientOptions {
@@ -17,14 +18,10 @@ export interface VexaClientOptions {
   fetch?: typeof fetch;
 }
 
-/** Thrown for any non-2xx from Vexa; carries status + raw detail for logs only (never surfaced to clients). */
+/** Thrown for any non-2xx from Vexa. Provider paths and bodies are deliberately never retained. */
 export class VexaHttpError extends Error {
-  constructor(
-    readonly status: number,
-    readonly detail: string,
-    readonly path: string,
-  ) {
-    super(`Vexa ${path} -> ${status}`);
+  constructor(readonly status: number) {
+    super(`Vexa request failed with HTTP ${status}`);
   }
   get notFound() {
     return this.status === 404;
@@ -68,8 +65,10 @@ export class VexaClient {
       );
     }
     if (!res.ok) {
-      const detail = await res.text().catch(() => "");
-      throw new VexaHttpError(res.status, detail, path);
+      // Error pages regularly echo meeting URLs, native IDs, and authorization failures. Do not
+      // place any provider-controlled response or request identity on an Error object/stack.
+      await res.body?.cancel().catch(() => {});
+      throw new VexaHttpError(res.status);
     }
     return res;
   }
@@ -89,6 +88,12 @@ export class VexaClient {
       "GET",
       `/transcripts/${encodeURIComponent(platform)}/${encodeURIComponent(nativeMeetingId)}`,
     );
+  }
+
+  /** Contract endpoint. Range URLs are deliberately resolved only by this authenticated client. */
+  getAttributedAudio(meetingId: number) {
+    if (!Number.isSafeInteger(meetingId) || meetingId <= 0) throw new ApiError("transcription_failed", "Invalid Vexa meeting identifier");
+    return this.request<VexaAttributedAudioManifest>("GET", `/meetings/${meetingId}/attributed-audio`);
   }
 
   /** DELETE /bots/{p}/{id} → {status:"stopping", meeting_id, native_meeting_id}; 404 once no bot is active. */

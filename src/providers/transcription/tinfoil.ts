@@ -1,6 +1,7 @@
 import { ApiError } from "../../domain/errors.ts";
 import { normalizeSegments, type NormalizedTranscript } from "../../domain/transcript.ts";
-import { decodeToPcm, rmsDbfs, sliceToWav, type Pcm16 } from "./audio.ts";
+import { decodeToPcm, rmsDbfs, sliceToWav, pcmToWav, type Pcm16 } from "./audio.ts";
+import type { AttributedBatch } from "./attributed.ts";
 import type { TranscriptionInput, TranscriptionProvider } from "./types.ts";
 
 export interface TinfoilOptions {
@@ -24,6 +25,15 @@ interface TinfoilResponse {
   usage?: { type?: string; seconds?: number };
 }
 
+// Provider metadata is untrusted and may become canonical API/webhook data. Keep only a compact
+// BCP-47-like identifier; text is separately bounded by the transcription pipeline.
+export function safeTinfoilLanguage(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length > 35) return undefined;
+  return /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,3}$/.test(value)
+      && !/private|credential|secret|token|password|api[_-]?key|bearer|authorization/i.test(value)
+    ? value : undefined;
+}
+
 export interface TinfoilStats {
   audio_seconds: number;
   chunks: number;
@@ -39,6 +49,26 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
 
   constructor(private readonly opts: TinfoilOptions) {
     this.fetchImpl = opts.fetch ?? fetch;
+  }
+
+  /** Text-only operation for a Vexa-owned, already-attributed PCM batch. */
+  async transcribeAttributedPcm(bytes: Uint8Array, batch: AttributedBatch, language: string | null) {
+    const first = batch.ranges[0];
+    if (!first || first.codec !== "pcm_f32le" || first.channels !== 1) throw new ApiError("transcription_failed", "Unsupported attributed audio codec");
+    const input = new Float32Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 4));
+    let energy = 0;
+    const pcm16 = new Int16Array(input.length);
+    for (let i = 0; i < input.length; i++) {
+      const sample = input[i]!;
+      if (!Number.isFinite(sample)) throw new ApiError("transcription_failed", "Attributed audio contains non-finite PCM samples");
+      const value = Math.max(-1, Math.min(1, sample)); energy += value * value; pcm16[i] = value * 32767;
+    }
+    if (!input.length || 20 * Math.log10(Math.sqrt(energy / input.length) || 0) < (this.opts.silenceDbfs ?? -60)) throw new ApiError("transcription_failed", "Attributed audio is silent");
+    // An attributed request is durably claimed before this method is entered.  Retrying after a
+    // transport error can create a second billed request whose result cannot be attributed to the
+    // persisted claim, so this deliberately bypasses postWithRetry.
+    const body = await this.post(pcmToWav(pcm16, first.sample_rate), `${batch.idempotency_key}.wav`, language);
+    return { text: body.text, language: body.language };
   }
 
   async transcribe(input: TranscriptionInput): Promise<NormalizedTranscript> {
@@ -139,7 +169,8 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     if (!body || typeof body !== "object" || typeof (body as Record<string, unknown>).text !== "string") {
       throw new ApiError("transcription_failed", "Transcription provider returned no transcription text");
     }
-    return body as TinfoilResponse;
+    const parsed = body as TinfoilResponse;
+    return { text: parsed.text, ...(safeTinfoilLanguage(parsed.language) ? { language: safeTinfoilLanguage(parsed.language) } : {}) };
   }
 }
 

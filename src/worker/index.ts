@@ -1,18 +1,28 @@
 import { createContext, type AppContext } from "../context.ts";
-import { deliverWebhook } from "../webhooks/dispatcher.ts";
+import { inArray } from "drizzle-orm";
+import { meetings } from "../db/schema.ts";
+import { deliverWebhook, reconcileWebhookDeliveries } from "../webhooks/dispatcher.ts";
 import { handleJoinDeadline, handleMeetingPoll, handleMeetingStart } from "./meeting-job.ts";
+import { finalizeAttributedRun, processAttributedBatch, reconcileAttributedRuns, recordAttributedWorkerReadiness } from "../services/attributed-transcription.ts";
+import { TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
 import type { Job } from "./queue.ts";
 
-export async function processJob(ctx: AppContext, job: Job): Promise<void> {
+export type JobOutcome = "processed" | "noop" | "deferred";
+
+export async function processJob(ctx: AppContext, job: Job): Promise<JobOutcome> {
   switch (job.type) {
     case "meeting.start":
-      return handleMeetingStart(ctx, job.meetingId, job.attempt ?? 1);
+      await handleMeetingStart(ctx, job.meetingId, job.attempt ?? 1); return "processed";
     case "meeting.poll":
-      return handleMeetingPoll(ctx, job.meetingId, job.recoveryAttempt ?? 1);
+      await handleMeetingPoll(ctx, job.meetingId, job.recoveryAttempt ?? 1); return "processed";
     case "meeting.join_deadline":
-      return handleJoinDeadline(ctx, job.meetingId);
+      await handleJoinDeadline(ctx, job.meetingId); return "processed";
+    case "attributed.batch":
+      return processAttributedBatch(ctx, job.meetingId, job.batchId);
+    case "attributed.finalize":
+      return (await finalizeAttributedRun(ctx, job.meetingId)) ? "processed" : "noop";
     case "webhook.deliver":
-      return deliverWebhook(ctx, job.deliveryId);
+      await deliverWebhook(ctx, job.deliveryId, job.claimToken); return "processed";
   }
 }
 
@@ -20,20 +30,137 @@ export interface WorkerHandle {
   stop(): Promise<void>;
 }
 
-/** Runs the queue loop until stopped. Errors in a job are logged and never crash the loop. */
-export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number } = {}): WorkerHandle {
+/** Runs the queue loop until stopped. Errors are retried without turning this process into an idle worker. */
+export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number; heartbeatIntervalMs?: number } = {}): WorkerHandle {
   let running = true;
+  const attributedEnabled = ctx.config.attributedTranscriptionEnabled;
+  let reconciliationInFlight = false;
+  let nextReconciliationAt = 0;
+  let reconciliationFailures = 0;
+  let queueFailures = 0;
+  let attributedJobFailures = 0;
+  let heartbeatInFlight = false;
+  let lastWebhookReconciliation = 0;
+
+  // Redis is a wakeup transport, not the work ledger. This repairs lost enqueue acknowledgements
+  // for Signal and the feature-off path without relaxing attributed publication's own ledger.
+  const reconcileMeetingWakeups = async () => {
+    const rows = await ctx.db.select().from(meetings).where(inArray(meetings.status, [
+      "queued", "joining", "waiting_for_admission", "in_progress", "processing",
+    ]));
+    for (const meeting of rows) {
+      if (attributedEnabled && meeting.platform === "google_meet" && meeting.status === "processing") continue;
+      const job = meeting.status === "queued"
+        ? { type: "meeting.start" as const, meetingId: meeting.id }
+        : { type: "meeting.poll" as const, meetingId: meeting.id };
+      await ctx.queue.push(job).catch(() => {});
+    }
+  };
+
+  const reconcileAttributed = async () => {
+    if (!attributedEnabled || reconciliationInFlight || Date.now() < nextReconciliationAt) return;
+    reconciliationInFlight = true;
+    try {
+      if (!ctx.attributedReconciliationReady) await recordAttributedWorkerReadiness(ctx, false, reconciliationFailures ? "reconciliation_failed" : "startup");
+      if (!(ctx.transcriptRecovery instanceof TinfoilTranscriptionProvider)) {
+        ctx.attributedReconciliationReady = false;
+        ctx.attributedWorkerHealthy = false;
+        await recordAttributedWorkerReadiness(ctx, false, "reconciliation_failed");
+        return;
+      }
+      await reconcileAttributedRuns(ctx);
+      ctx.attributedReconciliationReady = true;
+      reconciliationFailures = 0;
+      nextReconciliationAt = 0;
+      await recordAttributedWorkerReadiness(ctx, ctx.attributedWorkerHealthy && queueFailures < 3 && attributedJobFailures < 3, "reconciled");
+    } catch {
+      reconciliationFailures++;
+      ctx.attributedReconciliationReady = false;
+      // Keep consuming independent Signal/feature-off work.  The exponential bound prevents a
+      // bad database from becoming a hot loop while guaranteeing a future recovery attempt.
+      nextReconciliationAt = Date.now() + Math.min(30_000, 250 * 2 ** Math.min(reconciliationFailures, 7));
+      ctx.log.error("attributed reconciliation failed", { stage: "startup_reconciliation", attempt: reconciliationFailures });
+      await recordAttributedWorkerReadiness(ctx, false, "reconciliation_failed").catch(() => {});
+    } finally {
+      reconciliationInFlight = false;
+    }
+  };
+
+  const heartbeat = async () => {
+    if (!running || heartbeatInFlight) return;
+    heartbeatInFlight = true;
+    try {
+      await reconcileAttributed();
+      await reconcileMeetingWakeups();
+      if (attributedEnabled) {
+        await recordAttributedWorkerReadiness(ctx, ctx.attributedWorkerHealthy && ctx.attributedReconciliationReady && queueFailures < 3 && attributedJobFailures < 3, "heartbeat");
+      }
+      if (Date.now() - lastWebhookReconciliation >= 5_000) {
+        await reconcileWebhookDeliveries(ctx);
+        lastWebhookReconciliation = Date.now();
+      }
+    } catch {
+      // A failed durable heartbeat is itself fail-closed: its timestamp cannot be refreshed.
+      if (attributedEnabled) await recordAttributedWorkerReadiness(ctx, false, "reconciliation_failed").catch(() => {});
+      ctx.log.error("worker heartbeat failed", { stage: "heartbeat" });
+    } finally {
+      heartbeatInFlight = false;
+    }
+  };
+
   const loop = (async () => {
+    if (attributedEnabled) ctx.attributedReconciliationReady = false;
+    // Do not await startup reconciliation: a transient attributed failure must never prevent
+    // feature-off or Signal jobs from being consumed by this same worker.
+    void reconcileAttributed();
+    void heartbeat();
+    // 5 seconds leaves generous margin under the 15-second API staleness window while this timer
+    // remains independent of a long-running queue job.
+    const heartbeatTimer = setInterval(() => { void heartbeat(); }, opts.heartbeatIntervalMs ?? 5_000);
     while (running) {
       let job: Job | null = null;
       try {
         job = await ctx.queue.pop(opts.popTimeoutSec ?? 1);
-        if (job) await processJob(ctx, job);
+        queueFailures = 0;
       } catch (e) {
-        ctx.log.error("job failed", { job, error: String(e) });
+        queueFailures++;
+        if (attributedEnabled && queueFailures >= 3) await recordAttributedWorkerReadiness(ctx, false, "reconciliation_failed").catch(() => {});
+        ctx.log.error("queue pop failed", { stage: "queue_pop", attempt: queueFailures });
+        await Bun.sleep(250);
+        continue;
+      }
+      if (!job) continue;
+      try {
+        if (attributedEnabled && !ctx.attributedReconciliationReady && job.type.startsWith("attributed.")) {
+          await ctx.queue.push(job, 1_000);
+        } else {
+          const outcome = await processJob(ctx, job);
+          if (job.type.startsWith("attributed.")) {
+            // Only a real durable batch/finalization result can heal a failing publisher. Queue
+            // duplicates, missing meetings, and deferred configuration are intentionally neutral.
+            if (outcome === "processed") {
+              const recovered = attributedJobFailures >= 3;
+              attributedJobFailures = 0;
+              if (recovered && attributedEnabled && ctx.attributedReconciliationReady) {
+                await recordAttributedWorkerReadiness(ctx, ctx.attributedWorkerHealthy, "heartbeat");
+              }
+            }
+          }
+        }
+      } catch (e) {
+        if (job.type.startsWith("attributed.") || (attributedEnabled && (job.type === "meeting.poll" || job.type === "meeting.start"))) {
+          if (job.type.startsWith("attributed.")) {
+            attributedJobFailures++;
+            if (attributedJobFailures >= 3) await recordAttributedWorkerReadiness(ctx, false, "reconciliation_failed").catch(() => {});
+          }
+          ctx.log.error("attributed job failed", { stage: job.type, code: "job_error" });
+        }
+        else ctx.log.error("job failed", { stage: job.type, code: "job_error" });
         await Bun.sleep(250);
       }
     }
+    clearInterval(heartbeatTimer);
+    if (attributedEnabled) await recordAttributedWorkerReadiness(ctx, false, "stopped").catch(() => {});
   })();
   return {
     async stop() {

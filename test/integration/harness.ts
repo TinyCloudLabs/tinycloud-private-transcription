@@ -47,6 +47,9 @@ export async function startHarness(
     signalCapabilityKey?: string;
     signalMaxConcurrentCalls?: number;
     transcriptionProvider?: TranscriptionProviderName;
+    attributedTranscriptionEnabled?: boolean;
+    workerHeartbeatIntervalMs?: number;
+    workerPopTimeoutSec?: number;
   } = {},
 ): Promise<Harness> {
   const vexa = startMockVexa(0);
@@ -60,6 +63,7 @@ export async function startHarness(
       ? { signal: { ...baseConfig.signal, ...(opts.signalCapabilityKey ? { capabilityKey: opts.signalCapabilityKey } : {}), ...(opts.signalMaxConcurrentCalls !== undefined ? { maxConcurrentCalls: opts.signalMaxConcurrentCalls } : {}) } }
       : {}),
     ...(opts.transcriptionProvider ? { transcriptionProvider: opts.transcriptionProvider } : {}),
+    ...(opts.attributedTranscriptionEnabled !== undefined ? { attributedTranscriptionEnabled: opts.attributedTranscriptionEnabled } : {}),
   };
   const db = await runMigrations(config.databaseUrl);
   await db.execute(sql`truncate table webhook_deliveries, transcripts, meetings, api_keys, projects cascade`);
@@ -95,7 +99,10 @@ export async function startHarness(
   });
   webhook.url = `http://127.0.0.1:${receiver.port}/hook`;
 
-  const worker: WorkerHandle = startWorker(ctx, { popTimeoutSec: 1 });
+  const worker: WorkerHandle = startWorker(ctx, {
+    popTimeoutSec: opts.workerPopTimeoutSec ?? 1,
+    ...(opts.workerHeartbeatIntervalMs !== undefined ? { heartbeatIntervalMs: opts.workerHeartbeatIntervalMs } : {}),
+  });
 
   const api: Harness["api"] = async (path, init = {}) => {
     const { json, key: k, ...rest } = init;

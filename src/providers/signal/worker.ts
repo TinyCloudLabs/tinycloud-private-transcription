@@ -83,7 +83,7 @@ export function createSignalWorkerApp(opts: SignalWorkerOptions) {
 
   const live = () => reservations + [...seats.values()].filter((s) => !s.terminal).length;
   const readiness = async () => {
-    const value = await opts.backend.preflight().catch((e) => ({ ready: false, reason: String(e) }));
+    const value = await opts.backend.preflight().catch(() => ({ ready: false, reason: "backend_unavailable" }));
     if (opts.healthPath) {
       try {
         mkdirSync(dirname(opts.healthPath), { recursive: true });
@@ -97,8 +97,8 @@ export function createSignalWorkerApp(opts: SignalWorkerOptions) {
           capacity: { running: live(), max: opts.maxConcurrentCalls },
         }) + "\n", { mode: 0o644 });
         renameSync(next, opts.healthPath);
-      } catch (e) {
-        opts.log.warn("signal readiness record failed", { error: String(e) });
+      } catch {
+        opts.log.warn("signal readiness record failed", { stage: "signal_readiness", code: "readiness_write_failed" });
       }
     }
     return value;
@@ -129,10 +129,10 @@ export function createSignalWorkerApp(opts: SignalWorkerOptions) {
         seat.terminalAt = Date.now();
         opts.log.info("signal seat released", { sessionId: seat.id, meetingId: seat.meetingId, status: snapshot.status });
         return snapshot;
-      } catch (e) {
+      } catch {
         // Fail closed: an unproven release must continue to occupy the only linked Desktop seat.
         // A later observe/delete retries cleanup rather than admitting a second call.
-        opts.log.warn("signal seat cleanup failed", { sessionId: seat.id, meetingId: seat.meetingId, error: String(e) });
+        opts.log.warn("signal seat cleanup failed", { sessionId: seat.id, meetingId: seat.meetingId, stage: "signal_cleanup", code: "backend_error" });
         seat.cleanup = null;
         return { status: "failed", errorCode: "capture_failed" };
       }
@@ -146,8 +146,8 @@ export function createSignalWorkerApp(opts: SignalWorkerOptions) {
     let snapshot: SignalCaptureSnapshot;
     try {
       snapshot = await seat.session.snapshot();
-    } catch (e) {
-      opts.log.warn("signal seat snapshot failed", { sessionId: seat.id, meetingId: seat.meetingId, error: String(e) });
+    } catch {
+      opts.log.warn("signal seat snapshot failed", { sessionId: seat.id, meetingId: seat.meetingId, stage: "signal_snapshot", code: "backend_error" });
       return await settle(seat, { status: "failed", errorCode: "capture_failed" });
     }
     if (snapshot.status === "completed" || snapshot.status === "failed") return await settle(seat, snapshot);
@@ -189,8 +189,8 @@ export function createSignalWorkerApp(opts: SignalWorkerOptions) {
       let session: SignalCallSession;
       try {
         session = await opts.backend.open(body);
-      } catch (e) {
-        opts.log.error("signal capture could not open a call", { meetingId: body.meetingId, error: String(e) });
+      } catch {
+        opts.log.error("signal capture could not open a call", { meetingId: body.meetingId, stage: "signal_start", code: "backend_error" });
         return { ok: false, status: 502, code: "capture_failed", message: "Signal Desktop could not open the call." };
       }
       seats.set(id, { id, meetingId: body.meetingId, session, startedAt: Date.now(), terminal: null, terminalAt: 0, cleanup: null, observation: null });
@@ -266,7 +266,7 @@ export function createSignalWorkerApp(opts: SignalWorkerOptions) {
     const seat = seats.get(c.req.param("id"));
     if (!seat) return c.json({ error: { code: "not_found", message: "No such capture session." } }, 404);
     if (seat.terminal) return c.body(null, 204); // idempotent
-    await seat.session.leave().catch((e) => opts.log.warn("signal seat leave failed", { sessionId: seat.id, meetingId: seat.meetingId, error: String(e) }));
+    await seat.session.leave().catch(() => opts.log.warn("signal seat leave failed", { sessionId: seat.id, meetingId: seat.meetingId, stage: "signal_leave", code: "backend_error" }));
     // Publish the backend's post-leave verdict immediately so PTX's next poll is terminal.
     await settle(seat, await seat.session.snapshot().catch(() => ({ status: "failed", errorCode: "capture_failed" }) as SignalCaptureSnapshot));
     return c.body(null, 204);

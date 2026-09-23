@@ -2,9 +2,21 @@ import { sql } from "drizzle-orm";
 import { readFileSync } from "node:fs";
 import { Hono } from "hono";
 import type { AppContext } from "../../context.ts";
+import { TinfoilTranscriptionProvider } from "../../providers/transcription/tinfoil.ts";
+import { attributedWorkerReady } from "../../services/attributed-transcription.ts";
 
 export function healthRoutes(ctx: AppContext) {
   const r = new Hono();
+  // Compose uses this endpoint to decide whether the API has started and finished its migrations.
+  // Publication readiness deliberately remains on /health: the worker is started after this
+  // liveness check, so making it a startup dependency would create a bootstrap cycle.
+  r.get("/health/live", async (c) => {
+    const [postgres, redis] = await Promise.all([
+      ctx.db.execute(sql`select 1`).then(() => true, () => false),
+      ctx.redis.ping().then(() => true, () => false),
+    ]);
+    return c.json({ status: postgres && redis ? "ok" : "error", checks: { postgres, redis } }, postgres && redis ? 200 : 503);
+  });
   r.get("/health", async (c) => {
     const [postgres, redis, vexa] = await Promise.all([
       ctx.db.execute(sql`select 1`).then(() => true, () => false),
@@ -17,7 +29,14 @@ export function healthRoutes(ctx: AppContext) {
       ctx.config.signal.maxConcurrentCalls,
     );
     const core = postgres && redis;
-    const status = !core ? "error" : vexa.ok && signal.ready ? "ok" : "degraded";
+    const attributedProviderReady = ctx.transcriptRecovery instanceof TinfoilTranscriptionProvider && await attributedWorkerReady(ctx);
+    const attributed = {
+      enabled: ctx.config.attributedTranscriptionEnabled,
+      ready: !ctx.config.attributedTranscriptionEnabled || attributedProviderReady,
+      reason: ctx.config.attributedTranscriptionEnabled && !attributedProviderReady ? (ctx.transcriptRecovery instanceof TinfoilTranscriptionProvider ? "Attributed transcription reconciliation is incomplete" : "Attributed transcription provider is not configured") : null,
+    };
+    const ready = core && vexa.ok && signal.ready && attributed.ready;
+    const status = !core ? "error" : ready ? "ok" : "degraded";
     return c.json(
       {
         status,
@@ -28,10 +47,13 @@ export function healthRoutes(ctx: AppContext) {
           // running = bots Vexa reports as live (null when Vexa is unreachable); max = provisioned ceiling.
           bot_capacity: { running: vexa.running_bots, max: ctx.config.vexa.maxConcurrentBots },
           transcription_provider: ctx.transcription.name,
+          attributed_transcription: attributed,
           signal,
         },
       },
-      core ? 200 : 503,
+      // Status-only deployment checks must fail closed when the enabled attributed path cannot
+      // safely publish (including missing Tinfoil/recovery configuration).
+      ready ? 200 : 503,
     );
   });
   return r;

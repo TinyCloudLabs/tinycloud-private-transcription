@@ -40,6 +40,12 @@ describe("auth", () => {
 });
 
 describe("health", () => {
+  test("startup liveness does not wait for attributed publication readiness", async () => {
+    const r = await h.api("/health/live", { key: null });
+    expect(r.status).toBe(200);
+    expect(await r.json()).toEqual({ status: "ok", checks: { postgres: true, redis: true } });
+  });
+
   test("GET /health", async () => {
     const r = await h.api("/health", { key: null });
     expect(r.status).toBe(200);

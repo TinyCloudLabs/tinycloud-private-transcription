@@ -1,0 +1,392 @@
+import { and, eq, inArray, sql } from "drizzle-orm";
+import type { AppContext } from "../context.ts";
+import { attributedAttempts, attributedBatches as batchesTable, attributedRanges, attributedTranscriptionRuns, attributedWorkerReadiness, meetings, tinfoilDispatchSlots, transcripts, webhookDeliveries } from "../db/schema.ts";
+import { normalizeSegments } from "../domain/transcript.ts";
+import { attributedBatches, readAttributedBatch, type AttributedBatch, type AttributedCapability, type AttributedManifest } from "../providers/transcription/attributed.ts";
+import { safeTinfoilLanguage, TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
+import { failMeeting, getMeetingById } from "./meetings.ts";
+import { enqueueMeetingWebhook, webhookDeliveryValues, wakeWebhookDelivery } from "../webhooks/dispatcher.ts";
+
+const ATTEMPT_LIMIT = 1, CLAIM_MS = 5 * 60_000, SLOT_CLAIM_MS = 10 * 60_000;
+const READINESS_STALE_MS = 15_000;
+type AttributedReadinessStage = "startup" | "reconciled" | "reconciliation_failed" | "heartbeat" | "publication_failed" | "published" | "stopped";
+const json = (value: unknown) => sql`${JSON.stringify(value)}::text::jsonb`;
+const object = <T>(value: unknown): T => typeof value === "string" ? JSON.parse(value) as T : value as T;
+const canonical = (value: unknown): string => Array.isArray(value) ? `[${value.map(canonical).join(",")}]` : value && typeof value === "object" ? `{${Object.keys(value as object).sort().map((key) => `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`).join(",")}}` : JSON.stringify(value);
+const capabilityOk = (value: unknown): value is AttributedCapability => canonical(value) === canonical({ requested_version: 1, supported_version: 1, status: "supported" });
+
+/** Persisted independently of queue wakeups so API processes can observe worker startup safely. */
+export async function recordAttributedWorkerReadiness(ctx: AppContext, ready: boolean, stage: AttributedReadinessStage): Promise<void> {
+  // 0009 creates this on fresh/normal upgrades. The guard also makes an already-applied draft
+  // 0009 safe to upgrade without changing migration history.
+  await ctx.db.execute(sql`CREATE TABLE IF NOT EXISTS attributed_worker_readiness (id text PRIMARY KEY NOT NULL, ready boolean NOT NULL, stage text NOT NULL, observed_at timestamp with time zone NOT NULL)`);
+  // Startup and reconciliation unreadiness are recoverable operational states. A canonical
+  // publication failure is different: queue liveness and reconciliation prove neither a
+  // publication nor recovery, so only the transaction that commits canonical text heals it.
+  //
+  // Keep the latch test in the conflict update itself. A read followed by an upsert lets a
+  // heartbeat that saw the old healthy row overwrite a publication failure committed while it
+  // was paused. PostgreSQL evaluates this expression while holding the current row lock.
+  await ctx.db.execute(sql`
+    INSERT INTO attributed_worker_readiness (id, ready, stage, observed_at)
+    VALUES (${ctx.attributedWorkerId}, ${ready}, ${stage}, ${new Date()})
+    ON CONFLICT (id) DO UPDATE SET
+      ready = CASE
+        WHEN attributed_worker_readiness.stage = 'publication_failed'
+          AND EXCLUDED.stage <> 'published' THEN false
+        ELSE EXCLUDED.ready
+      END,
+      stage = CASE
+        WHEN attributed_worker_readiness.stage = 'publication_failed'
+          AND EXCLUDED.stage <> 'published' THEN 'publication_failed'
+        ELSE EXCLUDED.stage
+      END,
+      observed_at = EXCLUDED.observed_at
+  `);
+}
+
+export async function attributedWorkerReady(ctx: AppContext): Promise<boolean> {
+  try {
+    const records = await ctx.db.select().from(attributedWorkerReadiness);
+    const now = Date.now();
+    // A stopped or dead process naturally expires. Every still-live identity must be healthy;
+    // one healthy worker may not overwrite a different worker's failure.
+    const live = records.filter((record) => now - record.observedAt.getTime() >= 0 && now - record.observedAt.getTime() <= READINESS_STALE_MS);
+    return live.length > 0 && live.every((record) => record.ready);
+  } catch {
+    return false;
+  }
+}
+
+/** Immutable insert is serialized even when no run row exists yet. */
+export async function stageAttributedManifest(ctx: AppContext, meetingId: string, vexaMeetingId: number, manifest: AttributedManifest, capability: unknown): Promise<void> {
+  if (!capabilityOk(capability)) throw new Error("attributed_capability_not_supported");
+  const specs = attributedBatches(manifest, vexaMeetingId);
+  const staged = await ctx.db.transaction(async (tx) => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`attributed:${meetingId}`}))`);
+    const [meeting] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
+    if (!meeting || meeting.status !== "processing" || meeting.dispatchBlocked) return false;
+    const existing = await tx.select().from(attributedTranscriptionRuns).where(eq(attributedTranscriptionRuns.meetingId, meetingId)).for("update");
+    if (existing[0]) {
+      if (canonical(existing[0].manifestJson) !== canonical(manifest)) throw new Error("attributed_manifest_conflict");
+      return false;
+    }
+    await tx.insert(attributedTranscriptionRuns).values({ meetingId, status: "processing", manifestJson: json(manifest) });
+    for (const range of manifest.ranges) await tx.insert(attributedRanges).values({ meetingId, sequence: range.sequence, rangeJson: json(range), status: range.state === "failed" || range.attribution.source === "unresolved" ? "unresolved" : "pending" });
+    for (const [ordinal, batch] of specs.entries()) await tx.insert(batchesTable).values({ id: `${meetingId}:batch:${ordinal}`, meetingId, ordinal, batchJson: json(batch) });
+    return true;
+  });
+  // A staging transaction can commit just before its Redis wakeup is lost.  Existing immutable
+  // state is therefore resumed explicitly, rather than treated as a no-op.
+  const pending = staged
+    ? specs.map((_, ordinal) => `${meetingId}:batch:${ordinal}`)
+    : (await ctx.db.select({ id: batchesTable.id }).from(batchesTable)
+      .where(and(eq(batchesTable.meetingId, meetingId), eq(batchesTable.status, "pending")))).map((row) => row.id);
+  // Redis acknowledges only a wakeup, never admission. A lost acknowledgement after this
+  // transaction must leave retained unpaid work pending for the durable reconciler, not fail it.
+  for (const batchId of pending) await ctx.queue.push({ type: "attributed.batch", meetingId, batchId }).catch(() => {});
+  await ctx.queue.push({ type: "attributed.finalize", meetingId }).catch(() => {});
+}
+
+async function claimBatch(ctx: AppContext, batchId: string) {
+  const token = crypto.randomUUID();
+  const [batch] = await ctx.db.update(batchesTable).set({ status: "claimed", claimToken: token, claimedAt: new Date(), updatedAt: new Date() })
+    .where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "pending"), sql`${batchesTable.attempts} < ${ATTEMPT_LIMIT}`)).returning();
+  return batch ? { batch, token } : null;
+}
+const sequences = (spec: AttributedBatch) => spec.ranges.map((range) => range.sequence);
+
+/** All batch/range/attempt writes are fenced by the durable claim token. */
+async function settle(ctx: AppContext, batchId: string, token: string, status: "completed" | "silence" | "failed" | "ambiguous", meetingId: string, spec: AttributedBatch, result?: unknown, attemptId?: string, outcome?: string) {
+  await ctx.db.transaction(async (tx) => {
+    const [won] = await tx.update(batchesTable).set({ status, claimToken: null, dispatchToken: null, dispatchOwnerId: null, dispatchedAt: null, ...(result === undefined ? {} : { resultJson: json(result) }), updatedAt: new Date() })
+      .where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "claimed"), eq(batchesTable.claimToken, token))).returning();
+    if (!won) return;
+    await tx.update(tinfoilDispatchSlots).set({ claimToken: null, claimedAt: null, ownerId: null })
+      .where(eq(tinfoilDispatchSlots.claimToken, token));
+    const rangeStatus = status === "completed" ? "completed" : status === "silence" ? "silence" : status === "failed" ? "failed" : "unresolved";
+    await tx.update(attributedRanges).set({ status: rangeStatus }).where(and(eq(attributedRanges.meetingId, meetingId), inArray(attributedRanges.sequence, sequences(spec))));
+    if (attemptId) await tx.update(attributedAttempts).set({ status: status === "completed" ? "succeeded" : status === "failed" ? "failed" : "ambiguous", outcome: outcome ?? null, completedAt: new Date() }).where(eq(attributedAttempts.id, attemptId));
+  });
+}
+/**
+ * Atomically admits one paid request at the provider-call boundary. A stale slot is reusable only
+ * after its named worker's durable heartbeat has died; a paused live continuation keeps its slot.
+ */
+type DispatchAdmission =
+  | { kind: "admitted"; language: string | null; attemptId: string }
+  | { kind: "capacity" }
+  | { kind: "ineligible" };
+
+async function admitTinfoilDispatch(ctx: AppContext, meetingId: string, batchId: string, token: string): Promise<DispatchAdmission> {
+  return ctx.db.transaction(async (tx) => {
+    const [meeting] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
+    const [run] = await tx.select().from(attributedTranscriptionRuns).where(eq(attributedTranscriptionRuns.meetingId, meetingId)).for("update");
+    const [batch] = await tx.select().from(batchesTable).where(eq(batchesTable.id, batchId)).for("update");
+    if (!meeting || meeting.status !== "processing" || meeting.dispatchBlocked || !run || run.status !== "processing"
+        || !batch || batch.meetingId !== meetingId || batch.status !== "claimed" || batch.claimToken !== token) return { kind: "ineligible" };
+    // FOR UPDATE SKIP LOCKED makes concurrent workers choose at most one of two slots.  Expiry
+    // alone is never authority to steal a slot from a heartbeat-live process.
+    const slots = await tx.execute<{ id: number }>(sql`
+      select s.id from tinfoil_dispatch_slots s
+      where s.claim_token is null
+         or (s.claimed_at < ${new Date(Date.now() - SLOT_CLAIM_MS)} and not exists (
+           select 1 from attributed_worker_readiness w
+           where w.id = s.owner_id and w.observed_at >= ${new Date(Date.now() - READINESS_STALE_MS)}
+         ))
+      order by s.id for update skip locked limit 1
+    `);
+    const slot = slots[0];
+    if (!slot) return { kind: "capacity" };
+    const [slotClaimed] = await tx.update(tinfoilDispatchSlots).set({ claimToken: token, claimedAt: new Date(), ownerId: ctx.attributedWorkerId })
+      .where(eq(tinfoilDispatchSlots.id, slot.id)).returning();
+    if (!slotClaimed) return { kind: "capacity" };
+    const [admitted] = await tx.update(batchesTable).set({ attempts: sql`${batchesTable.attempts} + 1`, dispatchToken: token, dispatchOwnerId: ctx.attributedWorkerId, dispatchedAt: new Date(), updatedAt: new Date() })
+      .where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "claimed"), eq(batchesTable.claimToken, token), sql`${batchesTable.dispatchToken} is null`, sql`${batchesTable.attempts} < ${ATTEMPT_LIMIT}`)).returning();
+    if (!admitted) {
+      await tx.update(tinfoilDispatchSlots).set({ claimToken: null, claimedAt: null, ownerId: null }).where(and(eq(tinfoilDispatchSlots.id, slot.id), eq(tinfoilDispatchSlots.claimToken, token)));
+      return { kind: "ineligible" };
+    }
+    const attemptId = `${batchId}:attempt:${admitted.attempts}`;
+    await tx.insert(attributedAttempts).values({ id: attemptId, batchId, ordinal: admitted.attempts, status: "started" });
+    return { kind: "admitted", language: meeting.language, attemptId };
+  });
+}
+
+async function releaseBatchClaim(ctx: AppContext, batchId: string, token: string): Promise<boolean> {
+  const [released] = await ctx.db.update(batchesTable).set({ status: "pending", claimToken: null, claimedAt: null, updatedAt: new Date() })
+    .where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "claimed"), eq(batchesTable.claimToken, token), sql`${batchesTable.dispatchToken} is null`)).returning();
+  return !!released;
+}
+
+export type AttributedJobOutcome = "processed" | "noop" | "deferred";
+
+export async function processAttributedBatch(ctx: AppContext, meetingId: string, batchId: string): Promise<AttributedJobOutcome> {
+  const [stored] = await ctx.db.select().from(batchesTable).where(and(eq(batchesTable.id, batchId), eq(batchesTable.meetingId, meetingId)));
+  if (!stored || stored.status !== "pending") return "noop";
+  // Readiness is checked before any claim, fetch, or attempt; an operator can configure Tinfoil later.
+  const provider = ctx.transcriptRecovery;
+  if (!(provider instanceof TinfoilTranscriptionProvider)) { await ctx.queue.push({ type: "attributed.batch", meetingId, batchId }, ctx.config.vexa.pollIntervalMs); return "deferred"; }
+  const claimed = await claimBatch(ctx, batchId); if (!claimed) return "noop";
+  const spec = object<AttributedBatch>(claimed.batch.batchJson);
+    const done = async (outcome: AttributedJobOutcome) => {
+      await ctx.queue.push({ type: "attributed.finalize", meetingId });
+      return outcome;
+    };
+    let prepared;
+    try { prepared = await readAttributedBatch(spec, async (range) => (await ctx.vexa.fetchBytes(range.path!)).bytes); }
+    catch { await settle(ctx, batchId, claimed.token, "failed", meetingId, spec); return done("processed"); }
+    if (prepared.silent) { await settle(ctx, batchId, claimed.token, "silence", meetingId, spec, { text: "", language: null }); return done("processed"); }
+    // Make the process identity durable before it can own a paid request. This also lets a
+    // recovery scanner distinguish a paused continuation from a dead worker.
+    await recordAttributedWorkerReadiness(ctx, ctx.attributedWorkerHealthy, "heartbeat");
+    const eligibility = await admitTinfoilDispatch(ctx, meetingId, batchId, claimed.token);
+    if (eligibility.kind === "capacity") {
+      if (await releaseBatchClaim(ctx, batchId, claimed.token)) await ctx.queue.push({ type: "attributed.batch", meetingId, batchId }, ctx.config.vexa.pollIntervalMs);
+      return done("deferred");
+    }
+    if (eligibility.kind === "ineligible") {
+      // The durable owner went terminal while this job was queued/fetching.  Preserve the
+      // one-attempt ledger without sending an ineligible request outside the process.
+      await settle(ctx, batchId, claimed.token, "ambiguous", meetingId, spec, undefined, undefined, "ineligible_dispatch");
+      return done("processed");
+    }
+    try {
+      // No await is permitted between the durable admission above and invoking the paid provider.
+      const response = await provider.transcribeAttributedPcm(prepared.pcm, spec, eligibility.language);
+      // A voiced request that returned no words is evidence failure, not a silent meeting.
+      await settle(ctx, batchId, claimed.token, response.text.trim() ? "completed" : "failed", meetingId, spec, response, eligibility.attemptId, response.text.trim() ? undefined : "empty_transcript");
+    } catch { await settle(ctx, batchId, claimed.token, "ambiguous", meetingId, spec, undefined, eligibility.attemptId, "external_call_uncertain"); }
+  await ctx.queue.push({ type: "attributed.finalize", meetingId });
+  return "processed";
+}
+
+async function reconcileClaim(ctx: AppContext, batchId: string): Promise<boolean> {
+  return ctx.db.transaction(async (tx) => {
+    const [batch] = await tx.select().from(batchesTable).where(eq(batchesTable.id, batchId)).for("update");
+    if (!batch || batch.status !== "claimed" || !batch.claimedAt) return false;
+    const expired = batch.claimedAt.getTime() <= Date.now() - CLAIM_MS;
+    if (batch.dispatchToken) {
+      // An admitted call is never retried. Its slot and continuation stay fenced while the named
+      // owner is live; once that owner's heartbeat is stale, terminalize the ambiguous attempt so
+      // finalization/deletion can proceed without issuing a second paid request.
+      const [owner] = batch.dispatchOwnerId
+        ? await tx.select().from(attributedWorkerReadiness).where(and(eq(attributedWorkerReadiness.id, batch.dispatchOwnerId), sql`${attributedWorkerReadiness.observedAt} >= ${new Date(Date.now() - READINESS_STALE_MS)}`)).limit(1)
+        : [];
+      if (owner) return false;
+    } else if (!expired) return false;
+    const spec = object<AttributedBatch>(batch.batchJson);
+    // This process died before durable paid admission. It is explicitly safe to requeue: no
+    // attempt row/dispatch token exists, so retained audio gets exactly its first paid call.
+    const unpaid = !batch.dispatchToken;
+    const [won] = await tx.update(batchesTable).set({ status: unpaid ? "pending" : "ambiguous", claimToken: null, dispatchToken: null, dispatchOwnerId: null, dispatchedAt: null, claimedAt: null, updatedAt: new Date() }).where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "claimed"), eq(batchesTable.claimToken, batch.claimToken ?? ""))).returning();
+    if (!won) return false;
+    if (batch.dispatchToken) await tx.update(tinfoilDispatchSlots).set({ claimToken: null, claimedAt: null, ownerId: null })
+      .where(eq(tinfoilDispatchSlots.claimToken, batch.dispatchToken));
+    if (!unpaid) {
+      await tx.update(attributedRanges).set({ status: "unresolved" }).where(and(eq(attributedRanges.meetingId, batch.meetingId), inArray(attributedRanges.sequence, sequences(spec))));
+      await tx.update(attributedAttempts).set({ status: "ambiguous", outcome: "external_call_uncertain", completedAt: new Date() }).where(and(eq(attributedAttempts.batchId, batchId), eq(attributedAttempts.status, "started")));
+    }
+    return true;
+  });
+}
+
+export async function finalizeAttributedRun(ctx: AppContext, meetingId: string): Promise<boolean> {
+  let rows = await ctx.db.select().from(batchesTable).where(eq(batchesTable.meetingId, meetingId)).orderBy(batchesTable.ordinal);
+  const live = rows.filter((row) => row.status === "claimed");
+  if (live.length) {
+    for (const row of live) await reconcileClaim(ctx, row.id);
+    // Re-read after reconciliation.  The prior snapshot may contain a claim we just settled;
+    // returning from it would strand a processing meeting without a further wakeup.
+    rows = await ctx.db.select().from(batchesTable).where(eq(batchesTable.meetingId, meetingId)).orderBy(batchesTable.ordinal);
+    const remaining = rows.filter((row) => row.status === "claimed");
+    if (remaining.length) await ctx.queue.push({ type: "attributed.finalize", meetingId }, Math.max(1_000, Math.min(...remaining.map((row) =>
+      row.dispatchToken ? READINESS_STALE_MS : row.claimedAt ? row.claimedAt.getTime() + CLAIM_MS - Date.now() : CLAIM_MS,
+    ))));
+    if (remaining.length) return false;
+  }
+  const pending = rows.filter((row) => row.status === "pending");
+  if (pending.length) {
+    for (const row of pending) await ctx.queue.push({ type: "attributed.batch", meetingId, batchId: row.id }).catch(() => {});
+    return false;
+  }
+  const ranges = await ctx.db.select().from(attributedRanges).where(eq(attributedRanges.meetingId, meetingId));
+  const meeting = await getMeetingById(ctx, meetingId);
+  if (!meeting || meeting.status === "completed" || meeting.status === "failed") return false;
+  if (rows.some((row) => !["completed", "silence"].includes(row.status)) || ranges.some((row) => !["completed", "silence"].includes(row.status))) {
+    await ctx.db.update(attributedTranscriptionRuns).set({ status: "partial", updatedAt: new Date() }).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
+    const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Attributed evidence is unresolved; canonical transcript was not published.");
+    if (changed) {
+      ctx.attributedWorkerHealthy = false;
+      await recordAttributedWorkerReadiness(ctx, false, "publication_failed");
+      await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+    }
+    return changed;
+  }
+  return publish(ctx, meetingId);
+}
+
+type Publication = { meeting: typeof meetings.$inferSelect; webhook: boolean; deliveryId: string | null } | null;
+
+/**
+ * Publication is deliberately a second, complete verification pass.  Results fetched before this
+ * transaction are merely hints: only locked ledger rows and the immutable closed manifest may
+ * produce the canonical transcript.
+ */
+async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
+  const published = await ctx.db.transaction(async (tx) => {
+    const [meeting] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
+    const [run] = await tx.select().from(attributedTranscriptionRuns).where(eq(attributedTranscriptionRuns.meetingId, meetingId)).for("update");
+    const ranges = await tx.select().from(attributedRanges).where(eq(attributedRanges.meetingId, meetingId)).for("update");
+    const batches = await tx.select().from(batchesTable).where(eq(batchesTable.meetingId, meetingId)).orderBy(batchesTable.ordinal).for("update");
+    const attempts = await tx.select().from(attributedAttempts).innerJoin(batchesTable, eq(attributedAttempts.batchId, batchesTable.id)).where(eq(batchesTable.meetingId, meetingId)).for("update");
+    if (!meeting || meeting.status === "failed" || meeting.status === "cancelled" || meeting.dispatchBlocked || !run || run.status !== "processing" || !meeting.vexaMeetingId) return null;
+    const reject = async (): Promise<Publication> => {
+      const [failed] = await tx.update(meetings).set({ status: "failed", errorCode: "transcription_failed", errorMessage: "Attributed evidence could not be verified for publication.", endedAt: new Date() })
+        .where(and(eq(meetings.id, meetingId), eq(meetings.status, "processing"))).returning();
+      if (failed) await tx.update(attributedTranscriptionRuns).set({ status: "partial", updatedAt: new Date() }).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
+      return failed ? { meeting: failed, webhook: true, deliveryId: null } : null;
+    };
+    let manifest: AttributedManifest, expected: AttributedBatch[];
+    try {
+      manifest = object<AttributedManifest>(run.manifestJson);
+      // Revalidates closure, meeting identity, paths, bounds, and independently rebuilds batches.
+      expected = attributedBatches(manifest, meeting.vexaMeetingId);
+    } catch {
+      return reject();
+    }
+    const stagedBySequence = new Map(manifest.ranges.map((range) => [range.sequence, range]));
+    const attemptByBatch = new Map<string, typeof attempts>();
+    for (const attempt of attempts) {
+      const list = attemptByBatch.get(attempt.attributed_attempts.batchId) ?? [];
+      list.push(attempt); attemptByBatch.set(attempt.attributed_attempts.batchId, list);
+    }
+    const expectedByOrdinal = new Map(expected.map((batch, ordinal) => [ordinal, batch]));
+    const invalidLedger = ranges.length !== manifest.ranges.length || new Set(ranges.map((r) => r.sequence)).size !== manifest.ranges.length
+      || ranges.some((r) => canonical(r.rangeJson) !== canonical(stagedBySequence.get(r.sequence)))
+      || batches.length !== expected.length || batches.some((batch) => canonical(batch.batchJson) !== canonical(expectedByOrdinal.get(batch.ordinal)))
+      || batches.some((batch) => batch.ordinal < 0 || !expectedByOrdinal.has(batch.ordinal));
+    if (invalidLedger) return reject();
+    const raw: Array<{ start: number; end: number; text: string; speaker: string; speakerKey: string; attribution: "identified" | "provisional"; language: string | null }> = [];
+    for (const batch of batches) {
+      const spec = expectedByOrdinal.get(batch.ordinal)!;
+      const batchRanges = spec.ranges;
+      const ledgerRanges = batchRanges.map((range) => ranges.find((row) => row.sequence === range.sequence));
+      if (ledgerRanges.some((row) => !row || row.status !== batch.status) || !["completed", "silence"].includes(batch.status)) return reject();
+      const rowsForBatch = attemptByBatch.get(batch.id) ?? [];
+      const result = object<{ text?: unknown; language?: unknown }>(batch.resultJson ?? {});
+      if (batch.status === "completed") {
+        if (batch.attempts !== 1 || rowsForBatch.length !== 1 || rowsForBatch[0]!.attributed_attempts.ordinal !== 1
+            || rowsForBatch[0]!.attributed_attempts.status !== "succeeded" || !rowsForBatch[0]!.attributed_attempts.completedAt
+            || typeof result.text !== "string" || !result.text.trim() || (result.language !== null && result.language !== undefined && !safeTinfoilLanguage(result.language))) return reject();
+        raw.push({ start: spec.start_ms / 1000, end: spec.end_ms / 1000, text: result.text, speaker: spec.speaker_name, speakerKey: spec.speaker_key,
+          attribution: spec.attribution.source === "glow-bound" && spec.attribution.confidence > 0 ? "identified" : "provisional", language: typeof result.language === "string" ? result.language : null });
+      } else if (batch.attempts !== 0 || rowsForBatch.length !== 0 || result.text !== "") return reject();
+    }
+    if (ranges.some((row) => !["completed", "silence"].includes(row.status))) return reject();
+    const transcript = normalizeSegments(raw.sort((a, b) => a.start - b.start || a.end - b.end), meeting.language);
+    const payload = { speakers: transcript.speakers, segments: transcript.segments, text: transcript.text };
+    const existing = await tx.select().from(transcripts).where(eq(transcripts.meetingId, meetingId)).for("update");
+    if (existing[0] && (existing[0].provider !== "tinfoil-attributed" || canonical(existing[0].segmentsJson) !== canonical(payload)
+        || existing[0].language !== transcript.language || existing[0].durationSeconds !== transcript.duration_seconds)) {
+      const [failed] = await tx.update(meetings).set({ status: "failed", errorCode: "transcription_failed", errorMessage: "Attributed transcript conflicts with an existing transcript.", endedAt: new Date() })
+        .where(and(eq(meetings.id, meetingId), eq(meetings.status, "processing"))).returning();
+      if (failed) await tx.update(attributedTranscriptionRuns).set({ status: "partial", updatedAt: new Date() }).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
+      return failed ? { meeting: failed, webhook: true, deliveryId: null } satisfies Publication : null;
+    }
+    if (existing[0]) {
+      if (meeting.status !== "completed") return null;
+      await tx.update(attributedTranscriptionRuns).set({ status: "completed", updatedAt: new Date() }).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
+      return null;
+    }
+    if (meeting.status !== "processing") return null;
+    const [completed] = await tx.update(meetings).set({ status: "completed", completedAt: new Date() }).where(and(eq(meetings.id, meetingId), eq(meetings.status, "processing"))).returning();
+    if (!completed) return null;
+    await tx.insert(transcripts).values({ meetingId, language: transcript.language, durationSeconds: transcript.duration_seconds, segmentsJson: json(payload), provider: "tinfoil-attributed" });
+    await tx.update(attributedTranscriptionRuns).set({ status: "completed", updatedAt: new Date() }).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
+    // Canonical transcript, terminal state, and completion-delivery intent commit together.
+    // Redis is deliberately only a wakeup; a later reconciliation safely resumes this row.
+    const intent = webhookDeliveryValues(completed, "meeting.completed", {
+      meetingId, language: transcript.language, durationSeconds: transcript.duration_seconds,
+      segmentsJson: payload, provider: "tinfoil-attributed", createdAt: new Date(),
+    });
+    if (intent) await tx.insert(webhookDeliveries).values(intent)
+      .onConflictDoNothing({ target: [webhookDeliveries.meetingId, webhookDeliveries.eventType] });
+    return { meeting: completed, webhook: true, deliveryId: intent?.id ?? null } satisfies Publication;
+  });
+  if (published) {
+    // A no-op finalizer has no publication outcome and must not heal a prior failure. Only this
+    // worker's real commit (or rejection) changes its own durable readiness.
+    ctx.attributedWorkerHealthy = published.meeting.status === "completed";
+    if (published.meeting.status === "completed") await recordAttributedWorkerReadiness(ctx, true, "published");
+    else await recordAttributedWorkerReadiness(ctx, false, "publication_failed");
+    if (published.deliveryId) await wakeWebhookDelivery(ctx, published.deliveryId, new Date()).catch(() => {
+      ctx.log.warn("completion webhook wakeup deferred", { meetingId, stage: "webhook_wakeup" });
+    });
+    else await enqueueMeetingWebhook(ctx, published.meeting, published.webhook && published.meeting.status === "completed" ? "meeting.completed" : "meeting.failed");
+  }
+  return !!published;
+}
+
+export async function reconcileAttributedRuns(ctx: AppContext): Promise<void> {
+  const claimed = await ctx.db.select().from(batchesTable).where(eq(batchesTable.status, "claimed"));
+  for (const row of claimed) {
+    await reconcileClaim(ctx, row.id);
+    if (row.claimedAt) await ctx.queue.push({ type: "attributed.finalize", meetingId: row.meetingId }, Math.max(1_000,
+      row.dispatchToken ? READINESS_STALE_MS : row.claimedAt.getTime() + CLAIM_MS - Date.now(),
+    ));
+  }
+  const pending = await ctx.db.select().from(batchesTable).where(eq(batchesTable.status, "pending"));
+  for (const row of pending) await ctx.queue.push({ type: "attributed.batch", meetingId: row.meetingId, batchId: row.id });
+  const runs = await ctx.db.select().from(attributedTranscriptionRuns).where(inArray(attributedTranscriptionRuns.status, ["processing", "partial"]));
+  for (const run of runs) await ctx.queue.push({ type: "attributed.finalize", meetingId: run.meetingId });
+  // If a process died after moving the meeting to processing but before staging its immutable
+  // producer manifest, Vexa remains the retained source of truth.  Polling it reconstructs the
+  // manifest; an existing run instead takes the explicit resume path above.
+  const processing = await ctx.db.select().from(meetings)
+    .where(and(eq(meetings.status, "processing"), eq(meetings.platform, "google_meet")));
+  const staged = new Set(runs.map((run) => run.meetingId));
+  for (const meeting of processing) if (!staged.has(meeting.id) && meeting.vexaMeetingId != null) {
+    await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id });
+  }
+}
