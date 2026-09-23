@@ -106,6 +106,13 @@
       "when": 1790126131584,
       "tag": "0014_deletion_owner_lease",
       "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1790127501317,
+      "tag": "0015_giant_talon",
+      "breakpoints": true
     }
   ]
 }

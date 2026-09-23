@@ -7,6 +7,16 @@ import { attributedWorkerReady } from "../../services/attributed-transcription.t
 
 export function healthRoutes(ctx: AppContext) {
   const r = new Hono();
+  // Compose uses this endpoint to decide whether the API has started and finished its migrations.
+  // Publication readiness deliberately remains on /health: the worker is started after this
+  // liveness check, so making it a startup dependency would create a bootstrap cycle.
+  r.get("/health/live", async (c) => {
+    const [postgres, redis] = await Promise.all([
+      ctx.db.execute(sql`select 1`).then(() => true, () => false),
+      ctx.redis.ping().then(() => true, () => false),
+    ]);
+    return c.json({ status: postgres && redis ? "ok" : "error", checks: { postgres, redis } }, postgres && redis ? 200 : 503);
+  });
   r.get("/health", async (c) => {
     const [postgres, redis, vexa] = await Promise.all([
       ctx.db.execute(sql`select 1`).then(() => true, () => false),

@@ -91,7 +91,11 @@ export async function createMeeting(
     // Lost a race on the idempotency key; return the winner.
     return createMeeting(ctx, projectId, input, idempotencyKey);
   }
-  await ctx.queue.push({ type: "meeting.start", meetingId: row.id });
+  // Redis is only a wakeup. The worker's durable meeting scanner will resume this queued row if
+  // the acknowledgement is lost or Redis is briefly unavailable.
+  await ctx.queue.push({ type: "meeting.start", meetingId: row.id }).catch(() => {
+    ctx.log.warn("meeting start wakeup deferred", { meetingId: row.id, stage: "queue_wakeup" });
+  });
   return { meeting: row, created: true };
 }
 
@@ -254,7 +258,9 @@ export async function stopMeeting(ctx: AppContext, meeting: MeetingRow): Promise
   else await stopInVexa(ctx, meeting);
   if (status === "in_progress") {
     const { meeting: updated } = await transition(ctx, meeting, "processing");
-    await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id });
+    await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id }).catch(() => {
+      ctx.log.warn("meeting poll wakeup deferred", { meetingId: meeting.id, stage: "queue_wakeup" });
+    });
     return updated;
   }
   const { meeting: updated } = await transition(ctx, meeting, "cancelled");
@@ -273,7 +279,9 @@ export async function recoverMeeting(ctx: AppContext, meeting: MeetingRow): Prom
     // Repairs the crash window between the failed → processing commit and Redis delivery. A
     // duplicate poll is safe: transcript storage is an upsert and webhooks require the winning
     // terminal state transition.
-    await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id });
+    await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id }).catch(() => {
+      ctx.log.warn("meeting recovery wakeup deferred", { meetingId: meeting.id, stage: "queue_wakeup" });
+    });
     return meeting;
   }
   if (status !== "failed") {
@@ -293,13 +301,11 @@ export async function recoverMeeting(ctx: AppContext, meeting: MeetingRow): Prom
     .where(and(eq(meetings.id, meeting.id), eq(meetings.projectId, meeting.projectId), eq(meetings.status, "failed")))
     .returning();
   if (!updated) return (await getMeetingById(ctx, meeting.id)) ?? meeting;
-  try {
-    await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id });
-  } catch (error) {
-    // A Redis acknowledgement can be lost after its message was accepted. Do not restore failed:
-    // that message may already admit a paid dispatch. Durable reconciliation resumes processing.
-    throw error;
-  }
+  await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id }).catch(() => {
+    // The processing row is durable and the worker scanner handles both lost acknowledgements and
+    // a Redis outage. Returning it avoids falsely reporting a failed recovery to the caller.
+    ctx.log.warn("meeting recovery wakeup deferred", { meetingId: meeting.id, stage: "queue_wakeup" });
+  });
   return updated;
 }
 
@@ -327,67 +333,126 @@ async function stopInSignal(ctx: AppContext, meeting: MeetingRow) {
 const DELETION_LEASE_MS = 15_000;
 
 export async function deleteMeeting(ctx: AppContext, meeting: MeetingRow): Promise<void> {
-  const deletionToken = await fenceAttributedDeletion(ctx, meeting.id);
-  if (!deletionToken) return;
-  const renewLease = () => ctx.db.update(meetings).set({ deletionLeaseAt: new Date() })
-    .where(and(eq(meetings.id, meeting.id), eq(meetings.deletionToken, deletionToken), eq(meetings.deletionOwnerId, ctx.attributedWorkerId)))
-    .catch(() => {});
+  const fenced = await fenceAttributedDeletion(ctx, meeting.id);
+  if (!fenced) return;
+  const { token: deletionToken, providerAlreadyAdmitted } = fenced;
+  let owns = true;
+  const renewLease = async () => {
+    if (!owns) return false;
+    try {
+      const renewed = await ctx.db.update(meetings).set({ deletionLeaseAt: new Date() })
+        .where(and(eq(meetings.id, meeting.id), eq(meetings.deletionToken, deletionToken), eq(meetings.deletionOwnerId, ctx.attributedWorkerId)))
+        .returning({ id: meetings.id });
+      owns = renewed.length === 1;
+    } catch {
+      // A failed renewal cannot prove ownership. Stop rather than letting a stale caller perform
+      // a provider operation or remove the successor's local row.
+      owns = false;
+    }
+    return owns;
+  };
   const leaseTimer = setInterval(() => { void renewLease(); }, Math.max(1_000, Math.floor(DELETION_LEASE_MS / 3)));
   try {
     if (meeting.platform === "signal") {
+      if (!await renewLease()) return;
       if (!isTerminal(meeting.status as MeetingStatus)) await stopInSignal(ctx, meeting);
-      if (meeting.signalSessionId) await ctx.signal.remove(meeting.signalSessionId).catch(() => {});
-      await ctx.db.delete(meetings).where(eq(meetings.id, meeting.id));
+      if (!await renewLease()) return;
+      if (meeting.signalSessionId && !providerAlreadyAdmitted) {
+        const admitted = await admitProviderDeletion(ctx, meeting.id, deletionToken);
+        if (admitted === "lost") return;
+        if (admitted === "new") await ctx.signal.remove(meeting.signalSessionId);
+      }
+      await deleteLocalMeetingIfOwned(ctx, meeting.id, deletionToken);
       return;
     }
     if (meeting.vexaPlatform && meeting.vexaNativeMeetingId) {
+      if (!await renewLease()) return;
       if (!isTerminal(meeting.status as MeetingStatus)) await stopInVexa(ctx, meeting);
-      try {
-        await ctx.vexa.deleteMeeting(meeting.vexaPlatform, meeting.vexaNativeMeetingId);
-      } catch (e) {
-        if (e instanceof VexaHttpError && e.conflict && meeting.vexaMeetingId != null) {
-          // Attributed ranges are provider-owned evidence.  Retain the complete local ledger until
-          // Vexa confirms deletion so a retry cannot silently orphan or destroy that evidence.
-          throw new ApiError("provider_unavailable", "Could not confirm deletion from the capture provider");
-        } else if (e instanceof VexaHttpError && e.conflict) {
-          ctx.log.warn("vexa retains meeting row (409: bot lifecycle owns it)", { stage: "delete_provider", code: "provider_conflict" });
-        } else if (!(e instanceof VexaHttpError && e.notFound)) {
-          ctx.log.warn("vexa deleteMeeting failed", { stage: "delete_provider", code: "provider_unavailable" });
-          throw new ApiError("provider_unavailable", "Could not delete the meeting from the capture provider");
+      if (!await renewLease()) return;
+      if (!providerAlreadyAdmitted) {
+        const admitted = await admitProviderDeletion(ctx, meeting.id, deletionToken);
+        if (admitted === "lost") return;
+        if (admitted === "new") {
+          try {
+            await ctx.vexa.deleteMeeting(meeting.vexaPlatform, meeting.vexaNativeMeetingId);
+          } catch (e) {
+            if (e instanceof VexaHttpError && e.conflict && meeting.vexaMeetingId != null) {
+              // Attributed ranges are provider-owned evidence. Retain them until Vexa confirms
+              // deletion. A received conflict proves this request was rejected, so it is safe to
+              // release the admission rather than strand later attributed dispatches.
+              await releaseRejectedProviderDeletion(ctx, meeting.id, deletionToken);
+              throw new ApiError("provider_unavailable", "Could not confirm deletion from the capture provider");
+            } else if (e instanceof VexaHttpError && e.conflict) {
+              ctx.log.warn("vexa retains meeting row (409: bot lifecycle owns it)", { stage: "delete_provider", code: "provider_conflict" });
+            } else if (!(e instanceof VexaHttpError && e.notFound)) {
+              ctx.log.warn("vexa deleteMeeting failed", { stage: "delete_provider", code: "provider_unavailable" });
+              // A received non-409/404 HTTP response is an explicit rejection, unlike a timeout
+              // or transport loss. It is safe for this owner to release the unperformed delete
+              // fence so a later dispatch is not stranded.
+              if (e instanceof VexaHttpError) await releaseRejectedProviderDeletion(ctx, meeting.id, deletionToken);
+              throw new ApiError("provider_unavailable", "Could not delete the meeting from the capture provider");
+            }
+          }
         }
       }
     }
-    await ctx.db.delete(meetings).where(eq(meetings.id, meeting.id));
+    await deleteLocalMeetingIfOwned(ctx, meeting.id, deletionToken);
   } catch (error) {
-    // Compare the owner token: a failed overlapping deletion must not lower another deletion's
-    // fence and admit a later attributed request.
-    await ctx.db.update(meetings).set({ dispatchBlocked: false, deletionToken: null, deletionOwnerId: null, deletionLeaseAt: null })
-      .where(and(eq(meetings.id, meeting.id), eq(meetings.deletionToken, deletionToken), eq(meetings.deletionOwnerId, ctx.attributedWorkerId)));
+    // Unknown provider outcomes retain the admission marker and therefore stay fail-closed. A
+    // stale owner cannot clear its successor's fence, and a later owner reconciles the admitted
+    // deletion without sending it again.
+    if (!providerAlreadyAdmitted) await releaseUnadmittedDeletion(ctx, meeting.id, deletionToken);
     throw error;
   } finally {
     clearInterval(leaseTimer);
   }
 }
 
+async function admitProviderDeletion(ctx: AppContext, meetingId: string, token: string): Promise<"new" | "already" | "lost"> {
+  return ctx.db.transaction(async (tx) => {
+    const [current] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
+    if (!current || current.deletionToken !== token || current.deletionOwnerId !== ctx.attributedWorkerId) return "lost";
+    if (current.deletionProviderAdmittedAt) return "already";
+    await tx.update(meetings).set({ deletionProviderAdmittedAt: new Date(), deletionLeaseAt: new Date() })
+      .where(and(eq(meetings.id, meetingId), eq(meetings.deletionToken, token), eq(meetings.deletionOwnerId, ctx.attributedWorkerId)));
+    return "new";
+  });
+}
+
+async function deleteLocalMeetingIfOwned(ctx: AppContext, meetingId: string, token: string): Promise<boolean> {
+  const deleted = await ctx.db.delete(meetings).where(and(eq(meetings.id, meetingId), eq(meetings.deletionToken, token), eq(meetings.deletionOwnerId, ctx.attributedWorkerId))).returning({ id: meetings.id });
+  return deleted.length === 1;
+}
+
+async function releaseUnadmittedDeletion(ctx: AppContext, meetingId: string, token: string): Promise<void> {
+  await ctx.db.update(meetings).set({ dispatchBlocked: false, deletionToken: null, deletionOwnerId: null, deletionLeaseAt: null })
+    .where(and(eq(meetings.id, meetingId), eq(meetings.deletionToken, token), eq(meetings.deletionOwnerId, ctx.attributedWorkerId), sql`${meetings.deletionProviderAdmittedAt} is null`));
+}
+
+async function releaseRejectedProviderDeletion(ctx: AppContext, meetingId: string, token: string): Promise<void> {
+  await ctx.db.update(meetings).set({ deletionProviderAdmittedAt: null })
+    .where(and(eq(meetings.id, meetingId), eq(meetings.deletionToken, token), eq(meetings.deletionOwnerId, ctx.attributedWorkerId)));
+}
+
 /** Claim deletion only after any admitted attributed request has settled. */
-async function fenceAttributedDeletion(ctx: AppContext, meetingId: string): Promise<string | null> {
+async function fenceAttributedDeletion(ctx: AppContext, meetingId: string): Promise<{ token: string; providerAlreadyAdmitted: boolean } | null> {
   const token = crypto.randomUUID();
   for (;;) {
     const result = await ctx.db.transaction(async (tx) => {
       const [current] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
-      if (!current) return { token: null, waiting: false };
+      if (!current) return { token: null, waiting: false, providerAlreadyAdmitted: false };
       // Another deletion owns the provider call while its renewable lease is fresh. A dead owner
       // that crashed immediately after fencing is safely replaced under this row lock.
       const leaseLive = !!current.deletionLeaseAt && current.deletionLeaseAt.getTime() > Date.now() - DELETION_LEASE_MS;
-      if (current.deletionToken && leaseLive) return { token: null, waiting: true };
-      if (current.dispatchBlocked && !current.deletionToken) return { token: null, waiting: true };
+      if (current.deletionToken && leaseLive) return { token: null, waiting: true, providerAlreadyAdmitted: false };
+      if (current.dispatchBlocked && !current.deletionToken) return { token: null, waiting: true, providerAlreadyAdmitted: false };
       const active = await tx.select({ id: attributedBatches.id }).from(attributedBatches)
         .where(and(eq(attributedBatches.meetingId, meetingId), isNotNull(attributedBatches.dispatchToken))).for("update");
-      if (active.length) return { token: null, waiting: true };
+      if (active.length) return { token: null, waiting: true, providerAlreadyAdmitted: false };
       await tx.update(meetings).set({ dispatchBlocked: true, deletionToken: token, deletionOwnerId: ctx.attributedWorkerId, deletionLeaseAt: new Date() }).where(eq(meetings.id, meetingId));
-      return { token, waiting: false };
+      return { token, waiting: false, providerAlreadyAdmitted: !!current.deletionProviderAdmittedAt };
     });
-    if (!result.waiting) return result.token;
+    if (!result.waiting) return result.token ? { token: result.token, providerAlreadyAdmitted: result.providerAlreadyAdmitted } : null;
     await Bun.sleep(10);
   }
 }

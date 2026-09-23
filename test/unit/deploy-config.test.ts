@@ -155,6 +155,13 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(line).toContain("signal");
   });
 
+  test("uses API startup liveness rather than worker-owned publication readiness", () => {
+    const apiStart = compose.indexOf("\n  api:\n");
+    const api = compose.slice(apiStart, compose.indexOf("\n  worker:\n", apiStart));
+    expect(api).toContain("/health/live");
+    expect(api).not.toContain("127.0.0.1:8080/health').then");
+  });
+
   test("the worker gives every Vexa meeting the TinyCloud empty-room window", () => {
     const env = serviceEnv("worker");
     const line = env.split("\n").find((l) => l.trim().startsWith("VEXA_MAX_TIME_LEFT_ALONE_MS:"));

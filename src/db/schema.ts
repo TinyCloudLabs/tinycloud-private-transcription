@@ -53,6 +53,8 @@ export const meetings = pgTable(
     /** Renewable owner lease makes a crash between fencing and provider work recoverable. */
     deletionOwnerId: text("deletion_owner_id"),
     deletionLeaseAt: timestamp("deletion_lease_at", { withTimezone: true }),
+    /** Set immediately before an external delete. A replacement reconciles it, never repeats it. */
+    deletionProviderAdmittedAt: timestamp("deletion_provider_admitted_at", { withTimezone: true }),
   },
   (t) => [
     uniqueIndex("meetings_project_idempotency_idx").on(t.projectId, t.idempotencyKey),

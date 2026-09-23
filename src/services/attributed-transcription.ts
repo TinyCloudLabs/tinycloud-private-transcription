@@ -3,7 +3,7 @@ import type { AppContext } from "../context.ts";
 import { attributedAttempts, attributedBatches as batchesTable, attributedRanges, attributedTranscriptionRuns, attributedWorkerReadiness, meetings, tinfoilDispatchSlots, transcripts, webhookDeliveries } from "../db/schema.ts";
 import { normalizeSegments } from "../domain/transcript.ts";
 import { attributedBatches, readAttributedBatch, type AttributedBatch, type AttributedCapability, type AttributedManifest } from "../providers/transcription/attributed.ts";
-import { TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
+import { safeTinfoilLanguage, TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
 import { failMeeting, getMeetingById } from "./meetings.ts";
 import { enqueueMeetingWebhook, webhookDeliveryValues, wakeWebhookDelivery } from "../webhooks/dispatcher.ts";
 
@@ -299,7 +299,7 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
       if (batch.status === "completed") {
         if (batch.attempts !== 1 || rowsForBatch.length !== 1 || rowsForBatch[0]!.attributed_attempts.ordinal !== 1
             || rowsForBatch[0]!.attributed_attempts.status !== "succeeded" || !rowsForBatch[0]!.attributed_attempts.completedAt
-            || typeof result.text !== "string" || !result.text.trim() || (result.language !== null && result.language !== undefined && typeof result.language !== "string")) return reject();
+            || typeof result.text !== "string" || !result.text.trim() || (result.language !== null && result.language !== undefined && !safeTinfoilLanguage(result.language))) return reject();
         raw.push({ start: spec.start_ms / 1000, end: spec.end_ms / 1000, text: result.text, speaker: spec.speaker_name, speakerKey: spec.speaker_key,
           attribution: spec.attribution.source === "glow-bound" && spec.attribution.confidence > 0 ? "identified" : "provisional", language: typeof result.language === "string" ? result.language : null });
       } else if (batch.attempts !== 0 || rowsForBatch.length !== 0 || result.text !== "") return reject();

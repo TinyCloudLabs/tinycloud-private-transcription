@@ -74,6 +74,15 @@ test("rejects extra, secret-shaped, and oversized producer fields before they ca
   expect(() => attributedBatches(manifest([{ ...one, provider_debug: "credential=do-not-store" } as any]), 1)).toThrow();
 });
 
+test("accepts bounded international speaker names but rejects unsafe names and extreme timelines", () => {
+  const one = range(0, "jose", "José", 0, 1_000);
+  expect(attributedBatches(manifest([one]), 1)[0]!.speaker_name).toBe("José");
+  for (const speaker_name of ["https://private.example", "Bearer token", "Alice\nBob"]) {
+    expect(() => attributedBatches(manifest([{ ...one, speaker_name }]), 1)).toThrow();
+  }
+  expect(() => attributedBatches(manifest([{ ...one, start_ms: 1e300, end_ms: 1e300, audio_duration_ms: 0, byte_count: 0 }]), 1)).toThrow();
+});
+
 test("checksum-valid non-finite PCM is rejected before silence classification", async () => {
   const bytes = new Uint8Array(new Float32Array([Number.NaN, 0]).buffer);
   const corrupted = { ...range(0, "a", "Alice", 0, 1), byte_count: bytes.byteLength, audio_duration_ms: .125,

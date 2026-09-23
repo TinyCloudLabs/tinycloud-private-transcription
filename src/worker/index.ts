@@ -1,4 +1,6 @@
 import { createContext, type AppContext } from "../context.ts";
+import { inArray } from "drizzle-orm";
+import { meetings } from "../db/schema.ts";
 import { deliverWebhook, reconcileWebhookDeliveries } from "../webhooks/dispatcher.ts";
 import { handleJoinDeadline, handleMeetingPoll, handleMeetingStart } from "./meeting-job.ts";
 import { finalizeAttributedRun, processAttributedBatch, reconcileAttributedRuns, recordAttributedWorkerReadiness } from "../services/attributed-transcription.ts";
@@ -40,6 +42,21 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number } = 
   let heartbeatInFlight = false;
   let lastWebhookReconciliation = 0;
 
+  // Redis is a wakeup transport, not the work ledger. This repairs lost enqueue acknowledgements
+  // for Signal and the feature-off path without relaxing attributed publication's own ledger.
+  const reconcileMeetingWakeups = async () => {
+    const rows = await ctx.db.select().from(meetings).where(inArray(meetings.status, [
+      "queued", "joining", "waiting_for_admission", "in_progress", "processing",
+    ]));
+    for (const meeting of rows) {
+      if (attributedEnabled && meeting.platform === "google_meet" && meeting.status === "processing") continue;
+      const job = meeting.status === "queued"
+        ? { type: "meeting.start" as const, meetingId: meeting.id }
+        : { type: "meeting.poll" as const, meetingId: meeting.id };
+      await ctx.queue.push(job).catch(() => {});
+    }
+  };
+
   const reconcileAttributed = async () => {
     if (!attributedEnabled || reconciliationInFlight || Date.now() < nextReconciliationAt) return;
     reconciliationInFlight = true;
@@ -74,6 +91,7 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number } = 
     heartbeatInFlight = true;
     try {
       await reconcileAttributed();
+      await reconcileMeetingWakeups();
       if (attributedEnabled) {
         await recordAttributedWorkerReadiness(ctx, ctx.attributedWorkerHealthy && ctx.attributedReconciliationReady && queueFailures < 3 && attributedJobFailures < 3, "heartbeat");
       }

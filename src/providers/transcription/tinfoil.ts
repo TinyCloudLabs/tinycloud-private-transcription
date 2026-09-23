@@ -25,6 +25,15 @@ interface TinfoilResponse {
   usage?: { type?: string; seconds?: number };
 }
 
+// Provider metadata is untrusted and may become canonical API/webhook data. Keep only a compact
+// BCP-47-like identifier; text is separately bounded by the transcription pipeline.
+export function safeTinfoilLanguage(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length > 35) return undefined;
+  return /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,3}$/.test(value)
+      && !/private|credential|secret|token|password|api[_-]?key|bearer|authorization/i.test(value)
+    ? value : undefined;
+}
+
 export interface TinfoilStats {
   audio_seconds: number;
   chunks: number;
@@ -160,7 +169,8 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     if (!body || typeof body !== "object" || typeof (body as Record<string, unknown>).text !== "string") {
       throw new ApiError("transcription_failed", "Transcription provider returned no transcription text");
     }
-    return body as TinfoilResponse;
+    const parsed = body as TinfoilResponse;
+    return { text: parsed.text, ...(safeTinfoilLanguage(parsed.language) ? { language: safeTinfoilLanguage(parsed.language) } : {}) };
   }
 }
 

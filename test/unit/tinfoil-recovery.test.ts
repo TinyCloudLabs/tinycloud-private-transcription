@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { PCM_RATE, pcmToWav } from "../../src/providers/transcription/audio.ts";
-import { quietBoundedChunks, TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
+import { quietBoundedChunks, safeTinfoilLanguage, TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
 
 const toneWav = (seconds: number) => pcmToWav(new Int16Array(Math.round(PCM_RATE * seconds)).fill(2_000), PCM_RATE);
 const input = (bytes: Uint8Array) => ({
@@ -11,6 +11,12 @@ const input = (bytes: Uint8Array) => ({
 });
 
 describe("whole-recording Tinfoil recovery", () => {
+  test("drops provider language metadata that is not a bounded language identifier", () => {
+    expect(safeTinfoilLanguage("pt-BR")).toBe("pt-BR");
+    for (const value of ["https://private.example/token", "Bearer secret", "x".repeat(36), { language: "en" }]) {
+      expect(safeTinfoilLanguage(value)).toBeUndefined();
+    }
+  });
   test("plans an hour as contiguous bounded chunks ending at 3600 seconds", () => {
     const chunks = quietBoundedChunks({ samples: new Int16Array(3_600).fill(1), sampleRate: 1, durationSec: 3_600 }, 600);
     expect(chunks.length).toBeGreaterThanOrEqual(6);

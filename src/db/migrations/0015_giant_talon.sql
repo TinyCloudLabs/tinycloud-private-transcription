@@ -1,0 +1,1 @@
+ALTER TABLE "meetings" ADD COLUMN "deletion_provider_admitted_at" timestamp with time zone;

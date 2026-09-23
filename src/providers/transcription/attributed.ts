@@ -21,7 +21,7 @@ export interface AttributedBatch {
   attribution: AttributedRange["attribution"]; start_ms: number; end_ms: number; ranges: AttributedRange[];
 }
 
-const TARGET_MS = 90_000, MAX_MS = 120_000, PCM_FLOAT_BYTES = 4, CLOCK_JITTER_MS = 250;
+const TARGET_MS = 90_000, MAX_MS = 120_000, MAX_TIMELINE_MS = 24 * 60 * 60 * 1000, PCM_FLOAT_BYTES = 4, CLOCK_JITTER_MS = 250;
 const MAX_RANGES = 2_048, MAX_IDEMPOTENCY_KEY = 256, MAX_SPEAKER_KEY = 128, MAX_SPEAKER_NAME = 128;
 const MAX_SAMPLE_RATE = 192_000, MAX_CLOCK_MS = 9_007_199_254_740_991;
 const invalid = (message: string): never => { throw new ApiError("transcription_failed", message); };
@@ -36,7 +36,10 @@ const ownKeys = (value: unknown, keys: readonly string[]) =>
 const opaqueId = (value: unknown, limit: number) => typeof value === "string" && value.length > 0 && value.length <= limit
   && /^[A-Za-z0-9._:-]+$/.test(value) && !/private|credential|secret|token|https?:/i.test(value);
 const speakerName = (value: unknown) => typeof value === "string" && value.length > 0 && value.length <= MAX_SPEAKER_NAME
-  && /^[A-Za-z0-9 .,'_-]+$/.test(value) && !/private|credential|secret|token|https?:/i.test(value);
+  // Names are user-facing, international Unicode text; controls, URL punctuation, and other
+  // protocol-shaped strings are not names. Combining marks keep normalized and decomposed José valid.
+  && /^[\p{L}\p{M}\p{N} .,'’_-]+$/u.test(value)
+  && !/private|credential|secret|token|password|api[_-]?key|bearer|authorization|https?:/i.test(value);
 
 /** The server validates fractional sample durations within one f32 sample, not rounded milliseconds. */
 function validateRange(manifest: AttributedManifest, range: AttributedRange, index: number, vexaMeetingId: number): void {
@@ -55,7 +58,7 @@ function validateRange(manifest: AttributedManifest, range: AttributedRange, ind
     || !opaqueId(range.idempotency_key, MAX_IDEMPOTENCY_KEY) || !opaqueId(range.speaker_key, MAX_SPEAKER_KEY) || unknown(range.speaker_key)
     || (range.attribution?.source === "unresolved" ? range.speaker_name !== "" : !speakerName(range.speaker_name)) || !Number.isSafeInteger(range.channel) || range.channel < 0 || range.channel > 255 || !Number.isSafeInteger(range.turn_generation) || range.turn_generation < 1 || range.turn_generation > 1_000_000
     || !Number.isSafeInteger(range.clock_origin_ms) || range.clock_origin_ms !== manifest.clock_origin_ms
-    || !Number.isFinite(range.start_ms) || !Number.isFinite(range.end_ms) || range.start_ms < 0 || duration < 0 || duration >= MAX_MS
+    || !Number.isFinite(range.start_ms) || !Number.isFinite(range.end_ms) || range.start_ms < 0 || range.start_ms > MAX_TIMELINE_MS || range.end_ms < 0 || range.end_ms > MAX_TIMELINE_MS || duration < 0 || duration >= MAX_MS
     || !Number.isFinite(range.audio_duration_ms) || range.audio_duration_ms < 0 || range.audio_duration_ms >= MAX_MS || sampleDuration >= MAX_MS || Math.abs(duration - range.audio_duration_ms) > allowedClockSkew
     || range.codec !== "pcm_f32le" || range.channels !== 1 || !Number.isInteger(range.sample_rate) || range.sample_rate < 8_000 || range.sample_rate > MAX_SAMPLE_RATE
     || !Number.isSafeInteger(range.byte_count) || range.byte_count < 0 || range.byte_count > MAX_MS * MAX_SAMPLE_RATE * PCM_FLOAT_BYTES / 1000 || range.byte_count % PCM_FLOAT_BYTES !== 0 || Math.abs(expectedBytes - range.byte_count) > PCM_FLOAT_BYTES
