@@ -52,16 +52,26 @@ test("attributed readiness is a stale-safe PostgreSQL worker heartbeat", async (
   expect(stale).toMatchObject({ status: "degraded", checks: { attributed_transcription: { enabled: true, ready: false } } });
 });
 
-test("live worker readiness is conjunctive and a no-op peer cannot heal a failed worker", async () => {
-  const failed = { ...h.ctx, attributedWorkerId: `attributed-worker:test-failed:${crypto.randomUUID()}` };
-  const healthy = { ...h.ctx, attributedWorkerId: `attributed-worker:test-healthy:${crypto.randomUUID()}` };
-  await recordAttributedWorkerReadiness(failed, false, "reconciliation_failed");
-  await recordAttributedWorkerReadiness(healthy, true, "heartbeat");
-  expect(await attributedWorkerReady(h.ctx)).toBe(false);
-  // A successful no-op heartbeat for another worker leaves the failed identity authoritative.
-  await recordAttributedWorkerReadiness(healthy, true, "reconciled");
-  expect(await attributedWorkerReady(h.ctx)).toBe(false);
-  await h.ctx.db.update(attributedWorkerReadiness).set({ observedAt: new Date(Date.now() - 16_000) })
-    .where(eq(attributedWorkerReadiness.id, failed.attributedWorkerId));
-  expect(await attributedWorkerReady(h.ctx)).toBe(true);
+test("startup unreadiness heals after a successful configured reconciliation", async () => {
+  const worker = { ...h.ctx, attributedWorkerId: `attributed-worker:test-startup:${crypto.randomUUID()}` };
+  await recordAttributedWorkerReadiness(worker, false, "startup");
+  await recordAttributedWorkerReadiness(worker, true, "reconciled");
+  const [readiness] = await h.ctx.db.select().from(attributedWorkerReadiness)
+    .where(eq(attributedWorkerReadiness.id, worker.attributedWorkerId));
+  expect(readiness).toMatchObject({ ready: true, stage: "reconciled" });
+});
+
+test("canonical publication failure remains latched until canonical publication succeeds", async () => {
+  const worker = { ...h.ctx, attributedWorkerId: `attributed-worker:test-publication:${crypto.randomUUID()}` };
+  await recordAttributedWorkerReadiness(worker, false, "publication_failed");
+  await recordAttributedWorkerReadiness(worker, true, "reconciled");
+  await recordAttributedWorkerReadiness(worker, false, "reconciliation_failed");
+  await recordAttributedWorkerReadiness(worker, true, "heartbeat");
+  let [readiness] = await h.ctx.db.select().from(attributedWorkerReadiness)
+    .where(eq(attributedWorkerReadiness.id, worker.attributedWorkerId));
+  expect(readiness).toMatchObject({ ready: false, stage: "publication_failed" });
+  await recordAttributedWorkerReadiness(worker, true, "published");
+  [readiness] = await h.ctx.db.select().from(attributedWorkerReadiness)
+    .where(eq(attributedWorkerReadiness.id, worker.attributedWorkerId));
+  expect(readiness).toMatchObject({ ready: true, stage: "published" });
 });

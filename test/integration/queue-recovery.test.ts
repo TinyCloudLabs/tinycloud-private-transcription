@@ -19,6 +19,9 @@ beforeAll(async () => {
     enabledPlatforms: ["jitsi", "signal"],
     signal,
     signalCapabilityKey: Buffer.alloc(32, 9).toString("base64"),
+    // Exercise the durable scanner independently of Bun's five-second test deadline.
+    workerHeartbeatIntervalMs: 25,
+    workerPopTimeoutSec: .05,
   });
 });
 afterAll(async () => h.stop());
@@ -34,6 +37,6 @@ test("lost create wakeups are durably recovered for feature-off and Signal meeti
   } finally {
     h.ctx.queue.push = push;
   }
-  await h.waitFor(async () => h.vexa.meetings.has("jitsi/QueueRecovery@jitsi.local") ? true : null, { timeoutMs: 8_000, label: "feature-off wakeup recovery" });
-  await h.waitFor(async () => signal.starts === 1 ? true : null, { timeoutMs: 8_000, label: "Signal wakeup recovery" });
+  await h.waitFor(async () => h.vexa.meetings.has("jitsi/QueueRecovery@jitsi.local") ? true : null, { timeoutMs: 1_000, label: "feature-off wakeup recovery" });
+  await h.waitFor(async () => signal.starts === 1 ? true : null, { timeoutMs: 1_000, label: "Signal wakeup recovery" });
 });

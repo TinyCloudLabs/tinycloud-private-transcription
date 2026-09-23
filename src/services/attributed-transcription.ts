@@ -9,22 +9,26 @@ import { enqueueMeetingWebhook, webhookDeliveryValues, wakeWebhookDelivery } fro
 
 const ATTEMPT_LIMIT = 1, CLAIM_MS = 5 * 60_000, SLOT_CLAIM_MS = 10 * 60_000;
 const READINESS_STALE_MS = 15_000;
+type AttributedReadinessStage = "startup" | "reconciled" | "reconciliation_failed" | "heartbeat" | "publication_failed" | "published" | "stopped";
 const json = (value: unknown) => sql`${JSON.stringify(value)}::text::jsonb`;
 const object = <T>(value: unknown): T => typeof value === "string" ? JSON.parse(value) as T : value as T;
 const canonical = (value: unknown): string => Array.isArray(value) ? `[${value.map(canonical).join(",")}]` : value && typeof value === "object" ? `{${Object.keys(value as object).sort().map((key) => `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`).join(",")}}` : JSON.stringify(value);
 const capabilityOk = (value: unknown): value is AttributedCapability => canonical(value) === canonical({ requested_version: 1, supported_version: 1, status: "supported" });
 
 /** Persisted independently of queue wakeups so API processes can observe worker startup safely. */
-export async function recordAttributedWorkerReadiness(ctx: AppContext, ready: boolean, stage: "startup" | "reconciled" | "reconciliation_failed" | "heartbeat" | "published" | "stopped"): Promise<void> {
+export async function recordAttributedWorkerReadiness(ctx: AppContext, ready: boolean, stage: AttributedReadinessStage): Promise<void> {
   // 0009 creates this on fresh/normal upgrades. The guard also makes an already-applied draft
   // 0009 safe to upgrade without changing migration history.
   await ctx.db.execute(sql`CREATE TABLE IF NOT EXISTS attributed_worker_readiness (id text PRIMARY KEY NOT NULL, ready boolean NOT NULL, stage text NOT NULL, observed_at timestamp with time zone NOT NULL)`);
-  // A failed publisher is sticky. Queue liveness and a successful reconciliation prove neither
-  // canonical publication nor recovery; only the transaction that commits that transcript heals it.
+  // Startup and reconciliation unreadiness are recoverable operational states. A canonical
+  // publication failure is different: queue liveness and reconciliation prove neither a
+  // publication nor recovery, so only the transaction that commits canonical text heals it.
   const [prior] = await ctx.db.select().from(attributedWorkerReadiness).where(eq(attributedWorkerReadiness.id, ctx.attributedWorkerId)).limit(1);
-  const healed = ready && prior?.ready === false && stage !== "published" ? false : ready;
-  await ctx.db.insert(attributedWorkerReadiness).values({ id: ctx.attributedWorkerId, ready: healed, stage: healed ? stage : (ready ? prior?.stage ?? stage : stage), observedAt: new Date() })
-    .onConflictDoUpdate({ target: attributedWorkerReadiness.id, set: { ready: healed, stage: healed ? stage : (ready ? prior?.stage ?? stage : stage), observedAt: new Date() } });
+  const publicationFailureLatched = prior?.stage === "publication_failed" && stage !== "published";
+  const persistedReady = publicationFailureLatched ? false : ready;
+  const persistedStage = publicationFailureLatched ? "publication_failed" : stage;
+  await ctx.db.insert(attributedWorkerReadiness).values({ id: ctx.attributedWorkerId, ready: persistedReady, stage: persistedStage, observedAt: new Date() })
+    .onConflictDoUpdate({ target: attributedWorkerReadiness.id, set: { ready: persistedReady, stage: persistedStage, observedAt: new Date() } });
 }
 
 export async function attributedWorkerReady(ctx: AppContext): Promise<boolean> {
@@ -240,6 +244,7 @@ export async function finalizeAttributedRun(ctx: AppContext, meetingId: string):
     const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Attributed evidence is unresolved; canonical transcript was not published.");
     if (changed) {
       ctx.attributedWorkerHealthy = false;
+      await recordAttributedWorkerReadiness(ctx, false, "publication_failed");
       await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
     }
     return changed;
@@ -340,7 +345,7 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
     // worker's real commit (or rejection) changes its own durable readiness.
     ctx.attributedWorkerHealthy = published.meeting.status === "completed";
     if (published.meeting.status === "completed") await recordAttributedWorkerReadiness(ctx, true, "published");
-    else await recordAttributedWorkerReadiness(ctx, false, "reconciliation_failed");
+    else await recordAttributedWorkerReadiness(ctx, false, "publication_failed");
     if (published.deliveryId) await wakeWebhookDelivery(ctx, published.deliveryId, new Date()).catch(() => {
       ctx.log.warn("completion webhook wakeup deferred", { meetingId, stage: "webhook_wakeup" });
     });

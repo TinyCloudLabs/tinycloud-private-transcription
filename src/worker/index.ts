@@ -31,7 +31,7 @@ export interface WorkerHandle {
 }
 
 /** Runs the queue loop until stopped. Errors are retried without turning this process into an idle worker. */
-export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number } = {}): WorkerHandle {
+export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number; heartbeatIntervalMs?: number } = {}): WorkerHandle {
   let running = true;
   const attributedEnabled = ctx.config.attributedTranscriptionEnabled;
   let reconciliationInFlight = false;
@@ -116,7 +116,7 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number } = 
     void heartbeat();
     // 5 seconds leaves generous margin under the 15-second API staleness window while this timer
     // remains independent of a long-running queue job.
-    const heartbeatTimer = setInterval(() => { void heartbeat(); }, 5_000);
+    const heartbeatTimer = setInterval(() => { void heartbeat(); }, opts.heartbeatIntervalMs ?? 5_000);
     while (running) {
       let job: Job | null = null;
       try {

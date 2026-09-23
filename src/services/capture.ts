@@ -7,8 +7,16 @@ import type { VexaTranscriptionResponse } from "../providers/vexa/types.ts";
 /** Merge in SQL so an in-flight provider poll cannot erase a concurrent user stop request. */
 export async function recordCapture(ctx: AppContext, meeting: MeetingRow, patch: CaptureDiagnostics): Promise<MeetingRow> {
   // Bind JSON as text before casting: the Bun SQL driver also encodes JSON-typed parameters.
+  // Terminal observations can race with a retry using a stale MeetingRow. Once terminal
+  // evidence exists, null fields from that stale retry must not erase it (while a direct,
+  // non-null terminal observation can still refine it).
+  const patchJson = sql`${JSON.stringify(patch)}::text::jsonb`;
   const [updated] = await ctx.db.update(meetings).set({
-    captureDiagnostics: sql`coalesce(${meetings.captureDiagnostics}, '{}'::jsonb) || ${JSON.stringify(patch)}::text::jsonb`,
+    captureDiagnostics: sql`coalesce(${meetings.captureDiagnostics}, '{}'::jsonb) || case
+      when coalesce(${meetings.captureDiagnostics}->>'provider_status', '') in ('completed', 'failed')
+      then jsonb_strip_nulls(${patchJson})
+      else ${patchJson}
+    end`,
   }).where(eq(meetings.id, meeting.id)).returning();
   return updated ?? meeting;
 }
