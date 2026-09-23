@@ -81,7 +81,10 @@ export function attributedBatches(manifest: AttributedManifest, vexaMeetingId: n
   const flush = (key: string) => {
     const current = active.get(key); if (!current?.ranges.length) return;
     const first = current.ranges[0]!, last = current.ranges.at(-1)!;
-    done.push({ idempotency_key: current.ranges.map((r) => r.idempotency_key).join(","), speaker_key: first.speaker_key, speaker_name: first.speaker_name,
+    // The range keys are independently validated, but concatenating a provider-controlled list
+    // would make the persisted batch JSON and multipart filename unbounded. Keep a deterministic,
+    // opaque fixed-width batch key instead.
+    done.push({ idempotency_key: `batch-${createHash("sha256").update(current.ranges.map((r) => r.idempotency_key).join("\u0000")).digest("hex")}`, speaker_key: first.speaker_key, speaker_name: first.speaker_name,
       attribution: first.attribution, start_ms: first.start_ms, end_ms: last.end_ms, ranges: current.ranges });
     active.delete(key);
   };
