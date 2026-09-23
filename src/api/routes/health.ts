@@ -25,7 +25,8 @@ export function healthRoutes(ctx: AppContext) {
       ready: !ctx.config.attributedTranscriptionEnabled || attributedProviderReady,
       reason: ctx.config.attributedTranscriptionEnabled && !attributedProviderReady ? (ctx.transcriptRecovery instanceof TinfoilTranscriptionProvider ? "Attributed transcription reconciliation is incomplete" : "Attributed transcription provider is not configured") : null,
     };
-    const status = !core ? "error" : vexa.ok && signal.ready && attributed.ready ? "ok" : "degraded";
+    const ready = core && vexa.ok && signal.ready && attributed.ready;
+    const status = !core ? "error" : ready ? "ok" : "degraded";
     return c.json(
       {
         status,
@@ -40,7 +41,9 @@ export function healthRoutes(ctx: AppContext) {
           signal,
         },
       },
-      core ? 200 : 503,
+      // Status-only deployment checks must fail closed when the enabled attributed path cannot
+      // safely publish (including missing Tinfoil/recovery configuration).
+      ready ? 200 : 503,
     );
   });
   return r;

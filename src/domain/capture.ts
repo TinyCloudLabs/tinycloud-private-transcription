@@ -37,7 +37,9 @@ export function captureObservation(vexa: VexaTranscriptionResponse, now = new Da
   const rawReason = vexa.data?.last_error?.reason;
   const failure = typeof rawReason === "string" ? /^(browser_crashed|browser_closed):/.exec(rawReason)?.[1] : undefined;
   return {
-    provider_meeting_id: vexa.id,
+    // This diagnostic is serialized to API/webhook consumers. Provider ids are not trusted
+    // opaque text: retain only the bounded numeric shape used by the documented Vexa contract.
+    ...(typeof vexa.id === "number" && Number.isSafeInteger(vexa.id) && vexa.id > 0 && vexa.id <= 2_147_483_647 ? { provider_meeting_id: vexa.id } : {}),
     provider_status: safeEnum(vexa.status, statuses),
     completion_reason: reasonOf(completionReasonOf(vexa)),
     failure_stage: vexa.data?.failure_stage == null ? null : safeEnum(vexa.data.failure_stage, statuses),

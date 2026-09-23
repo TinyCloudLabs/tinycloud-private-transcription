@@ -324,9 +324,15 @@ async function stopInSignal(ctx: AppContext, meeting: MeetingRow) {
  * deletes PLANNED rows and answers 409 for anything the bot lifecycle touched — we log that ("retained
  * by capture provider") and still remove our data; purging Vexa's copy is a documented gap.
  */
+const DELETION_LEASE_MS = 15_000;
+
 export async function deleteMeeting(ctx: AppContext, meeting: MeetingRow): Promise<void> {
   const deletionToken = await fenceAttributedDeletion(ctx, meeting.id);
   if (!deletionToken) return;
+  const renewLease = () => ctx.db.update(meetings).set({ deletionLeaseAt: new Date() })
+    .where(and(eq(meetings.id, meeting.id), eq(meetings.deletionToken, deletionToken), eq(meetings.deletionOwnerId, ctx.attributedWorkerId)))
+    .catch(() => {});
+  const leaseTimer = setInterval(() => { void renewLease(); }, Math.max(1_000, Math.floor(DELETION_LEASE_MS / 3)));
   try {
     if (meeting.platform === "signal") {
       if (!isTerminal(meeting.status as MeetingStatus)) await stopInSignal(ctx, meeting);
@@ -355,9 +361,11 @@ export async function deleteMeeting(ctx: AppContext, meeting: MeetingRow): Promi
   } catch (error) {
     // Compare the owner token: a failed overlapping deletion must not lower another deletion's
     // fence and admit a later attributed request.
-    await ctx.db.update(meetings).set({ dispatchBlocked: false, deletionToken: null })
-      .where(and(eq(meetings.id, meeting.id), eq(meetings.deletionToken, deletionToken)));
+    await ctx.db.update(meetings).set({ dispatchBlocked: false, deletionToken: null, deletionOwnerId: null, deletionLeaseAt: null })
+      .where(and(eq(meetings.id, meeting.id), eq(meetings.deletionToken, deletionToken), eq(meetings.deletionOwnerId, ctx.attributedWorkerId)));
     throw error;
+  } finally {
+    clearInterval(leaseTimer);
   }
 }
 
@@ -368,13 +376,15 @@ async function fenceAttributedDeletion(ctx: AppContext, meetingId: string): Prom
     const result = await ctx.db.transaction(async (tx) => {
       const [current] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
       if (!current) return { token: null, waiting: false };
-      // Another deletion owns the provider call. Wait for its outcome rather than becoming a
-      // second owner; on failure its token is cleared conditionally and this loop can claim next.
-      if (current.deletionToken || current.dispatchBlocked) return { token: null, waiting: true };
+      // Another deletion owns the provider call while its renewable lease is fresh. A dead owner
+      // that crashed immediately after fencing is safely replaced under this row lock.
+      const leaseLive = !!current.deletionLeaseAt && current.deletionLeaseAt.getTime() > Date.now() - DELETION_LEASE_MS;
+      if (current.deletionToken && leaseLive) return { token: null, waiting: true };
+      if (current.dispatchBlocked && !current.deletionToken) return { token: null, waiting: true };
       const active = await tx.select({ id: attributedBatches.id }).from(attributedBatches)
         .where(and(eq(attributedBatches.meetingId, meetingId), isNotNull(attributedBatches.dispatchToken))).for("update");
       if (active.length) return { token: null, waiting: true };
-      await tx.update(meetings).set({ dispatchBlocked: true, deletionToken: token }).where(eq(meetings.id, meetingId));
+      await tx.update(meetings).set({ dispatchBlocked: true, deletionToken: token, deletionOwnerId: ctx.attributedWorkerId, deletionLeaseAt: new Date() }).where(eq(meetings.id, meetingId));
       return { token, waiting: false };
     });
     if (!result.waiting) return result.token;

@@ -22,9 +22,11 @@ const usesAttributedCapture = (ctx: AppContext, meeting: MeetingRow) => ctx.conf
 // The only Vexa container shape we retain is its documented opaque runtime handle. Provider
 // responses are untrusted: URLs, text, and arbitrary identifiers must never become SQL data.
 const safeVexaBotId = (value: unknown): string | undefined =>
-  typeof value === "string" && /^mtg-[0-9]+-[a-f0-9]{8}$/i.test(value) ? value : undefined;
+  typeof value === "string" && value.length <= 128 && /^[a-z0-9][a-z0-9._:-]*$/i.test(value) && !/private|credential|secret|token|https?:/i.test(value) ? value : undefined;
 const safeProviderNativeId = (value: unknown): string | undefined =>
-  typeof value === "string" && /^[a-z0-9][a-z0-9.@-]{0,127}$/.test(value) ? value : undefined;
+  typeof value === "string" && /^[a-z0-9][a-z0-9.@-]{0,127}$/i.test(value) && !/private|credential|secret|token|https?:/i.test(value) ? value : undefined;
+const safeVexaMeetingId = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isSafeInteger(value) && value > 0 && value <= 2_147_483_647 ? value : undefined;
 
 /** Job: meeting.start — ask Vexa to send a bot. */
 export async function handleMeetingStart(ctx: AppContext, meetingId: string, attempt = 1): Promise<void> {
@@ -54,14 +56,19 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
     const vexaNativeMeetingId = created.native_meeting_id === meeting.vexaNativeMeetingId
       ? meeting.vexaNativeMeetingId
       : safeProviderNativeId(created.native_meeting_id) ?? meeting.vexaNativeMeetingId;
+    // Attributed audio is addressed by Vexa's numeric row id.  Do not put an untrusted provider
+    // handle in SQL and never fall back to a value which can later enter an API/webhook payload.
+    const vexaMeetingId = usesAttributedCapture(ctx, meeting) ? safeVexaMeetingId(created.id) : undefined;
+    if (usesAttributedCapture(ctx, meeting) && !vexaMeetingId) throw new ApiError("provider_unavailable", "Capture provider returned an invalid meeting identity.");
     const dispatched = await recordCapture(ctx, meeting, {
       silence_timeout_ms: ctx.config.vexa.maxTimeLeftAloneMs,
       live_transcription_requested: !usesAttributedCapture(ctx, meeting),
     });
     const { meeting: updated, changed } = await transition(ctx, dispatched, "joining", {
-      vexaPlatform: created.platform ?? vexaPlatform,
+      // Platform is request-derived and allowlisted. A provider response must not replace it.
+      vexaPlatform,
       vexaNativeMeetingId,
-      ...(usesAttributedCapture(ctx, meeting) ? { vexaMeetingId: created.id } : {}),
+      ...(vexaMeetingId ? { vexaMeetingId } : {}),
       ...(safeVexaBotId(created.bot_container_id) ? { vexaBotId: safeVexaBotId(created.bot_container_id) } : {}),
     });
     if (changed) {
@@ -72,7 +79,7 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
       await ctx.queue.push({ type: "meeting.join_deadline", meetingId }, ctx.config.joinTimeoutSeconds * 1000);
     } else if (updated.status === "cancelled" && vexaNativeMeetingId) {
       // Stopped while we were dispatching the bot: don't leave it orphaned in Vexa.
-      await ctx.vexa.stopBot(created.platform ?? vexaPlatform, vexaNativeMeetingId).catch(() => {});
+      await ctx.vexa.stopBot(vexaPlatform, vexaNativeMeetingId).catch(() => {});
     }
   } catch (e) {
     await handleStartError(ctx, meeting, e, attempt);

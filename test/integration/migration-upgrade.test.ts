@@ -28,7 +28,7 @@ async function productionMigrationsFixture(): Promise<string> {
   return folder;
 }
 
-test("0004-0012 retain production retry, fallback, and terminal delivery state for rollback", async () => {
+test("0004-0014 retain production retry, fallback, and terminal delivery state for rollback", async () => {
   const databaseName = `ptx_upgrade_${crypto.randomUUID().replaceAll("-", "")}`;
   const databaseUrl = new URL(config.databaseUrl);
   databaseUrl.pathname = `/${databaseName}`;
@@ -155,7 +155,7 @@ test("0004-0012 retain production retry, fallback, and terminal delivery state f
     expect(signalColumns).toEqual({ count: 2 });
 
     const [migrationCount] = await db.execute(sql`SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`);
-    expect(migrationCount).toEqual({ count: 14 });
+    expect(migrationCount).toEqual({ count: 15 });
 
     const app = createApp({ db, log: silentLogger } as AppContext);
     const response = await app.request("/v1/meetings/mtg_legacy_1", {

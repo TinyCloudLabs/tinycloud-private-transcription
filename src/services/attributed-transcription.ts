@@ -15,12 +15,16 @@ const canonical = (value: unknown): string => Array.isArray(value) ? `[${value.m
 const capabilityOk = (value: unknown): value is AttributedCapability => canonical(value) === canonical({ requested_version: 1, supported_version: 1, status: "supported" });
 
 /** Persisted independently of queue wakeups so API processes can observe worker startup safely. */
-export async function recordAttributedWorkerReadiness(ctx: AppContext, ready: boolean, stage: "startup" | "reconciled" | "reconciliation_failed" | "heartbeat" | "stopped"): Promise<void> {
+export async function recordAttributedWorkerReadiness(ctx: AppContext, ready: boolean, stage: "startup" | "reconciled" | "reconciliation_failed" | "heartbeat" | "published" | "stopped"): Promise<void> {
   // 0009 creates this on fresh/normal upgrades. The guard also makes an already-applied draft
   // 0009 safe to upgrade without changing migration history.
   await ctx.db.execute(sql`CREATE TABLE IF NOT EXISTS attributed_worker_readiness (id text PRIMARY KEY NOT NULL, ready boolean NOT NULL, stage text NOT NULL, observed_at timestamp with time zone NOT NULL)`);
-  await ctx.db.insert(attributedWorkerReadiness).values({ id: ctx.attributedWorkerId, ready, stage, observedAt: new Date() })
-    .onConflictDoUpdate({ target: attributedWorkerReadiness.id, set: { ready, stage, observedAt: new Date() } });
+  // A failed publisher is sticky. Queue liveness and a successful reconciliation prove neither
+  // canonical publication nor recovery; only the transaction that commits that transcript heals it.
+  const [prior] = await ctx.db.select().from(attributedWorkerReadiness).where(eq(attributedWorkerReadiness.id, ctx.attributedWorkerId)).limit(1);
+  const healed = ready && prior?.ready === false && stage !== "published" ? false : ready;
+  await ctx.db.insert(attributedWorkerReadiness).values({ id: ctx.attributedWorkerId, ready: healed, stage: healed ? stage : (ready ? prior?.stage ?? stage : stage), observedAt: new Date() })
+    .onConflictDoUpdate({ target: attributedWorkerReadiness.id, set: { ready: healed, stage: healed ? stage : (ready ? prior?.stage ?? stage : stage), observedAt: new Date() } });
 }
 
 export async function attributedWorkerReady(ctx: AppContext): Promise<boolean> {
@@ -60,8 +64,10 @@ export async function stageAttributedManifest(ctx: AppContext, meetingId: string
     ? specs.map((_, ordinal) => `${meetingId}:batch:${ordinal}`)
     : (await ctx.db.select({ id: batchesTable.id }).from(batchesTable)
       .where(and(eq(batchesTable.meetingId, meetingId), eq(batchesTable.status, "pending")))).map((row) => row.id);
-  for (const batchId of pending) await ctx.queue.push({ type: "attributed.batch", meetingId, batchId });
-  await ctx.queue.push({ type: "attributed.finalize", meetingId });
+  // Redis acknowledges only a wakeup, never admission. A lost acknowledgement after this
+  // transaction must leave retained unpaid work pending for the durable reconciler, not fail it.
+  for (const batchId of pending) await ctx.queue.push({ type: "attributed.batch", meetingId, batchId }).catch(() => {});
+  await ctx.queue.push({ type: "attributed.finalize", meetingId }).catch(() => {});
 }
 
 async function claimBatch(ctx: AppContext, batchId: string) {
@@ -192,12 +198,17 @@ async function reconcileClaim(ctx: AppContext, batchId: string): Promise<boolean
       if (owner) return false;
     } else if (!expired) return false;
     const spec = object<AttributedBatch>(batch.batchJson);
-    const [won] = await tx.update(batchesTable).set({ status: "ambiguous", claimToken: null, dispatchToken: null, dispatchOwnerId: null, dispatchedAt: null, updatedAt: new Date() }).where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "claimed"), eq(batchesTable.claimToken, batch.claimToken ?? ""))).returning();
+    // This process died before durable paid admission. It is explicitly safe to requeue: no
+    // attempt row/dispatch token exists, so retained audio gets exactly its first paid call.
+    const unpaid = !batch.dispatchToken;
+    const [won] = await tx.update(batchesTable).set({ status: unpaid ? "pending" : "ambiguous", claimToken: null, dispatchToken: null, dispatchOwnerId: null, dispatchedAt: null, claimedAt: null, updatedAt: new Date() }).where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "claimed"), eq(batchesTable.claimToken, batch.claimToken ?? ""))).returning();
     if (!won) return false;
     if (batch.dispatchToken) await tx.update(tinfoilDispatchSlots).set({ claimToken: null, claimedAt: null, ownerId: null })
       .where(eq(tinfoilDispatchSlots.claimToken, batch.dispatchToken));
-    await tx.update(attributedRanges).set({ status: "unresolved" }).where(and(eq(attributedRanges.meetingId, batch.meetingId), inArray(attributedRanges.sequence, sequences(spec))));
-    await tx.update(attributedAttempts).set({ status: "ambiguous", outcome: "external_call_uncertain", completedAt: new Date() }).where(and(eq(attributedAttempts.batchId, batchId), eq(attributedAttempts.status, "started")));
+    if (!unpaid) {
+      await tx.update(attributedRanges).set({ status: "unresolved" }).where(and(eq(attributedRanges.meetingId, batch.meetingId), inArray(attributedRanges.sequence, sequences(spec))));
+      await tx.update(attributedAttempts).set({ status: "ambiguous", outcome: "external_call_uncertain", completedAt: new Date() }).where(and(eq(attributedAttempts.batchId, batchId), eq(attributedAttempts.status, "started")));
+    }
     return true;
   });
 }
@@ -216,7 +227,11 @@ export async function finalizeAttributedRun(ctx: AppContext, meetingId: string):
     ))));
     if (remaining.length) return false;
   }
-  if (rows.some((row) => row.status === "pending")) return false;
+  const pending = rows.filter((row) => row.status === "pending");
+  if (pending.length) {
+    for (const row of pending) await ctx.queue.push({ type: "attributed.batch", meetingId, batchId: row.id }).catch(() => {});
+    return false;
+  }
   const ranges = await ctx.db.select().from(attributedRanges).where(eq(attributedRanges.meetingId, meetingId));
   const meeting = await getMeetingById(ctx, meetingId);
   if (!meeting || meeting.status === "completed" || meeting.status === "failed") return false;
@@ -324,6 +339,8 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
     // A no-op finalizer has no publication outcome and must not heal a prior failure. Only this
     // worker's real commit (or rejection) changes its own durable readiness.
     ctx.attributedWorkerHealthy = published.meeting.status === "completed";
+    if (published.meeting.status === "completed") await recordAttributedWorkerReadiness(ctx, true, "published");
+    else await recordAttributedWorkerReadiness(ctx, false, "reconciliation_failed");
     if (published.deliveryId) await wakeWebhookDelivery(ctx, published.deliveryId, new Date()).catch(() => {
       ctx.log.warn("completion webhook wakeup deferred", { meetingId, stage: "webhook_wakeup" });
     });

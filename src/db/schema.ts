@@ -50,6 +50,9 @@ export const meetings = pgTable(
     dispatchBlocked: boolean("dispatch_blocked").notNull().default(false),
     /** Ownership token for the deletion fence. A loser must never clear a winner's fence. */
     deletionToken: text("deletion_token"),
+    /** Renewable owner lease makes a crash between fencing and provider work recoverable. */
+    deletionOwnerId: text("deletion_owner_id"),
+    deletionLeaseAt: timestamp("deletion_lease_at", { withTimezone: true }),
   },
   (t) => [
     uniqueIndex("meetings_project_idempotency_idx").on(t.projectId, t.idempotencyKey),

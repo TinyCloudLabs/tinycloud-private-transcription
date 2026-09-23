@@ -22,13 +22,29 @@ export interface AttributedBatch {
 }
 
 const TARGET_MS = 90_000, MAX_MS = 120_000, PCM_FLOAT_BYTES = 4, CLOCK_JITTER_MS = 250;
+const MAX_RANGES = 2_048, MAX_IDEMPOTENCY_KEY = 256, MAX_SPEAKER_KEY = 128, MAX_SPEAKER_NAME = 128;
+const MAX_SAMPLE_RATE = 192_000, MAX_CLOCK_MS = 9_007_199_254_740_991;
 const invalid = (message: string): never => { throw new ApiError("transcription_failed", message); };
 const relativePath = (path: string | undefined, meetingId: number, sequence: number) => path === `/meetings/${meetingId}/attributed-audio/ranges/${sequence}`;
 const unknown = (value: string) => !value.trim() || /^unknown$/i.test(value.trim());
 const sameAttribution = (a: AttributedRange, b: AttributedRange) => a.attribution.source === b.attribution.source && a.attribution.confidence === b.attribution.confidence;
+const ownKeys = (value: unknown, keys: readonly string[]) =>
+  !!value && typeof value === "object" && !Array.isArray(value)
+  && Object.keys(value).length === keys.length && Object.keys(value).every((key) => keys.includes(key));
+// Provider strings become durable JSON and, for names, canonical transcript/webhook text.  Keep
+// the producer protocol opaque but deliberately non-secret and bounded at that boundary.
+const opaqueId = (value: unknown, limit: number) => typeof value === "string" && value.length > 0 && value.length <= limit
+  && /^[A-Za-z0-9._:-]+$/.test(value) && !/private|credential|secret|token|https?:/i.test(value);
+const speakerName = (value: unknown) => typeof value === "string" && value.length > 0 && value.length <= MAX_SPEAKER_NAME
+  && /^[A-Za-z0-9 .,'_-]+$/.test(value) && !/private|credential|secret|token|https?:/i.test(value);
 
 /** The server validates fractional sample durations within one f32 sample, not rounded milliseconds. */
 function validateRange(manifest: AttributedManifest, range: AttributedRange, index: number, vexaMeetingId: number): void {
+  const hasPath = Object.prototype.hasOwnProperty.call(range, "path");
+  if (!ownKeys(range, hasPath
+    ? ["version", "meeting_id", "sequence", "idempotency_key", "speaker_key", "speaker_name", "channel", "turn_generation", "attribution", "clock_origin_ms", "start_ms", "end_ms", "audio_duration_ms", "codec", "sample_rate", "channels", "byte_count", "sha256", "state", "path"]
+    : ["version", "meeting_id", "sequence", "idempotency_key", "speaker_key", "speaker_name", "channel", "turn_generation", "attribution", "clock_origin_ms", "start_ms", "end_ms", "audio_duration_ms", "codec", "sample_rate", "channels", "byte_count", "sha256", "state"])
+    || !ownKeys(range.attribution, ["source", "confidence"])) invalid("Attributed audio manifest contains unexpected producer fields");
   const duration = range.end_ms - range.start_ms;
   const expectedBytes = range.audio_duration_ms * range.sample_rate * PCM_FLOAT_BYTES / 1000;
   const sampleDuration = range.byte_count * 1000 / (range.sample_rate * PCM_FLOAT_BYTES);
@@ -36,13 +52,13 @@ function validateRange(manifest: AttributedManifest, range: AttributedRange, ind
   const failedPathIsValid = range.path === undefined || relativePath(range.path, vexaMeetingId, range.sequence);
   if (
     range.version !== 1 || range.meeting_id !== manifest.meeting_id || range.sequence !== index
-    || typeof range.idempotency_key !== "string" || !range.idempotency_key || typeof range.speaker_key !== "string" || unknown(range.speaker_key)
-    || typeof range.speaker_name !== "string" || !Number.isSafeInteger(range.channel) || range.channel < 0 || !Number.isSafeInteger(range.turn_generation) || range.turn_generation < 1
-    || !Number.isFinite(range.clock_origin_ms) || range.clock_origin_ms !== manifest.clock_origin_ms
+    || !opaqueId(range.idempotency_key, MAX_IDEMPOTENCY_KEY) || !opaqueId(range.speaker_key, MAX_SPEAKER_KEY) || unknown(range.speaker_key)
+    || (range.attribution?.source === "unresolved" ? range.speaker_name !== "" : !speakerName(range.speaker_name)) || !Number.isSafeInteger(range.channel) || range.channel < 0 || range.channel > 255 || !Number.isSafeInteger(range.turn_generation) || range.turn_generation < 1 || range.turn_generation > 1_000_000
+    || !Number.isSafeInteger(range.clock_origin_ms) || range.clock_origin_ms !== manifest.clock_origin_ms
     || !Number.isFinite(range.start_ms) || !Number.isFinite(range.end_ms) || range.start_ms < 0 || duration < 0 || duration >= MAX_MS
     || !Number.isFinite(range.audio_duration_ms) || range.audio_duration_ms < 0 || range.audio_duration_ms >= MAX_MS || sampleDuration >= MAX_MS || Math.abs(duration - range.audio_duration_ms) > allowedClockSkew
-    || range.codec !== "pcm_f32le" || range.channels !== 1 || !Number.isInteger(range.sample_rate) || range.sample_rate < 1
-    || !Number.isSafeInteger(range.byte_count) || range.byte_count < 0 || range.byte_count % PCM_FLOAT_BYTES !== 0 || Math.abs(expectedBytes - range.byte_count) > PCM_FLOAT_BYTES
+    || range.codec !== "pcm_f32le" || range.channels !== 1 || !Number.isInteger(range.sample_rate) || range.sample_rate < 8_000 || range.sample_rate > MAX_SAMPLE_RATE
+    || !Number.isSafeInteger(range.byte_count) || range.byte_count < 0 || range.byte_count > MAX_MS * MAX_SAMPLE_RATE * PCM_FLOAT_BYTES / 1000 || range.byte_count % PCM_FLOAT_BYTES !== 0 || Math.abs(expectedBytes - range.byte_count) > PCM_FLOAT_BYTES
     || !/^[a-f0-9]{64}$/i.test(range.sha256) || !["uploaded", "failed"].includes(range.state)
     || !range.attribution || !Number.isFinite(range.attribution.confidence) || range.attribution.confidence < 0 || range.attribution.confidence > 1
     || !["glow-bound", "provisional", "unresolved"].includes(range.attribution.source)
@@ -53,8 +69,10 @@ function validateRange(manifest: AttributedManifest, range: AttributedRange, ind
 
 /** Keep each speaker's stream independent while retaining the producer sequence in each batch. */
 export function attributedBatches(manifest: AttributedManifest, vexaMeetingId: number): AttributedBatch[] {
-  if (manifest.version !== 1 || manifest.state !== "closed" || !manifest.meeting_id || manifest.clock_origin !== "first_admitted_capture_epoch_ms"
-      || manifest.meeting_id !== String(vexaMeetingId) || !Number.isFinite(manifest.clock_origin_ms) || manifest.clock_origin_ms < 0 || !Array.isArray(manifest.ranges)) {
+  if (!Number.isSafeInteger(vexaMeetingId) || vexaMeetingId <= 0
+      || !ownKeys(manifest, ["version", "meeting_id", "clock_origin", "clock_origin_ms", "state", "ranges"])
+      || manifest.version !== 1 || manifest.state !== "closed" || !opaqueId(manifest.meeting_id, 10) || !/^\d+$/.test(manifest.meeting_id) || manifest.clock_origin !== "first_admitted_capture_epoch_ms"
+      || manifest.meeting_id !== String(vexaMeetingId) || !Number.isSafeInteger(manifest.clock_origin_ms) || manifest.clock_origin_ms < 0 || manifest.clock_origin_ms > MAX_CLOCK_MS || !Array.isArray(manifest.ranges) || manifest.ranges.length > MAX_RANGES) {
     invalid("Attributed audio manifest is not a closed v1 manifest for this Vexa meeting");
   }
   manifest.ranges.forEach((range, index) => validateRange(manifest, range, index, vexaMeetingId));

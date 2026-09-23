@@ -2,6 +2,7 @@ import { createContext, type AppContext } from "../context.ts";
 import { deliverWebhook, reconcileWebhookDeliveries } from "../webhooks/dispatcher.ts";
 import { handleJoinDeadline, handleMeetingPoll, handleMeetingStart } from "./meeting-job.ts";
 import { finalizeAttributedRun, processAttributedBatch, reconcileAttributedRuns, recordAttributedWorkerReadiness } from "../services/attributed-transcription.ts";
+import { TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
 import type { Job } from "./queue.ts";
 
 export type JobOutcome = "processed" | "noop" | "deferred";
@@ -44,6 +45,12 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number } = 
     reconciliationInFlight = true;
     try {
       if (!ctx.attributedReconciliationReady) await recordAttributedWorkerReadiness(ctx, false, reconciliationFailures ? "reconciliation_failed" : "startup");
+      if (!(ctx.transcriptRecovery instanceof TinfoilTranscriptionProvider)) {
+        ctx.attributedReconciliationReady = false;
+        ctx.attributedWorkerHealthy = false;
+        await recordAttributedWorkerReadiness(ctx, false, "reconciliation_failed");
+        return;
+      }
       await reconcileAttributedRuns(ctx);
       ctx.attributedReconciliationReady = true;
       reconciliationFailures = 0;

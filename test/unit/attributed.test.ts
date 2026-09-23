@@ -28,7 +28,7 @@ const range = (sequence: number, speaker_key: string, speaker_name: string, star
     state: "uploaded" as const, path: `/meetings/1/attributed-audio/ranges/${sequence}`, bytes };
 };
 const manifest = (ranges: ReturnType<typeof range>[], state: "open" | "closed" = "closed"): AttributedManifest =>
-  ({ version: 1, meeting_id: "1", state, clock_origin: "first_admitted_capture_epoch_ms", clock_origin_ms: 0, ranges: ranges.map((range) => ({ ...range, meeting_id: "1" })) });
+  ({ version: 1, meeting_id: "1", state, clock_origin: "first_admitted_capture_epoch_ms", clock_origin_ms: 0, ranges: ranges.map(({ bytes: _bytes, ...range }) => ({ ...range, meeting_id: "1" })) });
 test("closed evidence batches contiguous named speakers and maps text without diarization", async () => {
   const a = range(0, "a", "Alice", 0, 3000), b = range(1, "a", "Alice", 3000, 6000), c = range(2, "b", "Bob", 6000, 9000);
   const input = manifest([a, b, c]);
@@ -65,6 +65,13 @@ test("requires the exact numeric Vexa meeting identity even for empty evidence",
   expect(() => attributedBatches({ ...manifest([]), meeting_id: "2" }, 1)).toThrow();
   const one = range(0, "a", "Alice", 0, 1_000);
   expect(() => attributedBatches({ ...manifest([one]), meeting_id: "2" }, 1)).toThrow();
+});
+
+test("rejects extra, secret-shaped, and oversized producer fields before they can be staged", () => {
+  const one = range(0, "alice", "Alice", 0, 1000);
+  expect(() => attributedBatches(manifest([{ ...one, idempotency_key: "https://private.example/PRIVATE_TRANSCRIPT" }]), 1)).toThrow();
+  expect(() => attributedBatches(manifest([{ ...one, idempotency_key: "x".repeat(257) }]), 1)).toThrow();
+  expect(() => attributedBatches(manifest([{ ...one, provider_debug: "credential=do-not-store" } as any]), 1)).toThrow();
 });
 
 test("checksum-valid non-finite PCM is rejected before silence classification", async () => {
