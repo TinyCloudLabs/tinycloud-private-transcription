@@ -77,8 +77,8 @@ describe("infra/dstack/app-compose.yaml", () => {
 
   test("pins every deploy and runtime-pulled image to an approved immutable digest", () => {
     const expected = {
-      api: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:c3cdff63e429720a79903384509337f3e67caf3d@sha256:19407b6b1393a9ef17d867f656631d2d47535c75436cd2aa7c52cb9a94943244",
-      worker: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:c3cdff63e429720a79903384509337f3e67caf3d@sha256:19407b6b1393a9ef17d867f656631d2d47535c75436cd2aa7c52cb9a94943244",
+      api: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:0c5b5ae12a1ea417d39e55e2291963393480222b@sha256:574e7106f93cb1bf730a816ada12a2e3d2fa545b149a8dce2308b09ddb303005",
+      worker: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:0c5b5ae12a1ea417d39e55e2291963393480222b@sha256:574e7106f93cb1bf730a816ada12a2e3d2fa545b149a8dce2308b09ddb303005",
       "signal-capture": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f",
       "signal-capture-2": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f",
       "signal-capture-3": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f",
@@ -91,11 +91,11 @@ describe("infra/dstack/app-compose.yaml", () => {
       minio: "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
       "minio-init": "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727",
       "admin-api": "vexaai/v012-admin-api:v012@sha256:4c702354384eafe3a933cd537a106b7c15067cfd368a5f6da1a6e675e7e03e04",
-      "bot-image-keeper": "ghcr.io/tinycloudlabs/vexa/bot:tc-be83d6c@sha256:b917c6ad56a26af34b78c0d4792c61953acb6f020a16758b6d860e68a0e733b6",
+      "bot-image-keeper": "ghcr.io/tinycloudlabs/vexa/bot:tc-e5482a8@sha256:3331c4ea30fa52c2070d5dc9e2887070df0c1ed17fa4be4cbb03e15afdd09ff9",
       runtime: "vexaai/v012-runtime:v012@sha256:a1f6448fbb380b9433364e8b572ec25a12aa4f274bf403f1d83a89cbf5812f2d",
       whisper: "fedirz/faster-whisper-server:latest-cpu@sha256:760e5e43d427dc6cfbbc4731934b908b7de9c7e6d5309c6a1f0c8c923a5b6030",
-      "meeting-api": "ghcr.io/tinycloudlabs/vexa/meeting-api:tc-e49f3f3@sha256:8cedc5943d943bee0dcb42a1be0478225b4ce9f4e9e6c53cd7a10507a2f794d3",
-      gateway: "ghcr.io/tinycloudlabs/vexa/gateway:tc-e49f3f3@sha256:01d9ecd1f126eb8e7943017bfff1e5fb6329c37ced46924925e73bb90630756d",
+      "meeting-api": "ghcr.io/tinycloudlabs/vexa/meeting-api:tc-36f0304@sha256:2f6f0c162402f13b72569d1a9f5bfb792af75f88b60b9178db85d468405d19e2",
+      gateway: "ghcr.io/tinycloudlabs/vexa/gateway:tc-36f0304@sha256:0e82c34a3f5838d6f592c71d6e8bebe4e79d3d0414160261def07a57971ef238",
       "vexa-provision": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
     } as const;
 
@@ -106,7 +106,7 @@ describe("infra/dstack/app-compose.yaml", () => {
 
     const runtime = serviceEnv("runtime");
     expect(runtime).toContain(
-      "BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-be83d6c@sha256:b917c6ad56a26af34b78c0d4792c61953acb6f020a16758b6d860e68a0e733b6}",
+      "BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-e5482a8@sha256:3331c4ea30fa52c2070d5dc9e2887070df0c1ed17fa4be4cbb03e15afdd09ff9}",
     );
     expect(runtime).toContain(
       "AGENT_IMAGE: ${VEXA_AGENT_IMAGE:-vexaai/v012-agent-api:v012@sha256:6eb37574b33aab233aabbe5907e06e106bae44a403e5df781a436da8201a928d}",
@@ -129,13 +129,13 @@ describe("infra/dstack/app-compose.yaml", () => {
 
   test("pins the Vexa bot, meeting-api, and gateway to the accepted fork commits and digests", () => {
     expect(compose).toContain(
-      "ghcr.io/tinycloudlabs/vexa/bot:tc-be83d6c@sha256:b917c6ad56a26af34b78c0d4792c61953acb6f020a16758b6d860e68a0e733b6",
+      "ghcr.io/tinycloudlabs/vexa/bot:tc-e5482a8@sha256:3331c4ea30fa52c2070d5dc9e2887070df0c1ed17fa4be4cbb03e15afdd09ff9",
     );
     expect(compose).toContain(
-      "ghcr.io/tinycloudlabs/vexa/meeting-api:tc-e49f3f3@sha256:8cedc5943d943bee0dcb42a1be0478225b4ce9f4e9e6c53cd7a10507a2f794d3",
+      "ghcr.io/tinycloudlabs/vexa/meeting-api:tc-36f0304@sha256:2f6f0c162402f13b72569d1a9f5bfb792af75f88b60b9178db85d468405d19e2",
     );
     expect(compose).toContain(
-      "ghcr.io/tinycloudlabs/vexa/gateway:tc-e49f3f3@sha256:01d9ecd1f126eb8e7943017bfff1e5fb6329c37ced46924925e73bb90630756d",
+      "ghcr.io/tinycloudlabs/vexa/gateway:tc-36f0304@sha256:0e82c34a3f5838d6f592c71d6e8bebe4e79d3d0414160261def07a57971ef238",
     );
     expect(compose).not.toContain("tc-2db950b");
     expect(compose).not.toContain("vexaai/v012-meeting-api");
@@ -153,6 +153,23 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(line).toContain("jitsi");
     expect(line).toContain("google_meet");
     expect(line).toContain("signal");
+  });
+
+  test("enables fail-closed attributed post-meeting transcription for API and worker", () => {
+    for (const service of ["api", "worker"]) {
+      const env = serviceEnv(service);
+      expect(env).toContain('ATTRIBUTED_TRANSCRIPTION_ENABLED: "true"');
+      expect(env).toContain("TINFOIL_BASE_URL: ${TINFOIL_BASE_URL:-https://inference.tinfoil.sh}");
+      expect(env).toContain("TINFOIL_API_KEY: ${TINFOIL_API_KEY:-}");
+      expect(env).toContain("TINFOIL_MODEL: ${TINFOIL_MODEL:-voxtral-small-24b}");
+    }
+  });
+
+  test("captures attributed Google Meet audio without live Vexa transcription", () => {
+    const env = serviceEnv("meeting-api");
+    expect(env).toContain('TRANSCRIBE_ENABLED: "false"');
+    expect(env).toContain('ATTRIBUTED_AUDIO_ENABLED: "true"');
+    expect(env).toContain('RECORDING_ENABLED: "true"');
   });
 
   test("uses API startup liveness rather than worker-owned publication readiness", () => {
