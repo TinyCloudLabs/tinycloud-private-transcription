@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
 import { attributedWorkerReadiness } from "../../src/db/schema.ts";
 import { attributedWorkerReady, recordAttributedWorkerReadiness } from "../../src/services/attributed-transcription.ts";
@@ -74,4 +74,56 @@ test("canonical publication failure remains latched until canonical publication 
   [readiness] = await h.ctx.db.select().from(attributedWorkerReadiness)
     .where(eq(attributedWorkerReadiness.id, worker.attributedWorkerId));
   expect(readiness).toMatchObject({ ready: true, stage: "published" });
+});
+
+test("a heartbeat paused after observing healthy readiness cannot clear a publication failure", async () => {
+  // This database trigger is a deterministic barrier at the service/database seam. Before the
+  // atomic upsert, the heartbeat reads the healthy row and then waits here; publication failure
+  // commits while it is paused. The resumed heartbeat must evaluate the latch against that newer
+  // row, rather than write its stale healthy decision.
+  const barrierKey = 77_231_091;
+  const worker = { ...h.ctx, attributedWorkerId: `attributed-worker:test-readiness-race:${crypto.randomUUID()}` };
+  const blocker = await h.ctx.db.$client.reserve();
+  await h.ctx.db.execute(sql`
+    CREATE OR REPLACE FUNCTION test_attributed_readiness_heartbeat_barrier()
+    RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.id LIKE 'attributed-worker:test-readiness-race:%' AND NEW.stage = 'heartbeat' THEN
+        PERFORM pg_advisory_xact_lock(77231091);
+      END IF;
+      RETURN NEW;
+    END;
+    $$
+  `);
+  await h.ctx.db.execute(sql`
+    CREATE TRIGGER test_attributed_readiness_heartbeat_barrier
+    BEFORE INSERT OR UPDATE ON attributed_worker_readiness
+    FOR EACH ROW EXECUTE FUNCTION test_attributed_readiness_heartbeat_barrier()
+  `);
+
+  try {
+    await recordAttributedWorkerReadiness(worker, true, "reconciled");
+    await blocker`SELECT pg_advisory_lock(${barrierKey})`;
+    const staleHeartbeat = recordAttributedWorkerReadiness(worker, true, "heartbeat");
+    await h.waitFor(async () => {
+      const [waiting] = await h.ctx.db.execute<{ count: number }>(sql`
+        SELECT count(*)::int AS count FROM pg_locks
+        WHERE locktype = 'advisory' AND objid = ${barrierKey} AND NOT granted
+      `);
+      return waiting.count > 0 ? waiting : null;
+    }, { label: "heartbeat readiness barrier" });
+
+    await recordAttributedWorkerReadiness(worker, false, "publication_failed");
+    await blocker`SELECT pg_advisory_unlock(${barrierKey})`;
+    await staleHeartbeat;
+
+    const [readiness] = await h.ctx.db.select().from(attributedWorkerReadiness)
+      .where(eq(attributedWorkerReadiness.id, worker.attributedWorkerId));
+    expect(readiness).toMatchObject({ ready: false, stage: "publication_failed" });
+  } finally {
+    await blocker`SELECT pg_advisory_unlock(${barrierKey})`.catch(() => {});
+    await blocker.release();
+    await h.ctx.db.execute(sql`DROP TRIGGER IF EXISTS test_attributed_readiness_heartbeat_barrier ON attributed_worker_readiness`);
+    await h.ctx.db.execute(sql`DROP FUNCTION IF EXISTS test_attributed_readiness_heartbeat_barrier()`);
+  }
 });

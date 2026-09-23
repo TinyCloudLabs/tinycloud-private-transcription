@@ -23,12 +23,26 @@ export async function recordAttributedWorkerReadiness(ctx: AppContext, ready: bo
   // Startup and reconciliation unreadiness are recoverable operational states. A canonical
   // publication failure is different: queue liveness and reconciliation prove neither a
   // publication nor recovery, so only the transaction that commits canonical text heals it.
-  const [prior] = await ctx.db.select().from(attributedWorkerReadiness).where(eq(attributedWorkerReadiness.id, ctx.attributedWorkerId)).limit(1);
-  const publicationFailureLatched = prior?.stage === "publication_failed" && stage !== "published";
-  const persistedReady = publicationFailureLatched ? false : ready;
-  const persistedStage = publicationFailureLatched ? "publication_failed" : stage;
-  await ctx.db.insert(attributedWorkerReadiness).values({ id: ctx.attributedWorkerId, ready: persistedReady, stage: persistedStage, observedAt: new Date() })
-    .onConflictDoUpdate({ target: attributedWorkerReadiness.id, set: { ready: persistedReady, stage: persistedStage, observedAt: new Date() } });
+  //
+  // Keep the latch test in the conflict update itself. A read followed by an upsert lets a
+  // heartbeat that saw the old healthy row overwrite a publication failure committed while it
+  // was paused. PostgreSQL evaluates this expression while holding the current row lock.
+  await ctx.db.execute(sql`
+    INSERT INTO attributed_worker_readiness (id, ready, stage, observed_at)
+    VALUES (${ctx.attributedWorkerId}, ${ready}, ${stage}, ${new Date()})
+    ON CONFLICT (id) DO UPDATE SET
+      ready = CASE
+        WHEN attributed_worker_readiness.stage = 'publication_failed'
+          AND EXCLUDED.stage <> 'published' THEN false
+        ELSE EXCLUDED.ready
+      END,
+      stage = CASE
+        WHEN attributed_worker_readiness.stage = 'publication_failed'
+          AND EXCLUDED.stage <> 'published' THEN 'publication_failed'
+        ELSE EXCLUDED.stage
+      END,
+      observed_at = EXCLUDED.observed_at
+  `);
 }
 
 export async function attributedWorkerReady(ctx: AppContext): Promise<boolean> {
