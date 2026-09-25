@@ -10,3 +10,12 @@ test("request hash is key-order independent, nested-aware, ignores undefined", (
   expect(a).not.toBe(c);
   expect(a).not.toBe(d);
 });
+
+test("calendar recovery hash matches the Tinychat client contract vector", () => {
+  expect(hashCreateRequest({
+    meeting_url: "https://meet.google.com/abc-defg-hij",
+    platform: "google_meet",
+    bot_name: "Tinychat",
+    metadata: { tenant: "tenant-a", occurrence: "opaque-id", nested: { b: 2, a: [1, 2] } },
+  })).toBe("616b587d408523cec2a11e32d77b42b9233149f31817b346390f7481b4958204");
+});

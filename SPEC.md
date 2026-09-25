@@ -32,6 +32,8 @@ States: `queued → joining → waiting_for_admission → in_progress → proces
 For every dispatched meeting, the worker sends Vexa `automatic_leave.max_time_left_alone` from `VEXA_MAX_TIME_LEFT_ALONE_MS` (default 300000 milliseconds). Vexa currently infers aloneness from the absence of remote participant audio, so five continuous silent minutes release the bot and continue normal finalization as `completed(left_alone)` on Jitsi or Google Meet; operators can tune the window when needed.
 
 `GET /v1/meetings/{id}` → status, platform, bot{name,joined_at}, transcript{status}, created/started/ended_at, metadata, error{type,code,message} on failure. Once completed it includes `transcript_provider: "vexa"`.
+
+`GET /v1/meetings/by-idempotency-key` with an `Idempotency-Key` header → `{meeting, request_hash}` for the authenticated project's existing create, or `404 meeting_not_found`. `meeting` has the same shape as the ID lookup; `request_hash` is SHA-256 of the canonical parsed create body (sorted object keys, omitted undefined fields, preserved array order; Signal URL fragments removed). This endpoint only reads: it never creates a meeting or enqueues work. Use it to recover uncertain creates even when sending another bot is no longer authorized. A lookup miss is not proof that a still-running request cannot commit later.
 `POST /v1/meetings/{id}/stop` → idempotent, returns `{id,status}`.
 
 `POST /v1/meetings/{id}/recover` → tenant-scoped, idempotently moves a failed meeting with a retained

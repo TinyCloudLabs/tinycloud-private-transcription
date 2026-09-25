@@ -5,6 +5,7 @@ import {
   createMeeting,
   deleteMeeting,
   getMeeting,
+  getMeetingByIdempotencyKey,
   getTranscript,
   recoverMeeting,
   serializeMeeting,
@@ -66,6 +67,14 @@ export function meetingRoutes(ctx: AppContext) {
     const idem = c.req.header("idempotency-key") ?? null;
     const { meeting, created } = await createMeeting(ctx, c.get("project").id, input, idem);
     return c.json(serializeMeeting(meeting, null), created ? 201 : 200);
+  });
+
+  r.get("/by-idempotency-key", async (c) => {
+    const key = c.req.header("idempotency-key");
+    if (!key?.trim()) throw new ApiError("invalid_request", "Idempotency-Key header is required");
+    const meeting = await getMeetingByIdempotencyKey(ctx, c.get("project").id, key);
+    const transcript = meeting.status === "completed" ? await getTranscript(ctx, meeting.id) : null;
+    return c.json({ meeting: serializeMeeting(meeting, transcript), request_hash: meeting.requestHash });
   });
 
   r.get("/:id", async (c) => {
