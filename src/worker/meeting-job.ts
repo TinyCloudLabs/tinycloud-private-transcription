@@ -194,7 +194,8 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
     try {
       // Sealed producer evidence is the only enabled-path source of canonical text.
       await stageAttributedManifest(ctx, meeting.id, vexaMeetingId, await ctx.vexa.getAttributedAudio(vexaMeetingId), vexa.data?.attributed_audio_capability);
-    } catch {
+    } catch (e) {
+      ctx.log.error("attributed manifest staging failed", { meetingId, vexaMeetingId, error: String(e) });
       const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Attributed source evidence could not be reconciled.");
       if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
     }
