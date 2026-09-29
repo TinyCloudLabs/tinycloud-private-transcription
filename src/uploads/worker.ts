@@ -189,6 +189,12 @@ async function admitDispatch(ctx: BatchContext, fence: Fence, regionOrdinal: num
     const [slot] = await tx.select().from(providerDispatchSlots).where(eq(providerDispatchSlots.id, 1)).for("update");
     if (!slot) throw new Error("provider_dispatch_slots row is missing (migration 0017 not applied)");
     if (slot.attemptId) {
+      // Held by another attempt. While its owner process lives, that request may still be in flight, so wait.
+      // Reclaiming from a dead owner is defense in depth: recoverStaleClaims normally terminalizes that
+      // attempt's job (provider_outcome_unknown) and frees the slot first, but it keeps the slot while the
+      // owner's process heartbeat is still fresh, so a slot can outlive a stale claim and be found here. The
+      // attempt belongs to a different, already-terminal job, so this write is not fenced by our claim; it is a
+      // CAS on that attempt still being `started`, and the request is never re-sent.
       if (slot.ownerId && await workerLive(ctx, tx, slot.ownerId)) return { kind: "capacity" };
       await tx.update(transcriptionAttempts).set({ status: "ambiguous", outcome: "owner_lost", completedAt: sql`now()` })
         .where(and(eq(transcriptionAttempts.id, slot.attemptId), eq(transcriptionAttempts.status, "started")));

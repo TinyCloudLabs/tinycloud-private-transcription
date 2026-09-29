@@ -78,8 +78,9 @@ service answers `503 service_unavailable` to every create. Worker: `bun run src/
 unless `PTX_ROLE=batch`). Migration 0017 only adds tables.
 
 ### Endpoints
-All `/v1/transcriptions*` routes need `transcriptions:*` and an `X-Tenant-Ref` header (64 lowercase hex; the caller's
-HMAC of its user id: PTX never sees a user identity). Every read, cancel and delete is tenant-scoped: a missing,
+All `/v1/transcriptions*` routes need `transcriptions:*`. All of them except `GET /v1/transcriptions/capabilities`
+(service-wide limits, not about any job) also need an `X-Tenant-Ref` header (64 lowercase hex; the caller's HMAC of its
+user id: PTX never sees a user identity). Every read, cancel and delete is tenant-scoped: a missing,
 other-tenant or deleted job is the same `404 transcription_not_found`.
 
 ```http
@@ -110,7 +111,10 @@ States: `awaiting_upload → queued → processing → completed`; terminal `fai
 
 ### Admission (atomic, all in one transaction on the admission row lock)
 - Admission `mode` must be `open` (`drain`: no creates, uploads and processing continue; `closed`: no creates, no
-  uploads, no new claims) → else `503 service_paused`.
+  uploads, no new claims) → else `503 service_paused`. `closed` also stops uploads already in flight: a streaming PUT
+  is cut within one lease heartbeat (10 s), and no upload commits after the request that closes admission has
+  returned (the commit takes a share lock on the admission row). The job stays `awaiting_upload`. A job already
+  processing runs to its end.
 - One active job (`awaiting_upload`/`queued`/`processing`) per tenant → `409 active_transcription_exists {id}`; a
   partial unique index enforces the same in the database.
 - Service-wide reservation over the same active set: at most `BATCH_MAX_ACTIVE_JOBS` jobs and
@@ -175,7 +179,8 @@ recreate deleted artifacts.
 
 ### Retention
 Every terminal transition commits `deletion_state='pending'` together with the terminal state, before any file is
-unlinked; the audio, PCM and temp files are then removed and verified absent (`ENOENT`) before `files_deleted` is
+unlinked. A `failed` or `cancelled` job also loses any partial region text in that transaction (`transcript_deleted_at`
+is set); only a `completed` job keeps text, until `DELETE` or 24 h after completion; the audio, PCM and temp files are then removed and verified absent (`ENOENT`) before `files_deleted` is
 recorded. `DELETE` cancels an active job, deletes transcript content and hides the job in the same transaction, and keeps
 a content-free tombstone (ids, tenant ref, sizes, timings, codes). A sweeper (every 60 s) retries pending deletions,
 expires unaccepted uploads, times out processing, recovers dead claims, deletes transcripts 24 h after completion,
