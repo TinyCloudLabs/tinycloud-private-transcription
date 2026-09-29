@@ -21,11 +21,26 @@ export const meetingGroups = (ctx: AppContext): ScopedGroups => ({
   "/v1/meetings": { scope: "meetings:*", routes: meetingRoutes(ctx) },
 });
 
-export function createApp(ctx: AppContext, groups: ScopedGroups = meetingGroups(ctx)) {
+/**
+ * Registers `groups` on `app`, deny by default. Every /v1 request is authenticated, then authorized against
+ * the group registry: the owning group's scope is required, and a path outside every registered group is
+ * 404 even for a valid key. A route mounted under /v1 any other way is therefore unreachable. Both the
+ * meeting app (createApp) and the batch app (src/roles/batch.ts) mount their /v1 groups only through this.
+ */
+export function mountScopedGroups(app: Hono<AuthEnv>, ctx: Pick<AppContext, "db">, groups: ScopedGroups) {
   const table = Object.entries(groups).map(([path, group]) => {
     if (!GROUP_PATH.test(path)) throw new Error(`authenticated route group ${path} must be mounted at /v1/<name>`);
     return { path, authorize: requireScope(group.scope) };
   });
+  app.use("/v1/*", bearerAuth(ctx), async (c, next) => {
+    const group = table.find(({ path }) => c.req.path === path || c.req.path.startsWith(`${path}/`));
+    if (!group) return c.notFound();
+    return group.authorize(c, next);
+  });
+  for (const [path, group] of Object.entries(groups)) app.route(path, group.routes);
+}
+
+export function createApp(ctx: AppContext, groups: ScopedGroups = meetingGroups(ctx)) {
   const app = new Hono<AuthEnv>();
 
   app.onError((err, c) => {
@@ -38,14 +53,6 @@ export function createApp(ctx: AppContext, groups: ScopedGroups = meetingGroups(
   app.notFound((c) => c.json({ error: { type: "not_found_error", code: "not_found", message: `No route for ${c.req.method} ${c.req.path}` } }, 404));
 
   app.route("/", healthRoutes(ctx));
-  // Deny by default. Every /v1 request is authenticated, then authorized against the group registry
-  // above: the owning group's scope is required, and a path outside every registered group is 404 even
-  // for a valid key. A route mounted under /v1 any other way is therefore unreachable.
-  app.use("/v1/*", bearerAuth(ctx), async (c, next) => {
-    const group = table.find(({ path }) => c.req.path === path || c.req.path.startsWith(`${path}/`));
-    if (!group) return c.notFound();
-    return group.authorize(c, next);
-  });
-  for (const [path, group] of Object.entries(groups)) app.route(path, group.routes);
+  mountScopedGroups(app, ctx, groups);
   return app;
 }
