@@ -61,6 +61,21 @@ export function parseBootstrapKeys(raw: string): BootstrapKey[] {
 }
 
 /**
+ * The ptx-batch deploy's pre-flight: `PTX_BOOTSTRAP_KEYS` must hold a transcriptions:* key, and the plaintext admin
+ * key the workflow drains and opens admission with must hash to exactly one entry, which holds admin:*. Throws
+ * without echoing either value.
+ */
+export function checkBatchDeployKeys(raw: string, adminKey: string): BootstrapKey[] {
+  const keys = parseBootstrapKeys(raw);
+  if (!keys.some((key) => key.scopes.includes("transcriptions:*"))) throw new Error(`${BOOTSTRAP_KEYS_ENV} needs a transcriptions:* key`);
+  const hash = hashApiKey(adminKey);
+  const admin = keys.find((key) => key.sha256 === hash);
+  if (!admin) throw new Error(`PTX_BATCH_ADMIN_KEY does not hash to any ${BOOTSTRAP_KEYS_ENV} entry`);
+  if (!admin.scopes.includes("admin:*")) throw new Error(`PTX_BATCH_ADMIN_KEY hashes to ${admin.id}, which does not hold admin:*`);
+  return keys;
+}
+
+/**
  * Makes the bootstrap-managed keys exactly `keys`, in one transaction: each entry is upserted by id (a
  * changed hash rotates that key; project and scopes follow the entry) and every other bootstrap-managed
  * key is revoked (deleted). Keys minted by `create-key` are never modified or revoked; an id that

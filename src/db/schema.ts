@@ -292,10 +292,13 @@ export const transcriptionTenantUsage = pgTable("transcription_tenant_usage", {
   bytes: bigint("bytes", { mode: "number" }).notNull().default(0),
 }, (t) => [primaryKey({ columns: [t.projectId, t.tenantRef, t.day] })]);
 
-/** One row (id=1): admission mode and the lock that serializes every create and upload-lease admission. */
+/**
+ * One row (id=1): admission mode and the lock that serializes every create and upload-lease admission. A fresh
+ * install starts `closed` (0018); only the deploy workflow's final gate opens it.
+ */
 export const transcriptionAdmission = pgTable("transcription_admission", {
   id: integer("id").primaryKey(),
-  mode: text("mode").notNull().default("open"), // open | drain | closed
+  mode: text("mode").notNull().default("closed"), // open | drain | closed
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
 

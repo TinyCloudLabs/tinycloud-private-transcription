@@ -114,7 +114,7 @@ States: `awaiting_upload → queued → processing → completed`; terminal `fai
   uploads, no new claims) → else `503 service_paused`. `closed` also stops uploads already in flight: a streaming PUT
   is cut within one lease heartbeat (10 s), and no upload commits after the request that closes admission has
   returned (the commit takes a share lock on the admission row). The job stays `awaiting_upload`. A job already
-  processing runs to its end.
+  processing runs to its end. A fresh install starts `closed`; the deploy workflow opens it only after its gates pass.
 - One active job (`awaiting_upload`/`queued`/`processing`) per tenant → `409 active_transcription_exists {id}`; a
   partial unique index enforces the same in the database.
 - Service-wide reservation over the same active set: at most `BATCH_MAX_ACTIVE_JOBS` jobs and
