@@ -298,6 +298,10 @@ their unchanged upstream v0.12 images.
 
 ## Deploy (Phala/dstack)
 
+The batch-transcription service is a separate CVM (`ptx-batch`), deployed only by the manual
+`.github/workflows/deploy-batch.yml`; see [infra/dstack-batch/README.md](./infra/dstack-batch/README.md). Everything below
+is the meeting service (`ptx-dev`).
+
 `infra/dstack/app-compose.yaml` runs api + worker + postgres + redis and the pinned Vexa stack
 (admin-api, runtime, meeting-api, gateway, valkey, postgres, MinIO, CPU whisper) in ONE CVM; only `:8080`
 is published. Bot spawning needs `/var/run/docker.sock` mounted into Vexa's `runtime` (one container per

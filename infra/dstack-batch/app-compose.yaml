@@ -1,0 +1,85 @@
+# ptx-batch: the dedicated batch-transcription CVM (PTX_ROLE=batch). It runs no meeting workload: no Vexa,
+# Redis, Signal seats, Whisper or docker.sock. Only :8080 is published (api: health, /v1/transcriptions*,
+# /v1/admin/*, PUT /uploads/{id}). Runbook: infra/dstack-batch/README.md.
+#
+# Sealed env (phala deploy -e, see .env.example; values never live in this file):
+#   POSTGRES_PASSWORD      internal Postgres password
+#   BATCH_TINFOIL_API_KEY  the owner's dedicated batch Tinfoil key (never the meeting service's key)
+#   PTX_BOOTSTRAP_KEYS     hashed API keys: tinychat (transcriptions:*) and owner-admin (admin:*)
+#
+# The api/worker image is an immutable pin that only a PR changes; it cannot be overridden from the sealed env.
+# Until the first batch image exists (P2 merged → publish-image.yml), it is the placeholder below, which
+# .github/workflows/deploy-batch.yml refuses to deploy.
+services:
+  api:
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:PIN_AFTER_P2_MERGE@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PTX_ROLE: batch
+      PORT: "8080"
+      DATABASE_URL: postgres://ptx:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/ptx
+      AUTO_MIGRATE: "true"
+      PTX_BOOTSTRAP_KEYS: "${PTX_BOOTSTRAP_KEYS:-}"
+      BATCH_UPLOAD_DIR: /var/lib/ptx-batch/uploads
+      BATCH_TINFOIL_BASE_URL: https://inference.tinfoil.sh
+      BATCH_TINFOIL_API_KEY: ${BATCH_TINFOIL_API_KEY:-}
+      BATCH_TINFOIL_MODEL: voxtral-small-24b
+      BATCH_MAX_ACTIVE_JOBS: "10"
+      BATCH_MAX_RESERVED_BYTES: "1209600000"
+      BATCH_MAX_CONCURRENT_UPLOADS: "3"
+      BATCH_DISK_HIGH_WATER_PERCENT: "80"
+      BATCH_TENANT_DAILY_BYTES: "362880000"
+      BATCH_UPLOAD_MAX_PUT_SECONDS: "1800"
+      BATCH_UPLOAD_MIN_BYTES_PER_SECOND: "32768"
+      LOG_LEVEL: info
+    ports:
+      - "8080:8080"
+    volumes:
+      - ptx-batch-uploads:/var/lib/ptx-batch/uploads
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:8080/health/live').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  upload-worker:
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:PIN_AFTER_P2_MERGE@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    restart: unless-stopped
+    command: ["bun", "run", "src/uploads/worker.ts"]
+    depends_on:
+      # The api applies migrations before it reports live.
+      api:
+        condition: service_healthy
+    environment:
+      PTX_ROLE: batch
+      DATABASE_URL: postgres://ptx:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/ptx
+      BATCH_UPLOAD_DIR: /var/lib/ptx-batch/uploads
+      BATCH_TINFOIL_BASE_URL: https://inference.tinfoil.sh
+      BATCH_TINFOIL_API_KEY: ${BATCH_TINFOIL_API_KEY:-}
+      BATCH_TINFOIL_MODEL: voxtral-small-24b
+      LOG_LEVEL: info
+    volumes:
+      - ptx-batch-uploads:/var/lib/ptx-batch/uploads
+
+  postgres:
+    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ptx
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ptx
+    volumes:
+      - ptx-batch-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ptx"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  ptx-batch-data: {}
+  ptx-batch-uploads: {}
