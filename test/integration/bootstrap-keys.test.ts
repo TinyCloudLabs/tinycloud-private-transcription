@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { eq, sql } from "drizzle-orm";
 import { Hono } from "hono";
-import { createApp, mountScoped } from "../../src/api/app.ts";
+import { createApp, meetingGroups } from "../../src/api/app.ts";
 import { generateApiKey, hashApiKey, type AuthEnv } from "../../src/api/auth.ts";
 import { mintBootstrapKeys, parseBootstrapKeys, syncBootstrapKeys, type BootstrapKey } from "../../src/api/bootstrap-keys.ts";
 import { apiKeys, projects } from "../../src/db/schema.ts";
@@ -32,10 +32,12 @@ function mint() {
 
 beforeAll(async () => {
   h = await startHarness();
-  app = createApp(h.ctx);
   const stub = () => new Hono<AuthEnv>().all("*", (c) => c.json({ project: c.get("project").id }));
-  mountScoped(app, "/v1/transcriptions", "transcriptions:*", stub());
-  mountScoped(app, "/v1/admin", "admin:*", stub());
+  app = createApp(h.ctx, {
+    ...meetingGroups(h.ctx),
+    "/v1/transcriptions": { scope: "transcriptions:*", routes: stub() },
+    "/v1/admin": { scope: "admin:*", routes: stub() },
+  });
 });
 beforeEach(async () => {
   await syncBootstrapKeys(h.ctx, []);

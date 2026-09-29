@@ -4,7 +4,8 @@ import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
+import { pgTable, text, timestamp } from "drizzle-orm/pg-core";
 import { migrate } from "drizzle-orm/bun-sql/migrator";
 import { createApp } from "../../src/api/app.ts";
 import { hashApiKey } from "../../src/api/auth.ts";
@@ -215,6 +216,8 @@ test("0016 keeps every pre-enforcement key working on meeting routes and grants 
   const cliKey = "tc_live_scope_upgrade_cli_fixture";
   const emptyKey = "tc_live_scope_upgrade_empty_fixture";
   const otherKey = "tc_live_scope_upgrade_other_fixture";
+  const nullKey = "tc_live_scope_upgrade_null_fixture";
+  const nullMixedKey = "tc_live_scope_upgrade_null_mixed_fixture";
 
   try {
     await admin.unsafe(`CREATE DATABASE "${databaseName}"`);
@@ -233,6 +236,12 @@ test("0016 keeps every pre-enforcement key working on meeting routes and grants 
       INSERT INTO api_keys (id, project_id, key_hash, scopes)
       VALUES ('key_other', 'demo', ${hashApiKey(otherKey)}, ARRAY['meetings'])
     `);
+    // Arrays holding NULL elements, where `'meetings:*' = ANY(scopes)` is NULL rather than false.
+    await productionDb.execute(sql`
+      INSERT INTO api_keys (id, project_id, key_hash, scopes)
+      VALUES ('key_null', 'demo', ${hashApiKey(nullKey)}, ARRAY[NULL]::text[]),
+             ('key_null_mixed', 'demo', ${hashApiKey(nullMixedKey)}, ARRAY[NULL, 'meetings']::text[])
+    `);
     await productionDb.$client.close();
 
     db = await runMigrations(databaseUrl.toString());
@@ -241,6 +250,8 @@ test("0016 keeps every pre-enforcement key working on meeting routes and grants 
     expect(rows).toEqual([
       { id: "key_cli", scopes: ["meetings:*"], bootstrap_managed: false },
       { id: "key_empty", scopes: ["meetings:*"], bootstrap_managed: false },
+      { id: "key_null", scopes: [null, "meetings:*"], bootstrap_managed: false },
+      { id: "key_null_mixed", scopes: [null, "meetings", "meetings:*"], bootstrap_managed: false },
       { id: "key_other", scopes: ["meetings", "meetings:*"], bootstrap_managed: false },
     ]);
 
@@ -250,6 +261,8 @@ test("0016 keeps every pre-enforcement key working on meeting routes and grants 
     expect((await get(cliKey)).status).toBe(404);
     expect((await get(emptyKey)).status).toBe(404);
     expect((await get(otherKey)).status).toBe(404);
+    expect((await get(nullKey)).status).toBe(404);
+    expect((await get(nullMixedKey)).status).toBe(404);
     // A key created after 0016 without meetings:* is not grandfathered.
     const newKey = "tc_live_scope_upgrade_new_fixture";
     await db.execute(sql`
@@ -257,6 +270,30 @@ test("0016 keeps every pre-enforcement key working on meeting routes and grants 
       VALUES ('key_new', 'demo', ${hashApiKey(newKey)}, ARRAY['transcriptions:*'])
     `);
     expect((await get(newKey)).status).toBe(403);
+
+    // Rollback: the pre-enforcement image, whose schema is exactly this table (no bootstrap_managed) and
+    // which never checks scopes, keeps minting and authenticating keys against the migrated schema.
+    const preEnforcementApiKeys = pgTable("api_keys", {
+      id: text("id").primaryKey(),
+      projectId: text("project_id").notNull(),
+      keyHash: text("key_hash").notNull().unique(),
+      scopes: text("scopes").array().notNull().default([]),
+      createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    });
+    const rollbackKey = "tc_live_scope_upgrade_rollback_fixture";
+    await db.insert(preEnforcementApiKeys).values({ id: "key_rollback", projectId: "demo", keyHash: hashApiKey(rollbackKey), scopes: ["meetings:*"] });
+    const lookup = (key: string) =>
+      db!
+        .select({ projectId: preEnforcementApiKeys.projectId, scopes: preEnforcementApiKeys.scopes })
+        .from(preEnforcementApiKeys)
+        .where(eq(preEnforcementApiKeys.keyHash, hashApiKey(key)))
+        .limit(1);
+    expect(await lookup(rollbackKey)).toEqual([{ projectId: "demo", scopes: ["meetings:*"] }]);
+    expect(await lookup(cliKey)).toEqual([{ projectId: "demo", scopes: ["meetings:*"] }]);
+    // A key the old image minted is an ordinary key when rolling forward again.
+    const [rolledBack] = await db.execute(sql`SELECT bootstrap_managed FROM api_keys WHERE id = 'key_rollback'`);
+    expect(rolledBack).toEqual({ bootstrap_managed: false });
+    expect((await get(rollbackKey)).status).toBe(404);
   } finally {
     await db?.$client.close();
     await admin.unsafe(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`);

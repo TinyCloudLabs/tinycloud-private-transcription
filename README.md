@@ -382,6 +382,22 @@ curl -s -X POST $API/v1/meetings -H "Authorization: Bearer $KEY" -H 'Content-Typ
 
 Debug: `phala logs ptx-dev -f`, `phala logs ptx-dev --serial --tail 200` (image pull / compose errors), `phala ps ptx-dev`.
 
+### API-key scopes: first deploy and rollback
+
+Migration `0016_api_key_scopes` (first image with scope enforcement) appends `meetings:*` to every existing key
+that lacks it, so callers keep their meeting access. Before that deploy, record which keys it will touch; on
+ptx-dev, the same query must return no rows afterwards:
+
+```bash
+phala ssh ptx-dev -- -i ~/.ssh/id_ed25519 "docker exec dstack-postgres-1 psql -U ptx -d ptx -c \"SELECT id, project_id, scopes FROM api_keys WHERE array_position(scopes, 'meetings:*') IS NULL\""
+```
+
+**Rollback = redeploy the previous compose (previous image digest) only.** 0016 is additive: the older image never
+reads or writes `bootstrap_managed`, ignores scopes, and keeps minting and authenticating keys against the migrated
+schema (covered by `migration-upgrade.test.ts`). Do **not** revert 0016 or strip scopes: a backfilled `meetings:*` is
+indistinguishable from a minted one, and removing it locks those keys out when enforcement returns. While rolled
+back, `PTX_BOOTSTRAP_KEYS` is not synced, so removing an id from it does not revoke that key until roll-forward.
+
 
 ### Diagnosing an unexpected bot departure
 

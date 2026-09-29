@@ -26,6 +26,8 @@ Auth: `Authorization: Bearer tc_live_xxx`. A missing, malformed or unknown key â
 Scopes: each authenticated route group requires exactly one scope on the key; otherwise `403`
 `{"error":{"type":"authentication_error","code":"insufficient_scope","message":"â€¦"}}`. Scopes are exact strings (the `:*`
 suffix is naming only): there is no global wildcard and no prefix matching, so `*`, `meetings` or `meetings:read` grant nothing.
+Routing is deny-by-default: every `/v1` request is authenticated and then authorized against the registered groups
+below; a `/v1` path outside them answers `404 not_found` even for a valid key.
 
 | Scope | Routes |
 |---|---|
