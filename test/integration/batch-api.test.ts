@@ -343,6 +343,21 @@ describe("tenant isolation", () => {
 });
 
 describe("upload capability", () => {
+  test("concurrent replays of one create never exceed maxLiveCapabilities", async () => {
+    const bytes = await audio("stereo");
+    const key = { "Idempotency-Key": "tc:replay-race" };
+    const body = { content_type: "audio/mpeg", byte_size: bytes.byteLength, sha256: sha256(bytes) };
+    const created = await h.api("/v1/transcriptions", { method: "POST", headers: key, json: body });
+    expect(created.status).toBe(201);
+    const { id } = await created.json();
+    const replays = await Promise.all(Array.from({ length: 12 }, () => h.api("/v1/transcriptions", { method: "POST", headers: key, json: body })));
+    const outcomes = await Promise.all(replays.map(async (r) => r.status === 200 ? "200" : `${r.status} ${(await errorOf(r)).code}`));
+    const max = h.ctx.config.upload.maxLiveCapabilities;
+    expect(outcomes.sort()).toEqual([...Array(max - 1).fill("200"), ...Array(12 - (max - 1)).fill("429 upload_capability_limit")]);
+    const live = await h.ctx.db.select().from(transcriptionCapabilities).where(eq(transcriptionCapabilities.transcriptionId, id));
+    expect(live.length).toBe(max);
+  });
+
   test("is bound to one job, never reads status, expires, and at most 5 are live (no revocation)", async () => {
     const bytes = await audio("stereo");
     const a = await (await h.create(bytes)).json();

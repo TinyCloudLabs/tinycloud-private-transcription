@@ -225,8 +225,11 @@ export async function createTranscription(
 }
 
 async function replayCreate(ctx: BatchContext, db: DbOrTx, projectId: string, key: string, requestHash: string, issue: boolean): Promise<CreateResult | null> {
-  const [existing] = await db.select().from(transcriptions)
+  const lookup = db.select().from(transcriptions)
     .where(and(eq(transcriptions.projectId, projectId), eq(transcriptions.idempotencyKey, key))).limit(1);
+  // Issuing locks the job row, so concurrent replays count and insert live capabilities one at a time (and the
+  // status check sees a committed upload). Lock order matches every other path: admission row, then job row.
+  const [existing] = issue ? await lookup.for("update") : await lookup;
   if (!existing) return null;
   if (existing.requestHash !== requestHash) throw new BatchError("idempotency_conflict", "Idempotency-Key was already used with a different request");
   if (existing.tombstoned) throw new BatchError("transcription_not_found", "No such transcription");
