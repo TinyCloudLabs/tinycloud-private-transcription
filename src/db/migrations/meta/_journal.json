@@ -120,6 +120,13 @@
       "when": 1790688349411,
       "tag": "0016_api_key_scopes",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1790689280840,
+      "tag": "0017_batch_transcription",
+      "breakpoints": true
     }
   ]
 }

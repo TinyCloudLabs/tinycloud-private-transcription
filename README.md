@@ -40,6 +40,8 @@ src/domain/         pure logic: IDs (mtg_+ULID), platform detection, state machi
 src/providers/vexa/ Vexa client, types (from Vexa's frozen OpenAPI), mock server
 src/providers/transcription/ Vexa segment normalization provider
 src/services/       meeting service (create/get/stop/delete/transition)
+src/roles/          PTX_ROLE=batch context, app and API process
+src/uploads/        batch transcription: jobs API, capability upload, admission, worker, arbiter, VAD, deletion ledger
 src/webhooks/       HMAC signature + delivery/retry
 test/               unit + integration (API ↔ mock Vexa ↔ worker ↔ Postgres/Redis)
 infra/dstack/       app-compose.yaml for the Phala/dstack CVM
@@ -81,8 +83,8 @@ bun run cli create-key --project demo --scopes 'transcriptions:*'   # quote: zsh
 ### API-key scopes
 
 Every authenticated route group requires one exact scope, or it answers `403 insufficient_scope`:
-`meetings:*` for `/v1/meetings*`, `transcriptions:*` for `/v1/transcriptions*` (batch API, not yet mounted), `admin:*`
-for `/v1/admin/*` (not yet mounted). There is no global wildcard. `create-key` defaults to `meetings:*`, which every
+`meetings:*` for `/v1/meetings*`, `transcriptions:*` for `/v1/transcriptions*` and `admin:*` for `/v1/admin/*` (the
+last two exist only in the batch role, below). There is no global wildcard. `create-key` defaults to `meetings:*`, which every
 pre-existing key holds, so meeting callers need no change. `--scopes` takes a comma-separated list.
 
 On a CVM without SSH, set the sealed env `PTX_BOOTSTRAP_KEYS` to a JSON array of `{id, project, scopes, sha256}`
@@ -101,6 +103,34 @@ run it; it mints a Vexa key via admin-api, starts api+worker in-process, creates
 `https://jitsi.local:8443/<room>`, sends Alice, waits for `completed`, checks transcript + signed webhook,
 then deletes. The test uses `E2E_AUTO_LEAVE_MS` (default `60000`) so it does not wait for the five-minute
 production window. Green 2/2 on 2026-08-17 (~2 min each; evidence in `tmp/e2e-<room>.json`).
+
+### Batch transcription role
+
+`PTX_ROLE=batch` runs the batch-transcription service from the same image (contract: [SPEC.md](./SPEC.md#batch-transcription-ptx_rolebatch)).
+It needs only Postgres and ffmpeg; it never talks to Vexa, Redis or Signal, and it mounts no meeting route. The meeting
+role (default) mounts none of its routes.
+
+```bash
+export PTX_ROLE=batch BATCH_UPLOAD_DIR=$PWD/tmp/uploads BATCH_TINFOIL_API_KEY=…   # a dedicated batch credential
+bun run api                       # migrates; serves /health, /v1/transcriptions*, /v1/admin/*, PUT /uploads/{id}
+bun run src/uploads/worker.ts     # one job at a time; one provider request at a time
+bun run cli create-key --project tinychat --scopes 'transcriptions:*'
+```
+
+| var (batch role) | default | notes |
+|---|---|---|
+| `PTX_ROLE` | `meeting` | `batch` selects this service; anything else fails boot |
+| `BATCH_TINFOIL_API_KEY` | – | the batch service's own Tinfoil key; `TINFOIL_API_KEY` is never read in this role. Unset = every create answers `503 service_unavailable` |
+| `BATCH_TINFOIL_BASE_URL` / `BATCH_TINFOIL_MODEL` / `BATCH_TINFOIL_TIMEOUT_MS` | `https://inference.tinfoil.sh` / `voxtral-small-24b` / `180000` | |
+| `BATCH_UPLOAD_DIR` | `/var/lib/ptx-batch/uploads` | accepted audio, in-flight uploads, PCM work files (both processes mount it) |
+| `BATCH_MAX_ACTIVE_JOBS` | `10` | service-wide awaiting_upload + queued + processing |
+| `BATCH_MAX_RESERVED_BYTES` | `1209600000` | service-wide declared bytes of those jobs (10 × the 120,960,000-byte cap) |
+| `BATCH_MAX_CONCURRENT_UPLOADS` | `3` | service-wide live PUTs |
+| `BATCH_DISK_HIGH_WATER_PERCENT` | `80` | creates and PUTs refused at or above this volume usage |
+| `BATCH_TENANT_DAILY_BYTES` | `362880000` | per tenant per UTC day (3 × cap) |
+| `BATCH_UPLOAD_MAX_PUT_SECONDS` | `1800` | absolute cap on one PUT (also clamped to the job's 2 h upload deadline) |
+| `BATCH_UPLOAD_MIN_BYTES_PER_SECOND` | `32768` | minimum average PUT rate after 60 s |
+| `PTX_FAULT_INJECT` | unset | staging-only fault injection (`<point>:<crash|error|delay=<ms>>,…`); must never be set in a deploy |
 
 ### Env vars
 

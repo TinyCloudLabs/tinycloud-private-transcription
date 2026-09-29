@@ -156,7 +156,7 @@ test("0004-0015 retain production retry, fallback, terminal delivery, and deleti
     expect(signalColumns).toEqual({ count: 2 });
 
     const [migrationCount] = await db.execute(sql`SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`);
-    expect(migrationCount).toEqual({ count: 17 });
+    expect(migrationCount).toEqual({ count: 18 });
 
     const [deletionAdmission] = await db.execute(sql`
       SELECT count(*)::int AS count
@@ -294,6 +294,52 @@ test("0016 keeps every pre-enforcement key working on meeting routes and grants 
     const [rolledBack] = await db.execute(sql`SELECT bootstrap_managed FROM api_keys WHERE id = 'key_rollback'`);
     expect(rolledBack).toEqual({ bootstrap_managed: false });
     expect((await get(rollbackKey)).status).toBe(404);
+  } finally {
+    await db?.$client.close();
+    await admin.unsafe(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`);
+    await admin.close();
+    await rm(fixture, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("0017 (batch transcription) is additive: every pre-existing table, row and meeting route is unchanged", async () => {
+  const databaseName = `ptx_batch_${crypto.randomUUID().replaceAll("-", "")}`;
+  const databaseUrl = new URL(config.databaseUrl);
+  databaseUrl.pathname = `/${databaseName}`;
+  const adminUrl = new URL(config.databaseUrl);
+  adminUrl.pathname = "/postgres";
+  const admin = new SQL(adminUrl.toString());
+  // Every migration through 0016: the schema the meeting service runs once P1 ships.
+  const fixture = await productionMigrationsFixture(17);
+  let db: Db | undefined;
+  const key = "tc_live_batch_upgrade_fixture";
+  const columns = (target: Db) => target.execute(sql`
+    SELECT table_name, column_name, data_type, is_nullable, column_default FROM information_schema.columns
+    WHERE table_schema = 'public' ORDER BY table_name, ordinal_position`);
+  try {
+    await admin.unsafe(`CREATE DATABASE "${databaseName}"`);
+    const before = createDb(databaseUrl.toString());
+    await migrate(before, { migrationsFolder: fixture });
+    await before.execute(sql`INSERT INTO projects (id, name, webhook_secret) VALUES ('demo', 'demo', 'whsec_legacy')`);
+    await before.execute(sql`INSERT INTO api_keys (id, project_id, key_hash, scopes) VALUES ('key_cli', 'demo', ${hashApiKey(key)}, ARRAY['meetings:*'])`);
+    await before.execute(sql`INSERT INTO meetings (id, project_id, meeting_url, platform, status) VALUES ('mtg_upgrade', 'demo', 'https://meet.jit.si/x', 'jitsi', 'processing')`);
+    const schemaBefore = await columns(before);
+    const rowsBefore = await before.execute(sql`SELECT * FROM meetings`);
+    await before.$client.close();
+
+    db = await runMigrations(databaseUrl.toString());
+    const tablesBefore = new Set((schemaBefore as { table_name: string }[]).map((c) => c.table_name));
+    const schemaAfter = (await columns(db) as { table_name: string }[]).filter((c) => tablesBefore.has(c.table_name));
+    expect(schemaAfter).toEqual(schemaBefore as never);
+    expect(await db.execute(sql`SELECT * FROM meetings`)).toEqual(rowsBefore);
+    expect(await db.execute(sql`SELECT id, mode FROM transcription_admission`)).toEqual([{ id: 1, mode: "open" }]);
+    expect(await db.execute(sql`SELECT id, attempt_id FROM provider_dispatch_slots`)).toEqual([{ id: 1, attempt_id: null }]);
+
+    const app = createApp({ db, log: silentLogger } as AppContext);
+    const res = await app.request("/v1/meetings/mtg_upgrade_missing", { headers: { Authorization: `Bearer ${key}` } });
+    expect(res.status).toBe(404);
+    // The meeting role never mounts the batch API.
+    expect((await app.request("/v1/transcriptions", { headers: { Authorization: `Bearer ${key}` } })).status).toBe(404);
   } finally {
     await db?.$client.close();
     await admin.unsafe(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`);

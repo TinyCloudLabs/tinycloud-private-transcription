@@ -12,7 +12,19 @@ export const positiveIntegerEnv = (name: string, fallback: string): number => {
 
 export type TranscriptionProviderName = "vexa" | "tinfoil";
 
+/**
+ * Which service this process is. `meeting` (default) is the live meeting-bot service and never mounts or
+ * runs anything batch. `batch` is the dedicated batch-transcription service (src/roles/batch.ts), which
+ * never touches Vexa, Redis or Signal. Anything else fails boot.
+ */
+export type PtxRole = "meeting" | "batch";
+export function parseRole(value: string): PtxRole {
+  if (value !== "meeting" && value !== "batch") throw new Error(`PTX_ROLE must be "meeting" or "batch", got ${JSON.stringify(value)}`);
+  return value;
+}
+
 export const config = {
+  role: parseRole(env("PTX_ROLE", "meeting")),
   port: Number(env("PORT", "8080")),
   databaseUrl: env("DATABASE_URL", "postgres://ptx:ptx@localhost:55432/ptx"),
   redisUrl: env("REDIS_URL", "redis://localhost:56379"),

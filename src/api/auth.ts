@@ -41,7 +41,7 @@ export interface AuthedProject {
 
 export type AuthEnv = { Variables: { project: AuthedProject } };
 
-export function bearerAuth(ctx: AppContext): MiddlewareHandler<AuthEnv> {
+export function bearerAuth(ctx: Pick<AppContext, "db">): MiddlewareHandler<AuthEnv> {
   return async (c, next) => {
     const header = c.req.header("authorization") ?? "";
     const [scheme, token] = header.split(" ");
