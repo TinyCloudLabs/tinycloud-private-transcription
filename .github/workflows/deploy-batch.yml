@@ -1,0 +1,244 @@
+name: Deploy ptx-batch
+# MANUAL ONLY (workflow_dispatch). Creates or updates the dedicated batch-transcription CVM `ptx-batch` from
+# infra/dstack-batch/app-compose.yaml. Never runs on push or pull_request, and never touches ptx-dev.
+#
+# Secrets and variables live in the `ptx-batch` GitHub Environment (add required reviewers there):
+#   secrets: PHALA_CLOUD_API_KEY, BATCH_POSTGRES_PASSWORD, BATCH_TINFOIL_API_KEY, PTX_BOOTSTRAP_KEYS,
+#            PTX_BATCH_ADMIN_KEY (plaintext of the admin:* key whose hash is in PTX_BOOTSTRAP_KEYS)
+#   variable: PTX_BATCH_CVM_ID  (unset = first creation; set it to the id this workflow prints afterwards)
+#
+# Update order: drain admission → wait until no job is active → deploy → sync allowed_envs → health gate →
+# reopen admission. A failure after the drain leaves admission in `drain` on purpose (see the runbook).
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type ptx-batch to deploy
+        required: true
+      drain_timeout_minutes:
+        description: Update only. Minutes to wait for active jobs to reach 0 before deploying
+        required: true
+        default: "130"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-ptx-batch
+  cancel-in-progress: false
+
+env:
+  CVM_NAME: ptx-batch
+  COMPOSE: infra/dstack-batch/app-compose.yaml
+  INSTANCE_TYPE: tdx.large
+  DISK_SIZE: 40G
+  IMAGE_REPO: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ptx-batch
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Guard inputs, secrets and the image pin
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+          DRAIN_TIMEOUT_MINUTES: ${{ inputs.drain_timeout_minutes }}
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+          BATCH_POSTGRES_PASSWORD: ${{ secrets.BATCH_POSTGRES_PASSWORD }}
+          BATCH_TINFOIL_API_KEY: ${{ secrets.BATCH_TINFOIL_API_KEY }}
+          PTX_BOOTSTRAP_KEYS: ${{ secrets.PTX_BOOTSTRAP_KEYS }}
+          PTX_BATCH_ADMIN_KEY: ${{ secrets.PTX_BATCH_ADMIN_KEY }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=Deploy refused::$1"; exit 1; }
+          [ "$CONFIRM" = "$CVM_NAME" ] || fail "confirm must be exactly $CVM_NAME"
+          [ "$GITHUB_REF" = "refs/heads/main" ] || fail "deploy only from main (got $GITHUB_REF)"
+          [[ "$DRAIN_TIMEOUT_MINUTES" =~ ^[0-9]+$ ]] || fail "drain_timeout_minutes must be an integer"
+          for name in PHALA_CLOUD_API_KEY BATCH_POSTGRES_PASSWORD BATCH_TINFOIL_API_KEY PTX_BOOTSTRAP_KEYS PTX_BATCH_ADMIN_KEY; do
+            [ -n "${!name}" ] || fail "secret $name is not set in the ptx-batch environment"
+          done
+          if grep -q PTX_FAULT_INJECT "$COMPOSE"; then fail "PTX_FAULT_INJECT must never appear in a deploy compose"; fi
+          images="$(grep -E "^ +image: ${IMAGE_REPO}:" "$COMPOSE" | sed -E 's/^ +image: //' | sort -u)"
+          [ "$(printf '%s\n' "$images" | wc -l)" -eq 1 ] || fail "api and upload-worker must pin the same image"
+          [[ "$images" =~ ^${IMAGE_REPO}:([0-9a-f]{40})@(sha256:[0-9a-f]{64})$ ]] \
+            || fail "the compose still has the placeholder pin; pin the image built from main first (infra/dstack-batch/README.md)"
+          sha="${BASH_REMATCH[1]}"
+          digest="${BASH_REMATCH[2]}"
+          git merge-base --is-ancestor "$sha" origin/main || fail "image commit $sha is not on main"
+          published="$(docker buildx imagetools inspect "${IMAGE_REPO}:${sha}" --format '{{json .Manifest}}' | jq -r '.digest')"
+          [ "$published" = "$digest" ] || fail "${IMAGE_REPO}:${sha} is ${published}, not the pinned ${digest}"
+          echo "IMAGE=${images}" >> "$GITHUB_ENV"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Validate the sealed environment
+        env:
+          BATCH_POSTGRES_PASSWORD: ${{ secrets.BATCH_POSTGRES_PASSWORD }}
+          BATCH_TINFOIL_API_KEY: ${{ secrets.BATCH_TINFOIL_API_KEY }}
+          PTX_BOOTSTRAP_KEYS: ${{ secrets.PTX_BOOTSTRAP_KEYS }}
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile
+          # API boot fails on an invalid value; refuse it here instead, without printing it.
+          # shellcheck disable=SC2016 # single quotes on purpose: a JS snippet with template literals
+          bun -e 'const { parseBootstrapKeys } = await import("./src/api/bootstrap-keys.ts"); const keys = parseBootstrapKeys(process.env.PTX_BOOTSTRAP_KEYS ?? ""); if (!keys.some((k) => k.scopes.includes("admin:*")) || !keys.some((k) => k.scopes.includes("transcriptions:*"))) throw new Error("PTX_BOOTSTRAP_KEYS needs an admin:* and a transcriptions:* key"); console.log(`bootstrap keys: ${keys.map((k) => `${k.id}(${k.scopes.join(",")})`).join(" ")}`);'
+          ENV_FILE="$RUNNER_TEMP/ptx-batch.env"
+          umask 077
+          {
+            printf '%s\n' "POSTGRES_PASSWORD=$BATCH_POSTGRES_PASSWORD"
+            printf '%s\n' "BATCH_TINFOIL_API_KEY=$BATCH_TINFOIL_API_KEY"
+            printf '%s\n' "PTX_BOOTSTRAP_KEYS=$PTX_BOOTSTRAP_KEYS"
+          } > "$ENV_FILE"
+          docker compose -f "$COMPOSE" --env-file "$ENV_FILE" config --quiet
+          echo "ENV_FILE=$ENV_FILE" >> "$GITHUB_ENV"
+
+      - name: Install Phala CLI
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+        run: |
+          set -euo pipefail
+          npm install -g phala@1.1.22
+          phala whoami --json | jq '{username: (.username // .name // "unknown")}'
+
+      - name: Resolve the CVM
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+          PTX_BATCH_CVM_ID: ${{ vars.PTX_BATCH_CVM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -n "$PTX_BATCH_CVM_ID" ]; then
+            RAW="$(phala cvms get "$PTX_BATCH_CVM_ID" --json)"
+            [ "$(echo "$RAW" | jq -r '.name')" = "$CVM_NAME" ] || { echo "::error::PTX_BATCH_CVM_ID does not name $CVM_NAME"; exit 1; }
+            APP_ID="$(echo "$RAW" | jq -r '.app_id // empty')"
+            BASE="$(echo "$RAW" | jq -r '.gateway.base_domain // empty')"
+            [ -n "$APP_ID" ] && [ -n "$BASE" ] || { echo "::error::could not resolve the gateway URL"; exit 1; }
+            {
+              echo "MODE=update"
+              echo "CVM_ID=$PTX_BATCH_CVM_ID"
+              echo "BATCH_URL=https://${APP_ID}-8080.${BASE}"
+            } >> "$GITHUB_ENV"
+          else
+            if phala cvms get "$CVM_NAME" --json >/dev/null 2>&1; then
+              echo "::error::a CVM named $CVM_NAME already exists; set the PTX_BATCH_CVM_ID environment variable to update it"
+              exit 1
+            fi
+            echo "MODE=create" >> "$GITHUB_ENV"
+          fi
+
+      - name: Drain admission and wait for zero active jobs
+        if: env.MODE == 'update'
+        env:
+          PTX_BATCH_ADMIN_KEY: ${{ secrets.PTX_BATCH_ADMIN_KEY }}
+          DRAIN_TIMEOUT_MINUTES: ${{ inputs.drain_timeout_minutes }}
+        run: |
+          set -euo pipefail
+          admission() { curl -fsS "$@" -H "Authorization: Bearer $PTX_BATCH_ADMIN_KEY" -H 'Content-Type: application/json' "$BATCH_URL/v1/admin/admission"; }
+          admission -X PUT -d '{"mode":"drain"}' | jq -c .
+          deadline=$((SECONDS + DRAIN_TIMEOUT_MINUTES * 60))
+          while :; do
+            status="$(admission)"
+            active="$(echo "$status" | jq '.active.awaiting_upload + .active.queued + .active.processing')"
+            echo "active=$active $(echo "$status" | jq -c .active)"
+            [ "$active" -eq 0 ] && break
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error title=Drain timeout::$active job(s) still active; admission is left in drain"
+              exit 1
+            fi
+            sleep 30
+          done
+
+      - name: Deploy
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+        run: |
+          set -euo pipefail
+          echo "Deploying $IMAGE ($MODE)"
+          if [ "$MODE" = "update" ]; then
+            phala deploy --cvm-id "$CVM_ID" -c "$COMPOSE" -e "$ENV_FILE" --no-public-logs --wait
+          else
+            phala deploy -n "$CVM_NAME" -c "$COMPOSE" -e "$ENV_FILE" -t "$INSTANCE_TYPE" --disk-size "$DISK_SIZE" \
+              --no-dev-os --no-public-logs --wait
+            RAW="$(phala cvms get "$CVM_NAME" --json)"
+            CVM_ID="$(echo "$RAW" | jq -r '.id')"
+            echo "CVM_ID=$CVM_ID" >> "$GITHUB_ENV"
+            echo "::notice title=Record the CVM id::gh variable set PTX_BATCH_CVM_ID --env ptx-batch --body $CVM_ID"
+          fi
+
+      # `phala deploy` updates the encrypted env but not the CVM's allowed_envs whitelist (fixed at creation).
+      - name: Sync allowed_envs
+        if: env.MODE == 'update'
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/phala-sync"
+          cp .github/scripts/phala-sync-allowed-envs.mjs "$RUNNER_TEMP/phala-sync/"
+          cd "$RUNNER_TEMP/phala-sync"
+          npm init -y >/dev/null
+          npm install @phala/cloud@0.3.0
+          PHALA_CVM_ID="$CVM_ID" node phala-sync-allowed-envs.mjs
+
+      - name: Wait for running and resolve the gateway URL
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 90); do
+            RAW="$(phala cvms get "$CVM_ID" --json)"
+            STATUS="$(echo "$RAW" | jq -r '.status // "unknown"')"
+            echo "attempt $i/90: status=$STATUS"
+            if [ "$STATUS" = "running" ]; then
+              APP_ID="$(echo "$RAW" | jq -r '.app_id')"
+              BASE="$(echo "$RAW" | jq -r '.gateway.base_domain')"
+              echo "BATCH_URL=https://${APP_ID}-8080.${BASE}" >> "$GITHUB_ENV"
+              echo "$RAW" | jq '{id, name, status, app_id, instance_type}'
+              exit 0
+            fi
+            if [ "$STATUS" = "failed" ] || [ "$STATUS" = "error" ]; then
+              echo "::error::CVM status $STATUS"
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "::error::timed out waiting for running"
+          exit 1
+
+      - name: Health gate (live, then upload_transcription.ready)
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 90); do
+            if curl -fsS "$BATCH_URL/health/live" >/dev/null 2>&1; then
+              body="$(curl -sS "$BATCH_URL/health" || true)"
+              echo "$body" | jq -c '.checks.upload_transcription // .' || true
+              if [ "$(echo "$body" | jq -r '.checks.upload_transcription.ready // false')" = "true" ]; then exit 0; fi
+            else
+              echo "attempt $i/90: /health/live not ready"
+            fi
+            sleep 10
+          done
+          echo "::error title=Health gate::upload_transcription never became ready; admission is not reopened"
+          exit 1
+
+      - name: Open admission
+        env:
+          PTX_BATCH_ADMIN_KEY: ${{ secrets.PTX_BATCH_ADMIN_KEY }}
+        run: |
+          set -euo pipefail
+          curl -fsS -X PUT -H "Authorization: Bearer $PTX_BATCH_ADMIN_KEY" -H 'Content-Type: application/json' \
+            -d '{"mode":"open"}' "$BATCH_URL/v1/admin/admission" | jq -c .
+          {
+            echo "### ptx-batch deployed"
+            echo
+            echo "- Mode: \`$MODE\`"
+            echo "- CVM: \`$CVM_ID\`"
+            echo "- URL: $BATCH_URL"
+            echo "- Image: \`$IMAGE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
