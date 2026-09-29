@@ -73,6 +73,11 @@ export const config = {
     model: env("TINFOIL_MODEL", "voxtral-small-24b"),
   },
   logLevel: env("LOG_LEVEL", "info"),
+  /**
+   * Sealed JSON array of `{id, project, scopes, sha256}` (hashes only) that the API makes the exact set of
+   * bootstrap-managed keys at boot. Unset/empty = no bootstrap management; `[]` revokes all bootstrap keys.
+   */
+  bootstrapKeys: env("PTX_BOOTSTRAP_KEYS", ""),
 };
 
 export type Config = typeof config;

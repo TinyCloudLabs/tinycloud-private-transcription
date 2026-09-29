@@ -4,7 +4,8 @@ import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
+import { pgTable, text, timestamp } from "drizzle-orm/pg-core";
 import { migrate } from "drizzle-orm/bun-sql/migrator";
 import { createApp } from "../../src/api/app.ts";
 import { hashApiKey } from "../../src/api/auth.ts";
@@ -16,11 +17,11 @@ import { silentLogger } from "../../src/log.ts";
 
 const migrationsSource = fileURLToPath(new URL("../../src/db/migrations/", import.meta.url));
 
-async function productionMigrationsFixture(): Promise<string> {
+async function productionMigrationsFixture(migrationCount = 4): Promise<string> {
   const folder = await mkdtemp(join(tmpdir(), "ptx-production-migrations-"));
   await mkdir(join(folder, "meta"));
   const journal = JSON.parse(await readFile(join(migrationsSource, "meta/_journal.json"), "utf8"));
-  journal.entries = journal.entries.slice(0, 4);
+  journal.entries = journal.entries.slice(0, migrationCount);
   await writeFile(join(folder, "meta/_journal.json"), `${JSON.stringify(journal, null, 2)}\n`);
   for (const entry of journal.entries) {
     await copyFile(join(migrationsSource, `${entry.tag}.sql`), join(folder, `${entry.tag}.sql`));
@@ -155,7 +156,7 @@ test("0004-0015 retain production retry, fallback, terminal delivery, and deleti
     expect(signalColumns).toEqual({ count: 2 });
 
     const [migrationCount] = await db.execute(sql`SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`);
-    expect(migrationCount).toEqual({ count: 16 });
+    expect(migrationCount).toEqual({ count: 17 });
 
     const [deletionAdmission] = await db.execute(sql`
       SELECT count(*)::int AS count
@@ -194,6 +195,105 @@ test("0004-0015 retain production retry, fallback, terminal delivery, and deleti
       WHERE m.id = 'mtg_legacy_1'
     `);
     expect(rollbackWrite).toEqual({ transcription_attempts: 2, fallback_reason: "rollback_write_verified" });
+  } finally {
+    await db?.$client.close();
+    await admin.unsafe(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`);
+    await admin.close();
+    await rm(fixture, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("0016 keeps every pre-enforcement key working on meeting routes and grants no other scope", async () => {
+  const databaseName = `ptx_scopes_${crypto.randomUUID().replaceAll("-", "")}`;
+  const databaseUrl = new URL(config.databaseUrl);
+  databaseUrl.pathname = `/${databaseName}`;
+  const adminUrl = new URL(config.databaseUrl);
+  adminUrl.pathname = "/postgres";
+  const admin = new SQL(adminUrl.toString());
+  // Every migration before 0016_api_key_scopes: the schema the live deployment runs today.
+  const fixture = await productionMigrationsFixture(16);
+  let db: Db | undefined;
+  const cliKey = "tc_live_scope_upgrade_cli_fixture";
+  const emptyKey = "tc_live_scope_upgrade_empty_fixture";
+  const otherKey = "tc_live_scope_upgrade_other_fixture";
+  const nullKey = "tc_live_scope_upgrade_null_fixture";
+  const nullMixedKey = "tc_live_scope_upgrade_null_mixed_fixture";
+
+  try {
+    await admin.unsafe(`CREATE DATABASE "${databaseName}"`);
+    const productionDb = createDb(databaseUrl.toString());
+    await migrate(productionDb, { migrationsFolder: fixture });
+    await productionDb.execute(sql`INSERT INTO projects (id, name, webhook_secret) VALUES ('demo', 'demo', 'whsec_legacy')`);
+    // What `create-key` has always written, e.g. the tinychat backend's live key.
+    await productionDb.execute(sql`
+      INSERT INTO api_keys (id, project_id, key_hash, scopes)
+      VALUES ('key_cli', 'demo', ${hashApiKey(cliKey)}, ARRAY['meetings:*'])
+    `);
+    // A raw insert relying on the column default '{}'.
+    await productionDb.execute(sql`INSERT INTO api_keys (id, project_id, key_hash) VALUES ('key_empty', 'demo', ${hashApiKey(emptyKey)})`);
+    // A raw insert with some other, never-enforced scope string.
+    await productionDb.execute(sql`
+      INSERT INTO api_keys (id, project_id, key_hash, scopes)
+      VALUES ('key_other', 'demo', ${hashApiKey(otherKey)}, ARRAY['meetings'])
+    `);
+    // Arrays holding NULL elements, where `'meetings:*' = ANY(scopes)` is NULL rather than false.
+    await productionDb.execute(sql`
+      INSERT INTO api_keys (id, project_id, key_hash, scopes)
+      VALUES ('key_null', 'demo', ${hashApiKey(nullKey)}, ARRAY[NULL]::text[]),
+             ('key_null_mixed', 'demo', ${hashApiKey(nullMixedKey)}, ARRAY[NULL, 'meetings']::text[])
+    `);
+    await productionDb.$client.close();
+
+    db = await runMigrations(databaseUrl.toString());
+
+    const rows = await db.execute(sql`SELECT id, scopes, bootstrap_managed FROM api_keys ORDER BY id`);
+    expect(rows).toEqual([
+      { id: "key_cli", scopes: ["meetings:*"], bootstrap_managed: false },
+      { id: "key_empty", scopes: ["meetings:*"], bootstrap_managed: false },
+      { id: "key_null", scopes: [null, "meetings:*"], bootstrap_managed: false },
+      { id: "key_null_mixed", scopes: [null, "meetings", "meetings:*"], bootstrap_managed: false },
+      { id: "key_other", scopes: ["meetings", "meetings:*"], bootstrap_managed: false },
+    ]);
+
+    const app = createApp({ db, log: silentLogger } as AppContext);
+    const get = (key: string) => app.request("/v1/meetings/mtg_missing", { headers: { Authorization: `Bearer ${key}` } });
+    // 404 meeting_not_found = authenticated, authorized, and answered by the handler, as before.
+    expect((await get(cliKey)).status).toBe(404);
+    expect((await get(emptyKey)).status).toBe(404);
+    expect((await get(otherKey)).status).toBe(404);
+    expect((await get(nullKey)).status).toBe(404);
+    expect((await get(nullMixedKey)).status).toBe(404);
+    // A key created after 0016 without meetings:* is not grandfathered.
+    const newKey = "tc_live_scope_upgrade_new_fixture";
+    await db.execute(sql`
+      INSERT INTO api_keys (id, project_id, key_hash, scopes)
+      VALUES ('key_new', 'demo', ${hashApiKey(newKey)}, ARRAY['transcriptions:*'])
+    `);
+    expect((await get(newKey)).status).toBe(403);
+
+    // Rollback: the pre-enforcement image, whose schema is exactly this table (no bootstrap_managed) and
+    // which never checks scopes, keeps minting and authenticating keys against the migrated schema.
+    const preEnforcementApiKeys = pgTable("api_keys", {
+      id: text("id").primaryKey(),
+      projectId: text("project_id").notNull(),
+      keyHash: text("key_hash").notNull().unique(),
+      scopes: text("scopes").array().notNull().default([]),
+      createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    });
+    const rollbackKey = "tc_live_scope_upgrade_rollback_fixture";
+    await db.insert(preEnforcementApiKeys).values({ id: "key_rollback", projectId: "demo", keyHash: hashApiKey(rollbackKey), scopes: ["meetings:*"] });
+    const lookup = (key: string) =>
+      db!
+        .select({ projectId: preEnforcementApiKeys.projectId, scopes: preEnforcementApiKeys.scopes })
+        .from(preEnforcementApiKeys)
+        .where(eq(preEnforcementApiKeys.keyHash, hashApiKey(key)))
+        .limit(1);
+    expect(await lookup(rollbackKey)).toEqual([{ projectId: "demo", scopes: ["meetings:*"] }]);
+    expect(await lookup(cliKey)).toEqual([{ projectId: "demo", scopes: ["meetings:*"] }]);
+    // A key the old image minted is an ordinary key when rolling forward again.
+    const [rolledBack] = await db.execute(sql`SELECT bootstrap_managed FROM api_keys WHERE id = 'key_rollback'`);
+    expect(rolledBack).toEqual({ bootstrap_managed: false });
+    expect((await get(rollbackKey)).status).toBe(404);
   } finally {
     await db?.$client.close();
     await admin.unsafe(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`);

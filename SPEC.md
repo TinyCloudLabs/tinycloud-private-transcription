@@ -21,7 +21,22 @@ Consumers: TinyCloud (`listen` app) and Conclave-shaped clients.
   4. dstack compose + Phala dev CVM attempt.
 
 ## API
-Auth: `Authorization: Bearer tc_live_xxx`.
+Auth: `Authorization: Bearer tc_live_xxx`. A missing, malformed or unknown key → `401 unauthorized`.
+
+Scopes: each authenticated route group requires exactly one scope on the key; otherwise `403`
+`{"error":{"type":"authentication_error","code":"insufficient_scope","message":"…"}}`. Scopes are exact strings (the `:*`
+suffix is naming only): there is no global wildcard and no prefix matching, so `*`, `meetings` or `meetings:read` grant nothing.
+Routing is deny-by-default: every `/v1` request is authenticated and then authorized against the registered groups
+below; a `/v1` path outside them answers `404 not_found` even for a valid key.
+
+| Scope | Routes |
+|---|---|
+| `meetings:*` | `/v1/meetings*` |
+| `transcriptions:*` | `/v1/transcriptions*` (batch API, not yet mounted) |
+| `admin:*` | `/v1/admin/*` (not yet mounted) |
+
+Keys minted without explicit scopes get `meetings:*`; every key that existed before enforcement holds it (migration 0016).
+Keys come from `create-key [--scopes …]` or, on CVMs without SSH, the sealed `PTX_BOOTSTRAP_KEYS` env (hashes only).
 
 `POST /v1/meetings` body: `meeting_url` (required), `bot_name`, `language`, `webhook_url`, `platform` (override), `metadata` (opaque, echoed everywhere). Returns immediately:
 ```json
@@ -48,7 +63,7 @@ capture-provider record back to `processing` and retries Vexa-segment finalizati
 `speaker_id` is stable within a meeting only. `provider` is `"vexa"`: Vexa owns the transcript and speaker attribution, while TinyCloud normalizes the completed segments. `DELETE /v1/meetings/{id}` removes our record + transcript and the Vexa meeting.
 `GET /health` → `{status:"ok","checks":{postgres,redis,vexa,bot_capacity:{running,max},transcription_provider}}` (`bot_capacity.max` from `VEXA_MAX_CONCURRENT_BOTS`).
 
-Errors: `{"error":{"type":"meeting_join_failed","code":"waiting_room_timeout","message":"…"}}`. Codes: invalid_meeting_url, unsupported_platform, meeting_not_found, meeting_join_failed, waiting_room_timeout, bot_removed, meeting_ended, capture_failed, transcription_failed, provider_timeout, provider_unavailable, internal_error. Never leak Vexa errors raw.
+Errors: `{"error":{"type":"meeting_join_failed","code":"waiting_room_timeout","message":"…"}}`. Codes: invalid_meeting_url, unsupported_platform, meeting_not_found, meeting_join_failed, waiting_room_timeout, bot_removed, meeting_ended, capture_failed, transcription_failed, provider_timeout, provider_unavailable, internal_error (+ request-level `unauthorized` 401, `insufficient_scope` 403, `invalid_request`, `idempotency_conflict`). Never leak Vexa errors raw.
 
 Platform detection: meet.google.com→google_meet, zoom.us→zoom, teams.microsoft.com→microsoft_teams, meet.jit.si / self-hosted Jitsi→jitsi. Only platforms in `ENABLED_PLATFORMS` (default `jitsi`) are accepted; a detected-but-disabled platform answers 400 `unsupported_platform` naming the platform.
 
@@ -87,7 +102,7 @@ once per minute otherwise while polling. Terminal evidence survives transcriptio
 `meetings(id, project_id, meeting_url, platform, status, bot_name, vexa_native_meeting_id, vexa_bot_id, created_at, started_at, ended_at, completed_at, metadata, capture_diagnostics, error_code, error_message, idempotency_key)`
 `transcripts(meeting_id, language, duration_seconds, segments_json, provider, created_at)`
 `webhook_deliveries(id, meeting_id, event_type, endpoint, attempt, status, response_code, created_at)`
-`api_keys(id, project_id, key_hash, scopes, created_at)`
+`api_keys(id, project_id, key_hash, scopes, bootstrap_managed, created_at)`
 
 ## Deployment
 Single dstack CVM: api, worker, Vexa services, redis, postgres.

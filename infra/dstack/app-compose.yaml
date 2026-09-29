@@ -7,7 +7,8 @@
 # TRANSCRIPTION_PROVIDER (PTX compatibility label; does not configure Vexa's STT endpoint),
 # VEXA_ADMIN_IMAGE / VEXA_RUNTIME_IMAGE / VEXA_AGENT_IMAGE / VEXA_AGENT_WORKER_IMAGE
 # (digest-pinned v012 upstream components),
-# PTX_BOT_IMAGE (fork bot image override; defaults to the pinned fork image below).
+# PTX_BOT_IMAGE (fork bot image override; defaults to the pinned fork image below),
+# PTX_BOOTSTRAP_KEYS (optional hashed API keys for the api service; see .env.example).
 # The PTX API/worker and three-seat Signal Desktop images are immutable production pins in this
 # file, not sealed-environment overrides. Signal profile volumes are deliberately persistent:
 # linking each Signal account is an operator action, never a deployment side effect.
@@ -55,6 +56,9 @@ services:
       # stale sealed environment cannot silently disable a shipped capture backend.
       ENABLED_PLATFORMS: jitsi,google_meet,signal
       AUTO_MIGRATE: "true"
+      # Sealed JSON array of hashed API keys the API syncs at boot (see README "API-key scopes").
+      # Empty = no bootstrap management; keys minted with `create-key` are never touched.
+      PTX_BOOTSTRAP_KEYS: "${PTX_BOOTSTRAP_KEYS:-}"
       LOG_LEVEL: info
       SIGNAL_MAX_CONCURRENT_CALLS: "3"
       SIGNAL_HEALTH_PATHS: /run/signal-health-1/health.json,/run/signal-health-2/health.json,/run/signal-health-3/health.json

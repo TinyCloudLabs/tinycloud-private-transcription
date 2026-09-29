@@ -12,7 +12,10 @@ export const apiKeys = pgTable("api_keys", {
   id: text("id").primaryKey(),
   projectId: text("project_id").notNull().references(() => projects.id),
   keyHash: text("key_hash").notNull().unique(),
+  /** Exact scope strings (see API_KEY_SCOPES); each authenticated route group requires one. */
   scopes: text("scopes").array().notNull().default([]),
+  /** Owned by the sealed PTX_BOOTSTRAP_KEYS env: upserted and revoked at API boot. CLI keys are never touched. */
+  bootstrapManaged: boolean("bootstrap_managed").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 

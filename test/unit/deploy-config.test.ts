@@ -6,8 +6,11 @@
  * this deployment.") for every valid https://meet.google.com/<code>.
  */
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { BOOTSTRAP_KEYS_ENV, mintBootstrapKeys, parseBootstrapKeys } from "../../src/api/bootstrap-keys.ts";
 
 const repo = fileURLToPath(new URL("../..", import.meta.url));
 const compose = readFileSync(new URL("../../infra/dstack/app-compose.yaml", import.meta.url), "utf8");
@@ -153,6 +156,37 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(line).toContain("jitsi");
     expect(line).toContain("google_meet");
     expect(line).toContain("signal");
+  });
+
+  test("passes sealed bootstrap API keys to the api service only", () => {
+    expect(serviceEnv("api")).toContain(`${BOOTSTRAP_KEYS_ENV}: "\${${BOOTSTRAP_KEYS_ENV}:-}"`);
+    expect(serviceEnv("worker")).not.toContain(BOOTSTRAP_KEYS_ENV);
+    expect(envExample).toMatch(new RegExp(`^${BOOTSTRAP_KEYS_ENV}=$`, "m"));
+
+    // The rendered api environment carries the minted JSON line verbatim, and API boot accepts it.
+    const { env } = mintBootstrapKeys([{ id: "tinychat-batch", project: "tinychat", scopes: ["transcriptions:*"] }]);
+    const dir = mkdtempSync(join(tmpdir(), "ptx-bootstrap-env-"));
+    try {
+      const envFile = join(dir, ".env");
+      const sealed = envExample.replace(new RegExp(`^${BOOTSTRAP_KEYS_ENV}=$`, "m"), `${BOOTSTRAP_KEYS_ENV}=${env}`);
+      writeFileSync(envFile, sealed);
+      const render = (file: string) => {
+        const rendered = Bun.spawnSync(
+          ["docker", "compose", "-f", "infra/dstack/app-compose.yaml", "--env-file", file, "config", "--format", "json"],
+          { cwd: repo, stdout: "pipe", stderr: "pipe" },
+        );
+        expect(rendered.exitCode).toBe(0);
+        return JSON.parse(rendered.stdout.toString()).services as Record<string, { environment: Record<string, string> }>;
+      };
+      const services = render(envFile);
+      expect(services.api!.environment[BOOTSTRAP_KEYS_ENV]).toBe(env);
+      expect(parseBootstrapKeys(services.api!.environment[BOOTSTRAP_KEYS_ENV]!)).toHaveLength(1);
+      expect(services.worker!.environment[BOOTSTRAP_KEYS_ENV]).toBeUndefined();
+      // An empty value (the example) renders empty, which the API treats as no bootstrap management.
+      expect(render("infra/dstack/.env.example").api!.environment[BOOTSTRAP_KEYS_ENV]).toBe("");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test("enables fail-closed attributed post-meeting transcription for API and worker", () => {
