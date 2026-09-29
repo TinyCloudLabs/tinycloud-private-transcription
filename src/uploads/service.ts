@@ -151,8 +151,12 @@ export async function createTranscription(
   input: CreateTranscriptionInput,
 ): Promise<CreateResult> {
   const requestHash = hashCreateRequest(input, tenantRef);
-  const replay = await replayCreate(ctx, ctx.db, projectId, idempotencyKey, requestHash, false);
-  if (replay) return ctx.db.transaction(async (tx) => (await replayCreate(ctx, tx, projectId, idempotencyKey, requestHash, true))!);
+  if (await replayCreate(ctx, ctx.db, projectId, idempotencyKey, requestHash, false)) {
+    const replayed = await ctx.db.transaction((tx) => replayCreate(ctx, tx, projectId, idempotencyKey, requestHash, true));
+    if (replayed) return replayed;
+    // The row was purged between the two reads (only possible 7 days after its files were deleted): the key
+    // is free again, so this is an ordinary create and takes every admission check below.
+  }
 
   const ready = await readiness(ctx);
   if (!ready.ready) {

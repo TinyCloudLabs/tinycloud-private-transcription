@@ -77,6 +77,11 @@ export async function handleUpload(ctx: BatchContext, id: string, request: Reque
 
     const probe = (probed as { ok: true; probe: { durationSeconds: number; channels: number } }).probe;
     const accepted = await ctx.db.transaction(async (tx) => {
+      // `closed` is a clean cut: the share lock orders this commit against PUT /v1/admin/admission, so once
+      // closing has returned no further upload is accepted.
+      const [admission] = await tx.select({ mode: transcriptionAdmission.mode }).from(transcriptionAdmission)
+        .where(eq(transcriptionAdmission.id, 1)).for("share");
+      if (admission?.mode === "closed") return "paused" as const;
       const [row] = await tx.update(transcriptions).set({
         status: "queued",
         audioFile: finalName,
@@ -95,6 +100,7 @@ export async function handleUpload(ctx: BatchContext, id: string, request: Reque
       await tx.delete(transcriptionCapabilities).where(eq(transcriptionCapabilities.transcriptionId, id));
       return true;
     });
+    if (accepted === "paused") throw new BatchError("service_paused", "Uploads were paused; try again later", { retry_after_seconds: 300 });
     if (!accepted) throw new BatchError("upload_capability_invalid", "The transcription is no longer accepting an upload");
     committed = true;
     await ctx.faults.hit("upload.after_commit", { id });
@@ -216,6 +222,8 @@ async function receiveBody(ctx: BatchContext, job: TranscriptionRow, lease: Leas
         throw interrupted("The upload is too slow");
       }
       if (now - lastHeartbeat >= cfg.leaseHeartbeatSeconds * 1000) {
+        // `closed` stops uploads already in flight too (within one heartbeat); the job stays awaiting_upload.
+        if (await admissionMode(ctx.db) === "closed") throw new BatchError("service_paused", "Uploads were paused; try again later", { retry_after_seconds: 300 });
         if (!await renewUploadLease(ctx, job.id, lease.token)) throw new BatchError("upload_capability_invalid", "The transcription is no longer accepting an upload");
         lastHeartbeat = now;
       }

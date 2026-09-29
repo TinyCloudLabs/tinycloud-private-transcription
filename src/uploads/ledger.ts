@@ -19,6 +19,10 @@ const secondsAgo = (seconds: number) => new Date(Date.now() - seconds * 1000);
  * deletion_state='pending' (the ledger entry) before any file is unlinked, bumps the fencing generation,
  * and drops every claim and upload lease; its capabilities are deleted in the same transaction. `guard`
  * is the caller's compare-and-swap. Returns null when the guard lost.
+ *
+ * A failed or cancelled job has no transcript to serve, so any region text it already holds (partial
+ * content) is deleted right away and transcript_deleted_at is recorded; only a completed job keeps text,
+ * until DELETE or its 24 h expiry. The sweeper re-runs this for a job whose caller died in between.
  */
 export async function terminalize(
   tx: DbOrTx,
@@ -47,6 +51,7 @@ export async function terminalize(
   }).where(and(eq(transcriptions.id, id), inArray(transcriptions.status, [...ACTIVE_STATUSES]), guard)).returning();
   if (!row) return null;
   await tx.delete(transcriptionCapabilities).where(eq(transcriptionCapabilities.transcriptionId, id));
+  if (status !== "completed") await deleteTranscriptContent(tx, id);
   return row;
 }
 
@@ -66,7 +71,9 @@ export async function cleanupJobFiles(ctx: BatchContext, id: string): Promise<bo
     verified = false;
   }
   if (!verified) {
-    await ctx.db.update(transcriptions).set({ deletionAttempts: sql`${transcriptions.deletionAttempts} + 1` }).where(eq(transcriptions.id, id));
+    // Bookkeeping only, but still a compare-and-swap: it counts only while the deletion is pending.
+    await ctx.db.update(transcriptions).set({ deletionAttempts: sql`${transcriptions.deletionAttempts} + 1` })
+      .where(and(eq(transcriptions.id, id), eq(transcriptions.deletionState, "pending")));
     ctx.log.error("batch artifact deletion failed", { transcriptionId: id, stage: "deletion", alert: true });
     return false;
   }
@@ -175,9 +182,15 @@ export async function runSweep(ctx: BatchContext): Promise<void> {
   const pending = await ctx.db.select({ id: transcriptions.id }).from(transcriptions)
     .where(and(eq(transcriptions.deletionState, "pending"), inArray(transcriptions.status, [...TERMINAL_STATUSES]))).orderBy(asc(transcriptions.terminalAt));
   for (const { id } of pending) await cleanupJobFiles(ctx, id);
-  // 6. Transcript expiry: 24 h after completion unless deleted earlier.
-  const due = await ctx.db.select({ id: transcriptions.id }).from(transcriptions)
-    .where(and(eq(transcriptions.status, "completed"), isNull(transcriptions.transcriptDeletedAt), lt(transcriptions.transcriptExpiresAt, now)));
+  // 6. Transcript expiry: 24 h after completion unless deleted earlier. Failed/cancelled jobs lose any
+  //    partial text at their terminal transition; this also finishes one whose caller died in between.
+  const due = await ctx.db.select({ id: transcriptions.id }).from(transcriptions).where(and(
+    isNull(transcriptions.transcriptDeletedAt),
+    or(
+      and(eq(transcriptions.status, "completed"), lt(transcriptions.transcriptExpiresAt, now)),
+      inArray(transcriptions.status, ["failed", "cancelled"]),
+    ),
+  ));
   for (const { id } of due) await deleteTranscriptContent(ctx.db, id);
   // 7. Directory reconciliation: anything on disk that the ledger does not currently authorize goes.
   await reconcileDirectories(ctx);

@@ -209,6 +209,65 @@ describe("create and admission", () => {
     expect((await (await h.api("/v1/transcriptions/capabilities")).json()).admission).toBe("drain");
   });
 
+  test("closing admission stops a PUT already streaming; the job stays awaiting_upload and uploads after reopening", async () => {
+    const bytes = await audio("stereo");
+    const job = await (await h.create(bytes)).json();
+    h.ctx.config.upload.leaseHeartbeatSeconds = 0.02;
+    const streaming = h.put(job.id, job.upload.capability, trickle(bytes, 20, 20), { contentLength: bytes.byteLength });
+    await Bun.sleep(100);
+    await h.api("/v1/admin/admission", { method: "PUT", key: h.keys.admin, json: { mode: "closed" } });
+    const cut = await streaming;
+    h.ctx.config.upload.leaseHeartbeatSeconds = 10;
+    expect({ status: cut.status, code: (await errorOf(cut)).code }).toEqual({ status: 503, code: "service_paused" });
+    expect(await h.row(job.id)).toMatchObject({ status: "awaiting_upload", uploadLeaseToken: null });
+    expect(await readdir(jobDir(h.uploadDir, job.id))).toEqual([]);
+    await h.api("/v1/admin/admission", { method: "PUT", key: h.keys.admin, json: { mode: "open" } });
+    expect((await h.put(job.id, job.upload.capability, bytes)).status).toBe(201);
+  });
+
+  test("an upload is not committed once admission has closed, even after its bytes were verified", async () => {
+    const bytes = await audio("stereo");
+    const job = await (await h.create(bytes)).json();
+    h.faults.once("upload.after_rename", async () => {
+      await h.api("/v1/admin/admission", { method: "PUT", key: h.keys.admin, json: { mode: "closed" } });
+    });
+    const res = await h.put(job.id, job.upload.capability, bytes);
+    expect({ status: res.status, code: (await errorOf(res)).code }).toEqual({ status: 503, code: "service_paused" });
+    expect(await h.row(job.id)).toMatchObject({ status: "awaiting_upload", uploadLeaseToken: null });
+    expect(await readdir(jobDir(h.uploadDir, job.id))).toEqual([]);
+  });
+
+  test("capabilities needs no X-Tenant-Ref (service-wide), every other transcription route does", async () => {
+    expect((await h.api("/v1/transcriptions/capabilities", { tenant: null })).status).toBe(200);
+    for (const [method, path] of [["GET", "/v1/transcriptions"], ["GET", "/v1/transcriptions/trn_01M3PQ71Q9YF7GSEFP6S19ZJPW"]] as const) {
+      const res = await h.api(path, { method, tenant: null });
+      expect({ path, status: res.status, code: (await errorOf(res)).code }).toEqual({ path, status: 400, code: "invalid_request" });
+    }
+  });
+
+  test("a replay whose job row is purged between the two reads becomes an ordinary create", async () => {
+    const bytes = await audio("stereo");
+    const key = { "Idempotency-Key": "tc:purged" };
+    const body = { content_type: "audio/mpeg", byte_size: bytes.byteLength, sha256: sha256(bytes) };
+    const first = await (await h.api("/v1/transcriptions", { method: "POST", headers: key, json: body })).json();
+    await h.api(`/v1/transcriptions/${first.id}/cancel`, { method: "POST" });
+    const { createTranscription, parseCreateBody } = await import("../../src/uploads/service.ts");
+    // The purge lands exactly between the fast-path read and the replay transaction.
+    const db = new Proxy(h.ctx.db, {
+      get(target, prop, receiver) {
+        if (prop !== "transaction") return Reflect.get(target, prop, receiver);
+        return async (fn: never) => {
+          await target.delete(transcriptions).where(eq(transcriptions.id, first.id));
+          return target.transaction(fn);
+        };
+      },
+    });
+    const result = await createTranscription({ ...h.ctx, db }, "tinychat", TENANT_A, "tc:purged", parseCreateBody(body, h.ctx.config.limits.maxBytes));
+    expect(result.created).toBe(true);
+    expect(result.job.id).not.toBe(first.id);
+    expect(result.upload).not.toBeNull();
+  });
+
   test("fails fast with service_unavailable when no worker is live or the provider is not configured", async () => {
     const bytes = await audio("stereo");
     await h.ctx.db.update(transcriptionWorkers).set({ observedAt: new Date(0) });
@@ -276,6 +335,18 @@ describe("upload capability", () => {
     expect({ status: expired.status, code: (await errorOf(expired)).code }).toEqual({ status: 410, code: "upload_capability_expired" });
     // The first-issued live capability (never revoked by later replays) still uploads.
     expect((await h.put(jobId, caps[1]!, bytes)).status).toBe(201);
+  });
+
+  test("a PUT that aborts without committing leaves every capability usable: another one then uploads", async () => {
+    const bytes = await audio("stereo");
+    const key = { "Idempotency-Key": "tc:abort" };
+    const body = { content_type: "audio/mpeg", byte_size: bytes.byteLength, sha256: sha256(bytes) };
+    const first = await (await h.api("/v1/transcriptions", { method: "POST", headers: key, json: body })).json();
+    const second = await (await h.api("/v1/transcriptions", { method: "POST", headers: key, json: body })).json();
+    const aborted = await h.put(first.id, first.upload.capability, trickle(bytes, 4, 1, { errorAfter: 2 }), { contentLength: bytes.byteLength });
+    expect({ status: aborted.status, code: (await errorOf(aborted)).code }).toEqual({ status: 408, code: "upload_interrupted" });
+    expect(await h.row(first.id)).toMatchObject({ status: "awaiting_upload", uploadLeaseToken: null });
+    expect((await h.put(second.id, second.upload.capability, bytes)).status).toBe(201);
   });
 
   test("two concurrent PUTs with different capabilities: the lease serializes them, exactly one is accepted", async () => {

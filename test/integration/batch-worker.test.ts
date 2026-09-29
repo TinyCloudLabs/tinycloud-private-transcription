@@ -257,14 +257,11 @@ describe("fencing: cancel/delete racing the worker at every boundary", () => {
         expect(row).toMatchObject({ status: "cancelled", tombstoned: action === "delete", deletionState: "files_deleted", claimToken: null });
         expect(row.generation).toBeGreaterThan(before + 1);
         expect(await h.ctx.db.select().from(transcriptionResults).where(eq(transcriptionResults.transcriptionId, id))).toEqual([]);
-        const texts = (await regions(id)).map((r) => r.text);
-        if (action === "delete") expect(texts.every((t) => t === null)).toBe(true);
-        // A cancel keeps text the worker legitimately committed before the cancel; nothing after it.
+        // Cancel and delete both remove any partial text the worker committed before them.
+        expect((await regions(id)).every((r) => r.text === null)).toBe(true);
+        expect(row.transcriptDeletedAt).not.toBeNull();
         const settled = await attempts(id);
-        if (point === "worker.after_response") {
-          expect(settled.map((a) => a.status)).toEqual(["discarded"]);
-          expect(texts.every((t) => t === null)).toBe(true);
-        }
+        if (point === "worker.after_response") expect(settled.map((a) => a.status)).toEqual(["discarded"]);
         expect(settled.every((a) => a.status !== "started")).toBe(true);
         expect((await slot()).attemptId).toBeNull();
         expect(await exists(jobDir(h.uploadDir, id))).toBe(false);
@@ -301,7 +298,65 @@ describe("fencing: cancel/delete racing the worker at every boundary", () => {
   });
 });
 
+describe("dispatch slot recovery", () => {
+  // State a stale claim can leave behind while its owner's process heartbeat is still fresh (recoverStaleClaims
+  // then keeps the slot): the slot names a started attempt of an already-terminal job.
+  async function orphanSlot(ownerId: string) {
+    const x = await h.submit(await audio("stereo"), { tenant: TENANT_B });
+    await h.ctx.db.update(transcriptions).set({ status: "failed", errorCode: "provider_outcome_unknown", deletionState: "pending", terminalAt: new Date() }).where(eq(transcriptions.id, x));
+    await h.ctx.db.insert(transcriptionAttempts).values({ id: `${x}:r0:a1`, transcriptionId: x, regionOrdinal: 0, ordinal: 1, generation: 1, status: "started" });
+    await h.ctx.db.update(providerDispatchSlots).set({ attemptId: `${x}:r0:a1`, transcriptionId: x, ownerId, claimedAt: new Date() });
+    return x;
+  }
+
+  test("a slot held by a live owner is never taken: the next job waits for that owner to settle", async () => {
+    const owner = h.withContext({ workerId: `live-owner:${crypto.randomUUID()}` });
+    await recordWorkerHeartbeat(owner);
+    await orphanSlot(owner.workerId);
+    const id = await h.submit(await audio("stereo"));
+    const running = h.work();
+    await Bun.sleep(400);
+    expect(h.tinfoil.calls.length).toBe(0);
+    const released = Date.now();
+    await h.ctx.db.update(providerDispatchSlots).set({ attemptId: null, transcriptionId: null, ownerId: null, claimedAt: null });
+    await running;
+    expect((await h.row(id)).status).toBe("completed");
+    expect(h.tinfoil.calls[0]!.at).toBeGreaterThanOrEqual(released);
+  }, 30_000);
+
+  test("a slot left by a dead owner is reclaimed: its attempt becomes ambiguous and is never re-sent", async () => {
+    const x = await orphanSlot(`dead-owner:${crypto.randomUUID()}`);
+    const id = await h.submit(await audio("stereo"));
+    await h.work();
+    expect((await h.row(id)).status).toBe("completed");
+    expect((await attempts(x)).map((a) => [a.status, a.outcome])).toEqual([["ambiguous", "owner_lost"]]);
+    expect((await slot()).attemptId).toBeNull();
+    expect(h.tinfoil.calls.length).toBe((await regions(id)).length);
+    expect(h.tinfoil.calls.every((c) => c.filename.startsWith(id))).toBe(true);
+  }, 30_000);
+});
+
 describe("retention ledger", () => {
+  test("a failed job's partial transcript text is deleted at its terminal transition", async () => {
+    h.tinfoil.handler = (call) => call === 1 ? Response.json({ text: "partial words" }) : new Response("down", { status: 503 });
+    const id = await h.submit(await audio("stereo"));
+    await h.work();
+    expect(await h.row(id)).toMatchObject({ status: "failed", errorCode: "provider_outcome_unknown" });
+    expect((await regions(id)).map((r) => [r.status, r.text])).toEqual([["completed", null], ["ambiguous", null]]);
+    const status = await (await h.api(`/v1/transcriptions/${id}`)).json();
+    expect(status.retention.transcript_deleted_at).toEqual(expect.any(String));
+  });
+
+  test("the sweeper removes partial text a failed or cancelled job still holds (caller died mid-transition)", async () => {
+    const id = await h.submit(await audio("stereo"));
+    await h.api(`/v1/transcriptions/${id}/cancel`, { method: "POST" });
+    await h.ctx.db.insert(transcriptionRegions).values({ transcriptionId: id, ordinal: 0, channel: 0, startMs: 0, endMs: 1000, status: "completed", text: "left behind", generation: 1 });
+    await h.ctx.db.update(transcriptions).set({ transcriptDeletedAt: null }).where(eq(transcriptions.id, id));
+    await runSweep(h.ctx);
+    expect((await regions(id)).map((r) => r.text)).toEqual([null]);
+    expect((await h.row(id)).transcriptDeletedAt).not.toBeNull();
+  });
+
   test("DELETE nulls content now and keeps a tombstone until files are verified gone + 7 days", async () => {
     const id = await h.submit(await audio("stereo"));
     await h.work();
