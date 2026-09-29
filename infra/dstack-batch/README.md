@@ -23,8 +23,9 @@ changes to this directory or that workflow deploys nothing, and no image is buil
 
 ```bash
 R=TinyCloudLabs/tinycloud-private-transcription
-# Postgres password (never leaves the sealed env).
-openssl rand -base64 32 | tr -d '\n' | gh secret set BATCH_POSTGRES_PASSWORD --env ptx-batch -R $R
+# Postgres password (never leaves the sealed env). Hex only: it is interpolated into DATABASE_URL, where base64's
+# '/' or '+' would break the URI; the workflow refuses anything but 32+ URI-unreserved characters.
+openssl rand -hex 32 | tr -d '\n' | gh secret set BATCH_POSTGRES_PASSWORD --env ptx-batch -R $R
 # API keys: prints each plaintext key once plus the hashed PTX_BOOTSTRAP_KEYS line.
 bun run scripts/mint-bootstrap-keys.ts --key 'tinychat-batch:tinychat:transcriptions:*' --key 'owner-admin:ops:admin:*'
 gh secret set PTX_BOOTSTRAP_KEYS  --env ptx-batch -R $R   # paste the JSON after "PTX_BOOTSTRAP_KEYS="
@@ -49,9 +50,15 @@ gh workflow run deploy-batch.yml -R $R --ref main -f confirm=ptx-batch
 - **First creation** (`PTX_BATCH_CVM_ID` unset): `phala deploy -n ptx-batch -t tdx.large --disk-size 40G
   --no-dev-os --no-public-logs --wait`, then a health gate. Record the CVM id it prints:
   `gh variable set PTX_BATCH_CVM_ID --env ptx-batch -R $R --body <id>`.
-- **Update**: `PUT /v1/admin/admission {"mode":"drain"}` → wait until `awaiting_upload + queued + processing = 0` (default
-  130 min, which covers the 2 h upload deadline) → `phala deploy --cvm-id … --wait` → allowed_envs sync → health gate
-  (`/health/live`, then `checks.upload_transcription.ready`) → `{"mode":"open"}`.
+- **Update**: `PUT /v1/admin/admission {"mode":"drain"}` → wait until `awaiting_upload + queued + processing = 0` →
+  `phala deploy --cvm-id … --wait` → allowed_envs sync → health gate (`/health/live`, then
+  `checks.upload_transcription.ready`) → `{"mode":"open"}`. A drain response without three non-negative integer counts
+  fails the run (never read as drained).
+- **Sizing `drain_timeout_minutes`** (1–300, default 130): an accepted create may upload for up to 120 min, then jobs
+  process one at a time, each bounded by the 240-min processing ceiling but typically far shorter. The worst case is
+  `120 + (awaiting_upload + queued + processing) × 240` minutes; the run prints it at drain start and warns when the
+  timeout is below it. Check the queue first (`GET /v1/admin/admission`) and size to what you see; with a deep queue,
+  drain ahead of time (`PUT … {"mode":"drain"}`) and dispatch once `active` is 0.
 - A failure after the drain leaves admission in **drain**. Investigate, then reopen deliberately:
   `curl -X PUT $URL/v1/admin/admission -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d '{"mode":"open"}'`.
 

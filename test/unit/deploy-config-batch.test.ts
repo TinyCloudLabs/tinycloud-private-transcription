@@ -3,7 +3,9 @@
  * deploy-config.test.ts and is not referenced here.
  */
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { batchConfigFromEnv } from "../../src/uploads/config.ts";
 
@@ -87,6 +89,7 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
 
 describe(".github/workflows/deploy-batch.yml", () => {
   const workflow = Bun.YAML.parse(workflowText) as {
+    env: Record<string, string>;
     on: Record<string, unknown>;
     permissions: Record<string, string>;
     jobs: { deploy: { environment: string; steps: { name?: string; run?: string; if?: string }[] } };
@@ -122,6 +125,68 @@ describe(".github/workflows/deploy-batch.yml", () => {
     expect([...order].sort((a, b) => a - b)).toEqual(order);
     expect(steps[index("Drain admission and wait for zero active jobs")]!.if).toBe("env.MODE == 'update'");
     expect(steps[index("Health gate (live, then upload_transcription.ready)")]!.run).toContain(".checks.upload_transcription.ready");
+  });
+
+  test("the admission filter accepts only three non-negative integer counts", () => {
+    const jq = (body: unknown) => Bun.spawnSync(["jq", "-er", workflow.env.ADMISSION_ACTIVE_JQ!], { stdin: Buffer.from(JSON.stringify(body)), stdout: "pipe", stderr: "pipe" });
+    const ok = jq({ mode: "drain", active: { awaiting_upload: 1, queued: 2, processing: 0 } });
+    expect([ok.exitCode, ok.stdout.toString()]).toEqual([0, "1\t2\t0\n"]);
+    for (const malformed of [{}, { active: {} }, { active: null }, { active: { awaiting_upload: null, queued: null, processing: null } },
+      { active: { awaiting_upload: "0", queued: 0, processing: 0 } }, { active: { awaiting_upload: -1, queued: 0, processing: 0 } },
+      { active: { awaiting_upload: 0.5, queued: 0, processing: 0 } }, { active: { queued: 0, processing: 0 } }]) {
+      expect({ malformed, exit: jq(malformed).exitCode === 0 }).toEqual({ malformed, exit: false });
+    }
+  });
+
+  // Runs the real drain step under bash with a fake curl: a malformed 200 must fail closed, never "drained".
+  function runDrain(putBody: string, getBodies: string[], timeoutMinutes = "130") {
+    const dir = mkdtempSync(join(tmpdir(), "ptx-drain-"));
+    try {
+      writeFileSync(join(dir, "gets"), getBodies.join("\n") + "\n");
+      writeFileSync(join(dir, "curl"), `#!/usr/bin/env bash
+if [[ " $* " == *" -X PUT "* ]]; then printf '%s' '${putBody}'; exit 0; fi
+n=$(cat "${dir}/n" 2>/dev/null || echo 0); echo $((n + 1)) > "${dir}/n"
+sed -n "$((n + 1))p" "${dir}/gets"
+`);
+      chmodSync(join(dir, "curl"), 0o755);
+      const script = steps[index("Drain admission and wait for zero active jobs")]!.run!;
+      const run = Bun.spawnSync(["bash", "-c", script], {
+        env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, BATCH_URL: "https://batch.test", PTX_BATCH_ADMIN_KEY: "k", DRAIN_TIMEOUT_MINUTES: timeoutMinutes, DRAIN_POLL_SECONDS: "0", ADMISSION_ACTIVE_JQ: workflow.env.ADMISSION_ACTIVE_JQ! },
+        stdout: "pipe", stderr: "pipe",
+      });
+      return { exitCode: run.exitCode, out: run.stdout.toString() + run.stderr.toString() };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  const counts = (a: number, q: number, p: number, mode = "drain") => JSON.stringify({ mode, active: { awaiting_upload: a, queued: q, processing: p }, retention_lag_seconds: 0 });
+
+  test("drain waits for zero active jobs and prints the worst case", () => {
+    const run = runDrain(counts(0, 1, 1), [counts(0, 1, 0), counts(0, 0, 0)]);
+    expect(run.exitCode).toBe(0);
+    expect(run.out).toContain("worst case 480 min");
+    expect(run.out).toContain("::warning title=Drain may time out::");
+    expect(run.out).toContain("active=0");
+  });
+
+  test("drain fails closed on a malformed 200 or a mode other than drain", () => {
+    for (const bad of ["{}", '{"active":{}}', '{"mode":"drain","active":{"awaiting_upload":null,"queued":null,"processing":null}}', "not json"]) {
+      const run = runDrain(counts(0, 1, 0), [bad]);
+      expect({ bad, exitCode: run.exitCode, malformed: run.out.includes("Malformed admission response") }).toEqual({ bad, exitCode: 1, malformed: true });
+      expect(run.out).not.toContain("active=0");
+    }
+    expect(runDrain("{}", [counts(0, 0, 0)]).exitCode).toBe(1);
+    expect(runDrain(counts(0, 0, 0, "open"), [counts(0, 0, 0)]).exitCode).toBe(1);
+  });
+
+  test("the Postgres password must be URI-safe; the runbook generates hex", () => {
+    const check = /\[\[ "\$BATCH_POSTGRES_PASSWORD" =~ (\^\[A-Za-z0-9\._~-\]\{32,\}\$) \]\]/.exec(workflowText);
+    expect(check).not.toBeNull();
+    const accepts = (value: string) => Bun.spawnSync(["bash", "-c", `[[ "$1" =~ ${check![1]} ]]`, "_", value]).exitCode === 0;
+    expect(accepts("a".repeat(64))).toBe(true);
+    for (const bad of [`${"a".repeat(40)}/b`, `${"a".repeat(40)}+b`, `${"a".repeat(40)}@b`, `${"a".repeat(40)}:b`, `${"a".repeat(40)}%2F`, "short"]) expect(accepts(bad)).toBe(false);
+    expect(runbook).toContain("openssl rand -hex 32");
+    expect(runbook).not.toContain("-base64");
   });
 
   test("never prints a secret", () => {

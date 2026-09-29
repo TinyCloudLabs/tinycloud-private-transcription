@@ -17,7 +17,11 @@ on:
         description: Type ptx-batch to deploy
         required: true
       drain_timeout_minutes:
-        description: Update only. Minutes to wait for active jobs to reach 0 before deploying
+        description: >-
+          Update only. Minutes (1-300) to wait for active jobs to reach 0 before deploying. Size it to the queue:
+          an accepted create may upload for up to 120 min, and each job then processes one at a time (ceiling
+          240 min each; typical far less). The run prints the worst case at drain start. On timeout admission
+          stays in drain.
         required: true
         default: "130"
 
@@ -34,12 +38,19 @@ env:
   INSTANCE_TYPE: tdx.large
   DISK_SIZE: 40G
   IMAGE_REPO: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api
+  # Reads GET/PUT /v1/admin/admission and prints "<awaiting_upload>\t<queued>\t<processing>". It fails (jq -e
+  # exit != 0) unless all three are non-negative integers, so a malformed 200 is never read as "drained".
+  ADMISSION_ACTIVE_JQ: >-
+    .active | if type == "object" and ([.awaiting_upload, .queued, .processing]
+    | all(type == "number" and . >= 0 and . == floor)) then [.awaiting_upload, .queued, .processing] | @tsv
+    else error("malformed admission response") end
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: ptx-batch
-    timeout-minutes: 240
+    # GitHub-hosted maximum; drain_timeout_minutes is capped at 300 to leave room for deploy and health.
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
         with:
@@ -59,7 +70,8 @@ jobs:
           fail() { echo "::error title=Deploy refused::$1"; exit 1; }
           [ "$CONFIRM" = "$CVM_NAME" ] || fail "confirm must be exactly $CVM_NAME"
           [ "$GITHUB_REF" = "refs/heads/main" ] || fail "deploy only from main (got $GITHUB_REF)"
-          [[ "$DRAIN_TIMEOUT_MINUTES" =~ ^[0-9]+$ ]] || fail "drain_timeout_minutes must be an integer"
+          [[ "$DRAIN_TIMEOUT_MINUTES" =~ ^[0-9]+$ ]] && [ "$DRAIN_TIMEOUT_MINUTES" -ge 1 ] && [ "$DRAIN_TIMEOUT_MINUTES" -le 300 ] \
+            || fail "drain_timeout_minutes must be an integer from 1 to 300"
           for name in PHALA_CLOUD_API_KEY BATCH_POSTGRES_PASSWORD BATCH_TINFOIL_API_KEY PTX_BOOTSTRAP_KEYS PTX_BATCH_ADMIN_KEY; do
             [ -n "${!name}" ] || fail "secret $name is not set in the ptx-batch environment"
           done
@@ -87,6 +99,10 @@ jobs:
         run: |
           set -euo pipefail
           bun install --frozen-lockfile
+          # The password is interpolated into DATABASE_URL (postgres://ptx:<password>@postgres/ptx), so it must be
+          # URI-unreserved: a '/', '@', ':' or '%' would change where the api and worker connect.
+          [[ "$BATCH_POSTGRES_PASSWORD" =~ ^[A-Za-z0-9._~-]{32,}$ ]] \
+            || { echo "::error title=Deploy refused::BATCH_POSTGRES_PASSWORD must be 32+ URI-unreserved characters (use openssl rand -hex 32)"; exit 1; }
           # API boot fails on an invalid value; refuse it here instead, without printing it.
           # shellcheck disable=SC2016 # single quotes on purpose: a JS snippet with template literals
           bun -e 'const { parseBootstrapKeys } = await import("./src/api/bootstrap-keys.ts"); const keys = parseBootstrapKeys(process.env.PTX_BOOTSTRAP_KEYS ?? ""); if (!keys.some((k) => k.scopes.includes("admin:*")) || !keys.some((k) => k.scopes.includes("transcriptions:*"))) throw new Error("PTX_BOOTSTRAP_KEYS needs an admin:* and a transcriptions:* key"); console.log(`bootstrap keys: ${keys.map((k) => `${k.id}(${k.scopes.join(",")})`).join(" ")}`);'
@@ -141,18 +157,34 @@ jobs:
         run: |
           set -euo pipefail
           admission() { curl -fsS "$@" -H "Authorization: Bearer $PTX_BATCH_ADMIN_KEY" -H 'Content-Type: application/json' "$BATCH_URL/v1/admin/admission"; }
-          admission -X PUT -d '{"mode":"drain"}' | jq -c .
+          # Fail closed: only three non-negative integer counts are ever read as a queue state (sets the globals).
+          read_counts() {
+            local counts
+            if ! counts="$(jq -er "$ADMISSION_ACTIVE_JQ" <<<"$1" 2>/dev/null)"; then
+              echo "::error title=Malformed admission response::not treated as drained; admission is left in drain"
+              exit 1
+            fi
+            read -r awaiting queued processing <<<"$counts"
+          }
+          body="$(admission -X PUT -d '{"mode":"drain"}')"
+          jq -e '.mode == "drain"' <<<"$body" >/dev/null || { echo "::error title=Drain refused::admission did not report mode=drain"; exit 1; }
+          read_counts "$body"
+          worst=$(( (awaiting > 0 ? 120 : 0) + (awaiting + queued + processing) * 240 ))
+          echo "draining: awaiting_upload=$awaiting queued=$queued processing=$processing; worst case ${worst} min (typical far less)"
+          if [ "$worst" -gt "$DRAIN_TIMEOUT_MINUTES" ]; then
+            echo "::warning title=Drain may time out::worst case ${worst} min exceeds drain_timeout_minutes=${DRAIN_TIMEOUT_MINUTES}"
+          fi
           deadline=$((SECONDS + DRAIN_TIMEOUT_MINUTES * 60))
           while :; do
-            status="$(admission)"
-            active="$(echo "$status" | jq '.active.awaiting_upload + .active.queued + .active.processing')"
-            echo "active=$active $(echo "$status" | jq -c .active)"
+            read_counts "$(admission)"
+            active=$((awaiting + queued + processing))
+            echo "active=$active (awaiting_upload=$awaiting queued=$queued processing=$processing)"
             [ "$active" -eq 0 ] && break
             if [ "$SECONDS" -ge "$deadline" ]; then
               echo "::error title=Drain timeout::$active job(s) still active; admission is left in drain"
               exit 1
             fi
-            sleep 30
+            sleep "${DRAIN_POLL_SECONDS:-30}"
           done
 
       - name: Deploy
