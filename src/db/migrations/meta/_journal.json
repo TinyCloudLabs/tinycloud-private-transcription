@@ -127,6 +127,13 @@
       "when": 1790689280840,
       "tag": "0017_batch_transcription",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1790706219951,
+      "tag": "0018_batch_admission_closed",
+      "breakpoints": true
     }
   ]
 }

@@ -30,6 +30,7 @@ openssl rand -hex 32 | tr -d '\n' | gh secret set BATCH_POSTGRES_PASSWORD --env 
 bun run scripts/mint-bootstrap-keys.ts --key 'tinychat-batch:tinychat:transcriptions:*' --key 'owner-admin:ops:admin:*'
 gh secret set PTX_BOOTSTRAP_KEYS  --env ptx-batch -R $R   # paste the JSON after "PTX_BOOTSTRAP_KEYS="
 gh secret set PTX_BATCH_ADMIN_KEY --env ptx-batch -R $R   # paste the owner-admin plaintext key (drain/open)
+# Every deploy refuses to start unless PTX_BATCH_ADMIN_KEY hashes to the admin:* entry of PTX_BOOTSTRAP_KEYS.
 # The tinychat-batch plaintext key is TinyChat's PRIVATE_CLOUD_TRANSCRIPTION_API_KEY (P4); store it there only.
 ```
 
@@ -41,19 +42,30 @@ The compose pins the api/worker image immutably. Until the first batch image exi
 that run's summary and open a PR that sets both `image:` lines to `api:<sha>@sha256:<digest>`. The workflow checks that
 `<sha>` is on `main` and that GHCR maps the tag to exactly that digest. Every later image change is the same one-line PR.
 
+The first creation needs an image that contains migration 0018 (a fresh install starts with admission `closed`); the
+workflow refuses a pin whose commit lacks `src/db/migrations/0018_batch_admission_closed.sql`, because an older image
+seeds admission `open`. The order is: merge the change to `main` → `publish-image.yml` publishes that commit's image →
+re-pin PR (both `image:` lines) merged → dispatch the create.
+
 ## Deploy
 
 ```bash
 gh workflow run deploy-batch.yml -R $R --ref main -f confirm=ptx-batch
 ```
 
+- **Tooling.** Bun is pinned, every action is SHA-pinned, and the repo's dependencies plus the Phala CLI/SDK
+  ([`.github/scripts/package-lock.json`](../../.github/scripts/package-lock.json)) are installed with lifecycle scripts
+  disabled before any secret is in scope. Bump the CLI by editing that `package.json` and regenerating the lockfile
+  (`npm install --package-lock-only --ignore-scripts`).
 - **First creation** (`PTX_BATCH_CVM_ID` unset): `phala deploy -n ptx-batch -t tdx.large --disk-size 40G
-  --no-dev-os --no-public-logs --wait`, then a health gate. Record the CVM id it prints:
+  --no-dev-os --no-public-logs --wait`, then a health gate, then an admission gate: a fresh install starts with
+  admission `closed` (migration 0018) and must report `closed` to the admin key before `{"mode":"open"}`. A failed
+  create leaves admission closed. Record the CVM id it prints:
   `gh variable set PTX_BATCH_CVM_ID --env ptx-batch -R $R --body <id>`.
 - **Update**: `PUT /v1/admin/admission {"mode":"drain"}` → wait until `awaiting_upload + queued + processing = 0` →
   `phala deploy --cvm-id … --wait` → allowed_envs sync → health gate (`/health/live`, then
-  `checks.upload_transcription.ready`) → `{"mode":"open"}`. A drain response without three non-negative integer counts
-  fails the run (never read as drained).
+  `checks.upload_transcription.ready`) → admission gate (reports `drain`) → `{"mode":"open"}`. A drain response without
+  three non-negative integer counts fails the run (never read as drained).
 - **Sizing `drain_timeout_minutes`** (1–300, default 130): an accepted create may upload for up to 120 min, then jobs
   process one at a time, each bounded by the 240-min processing ceiling but typically far shorter. The worst case is
   `120 + (awaiting_upload + queued + processing) × 240` minutes; the run prints it at drain start and warns when the
@@ -87,8 +99,9 @@ PTX upload origin (P7) and TinyChat's `PRIVATE_CLOUD_TRANSCRIPTION_API_URL`.
 
 ## Rollback
 
-Drain, then open a PR that sets the previous image pin, merge it, and dispatch. Migration 0017 only adds tables, so an
-older batch image runs against the newer schema. **Never purge the volumes** while any job has
+Drain, then open a PR that sets the previous image pin, merge it, and dispatch. Migration 0017 only adds tables and 0018
+only changes the admission default (and closes a fresh install's seed row), so an older batch image runs against the
+newer schema. **Never purge the volumes** while any job has
 `deletion_state='pending'` or is still active: the deletion ledger lives in that Postgres and reconciles on the next
 boot (the sweeper retries pending deletions and removes unauthorized files).
 

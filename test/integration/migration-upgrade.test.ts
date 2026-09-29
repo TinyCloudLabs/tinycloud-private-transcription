@@ -156,7 +156,7 @@ test("0004-0015 retain production retry, fallback, terminal delivery, and deleti
     expect(signalColumns).toEqual({ count: 2 });
 
     const [migrationCount] = await db.execute(sql`SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`);
-    expect(migrationCount).toEqual({ count: 18 });
+    expect(migrationCount).toEqual({ count: 19 });
 
     const [deletionAdmission] = await db.execute(sql`
       SELECT count(*)::int AS count
@@ -332,7 +332,8 @@ test("0017 (batch transcription) is additive: every pre-existing table, row and 
     const schemaAfter = (await columns(db) as { table_name: string }[]).filter((c) => tablesBefore.has(c.table_name));
     expect(schemaAfter).toEqual(schemaBefore as never);
     expect(await db.execute(sql`SELECT * FROM meetings`)).toEqual(rowsBefore);
-    expect(await db.execute(sql`SELECT id, mode FROM transcription_admission`)).toEqual([{ id: 1, mode: "open" }]);
+    // 0017 and 0018 applied in one run: the singleton is seeded and closed (the meeting role never reads it).
+    expect(await db.execute(sql`SELECT id, mode FROM transcription_admission`)).toEqual([{ id: 1, mode: "closed" }]);
     expect(await db.execute(sql`SELECT id, attempt_id FROM provider_dispatch_slots`)).toEqual([{ id: 1, attempt_id: null }]);
 
     const app = createApp({ db, log: silentLogger } as AppContext);
@@ -343,6 +344,45 @@ test("0017 (batch transcription) is additive: every pre-existing table, row and 
   } finally {
     await db?.$client.close();
     await admin.unsafe(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`);
+    await admin.close();
+    await rm(fixture, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("0018: a fresh install starts with admission closed; an existing deployment keeps its admission mode", async () => {
+  const adminUrl = new URL(config.databaseUrl);
+  adminUrl.pathname = "/postgres";
+  const admin = new SQL(adminUrl.toString());
+  const fresh = `ptx_admission_fresh_${crypto.randomUUID().replaceAll("-", "")}`;
+  const existing = `ptx_admission_existing_${crypto.randomUUID().replaceAll("-", "")}`;
+  const urlFor = (name: string) => {
+    const url = new URL(config.databaseUrl);
+    url.pathname = `/${name}`;
+    return url.toString();
+  };
+  // Every migration through 0017: a batch deployment that is already open.
+  const fixture = await productionMigrationsFixture(18);
+  const dbs: Db[] = [];
+  const state = (target: Db) => target.execute(sql`
+    SELECT a.mode, c.column_default FROM transcription_admission a, information_schema.columns c
+    WHERE c.table_name = 'transcription_admission' AND c.column_name = 'mode'`);
+  try {
+    await admin.unsafe(`CREATE DATABASE "${fresh}"`);
+    await admin.unsafe(`CREATE DATABASE "${existing}"`);
+
+    dbs.push(await runMigrations(urlFor(fresh)));
+    expect(await state(dbs[0]!)).toEqual([{ mode: "closed", column_default: "'closed'::text" }]);
+
+    const before = createDb(urlFor(existing));
+    await migrate(before, { migrationsFolder: fixture });
+    expect(await before.execute(sql`SELECT mode FROM transcription_admission`)).toEqual([{ mode: "open" }]);
+    await before.$client.close();
+    dbs.push(await runMigrations(urlFor(existing)));
+    expect(await state(dbs[1]!)).toEqual([{ mode: "open", column_default: "'closed'::text" }]);
+  } finally {
+    for (const db of dbs) await db.$client.close();
+    await admin.unsafe(`DROP DATABASE IF EXISTS "${fresh}" WITH (FORCE)`);
+    await admin.unsafe(`DROP DATABASE IF EXISTS "${existing}" WITH (FORCE)`);
     await admin.close();
     await rm(fixture, { recursive: true, force: true });
   }

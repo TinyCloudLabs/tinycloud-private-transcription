@@ -1,0 +1,9 @@
+{
+  "name": "ptx-deploy-tools",
+  "private": true,
+  "description": "Deploy tooling for deploy-batch.yml, installed with `npm ci --ignore-scripts` before any secret is in scope.",
+  "dependencies": {
+    "@phala/cloud": "0.3.0",
+    "phala": "1.1.22"
+  }
+}

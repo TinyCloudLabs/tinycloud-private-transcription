@@ -3,10 +3,12 @@
  * deploy-config.test.ts and is not referenced here.
  */
 import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { hashApiKey } from "../../src/api/auth.ts";
+import { checkBatchDeployKeys, mintBootstrapKeys } from "../../src/api/bootstrap-keys.ts";
 import { batchConfigFromEnv } from "../../src/uploads/config.ts";
 
 const repo = fileURLToPath(new URL("../..", import.meta.url));
@@ -92,7 +94,7 @@ describe(".github/workflows/deploy-batch.yml", () => {
     env: Record<string, string>;
     on: Record<string, unknown>;
     permissions: Record<string, string>;
-    jobs: { deploy: { environment: string; steps: { name?: string; run?: string; if?: string }[] } };
+    jobs: { deploy: { environment: string; steps: { name?: string; run?: string; if?: string; uses?: string; env?: Record<string, string> }[] } };
   };
   const steps = workflow.jobs.deploy.steps;
   const index = (name: string) => steps.findIndex((step) => step.name === name);
@@ -120,7 +122,7 @@ describe(".github/workflows/deploy-batch.yml", () => {
     expect(deploy).toContain('-t "$INSTANCE_TYPE" --disk-size "$DISK_SIZE"');
     expect(workflowText).toContain("INSTANCE_TYPE: tdx.large");
     expect(workflowText).toContain("DISK_SIZE: 40G");
-    const order = ["Resolve the CVM", "Drain admission and wait for zero active jobs", "Deploy", "Sync allowed_envs", "Wait for running and resolve the gateway URL", "Health gate (live, then upload_transcription.ready)", "Open admission"].map(index);
+    const order = ["Install dependencies and deploy tooling from lockfiles", "Guard inputs, secrets and the image pin", "Validate the sealed environment", "Resolve the CVM", "Drain admission and wait for zero active jobs", "Deploy", "Sync allowed_envs", "Wait for running and resolve the gateway URL", "Health gate (live, then upload_transcription.ready)", "Admission gate (the deployed service is not open)", "Open admission"].map(index);
     expect(order.every((i) => i >= 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
     expect(steps[index("Drain admission and wait for zero active jobs")]!.if).toBe("env.MODE == 'update'");
@@ -187,6 +189,136 @@ sed -n "$((n + 1))p" "${dir}/gets"
     for (const bad of [`${"a".repeat(40)}/b`, `${"a".repeat(40)}+b`, `${"a".repeat(40)}@b`, `${"a".repeat(40)}:b`, `${"a".repeat(40)}%2F`, "short"]) expect(accepts(bad)).toBe(false);
     expect(runbook).toContain("openssl rand -hex 32");
     expect(runbook).not.toContain("-base64");
+  });
+
+  test("installs tooling from lockfiles with lifecycle scripts disabled before any secret is in scope", () => {
+    const install = index("Install dependencies and deploy tooling from lockfiles");
+    const firstSecret = steps.findIndex((step) => JSON.stringify(step.env ?? {}).includes("secrets."));
+    expect(install).toBeGreaterThan(-1);
+    expect(firstSecret).toBeGreaterThan(install);
+    // Only checkout and setup-bun (both SHA-pinned; see workflow-pins.test.ts) run before the install.
+    expect(steps.slice(0, install).map((step) => step.uses?.split("@")[0])).toEqual(["actions/checkout", "oven-sh/setup-bun"]);
+    const run = steps[install]!.run!;
+    expect(steps[install]!.env).toBeUndefined();
+    expect(run).toContain("bun install --frozen-lockfile --ignore-scripts");
+    expect(run).toContain("npm ci --ignore-scripts --no-audit --no-fund --prefix .github/scripts");
+    // Nothing is fetched at run time from a registry, and phala is only ever the lockfile-installed binary.
+    for (const step of steps) expect({ step: step.name, fetches: /\b(npm (install|i|exec|update)|npx|bunx|bun (add|x))\b/.test(step.run ?? "") }).toEqual({ step: step.name, fetches: false });
+    expect(workflow.env.PHALA).toBe("${{ github.workspace }}/.github/scripts/node_modules/.bin/phala");
+    for (const step of steps) expect({ step: step.name, bare: /(^|[\s($])phala\s/m.test(step.run ?? "") }).toEqual({ step: step.name, bare: false });
+    expect(steps[index("Sync allowed_envs")]!.run).toContain("node .github/scripts/phala-sync-allowed-envs.mjs");
+  });
+
+  test("the deploy tooling lockfile pins exact versions with registry integrity", () => {
+    const manifest = JSON.parse(read(".github/scripts/package.json")) as { dependencies: Record<string, string> };
+    expect(manifest.dependencies).toEqual({ "@phala/cloud": "0.3.0", phala: "1.1.22" });
+    const lock = JSON.parse(read(".github/scripts/package-lock.json")) as { lockfileVersion: number; packages: Record<string, { version?: string; resolved?: string; integrity?: string; link?: boolean }> };
+    expect(lock.lockfileVersion).toBe(3);
+    expect(lock.packages["node_modules/phala"]!.version).toBe("1.1.22");
+    expect(lock.packages["node_modules/@phala/cloud"]!.version).toBe("0.3.0");
+    const unverified = Object.entries(lock.packages)
+      .filter(([path, entry]) => path !== "" && !(entry.resolved?.startsWith("https://registry.npmjs.org/") && entry.integrity?.startsWith("sha512-")))
+      .map(([path]) => path);
+    expect(unverified).toEqual([]);
+  });
+
+  // Runs a real step under bash with fakes for curl/docker on PATH.
+  function runStep(name: string, env: Record<string, string>, fakes: Record<string, string> = {}) {
+    const dir = mkdtempSync(join(tmpdir(), "ptx-step-"));
+    try {
+      for (const [bin, body] of Object.entries(fakes)) {
+        writeFileSync(join(dir, bin), `#!/usr/bin/env bash\n${body}\n`);
+        chmodSync(join(dir, bin), 0o755);
+      }
+      const githubEnv = join(dir, "github_env");
+      writeFileSync(githubEnv, "");
+      const run = Bun.spawnSync(["bash", "-c", steps[index(name)]!.run!], {
+        cwd: repo,
+        env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, RUNNER_TEMP: dir, GITHUB_ENV: githubEnv, COMPOSE: workflow.env.COMPOSE!, ...env },
+        stdout: "pipe", stderr: "pipe",
+      });
+      return { exitCode: run.exitCode, out: run.stdout.toString() + run.stderr.toString() };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  test("PTX_BATCH_ADMIN_KEY must hash to an admin:* bootstrap entry before anything deploys", () => {
+    const { keys, env } = mintBootstrapKeys([
+      { id: "tinychat-batch", project: "tinychat", scopes: ["transcriptions:*"] },
+      { id: "owner-admin", project: "ops", scopes: ["admin:*"] },
+    ]);
+    const [tinychatKey, adminKey] = [keys[0]!.key, keys[1]!.key];
+    const validate = (admin: string, bootstrap = env) => runStep("Validate the sealed environment", {
+      BATCH_POSTGRES_PASSWORD: "a".repeat(64), BATCH_TINFOIL_API_KEY: "tinfoil", PTX_BOOTSTRAP_KEYS: bootstrap, PTX_BATCH_ADMIN_KEY: admin,
+    }, { docker: "exit 0" });
+
+    const ok = validate(adminKey);
+    expect({ exitCode: ok.exitCode, out: ok.out }).toMatchObject({ exitCode: 0 });
+    expect(ok.out).toContain("bootstrap keys: tinychat-batch(transcriptions:*) owner-admin(admin:*)");
+    for (const [admin, error] of [
+      ["tc_live_not_a_minted_key", "PTX_BATCH_ADMIN_KEY does not hash to any PTX_BOOTSTRAP_KEYS entry"],
+      [tinychatKey, "PTX_BATCH_ADMIN_KEY hashes to tinychat-batch, which does not hold admin:*"],
+      ["", "PTX_BATCH_ADMIN_KEY does not hash to any PTX_BOOTSTRAP_KEYS entry"],
+    ] as const) {
+      const run = validate(admin);
+      expect({ error, exitCode: run.exitCode, reported: run.out.includes(error) }).toEqual({ error, exitCode: 1, reported: true });
+      if (admin) expect(run.out).not.toContain(admin);
+    }
+    const adminOnly = JSON.stringify([{ id: "owner-admin", project: "ops", scopes: ["admin:*"], sha256: hashApiKey(adminKey) }]);
+    expect(() => checkBatchDeployKeys(adminOnly, adminKey)).toThrow("PTX_BOOTSTRAP_KEYS needs a transcriptions:* key");
+    expect(checkBatchDeployKeys(env, adminKey).map((key) => key.id)).toEqual(["tinychat-batch", "owner-admin"]);
+  });
+
+  const serve = (body: string) => ({ curl: `printf '%s' '${body}'` });
+
+  test("the admission gate requires closed after a create and drain after an update; open is never accepted", () => {
+    const gate = (mode: string, body: string) => runStep("Admission gate (the deployed service is not open)", { MODE: mode, BATCH_URL: "https://batch.test", PTX_BATCH_ADMIN_KEY: "k" }, serve(body));
+    expect(gate("create", counts(0, 0, 0, "closed")).exitCode).toBe(0);
+    expect(gate("update", counts(0, 0, 0, "drain")).exitCode).toBe(0);
+    for (const [mode, body] of [["create", counts(0, 0, 0, "open")], ["create", counts(0, 0, 0, "drain")], ["update", counts(0, 0, 0, "open")],
+      ["update", counts(0, 0, 0, "closed")], ["create", "{}"], ["create", "not json"]] as const) {
+      const run = gate(mode, body);
+      expect({ mode, body, exitCode: run.exitCode, reported: run.out.includes("::error title=Admission gate::") }).toEqual({ mode, body, exitCode: 1, reported: true });
+    }
+    // Found open: the message says so and asks for a manual close, never "not opened".
+    const open = gate("create", counts(0, 0, 0, "open"));
+    expect(open.out).toContain("the deployed service is OPEN and accepting work (expected closed); close or drain it manually now");
+    expect(open.out).not.toContain("does not open admission");
+    // A rejected admin key (curl -f) fails the gate too.
+    expect(runStep("Admission gate (the deployed service is not open)", { MODE: "create", BATCH_URL: "https://batch.test", PTX_BATCH_ADMIN_KEY: "k" }, { curl: "exit 22" }).exitCode).not.toBe(0);
+  });
+
+  test("the guard refuses a pinned image whose commit predates migration 0018", () => {
+    const migration = "src/db/migrations/0018_batch_admission_closed.sql";
+    expect(existsSync(join(repo, migration))).toBe(true);
+    const [, sha, digest] = /api:([0-9a-f]{40})@(sha256:[0-9a-f]{64})/.exec(composeText)!;
+    // Fake git: the pinned commit is on main; `cat-file -e <sha>:<migration>` succeeds only when HAS_0018=1.
+    const git = `case "$1" in
+  merge-base) exit 0 ;;
+  cat-file) [ "$2" = "-e" ] && [ "$3" = "${sha}:${migration}" ] && [ "$HAS_0018" = 1 ] && exit 0; exit 128 ;;
+  *) exit 2 ;;
+esac`;
+    const guard = (has0018: string) => runStep("Guard inputs, secrets and the image pin", {
+      CONFIRM: "ptx-batch", CVM_NAME: "ptx-batch", GITHUB_REF: "refs/heads/main", DRAIN_TIMEOUT_MINUTES: "130", IMAGE_REPO: workflow.env.IMAGE_REPO!,
+      PHALA_CLOUD_API_KEY: "p", BATCH_POSTGRES_PASSWORD: "b", BATCH_TINFOIL_API_KEY: "t", PTX_BOOTSTRAP_KEYS: "[]", PTX_BATCH_ADMIN_KEY: "a", HAS_0018: has0018,
+    }, { git, docker: `printf '{"digest":"%s"}' '${digest}'` });
+    expect(guard("1")).toMatchObject({ exitCode: 0 });
+    const old = guard("0");
+    expect(old.exitCode).toBe(1);
+    expect(old.out).toContain(`pinned image ${sha} predates migration 0018`);
+  });
+
+  test("checkout does not persist the job token", () => {
+    const checkout = (workflow.jobs.deploy.steps[0] as { uses?: string; with?: Record<string, unknown> });
+    expect(checkout.uses?.startsWith("actions/checkout@")).toBe(true);
+    expect(checkout.with).toEqual({ "fetch-depth": 0, "persist-credentials": false });
+  });
+
+  test("opening admission fails unless the service reports open", () => {
+    const open = (body: string) => runStep("Open admission", { BATCH_URL: "https://batch.test", PTX_BATCH_ADMIN_KEY: "k", MODE: "create", CVM_ID: "c", IMAGE: "i", GITHUB_STEP_SUMMARY: "/dev/null" }, serve(body));
+    expect(open(counts(0, 0, 0, "open")).exitCode).toBe(0);
+    expect(open(counts(0, 0, 0, "closed")).exitCode).toBe(1);
   });
 
   test("never prints a secret", () => {
