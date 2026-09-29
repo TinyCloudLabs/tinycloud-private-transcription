@@ -41,3 +41,26 @@ jobs:
 
       - name: Run tests
         run: bun run test
+
+  image:
+    # The production runtime is the Alpine (musl) Bun in the api image, not the glibc Bun above. Build that image
+    # from this commit and run the Bun.SQL concurrency regression test and the Redis queue test inside it, against
+    # the same dev Postgres/Redis. test/ is mounted read-only; the image itself is unchanged.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Build the api image
+        run: docker build --tag ptx-api:test .
+
+      - name: Start Postgres + Redis
+        run: docker compose -f docker-compose.dev.yml up -d --wait
+
+      - name: Run tests inside the api image
+        run: |
+          set -euo pipefail
+          in_image() { docker run --rm --network host --volume "$PWD/test:/app/test:ro" ptx-api:test "$@"; }
+          in_image bun --version
+          in_image bun test test/integration/batch-api.test.ts --test-name-pattern "cold connection pool"
+          in_image bun test test/unit/queue.test.ts

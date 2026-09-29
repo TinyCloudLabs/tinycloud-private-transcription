@@ -153,7 +153,7 @@ describe("create and admission", () => {
 
   test("concurrent creates on a cold connection pool get only 201 or service_busy (Bun.SQL reply attribution)", async () => {
     // Bun 1.3.14's Postgres client could write an already-prepared query's Bind+Execute ahead of an earlier
-    // queued query that still needed a Parse, while replies stay FIFO (oven-sh/bun#33627; 1.4.x passes). A pooled
+    // queued query that still needed a Parse, while replies stay FIFO (oven-sh/bun#33665; 1.4.x passes). A pooled
     // query then ran inside a create transaction and the admission-row SELECT ... FOR UPDATE received its rows:
     // a 500 ("admission row is missing"), a 503 service_paused, or a wedged connection. It needs statements a
     // connection has not prepared yet, so every round uses a fresh pool.
