@@ -4,8 +4,10 @@ import { join } from "node:path";
 import { eq, sql } from "drizzle-orm";
 import { createApp } from "../../src/api/app.ts";
 import { createContext } from "../../src/context.ts";
+import { createDb } from "../../src/db/client.ts";
 import { transcriptionCapabilities, transcriptions, transcriptionWorkers } from "../../src/db/schema.ts";
 import { silentLogger } from "../../src/log.ts";
+import { createBatchApp } from "../../src/roles/batch.ts";
 import { runSweep } from "../../src/uploads/ledger.ts";
 import { audioName, jobDir } from "../../src/uploads/storage.ts";
 import { audio, exists, sha256, startBatchHarness, TENANT_A, TENANT_B, tenant, trickle, type BatchHarness } from "./batch-harness.ts";
@@ -148,6 +150,35 @@ describe("create and admission", () => {
       expect(busy.headers.get("retry-after")).toBeTruthy();
     }
   });
+
+  test("concurrent creates on a cold connection pool get only 201 or service_busy (Bun.SQL reply attribution)", async () => {
+    // Bun 1.3.14's Postgres client could write an already-prepared query's Bind+Execute ahead of an earlier
+    // queued query that still needed a Parse, while replies stay FIFO (oven-sh/bun#33627; 1.4.x passes). A pooled
+    // query then ran inside a create transaction and the admission-row SELECT ... FOR UPDATE received its rows:
+    // a 500 ("admission row is missing"), a 503 service_paused, or a wedged connection. It needs statements a
+    // connection has not prepared yet, so every round uses a fresh pool.
+    h.ctx.config.limits.maxActiveJobs = 5;
+    const bytes = await audio("stereo");
+    for (let round = 0; round < 25; round++) {
+      await h.ctx.db.execute(sql`truncate table transcriptions, transcription_tenant_usage cascade`);
+      const db = createDb(h.ctx.config.databaseUrl);
+      const app = createBatchApp({ ...h.ctx, db });
+      try {
+        const creates = Promise.all(Array.from({ length: 12 }, (_, i) => app.request("/v1/transcriptions", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${h.keys.transcriptions}`, "X-Tenant-Ref": tenant(i + 1), "Idempotency-Key": `tc:${crypto.randomUUID()}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ content_type: "audio/mpeg", byte_size: bytes.byteLength, sha256: sha256(bytes), language: "en" }),
+        })));
+        const results = await Promise.race([creates, Bun.sleep(2_000).then(() => null)]);
+        expect({ round, settled: results !== null }).toEqual({ round, settled: true });
+        const outcomes = await Promise.all(results!.map(async (r) => r.status === 201 ? "201" : `${r.status} ${(await errorOf(r)).code}`));
+        expect({ round, outcomes: outcomes.sort() }).toEqual({ round, outcomes: [...Array(5).fill("201"), ...Array(7).fill("429 service_busy")] });
+      } finally {
+        // A connection wedged by the bug never closes; bound the wait so the assertion above is what reports.
+        await Promise.race([db.$client.close({ timeout: 0 }), Bun.sleep(1_000)]);
+      }
+    }
+  }, 30_000);
 
   test("declared-byte reservation covers awaiting_upload + queued + processing and is released only by a terminal transition", async () => {
     const bytes = await audio("stereo");
