@@ -74,7 +74,24 @@ VEXA_API_KEY=vxa_mock bun run api                        # migrates, listens on 
 VEXA_API_KEY=vxa_mock bun run worker
 
 # 3) mint an API key (printed once; only the sha256 hash is stored)
-bun run cli create-key --project demo
+bun run cli create-key --project demo                       # scopes default to meetings:*
+bun run cli create-key --project demo --scopes 'transcriptions:*'   # quote: zsh globs a bare *
+```
+
+### API-key scopes
+
+Every authenticated route group requires one exact scope, or it answers `403 insufficient_scope`:
+`meetings:*` for `/v1/meetings*`, `transcriptions:*` for `/v1/transcriptions*` (batch API, not yet mounted), `admin:*`
+for `/v1/admin/*` (not yet mounted). There is no global wildcard. `create-key` defaults to `meetings:*`, which every
+pre-existing key holds, so meeting callers need no change. `--scopes` takes a comma-separated list.
+
+On a CVM without SSH, set the sealed env `PTX_BOOTSTRAP_KEYS` to a JSON array of `{id, project, scopes, sha256}`
+(hashes only). At boot the API makes exactly those the bootstrap-managed keys: new ids are inserted, a changed hash
+rotates that key, and bootstrap ids missing from the array are revoked. Keys from `create-key` are never touched. Unset
+means no bootstrap management; `[]` revokes all bootstrap keys. Mint entries offline (prints each plaintext key once):
+
+```bash
+bun run scripts/mint-bootstrap-keys.ts --key 'tinychat-batch:tinychat:transcriptions:*' --key 'owner-admin:ops:admin:*'
 ```
 
 `bun test` runs unit + integration (needs the dev Postgres/Redis; the mock Vexa is started in-process).
@@ -110,6 +127,7 @@ production window. Green 2/2 on 2026-08-17 (~2 min each; evidence in `tmp/e2e-<r
 | `TINFOIL_API_KEY` | – | bearer token; when set, enables recording retention and recovery transcription. |
 | `TINFOIL_MODEL` | `voxtral-small-24b` | recovery transcription model. |
 | `AUTO_MIGRATE` | `true` | API runs migrations at boot |
+| `PTX_BOOTSTRAP_KEYS` | unset | sealed JSON array of hashed API keys the API syncs at boot (see API-key scopes) |
 | `LOG_LEVEL` | `info` | JSON logs |
 
 ## Curl walkthrough (Definition of Done)
@@ -167,7 +185,7 @@ persisted in `webhook_deliveries`. Webhook failure never changes meeting status.
 `{"error":{"type":"meeting_join_failed","code":"waiting_room_timeout","message":"…"}}`. Codes:
 `invalid_meeting_url, unsupported_platform, meeting_not_found, meeting_join_failed, waiting_room_timeout,
 bot_removed, meeting_ended, capture_failed, transcription_failed, provider_timeout, provider_unavailable,
-internal_error` (+ `unauthorized`, `invalid_request`, `idempotency_conflict`). Vexa errors are never forwarded raw.
+internal_error` (+ `unauthorized`, `insufficient_scope`, `invalid_request`, `idempotency_conflict`). Vexa errors are never forwarded raw.
 
 ## Vexa mapping (typed against the real v0.12 payloads in `docs/vexa-samples/`)
 

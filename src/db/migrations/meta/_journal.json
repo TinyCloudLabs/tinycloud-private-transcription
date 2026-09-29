@@ -113,6 +113,13 @@
       "when": 1790127501317,
       "tag": "0015_giant_talon",
       "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1790688349411,
+      "tag": "0016_api_key_scopes",
+      "breakpoints": true
     }
   ]
 }

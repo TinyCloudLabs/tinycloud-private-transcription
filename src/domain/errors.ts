@@ -13,6 +13,7 @@ export type ErrorCode =
   | "internal_error"
   // request-level codes
   | "unauthorized"
+  | "insufficient_scope"
   | "invalid_request"
   | "idempotency_conflict";
 
@@ -32,6 +33,7 @@ const CODE_TYPE: Record<ErrorCode, ErrorType> = {
   invalid_request: "invalid_request_error",
   idempotency_conflict: "invalid_request_error",
   unauthorized: "authentication_error",
+  insufficient_scope: "authentication_error",
   meeting_not_found: "not_found_error",
   meeting_join_failed: "meeting_join_failed",
   waiting_room_timeout: "meeting_join_failed",
@@ -49,6 +51,7 @@ const CODE_STATUS: Partial<Record<ErrorCode, number>> = {
   unsupported_platform: 400,
   invalid_request: 400,
   unauthorized: 401,
+  insufficient_scope: 403,
   meeting_not_found: 404,
   idempotency_conflict: 409,
   provider_unavailable: 503,

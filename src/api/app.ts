@@ -1,9 +1,18 @@
 import { Hono } from "hono";
 import type { AppContext } from "../context.ts";
 import { ApiError } from "../domain/errors.ts";
-import { bearerAuth, type AuthEnv } from "./auth.ts";
+import { bearerAuth, requireScope, type ApiKeyScope, type AuthEnv } from "./auth.ts";
 import { healthRoutes } from "./routes/health.ts";
 import { meetingRoutes } from "./routes/meetings.ts";
+
+/**
+ * Mounts an authenticated `/v1` route group behind exactly one required API-key scope. Mount every `/v1`
+ * group through this, so no authenticated route is reachable on a valid key alone.
+ */
+export function mountScoped(app: Hono<AuthEnv>, path: `/v1/${string}`, scope: ApiKeyScope, routes: Hono<AuthEnv>) {
+  app.use(`${path}/*`, requireScope(scope));
+  app.route(path, routes);
+}
 
 export function createApp(ctx: AppContext) {
   const app = new Hono<AuthEnv>();
@@ -19,6 +28,6 @@ export function createApp(ctx: AppContext) {
 
   app.route("/", healthRoutes(ctx));
   app.use("/v1/*", bearerAuth(ctx));
-  app.route("/v1/meetings", meetingRoutes(ctx));
+  mountScoped(app, "/v1/meetings", "meetings:*", meetingRoutes(ctx));
   return app;
 }
