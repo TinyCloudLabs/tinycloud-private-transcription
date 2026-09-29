@@ -435,7 +435,7 @@ describe("upload validation fails the job and deletes its bytes", () => {
       expect(await h.row(job.id)).toMatchObject({ status: "failed", errorCode: code, deletionState: "files_deleted" });
       expect(await exists(jobDir(h.uploadDir, job.id))).toBe(false);
       expect((await h.put(job.id, job.upload.capability, bytes, { contentType })).status).toBe(401);
-    });
+    }, 60_000); // generating the real 7,201 s fixture takes seconds on CI runners
   }
 });
 

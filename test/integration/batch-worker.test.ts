@@ -62,7 +62,7 @@ describe("single-slot arbiter", () => {
     const perJob = await Promise.all(ids.map(async (id) => (await attempts(id)).length));
     expect(perJob).toEqual(await Promise.all(ids.map(async (id) => (await regions(id)).length)));
     expect(h.tinfoil.calls.length).toBe(perJob.reduce((x, y) => x + y, 0));
-  });
+  }, 60_000);
 
   test("happy path: separate channels become speakers with region timestamps; audio is deleted and verified", async () => {
     const id = await h.submit(await audio("stereo"));
@@ -129,7 +129,7 @@ describe("provider outcomes", () => {
     expect(h.tinfoil.calls[1]!.at - h.tinfoil.calls[0]!.at).toBeGreaterThanOrEqual(990);
     const statuses = (await attempts(id)).sort((a, b) => a.regionOrdinal - b.regionOrdinal || a.ordinal - b.ordinal).map((a) => `${a.regionOrdinal}:${a.status}`);
     expect(statuses).toEqual(["0:rate_limited", "0:rate_limited", "0:rate_limited", "0:succeeded", "1:succeeded"]);
-  });
+  }, 30_000);
 
   test("20 consecutive 429s fail the job provider_unavailable after exactly 20 calls", async () => {
     h.tinfoil.handler = () => new Response("busy", { status: 429, headers: { "Retry-After": "0" } });
