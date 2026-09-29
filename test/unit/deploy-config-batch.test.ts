@@ -3,7 +3,7 @@
  * deploy-config.test.ts and is not referenced here.
  */
 import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -281,8 +281,38 @@ sed -n "$((n + 1))p" "${dir}/gets"
       const run = gate(mode, body);
       expect({ mode, body, exitCode: run.exitCode, reported: run.out.includes("::error title=Admission gate::") }).toEqual({ mode, body, exitCode: 1, reported: true });
     }
+    // Found open: the message says so and asks for a manual close, never "not opened".
+    const open = gate("create", counts(0, 0, 0, "open"));
+    expect(open.out).toContain("the deployed service is OPEN and accepting work (expected closed); close or drain it manually now");
+    expect(open.out).not.toContain("does not open admission");
     // A rejected admin key (curl -f) fails the gate too.
     expect(runStep("Admission gate (the deployed service is not open)", { MODE: "create", BATCH_URL: "https://batch.test", PTX_BATCH_ADMIN_KEY: "k" }, { curl: "exit 22" }).exitCode).not.toBe(0);
+  });
+
+  test("the guard refuses a pinned image whose commit predates migration 0018", () => {
+    const migration = "src/db/migrations/0018_batch_admission_closed.sql";
+    expect(existsSync(join(repo, migration))).toBe(true);
+    const [, sha, digest] = /api:([0-9a-f]{40})@(sha256:[0-9a-f]{64})/.exec(composeText)!;
+    // Fake git: the pinned commit is on main; `cat-file -e <sha>:<migration>` succeeds only when HAS_0018=1.
+    const git = `case "$1" in
+  merge-base) exit 0 ;;
+  cat-file) [ "$2" = "-e" ] && [ "$3" = "${sha}:${migration}" ] && [ "$HAS_0018" = 1 ] && exit 0; exit 128 ;;
+  *) exit 2 ;;
+esac`;
+    const guard = (has0018: string) => runStep("Guard inputs, secrets and the image pin", {
+      CONFIRM: "ptx-batch", CVM_NAME: "ptx-batch", GITHUB_REF: "refs/heads/main", DRAIN_TIMEOUT_MINUTES: "130", IMAGE_REPO: workflow.env.IMAGE_REPO!,
+      PHALA_CLOUD_API_KEY: "p", BATCH_POSTGRES_PASSWORD: "b", BATCH_TINFOIL_API_KEY: "t", PTX_BOOTSTRAP_KEYS: "[]", PTX_BATCH_ADMIN_KEY: "a", HAS_0018: has0018,
+    }, { git, docker: `printf '{"digest":"%s"}' '${digest}'` });
+    expect(guard("1")).toMatchObject({ exitCode: 0 });
+    const old = guard("0");
+    expect(old.exitCode).toBe(1);
+    expect(old.out).toContain(`pinned image ${sha} predates migration 0018`);
+  });
+
+  test("checkout does not persist the job token", () => {
+    const checkout = (workflow.jobs.deploy.steps[0] as { uses?: string; with?: Record<string, unknown> });
+    expect(checkout.uses?.startsWith("actions/checkout@")).toBe(true);
+    expect(checkout.with).toEqual({ "fetch-depth": 0, "persist-credentials": false });
   });
 
   test("opening admission fails unless the service reports open", () => {

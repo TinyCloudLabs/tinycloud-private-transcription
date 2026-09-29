@@ -42,6 +42,11 @@ The compose pins the api/worker image immutably. Until the first batch image exi
 that run's summary and open a PR that sets both `image:` lines to `api:<sha>@sha256:<digest>`. The workflow checks that
 `<sha>` is on `main` and that GHCR maps the tag to exactly that digest. Every later image change is the same one-line PR.
 
+The first creation needs an image that contains migration 0018 (a fresh install starts with admission `closed`); the
+workflow refuses a pin whose commit lacks `src/db/migrations/0018_batch_admission_closed.sql`, because an older image
+seeds admission `open`. The order is: merge the change to `main` → `publish-image.yml` publishes that commit's image →
+re-pin PR (both `image:` lines) merged → dispatch the create.
+
 ## Deploy
 
 ```bash

@@ -64,6 +64,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
@@ -104,6 +105,9 @@ jobs:
           sha="${BASH_REMATCH[1]}"
           digest="${BASH_REMATCH[2]}"
           git merge-base --is-ancestor "$sha" origin/main || fail "image commit $sha is not on main"
+          # An older image seeds admission `open` on a fresh install; only 0018 and later start it closed.
+          git cat-file -e "$sha:src/db/migrations/0018_batch_admission_closed.sql" 2>/dev/null \
+            || fail "pinned image $sha predates migration 0018 (admission starts closed); re-pin to a later main image first (infra/dstack-batch/README.md)"
           published="$(docker buildx imagetools inspect "${IMAGE_REPO}:${sha}" --format '{{json .Manifest}}' | jq -r '.digest')"
           [ "$published" = "$digest" ] || fail "${IMAGE_REPO}:${sha} is ${published}, not the pinned ${digest}"
           echo "IMAGE=${images}" >> "$GITHUB_ENV"
@@ -283,8 +287,12 @@ jobs:
           if [ "$MODE" = "update" ]; then expected=drain; fi
           body="$(curl -fsS -H "Authorization: Bearer $PTX_BATCH_ADMIN_KEY" "$BATCH_URL/v1/admin/admission")"
           mode="$(jq -r '.mode // "missing"' <<<"$body" 2>/dev/null || echo unreadable)"
+          if [ "$mode" = "open" ]; then
+            echo "::error title=Admission gate::the deployed service is OPEN and accepting work (expected $expected); close or drain it manually now: PUT $BATCH_URL/v1/admin/admission {\"mode\":\"closed\"}"
+            exit 1
+          fi
           if [ "$mode" != "$expected" ]; then
-            echo "::error title=Admission gate::the deployed service reports mode=$mode, expected $expected; admission is not opened"
+            echo "::error title=Admission gate::the deployed service reports mode=$mode, expected $expected; this run does not open admission"
             exit 1
           fi
           echo "admission mode=$mode"
