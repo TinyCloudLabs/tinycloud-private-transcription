@@ -77,8 +77,8 @@ describe("infra/dstack/app-compose.yaml", () => {
 
   test("pins every deploy and runtime-pulled image to an approved immutable digest", () => {
     const expected = {
-      api: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:0c5b5ae12a1ea417d39e55e2291963393480222b@sha256:574e7106f93cb1bf730a816ada12a2e3d2fa545b149a8dce2308b09ddb303005",
-      worker: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:0c5b5ae12a1ea417d39e55e2291963393480222b@sha256:574e7106f93cb1bf730a816ada12a2e3d2fa545b149a8dce2308b09ddb303005",
+      api: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:calendar-autojoin-666c3111d4d47547050d06b637ac0eef74229e89@sha256:df9d4425eb5def3bcffff9b162934e4dc104784816f3531e66b0c3d0cf10eec3",
+      worker: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:calendar-autojoin-666c3111d4d47547050d06b637ac0eef74229e89@sha256:df9d4425eb5def3bcffff9b162934e4dc104784816f3531e66b0c3d0cf10eec3",
       "signal-capture": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f",
       "signal-capture-2": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f",
       "signal-capture-3": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f",
