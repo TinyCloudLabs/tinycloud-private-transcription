@@ -99,3 +99,31 @@ test("rejects exact 120-second sample durations and splits exact batch wall span
   expect(batches).toHaveLength(2);
   expect(batches.every((batch) => batch.end_ms - batch.start_ms < 120_000)).toBe(true);
 });
+
+test("accepts the production Vexa shape: name-derived keys, out-of-order sequences, and long meetings", () => {
+  // Meeting 74 on ptx-dev: 2,229 ranges for 37 minutes, reserved concurrently, keyed by display name.
+  const named = (sequence: number, name: string) => {
+    const item = range(sequence, `name:1:${name}`, name, sequence * 1_000, sequence * 1_000 + 800);
+    return { ...item, idempotency_key: `74:name:1:${name}:1:${item.start_ms}:${item.end_ms}` };
+  };
+  const ranges = Array.from({ length: 2_229 }, (_, sequence) => named(sequence, sequence % 2 ? "José Díaz" : "Alice Smith"));
+  [ranges[2], ranges[3]] = [ranges[3]!, ranges[2]!];
+  const batches = attributedBatches(manifest(ranges), 1);
+  expect(batches.flatMap((batch) => batch.ranges.map((item) => item.sequence)).sort((a, b) => a - b)).toEqual(ranges.map((_, i) => i));
+  expect(batches[0]!.ranges.map((item) => item.sequence).slice(0, 3)).toEqual([0, 2, 4]);
+  expect(batches.map((batch) => batch.speaker_key)).toContain("name:1:José Díaz");
+});
+
+test("sequence gaps and duplicates are still rejected after ordering", () => {
+  const a = range(0, "a", "Alice", 0, 1_000), b = range(2, "a", "Alice", 1_000, 2_000);
+  expect(() => attributedBatches(manifest([a, b]), 1)).toThrow();
+  expect(() => attributedBatches(manifest([a, { ...a, idempotency_key: "r0b" }]), 1)).toThrow();
+});
+
+test("name-derived keys still reject controls, URLs, and secret-shaped values", () => {
+  const one = range(0, "a", "Alice", 0, 1_000);
+  for (const key of ["name:1:Alice\nBob", "name:1:https://x", "name:1:api token"]) {
+    expect(() => attributedBatches(manifest([{ ...one, speaker_key: key }]), 1)).toThrow();
+    expect(() => attributedBatches(manifest([{ ...one, idempotency_key: key }]), 1)).toThrow();
+  }
+});

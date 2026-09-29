@@ -109,6 +109,21 @@ export async function getMeeting(ctx: AppContext, projectId: string, id: string)
   return row;
 }
 
+/** Read-only recovery of a possibly committed create. Never enqueue or retry dispatch here. */
+export async function getMeetingByIdempotencyKey(
+  ctx: AppContext,
+  projectId: string,
+  idempotencyKey: string,
+): Promise<MeetingRow> {
+  const [row] = await ctx.db
+    .select()
+    .from(meetings)
+    .where(and(eq(meetings.projectId, projectId), eq(meetings.idempotencyKey, idempotencyKey)))
+    .limit(1);
+  if (!row) throw new ApiError("meeting_not_found", "No meeting with this idempotency key");
+  return row;
+}
+
 export async function getMeetingById(ctx: AppContext, id: string): Promise<MeetingRow | null> {
   const [row] = await ctx.db.select().from(meetings).where(eq(meetings.id, id)).limit(1);
   return row ?? null;

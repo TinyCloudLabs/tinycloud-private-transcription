@@ -27,7 +27,7 @@
 services:
   # ─── ours ────────────────────────────────────────────────────────────────────────────────────
   api:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:0c5b5ae12a1ea417d39e55e2291963393480222b@sha256:574e7106f93cb1bf730a816ada12a2e3d2fa545b149a8dce2308b09ddb303005
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:calendar-autojoin-666c3111d4d47547050d06b637ac0eef74229e89@sha256:df9d4425eb5def3bcffff9b162934e4dc104784816f3531e66b0c3d0cf10eec3
     # VEXA_API_KEY is minted at first boot by `vexa-provision` (below) into a shared volume.
     command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal-capability/capability-key); exec bun run src/api/server.ts"]
     restart: unless-stopped
@@ -75,7 +75,7 @@ services:
     networks: [ptx, vexa]
 
   worker:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:0c5b5ae12a1ea417d39e55e2291963393480222b@sha256:574e7106f93cb1bf730a816ada12a2e3d2fa545b149a8dce2308b09ddb303005
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:calendar-autojoin-666c3111d4d47547050d06b637ac0eef74229e89@sha256:df9d4425eb5def3bcffff9b162934e4dc104784816f3531e66b0c3d0cf10eec3
     command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && [ -s /run/signal-control-1/token ] && [ -s /run/signal-control-2/token ] && [ -s /run/signal-control-3/token ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && [ -s /run/signal-control-1/token ] && [ -s /run/signal-control-2/token ] && [ -s /run/signal-control-3/token ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal-capability/capability-key); exec bun run src/worker/index.ts"]
     restart: unless-stopped
     environment:
