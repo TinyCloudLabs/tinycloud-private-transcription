@@ -12,7 +12,7 @@
 # .github/workflows/deploy-batch.yml refuses to deploy.
 services:
   api:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:68e55e4ae8393ccd27480bddba90132deae388bf@sha256:d701dfcd8518ab01ec45593d380737e4a5e5bc65f89ca146b8b73877c5823896
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:90770d38cda27c0e84916acd1363709121a89be3@sha256:d6412c92e8c71b9d0a941563005ae5a9d9c7987d2871d686a8c808702013b2be
     restart: unless-stopped
     depends_on:
       postgres:
@@ -47,7 +47,7 @@ services:
       start_period: 20s
 
   upload-worker:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:68e55e4ae8393ccd27480bddba90132deae388bf@sha256:d701dfcd8518ab01ec45593d380737e4a5e5bc65f89ca146b8b73877c5823896
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:90770d38cda27c0e84916acd1363709121a89be3@sha256:d6412c92e8c71b9d0a941563005ae5a9d9c7987d2871d686a8c808702013b2be
     restart: unless-stopped
     command: ["bun", "run", "src/uploads/worker.ts"]
     depends_on:
