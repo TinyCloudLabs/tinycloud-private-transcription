@@ -22,7 +22,9 @@ export interface AttributedBatch {
 }
 
 const TARGET_MS = 90_000, MAX_MS = 120_000, MAX_TIMELINE_MS = 24 * 60 * 60 * 1000, PCM_FLOAT_BYTES = 4, CLOCK_JITTER_MS = 250;
-const MAX_RANGES = 2_048, MAX_IDEMPOTENCY_KEY = 256, MAX_SPEAKER_KEY = 128, MAX_SPEAKER_NAME = 128;
+// Vexa seals roughly one range per second of speech (2,229 for a 37-minute Meet), so the bound
+// follows the 24-hour timeline cap rather than a typical meeting.
+const MAX_RANGES = 100_000, MAX_IDEMPOTENCY_KEY = 256, MAX_SPEAKER_KEY = 128, MAX_SPEAKER_NAME = 128;
 const MAX_SAMPLE_RATE = 192_000, MAX_CLOCK_MS = 9_007_199_254_740_991;
 const invalid = (message: string): never => { throw new ApiError("transcription_failed", message); };
 const relativePath = (path: string | undefined, meetingId: number, sequence: number) => path === `/meetings/${meetingId}/attributed-audio/ranges/${sequence}`;
@@ -35,6 +37,10 @@ const ownKeys = (value: unknown, keys: readonly string[]) =>
 // the producer protocol opaque but deliberately non-secret and bounded at that boundary.
 const opaqueId = (value: unknown, limit: number) => typeof value === "string" && value.length > 0 && value.length <= limit
   && /^[A-Za-z0-9._:-]+$/.test(value) && !/private|credential|secret|token|https?:/i.test(value);
+// Vexa derives glow-bound speaker keys, and the range idempotency keys built from them, from the
+// participant's display name (e.g. `name:1:José Díaz`), so they admit the speaker-name alphabet too.
+const providerKey = (value: unknown, limit: number) => typeof value === "string" && value.length > 0 && value.length <= limit
+  && /^[\p{L}\p{M}\p{N} .,'’_:-]+$/u.test(value) && !/private|credential|secret|token|https?:/i.test(value);
 const speakerName = (value: unknown) => typeof value === "string" && value.length > 0 && value.length <= MAX_SPEAKER_NAME
   // Names are user-facing, international Unicode text; controls, URL punctuation, and other
   // protocol-shaped strings are not names. Combining marks keep normalized and decomposed José valid.
@@ -55,7 +61,7 @@ function validateRange(manifest: AttributedManifest, range: AttributedRange, ind
   const failedPathIsValid = range.path === undefined || relativePath(range.path, vexaMeetingId, range.sequence);
   if (
     range.version !== 1 || range.meeting_id !== manifest.meeting_id || range.sequence !== index
-    || !opaqueId(range.idempotency_key, MAX_IDEMPOTENCY_KEY) || !opaqueId(range.speaker_key, MAX_SPEAKER_KEY) || unknown(range.speaker_key)
+    || !providerKey(range.idempotency_key, MAX_IDEMPOTENCY_KEY) || !providerKey(range.speaker_key, MAX_SPEAKER_KEY) || unknown(range.speaker_key)
     || (range.attribution?.source === "unresolved" ? range.speaker_name !== "" : !speakerName(range.speaker_name)) || !Number.isSafeInteger(range.channel) || range.channel < 0 || range.channel > 255 || !Number.isSafeInteger(range.turn_generation) || range.turn_generation < 1 || range.turn_generation > 1_000_000
     || !Number.isSafeInteger(range.clock_origin_ms) || range.clock_origin_ms !== manifest.clock_origin_ms
     || !Number.isFinite(range.start_ms) || !Number.isFinite(range.end_ms) || range.start_ms < 0 || range.start_ms > MAX_TIMELINE_MS || range.end_ms < 0 || range.end_ms > MAX_TIMELINE_MS || duration < 0 || duration >= MAX_MS
@@ -70,8 +76,13 @@ function validateRange(manifest: AttributedManifest, range: AttributedRange, ind
   ) invalid("Attributed audio manifest contains invalid producer evidence");
 }
 
+/** Vexa appends ranges as concurrent uploads are reserved, so array order is not sequence order. */
+export const bySequence = (manifest: AttributedManifest): AttributedManifest =>
+  Array.isArray(manifest?.ranges) ? { ...manifest, ranges: [...manifest.ranges].sort((a, b) => a.sequence - b.sequence) } : manifest;
+
 /** Keep each speaker's stream independent while retaining the producer sequence in each batch. */
-export function attributedBatches(manifest: AttributedManifest, vexaMeetingId: number): AttributedBatch[] {
+export function attributedBatches(unordered: AttributedManifest, vexaMeetingId: number): AttributedBatch[] {
+  const manifest = bySequence(unordered);
   if (!Number.isSafeInteger(vexaMeetingId) || vexaMeetingId <= 0
       || !ownKeys(manifest, ["version", "meeting_id", "clock_origin", "clock_origin_ms", "state", "ranges"])
       || manifest.version !== 1 || manifest.state !== "closed" || !opaqueId(manifest.meeting_id, 10) || !/^\d+$/.test(manifest.meeting_id) || manifest.clock_origin !== "first_admitted_capture_epoch_ms"

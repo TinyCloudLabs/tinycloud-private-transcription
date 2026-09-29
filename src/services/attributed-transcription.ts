@@ -2,7 +2,7 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import type { AppContext } from "../context.ts";
 import { attributedAttempts, attributedBatches as batchesTable, attributedRanges, attributedTranscriptionRuns, attributedWorkerReadiness, meetings, tinfoilDispatchSlots, transcripts, webhookDeliveries } from "../db/schema.ts";
 import { normalizeSegments } from "../domain/transcript.ts";
-import { attributedBatches, readAttributedBatch, type AttributedBatch, type AttributedCapability, type AttributedManifest } from "../providers/transcription/attributed.ts";
+import { attributedBatches, bySequence, readAttributedBatch, type AttributedBatch, type AttributedCapability, type AttributedManifest } from "../providers/transcription/attributed.ts";
 import { safeTinfoilLanguage, TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
 import { failMeeting, getMeetingById } from "./meetings.ts";
 import { enqueueMeetingWebhook, webhookDeliveryValues, wakeWebhookDelivery } from "../webhooks/dispatcher.ts";
@@ -59,9 +59,11 @@ export async function attributedWorkerReady(ctx: AppContext): Promise<boolean> {
 }
 
 /** Immutable insert is serialized even when no run row exists yet. */
-export async function stageAttributedManifest(ctx: AppContext, meetingId: string, vexaMeetingId: number, manifest: AttributedManifest, capability: unknown): Promise<void> {
+export async function stageAttributedManifest(ctx: AppContext, meetingId: string, vexaMeetingId: number, fetched: AttributedManifest, capability: unknown): Promise<void> {
   if (!capabilityOk(capability)) throw new Error("attributed_capability_not_supported");
-  const specs = attributedBatches(manifest, vexaMeetingId);
+  const specs = attributedBatches(fetched, vexaMeetingId);
+  // Persist and compare in sequence order so a re-read in a different array order is not a conflict.
+  const manifest = bySequence(fetched);
   const staged = await ctx.db.transaction(async (tx) => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`attributed:${meetingId}`}))`);
     const [meeting] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
