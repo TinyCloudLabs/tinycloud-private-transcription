@@ -285,7 +285,7 @@ their unchanged upstream v0.12 images.
   rescan (live-mixer parity) attaches new elements / detaches ended ones. Pinned by the module's
   `dynamic-tap.smoke.test.ts`.
 - **Images**: meeting-api and gateway use `ghcr.io/tinycloudlabs/vexa/<component>:tc-36f0304`; the bot
-  uses `ghcr.io/tinycloudlabs/vexa/bot:tc-78e5ae2` (TC-560). The release commit includes the accepted runtime
+  uses `ghcr.io/tinycloudlabs/vexa/bot:tc-429a94e` (TC-560, TC-582). The release commit includes the accepted runtime
   changes plus the workflow's missing pnpm toolchain correction. All are pinned by digest in
   `infra/dstack/app-compose.yaml`. The bot workflow is `tinycloud-bot-image`; the older
   `ghcr.io/tinycloudlabs/vexa-bot` package was created while the fork was private, is stuck private,
