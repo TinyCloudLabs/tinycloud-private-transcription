@@ -82,52 +82,67 @@ test("a permanently missing range is fetched at most MAX_FETCH_ATTEMPTS + 1 time
 // audio in a tight loop (TC-576).
 test("capacity deferrals do not spend the fetch budget and requeue at the poll interval", async () => {
   const baselineTinfoilCalls = tinfoilCalls;
-  const created = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://meet.google.com/fetch-bound-2" } });
-  const { id } = await created.json();
-  const native = "fetch-bound-2";
-  const bot = await h.waitFor(async () => h.vexa.meetings.get(`google_meet/${native}`) ?? null, { timeoutMs: 30_000 });
-  const path = `/meetings/${bot.id}/attributed-audio/ranges/0`;
-  // Hold both dispatch slots so every admitted-path hop defers on capacity.
-  await h.ctx.db.update(tinfoilDispatchSlots).set({ claimToken: "held", claimedAt: new Date(), ownerId: "other-worker" });
-  await h.vexa.control("google_meet", native, {
-    status: "completed", completion_reason: "stopped",
-    attributed_audio_capability: { requested_version: 1, supported_version: 1, status: "supported" },
-    attributed_audio_manifest: { version: 1, meeting_id: String(bot.id), state: "closed", clock_origin: "first_admitted_capture_epoch_ms", clock_origin_ms: 0, ranges: [rangeSpec(bot.id, path)] },
-    attributed_audio_base64: { [path]: Buffer.from(pcm).toString("base64") },
-  });
-  const batch = await h.waitFor(async () => {
-    const [row] = await h.ctx.db.select().from(attributedBatches).where(eq(attributedBatches.meetingId, id));
-    return row?.status === "pending" ? row : null;
-  }, { timeoutMs: 30_000, label: "batch deferred on capacity" });
-  // Measure the requeue rate against the wall clock — this test deliberately times real dequeue
-  // cadence, which fake timers cannot drive. ~20 fetches/sec at a 50 ms poll interval vs ~170/sec
-  // when the capacity branch re-pushed through an immediate finalize wakeup.
-  const fetchesAt = () => h.vexa.requests.filter((request) => request.path === path).length;
-  await h.waitFor(async () => fetchesAt() >= 3 || null, { timeoutMs: 30_000, label: "capacity churn live" });
-  const before = fetchesAt();
-  await Bun.sleep(1000);
-  expect(fetchesAt() - before).toBeLessThanOrEqual(40);
-  const [stillPending] = await h.ctx.db.select().from(attributedBatches).where(eq(attributedBatches.id, batch.id));
-  expect(stillPending.status).toBe("pending");
-  expect(stillPending.fetchAttempts).toBe(0);
-  // One transient 404 while still capacity-blocked spends exactly one retry.
-  await h.vexa.control("google_meet", native, { attributed_audio_base64: {} });
-  await h.waitFor(async () => {
-    const [row] = await h.ctx.db.select().from(attributedBatches).where(eq(attributedBatches.id, batch.id));
-    return row && row.fetchAttempts >= 1 ? row : null;
-  }, { timeoutMs: 30_000, label: "transient fetch failure counted once" });
-  // Audio returns and capacity opens: the batch completes on its first paid call.
-  await h.vexa.control("google_meet", native, { attributed_audio_base64: { [path]: Buffer.from(pcm).toString("base64") } });
-  await h.ctx.db.update(tinfoilDispatchSlots).set({ claimToken: null, claimedAt: null, ownerId: null });
-  await h.waitFor(async () => {
-    const body = await (await h.api(`/v1/meetings/${id}`)).json(); return body.status === "completed" ? body : null;
-  }, { timeoutMs: 30_000, label: "meeting completed after capacity cleared" });
-  const [settled] = await h.ctx.db.select().from(attributedBatches).where(eq(attributedBatches.id, batch.id));
-  expect(settled.status).toBe("completed");
-  expect(settled.attempts).toBe(1);
-  expect(settled.fetchAttempts).toBeLessThanOrEqual(3);
-  expect(settled.fetchAttempts).toBeGreaterThanOrEqual(1);
-  expect(tinfoilCalls).toBe(baselineTinfoilCalls + 1);
+  // Held slots are released in finally: a failing assertion must not poison the shared
+  // tinfoil_dispatch_slots for later tests (the harness truncates and re-seeds them anyway).
+  try {
+    const created = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://meet.google.com/fetch-bound-2" } });
+    const { id } = await created.json();
+    const native = "fetch-bound-2";
+    const bot = await h.waitFor(async () => h.vexa.meetings.get(`google_meet/${native}`) ?? null, { timeoutMs: 30_000 });
+    const path = `/meetings/${bot.id}/attributed-audio/ranges/0`;
+    // Hold both dispatch slots so every admitted-path hop defers on capacity.
+    await h.ctx.db.update(tinfoilDispatchSlots).set({ claimToken: "held", claimedAt: new Date(), ownerId: "other-worker" });
+    await h.vexa.control("google_meet", native, {
+      status: "completed", completion_reason: "stopped",
+      attributed_audio_capability: { requested_version: 1, supported_version: 1, status: "supported" },
+      attributed_audio_manifest: { version: 1, meeting_id: String(bot.id), state: "closed", clock_origin: "first_admitted_capture_epoch_ms", clock_origin_ms: 0, ranges: [rangeSpec(bot.id, path)] },
+      attributed_audio_base64: { [path]: Buffer.from(pcm).toString("base64") },
+    });
+    const batch = await h.waitFor(async () => {
+      const [row] = await h.ctx.db.select().from(attributedBatches).where(eq(attributedBatches.meetingId, id));
+      return row?.status === "pending" ? row : null;
+    }, { timeoutMs: 30_000, label: "batch deferred on capacity" });
+    // Measure the requeue rate against the wall clock over a 30x-poll-interval hold — this test
+    // deliberately times real dequeue cadence, which fake timers cannot drive. ~20 fetches/sec at
+    // a 50 ms interval vs ~190/sec when finalize/reconcile wakeups piled up undeduped retries.
+    const fetchesAt = () => h.vexa.requests.filter((request) => request.path === path).length;
+    await h.waitFor(async () => fetchesAt() >= 2 || null, { timeoutMs: 30_000, label: "capacity churn live" });
+    const slices = 8, sliceMs = 190; // 1.52 s hold ≈ 30 poll intervals
+    let previous = fetchesAt();
+    for (let slice = 0; slice < slices; slice++) {
+      await Bun.sleep(sliceMs); // real cadence window; see comment above
+      const now = fetchesAt();
+      expect(now - previous).toBeLessThanOrEqual(12); // ~60/s ceiling vs ~20/s nominal
+      previous = now;
+      const { delayed } = await h.ctx.queue.pending();
+      // Dedup key keeps at most one delayed retry per batch no matter how many wakeups pile on.
+      expect(delayed.filter((entry) => entry.job.type === "attributed.batch" && entry.job.batchId === batch.id).length).toBeLessThanOrEqual(1);
+    }
+    const [stillWaiting] = await h.ctx.db.select().from(attributedBatches).where(eq(attributedBatches.id, batch.id));
+    // A sample mid-hop may catch "claimed"; what matters is no budget was spent.
+    expect(["pending", "claimed"]).toContain(stillWaiting.status);
+    expect(stillWaiting.fetchAttempts).toBe(0);
+    // One transient 404 while still capacity-blocked spends exactly one retry.
+    await h.vexa.control("google_meet", native, { attributed_audio_base64: {} });
+    await h.waitFor(async () => {
+      const [row] = await h.ctx.db.select().from(attributedBatches).where(eq(attributedBatches.id, batch.id));
+      return row && row.fetchAttempts >= 1 ? row : null;
+    }, { timeoutMs: 30_000, label: "transient fetch failure counted once" });
+    // Audio returns and capacity opens: the batch completes on its first paid call.
+    await h.vexa.control("google_meet", native, { attributed_audio_base64: { [path]: Buffer.from(pcm).toString("base64") } });
+    await h.ctx.db.update(tinfoilDispatchSlots).set({ claimToken: null, claimedAt: null, ownerId: null });
+    await h.waitFor(async () => {
+      const body = await (await h.api(`/v1/meetings/${id}`)).json(); return body.status === "completed" ? body : null;
+    }, { timeoutMs: 30_000, label: "meeting completed after capacity cleared" });
+    const [settled] = await h.ctx.db.select().from(attributedBatches).where(eq(attributedBatches.id, batch.id));
+    expect(settled.status).toBe("completed");
+    expect(settled.attempts).toBe(1);
+    expect(settled.fetchAttempts).toBeLessThanOrEqual(3);
+    expect(settled.fetchAttempts).toBeGreaterThanOrEqual(1);
+    expect(tinfoilCalls).toBe(baselineTinfoilCalls + 1);
+  } finally {
+    await h.ctx.db.update(tinfoilDispatchSlots).set({ claimToken: null, claimedAt: null, ownerId: null });
+  }
 }, 60_000);
 
 // reconcileAttributedRuns polls run-less and fallback processing meetings so a lost chain wakeup

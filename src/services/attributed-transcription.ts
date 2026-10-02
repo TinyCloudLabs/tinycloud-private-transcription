@@ -227,7 +227,7 @@ export async function processAttributedBatch(ctx: AppContext, meetingId: string,
   if (!stored || stored.status !== "pending") return "noop";
   // Readiness is checked before any claim, fetch, or attempt; an operator can configure Tinfoil later.
   const provider = ctx.transcriptRecovery;
-  if (!(provider instanceof TinfoilTranscriptionProvider)) { await ctx.queue.push({ type: "attributed.batch", meetingId, batchId }, ctx.config.vexa.pollIntervalMs); return "deferred"; }
+  if (!(provider instanceof TinfoilTranscriptionProvider)) { await ctx.queue.push({ type: "attributed.batch", meetingId, batchId }, ctx.config.vexa.pollIntervalMs, `batch:${batchId}`); return "deferred"; }
   const claimed = await claimBatch(ctx, batchId); if (!claimed) return "noop";
   const spec = object<AttributedBatch>(claimed.batch.batchJson);
     const done = async (outcome: AttributedJobOutcome) => {
@@ -242,7 +242,7 @@ export async function processAttributedBatch(ctx: AppContext, meetingId: string,
       // requeues release through releaseBatchClaim and never count (TC-576). No finalize wakeup:
       // it would just requeue the already-pending batch, which the durable counter bounds anyway.
       if (await releaseFailedFetch(ctx, batchId, claimed.token)) {
-        await ctx.queue.push({ type: "attributed.batch", meetingId, batchId }, ctx.config.vexa.pollIntervalMs);
+        await ctx.queue.push({ type: "attributed.batch", meetingId, batchId }, ctx.config.vexa.pollIntervalMs, `batch:${batchId}`);
         return "deferred";
       }
       await settle(ctx, batchId, claimed.token, "failed", meetingId, spec); return done("processed");
@@ -253,10 +253,11 @@ export async function processAttributedBatch(ctx: AppContext, meetingId: string,
     await recordAttributedWorkerReadiness(ctx, ctx.attributedWorkerHealthy, "heartbeat");
     const eligibility = await admitTinfoilDispatch(ctx, meetingId, batchId, claimed.token);
     if (eligibility.kind === "capacity") {
-      // Requeue only the delayed batch job. An immediate finalize wakeup here re-pushed the
-      // pending batch with no delay, re-fetching retained audio hundreds of times a second
-      // while the batch simply waited on dispatch capacity (TC-576).
-      if (await releaseBatchClaim(ctx, batchId, claimed.token)) await ctx.queue.push({ type: "attributed.batch", meetingId, batchId }, ctx.config.vexa.pollIntervalMs);
+      // Requeue only the delayed batch job (deduped per batch: concurrent finalize/reconcile
+      // wakeups fold into the same entry instead of piling up retries). An immediate finalize
+      // wakeup here re-pushed the pending batch with no delay, re-fetching retained audio
+      // hundreds of times a second while the batch simply waited on dispatch capacity (TC-576).
+      if (await releaseBatchClaim(ctx, batchId, claimed.token)) await ctx.queue.push({ type: "attributed.batch", meetingId, batchId }, ctx.config.vexa.pollIntervalMs, `batch:${batchId}`);
       return "deferred";
     }
     if (eligibility.kind === "ineligible") {
@@ -321,9 +322,9 @@ export async function finalizeAttributedRun(ctx: AppContext, meetingId: string):
   }
   const pending = rows.filter((row) => row.status === "pending");
   if (pending.length) {
-    // Delayed like the batch's own requeues: an immediate push re-fetches retained audio in a
-    // tight loop while the batch is merely waiting on dispatch capacity (TC-576).
-    for (const row of pending) await ctx.queue.push({ type: "attributed.batch", meetingId, batchId: row.id }, ctx.config.vexa.pollIntervalMs).catch(() => {});
+    // Delayed like the batch's own requeues and deduped per batch, so this requeue folds into an
+    // already-scheduled retry instead of piling up a second delayed entry (TC-576).
+    for (const row of pending) await ctx.queue.push({ type: "attributed.batch", meetingId, batchId: row.id }, ctx.config.vexa.pollIntervalMs, `batch:${row.id}`).catch(() => {});
     return false;
   }
   const meeting = await getMeetingById(ctx, meetingId);

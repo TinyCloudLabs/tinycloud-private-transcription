@@ -26,11 +26,15 @@ export class Queue {
     this.pollLease = (meetingId) => `${prefix}:poll:${meetingId}`;
   }
 
-  async push(job: Job, delayMs = 0): Promise<void> {
+  async push(job: Job, delayMs = 0, dedupKey?: string): Promise<void> {
     const payload = JSON.stringify(job);
     if (delayMs > 0) {
-      // Suffix keeps identical jobs distinct inside the set.
-      await this.redis.zadd(this.delayed, String(Date.now() + delayMs), `${payload}|${crypto.randomUUID()}`);
+      const member = `${payload}|${dedupKey ?? crypto.randomUUID()}`;
+      // A caller-provided dedup key keeps at most one delayed entry per key: ZADD NX folds repeats
+      // into the pending member. Promotion removes the member, so the next delayed retry re-adds
+      // freely — NX only suppresses a duplicate while one is still waiting (TC-576).
+      if (dedupKey) await this.redis.send("ZADD", [this.delayed, "NX", String(Date.now() + delayMs), member]);
+      else await this.redis.zadd(this.delayed, String(Date.now() + delayMs), member);
     } else {
       await this.redis.lpush(this.ready, payload);
     }
