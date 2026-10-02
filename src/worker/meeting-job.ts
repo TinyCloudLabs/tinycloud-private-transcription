@@ -31,10 +31,12 @@ const safeVexaMeetingId = (value: unknown): number | undefined =>
 
 // The TTL bounds how long an orphaned lease (worker crash, dropped job) can suppress wakeup
 // reconciliation before expiry re-arms it — it never bounds how long a job may run, because the
-// owning job renews it continuously (see handleMeetingPoll). Three poll intervals keeps repairs at
-// ~3x the normal wakeup latency while giving each renewal two missed-beat margin, independent of
-// the Vexa request timeout (15 s by default) since renewal covers provider stalls too.
-const pollLeaseTtlMs = (ctx: AppContext) => ctx.config.vexa.pollIntervalMs * 3;
+// owning job renews it continuously (see handleMeetingPoll, handleMeetingStart). Three poll
+// intervals keeps repairs at ~3x the normal wakeup latency while giving each renewal two
+// missed-beat margin, independent of the Vexa request timeout (15 s by default) since renewal
+// covers provider stalls too. Start chains share the TTL: seat waits re-enqueue at most one
+// poll interval out and a start job's provider call is bounded by the same timeout.
+const chainLeaseTtlMs = (ctx: AppContext) => ctx.config.vexa.pollIntervalMs * 3;
 
 /**
  * Starts a poll chain for a freshly dispatched capture. The lease is claimed before the delayed
@@ -45,80 +47,119 @@ const pollLeaseTtlMs = (ctx: AppContext) => ctx.config.vexa.pollIntervalMs * 3;
  */
 async function startPollChain(ctx: AppContext, meetingId: string, delayMs: number): Promise<void> {
   const token = crypto.randomUUID();
-  const claimed = await ctx.queue.claimPollLease(meetingId, token, pollLeaseTtlMs(ctx)).catch(() => null);
+  const claimed = await ctx.queue.claimPollLease(meetingId, token, chainLeaseTtlMs(ctx)).catch(() => null);
   if (claimed === false) return;
   const job: Job = { type: "meeting.poll", meetingId, ...(claimed ? { pollToken: token } : {}) };
   await ctx.queue.push(job, delayMs);
-  if (claimed && (await ctx.queue.renewPollLease(meetingId, token, delayMs + pollLeaseTtlMs(ctx)).catch(() => null)) === false) {
+  if (claimed && (await ctx.queue.renewPollLease(meetingId, token, delayMs + chainLeaseTtlMs(ctx)).catch(() => null)) === false) {
     await ctx.queue.removeDelayed(job).catch(() => {});
   }
 }
 
-/** Job: meeting.start — ask Vexa to send a bot. */
-export async function handleMeetingStart(ctx: AppContext, meetingId: string, attempt = 1): Promise<void> {
-  const meeting = await getMeetingById(ctx, meetingId);
-  if (!meeting || meeting.status !== "queued") return;
-  if (meeting.platform === "signal") return handleSignalStart(ctx, meeting, attempt);
-  const vexaPlatform = toVexaPlatform(meeting.platform as Exclude<Platform, "signal">);
-  try {
-    const created = await ctx.vexa.createBot({
-      platform: vexaPlatform,
-      native_meeting_id: meeting.vexaNativeMeetingId,
-      meeting_url: meeting.meetingUrl,
-      bot_name: meeting.botName ?? undefined,
-      language: meeting.language ?? undefined,
-      // Keep the established Vexa contract untouched unless the new producer was explicitly
-      // selected.  A disabled flag is a compatibility boundary, not a partial rollout.
-      ...(usesAttributedCapture(ctx, meeting)
-        ? { transcribe_enabled: false, recording_enabled: true, attributed_audio_enabled: true }
-        : { transcribe_enabled: true, ...(ctx.transcriptRecovery ? { recording_enabled: true } : {}) }),
-      // Vexa otherwise applies its ten-minute deployment fallback. Pin every TinyCloud meeting to
-      // our configurable audio-silence window. This can expire with humans still connected;
-      // participant presence does not veto Vexa's silence verdict.
-      automatic_leave: { max_time_left_alone: ctx.config.vexa.maxTimeLeftAloneMs },
-    });
-    // Prefer our already-validated, request-derived identity. A provider-derived replacement is
-    // retained only when it is a narrow opaque identifier, never arbitrary returned text/URLs.
-    const vexaNativeMeetingId = created.native_meeting_id === meeting.vexaNativeMeetingId
-      ? meeting.vexaNativeMeetingId
-      : safeProviderNativeId(created.native_meeting_id) ?? meeting.vexaNativeMeetingId;
-    // Attributed audio is addressed by Vexa's numeric row id.  Do not put an untrusted provider
-    // handle in SQL and never fall back to a value which can later enter an API/webhook payload.
-    const vexaMeetingId = usesAttributedCapture(ctx, meeting) ? safeVexaMeetingId(created.id) : undefined;
-    if (usesAttributedCapture(ctx, meeting) && !vexaMeetingId) throw new ApiError("provider_unavailable", "Capture provider returned an invalid meeting identity.");
-    const dispatched = await recordCapture(ctx, meeting, {
-      silence_timeout_ms: ctx.config.vexa.maxTimeLeftAloneMs,
-      live_transcription_requested: !usesAttributedCapture(ctx, meeting),
-    });
-    const { meeting: updated, changed } = await transition(ctx, dispatched, "joining", {
-      // Platform is request-derived and allowlisted. A provider response must not replace it.
-      vexaPlatform,
-      vexaNativeMeetingId,
-      ...(vexaMeetingId ? { vexaMeetingId } : {}),
-      ...(safeVexaBotId(created.bot_container_id) ? { vexaBotId: safeVexaBotId(created.bot_container_id) } : {}),
-    });
-    if (changed) {
-      ctx.log.info("bot dispatched", { meetingId, stage: "dispatch_admitted" });
-      await startPollChain(ctx, meetingId, ctx.config.vexa.pollIntervalMs);
-      // Worker-side join deadline: Vexa's own awaiting_admission timeout is opaque; without this a
-      // never-admitted bot leaves the meeting in joining/waiting_for_admission forever.
-      await ctx.queue.push({ type: "meeting.join_deadline", meetingId }, ctx.config.joinTimeoutSeconds * 1000);
-    } else if (updated.status === "cancelled" && vexaNativeMeetingId) {
-      // Stopped while we were dispatching the bot: don't leave it orphaned in Vexa.
-      await ctx.vexa.stopBot(vexaPlatform, vexaNativeMeetingId).catch(() => {});
+/**
+ * Job: meeting.start — ask Vexa to send a bot, or reserve a Signal seat. One live start chain
+ * per meeting: the job claims the lease before anything else (a Signal seat wait re-enqueues
+ * itself under this token, so every hop — including a heartbeat wakeup — shares the attempt
+ * counter and the join-timeout bound fires once). A wakeup that cannot claim exits; an orphaned
+ * lease expires and reconciliation starts a fresh chain.
+ */
+export async function handleMeetingStart(ctx: AppContext, meetingId: string, attempt = 1, startToken?: string): Promise<void> {
+  const token = startToken ?? crypto.randomUUID();
+  if (!(await ctx.queue.claimStartLease(meetingId, token, chainLeaseTtlMs(ctx)))) return;
+  let chainAlive = false;
+  const continueStart = async (delayMs: number, nextAttempt: number) => {
+    // Re-verify and extend ownership to cover the delay plus the next job's own TTL before the
+    // push lands; a lost lease (or Redis outage) ends this chain and reconciliation re-arms it.
+    if (await ctx.queue.renewStartLease(meetingId, token, delayMs + chainLeaseTtlMs(ctx))) {
+      const job: Job = { type: "meeting.start", meetingId, attempt: nextAttempt, startToken: token };
+      await ctx.queue.push(job, delayMs);
+      // Re-verify after the push; failure means the lease was already lost and the just-pushed
+      // hop must not survive as a zombie chain.
+      if (await ctx.queue.renewStartLease(meetingId, token, delayMs + chainLeaseTtlMs(ctx))) {
+        chainAlive = true;
+        return;
+      }
+      await ctx.queue.removeDelayed(job).catch(() => {});
     }
-  } catch (e) {
-    await handleStartError(ctx, meeting, e, attempt);
+    ctx.log.warn("start chain lost its lease; not re-enqueueing", { meetingId, stage: "start", code: "lease_lost" });
+  };
+  // Renewal while the job works keeps the lease alive through provider stalls longer than the
+  // TTL (a Vexa createBot or Signal dispatch may take up to the request timeout). A failed beat
+  // only means Redis or ownership is gone; continueStart's own renewal is the authoritative gate.
+  const renewal = setInterval(() => {
+    ctx.queue.renewStartLease(meetingId, token, chainLeaseTtlMs(ctx)).catch(() => {});
+  }, Math.max(10, Math.floor(chainLeaseTtlMs(ctx) / 3)));
+  try {
+    const meeting = await getMeetingById(ctx, meetingId);
+    if (!meeting || meeting.status !== "queued") return;
+    if (meeting.platform === "signal") return await handleSignalStart(ctx, meeting, attempt, continueStart);
+    const vexaPlatform = toVexaPlatform(meeting.platform as Exclude<Platform, "signal">);
+    try {
+      const created = await ctx.vexa.createBot({
+        platform: vexaPlatform,
+        native_meeting_id: meeting.vexaNativeMeetingId,
+        meeting_url: meeting.meetingUrl,
+        bot_name: meeting.botName ?? undefined,
+        language: meeting.language ?? undefined,
+        // Keep the established Vexa contract untouched unless the new producer was explicitly
+        // selected.  A disabled flag is a compatibility boundary, not a partial rollout.
+        ...(usesAttributedCapture(ctx, meeting)
+          ? { transcribe_enabled: false, recording_enabled: true, attributed_audio_enabled: true }
+          : { transcribe_enabled: true, ...(ctx.transcriptRecovery ? { recording_enabled: true } : {}) }),
+        // Vexa otherwise applies its ten-minute deployment fallback. Pin every TinyCloud meeting to
+        // our configurable audio-silence window. This can expire with humans still connected;
+        // participant presence does not veto Vexa's silence verdict.
+        automatic_leave: { max_time_left_alone: ctx.config.vexa.maxTimeLeftAloneMs },
+      });
+      // Prefer our already-validated, request-derived identity. A provider-derived replacement is
+      // retained only when it is a narrow opaque identifier, never arbitrary returned text/URLs.
+      const vexaNativeMeetingId = created.native_meeting_id === meeting.vexaNativeMeetingId
+        ? meeting.vexaNativeMeetingId
+        : safeProviderNativeId(created.native_meeting_id) ?? meeting.vexaNativeMeetingId;
+      // Attributed audio is addressed by Vexa's numeric row id.  Do not put an untrusted provider
+      // handle in SQL and never fall back to a value which can later enter an API/webhook payload.
+      const vexaMeetingId = usesAttributedCapture(ctx, meeting) ? safeVexaMeetingId(created.id) : undefined;
+      if (usesAttributedCapture(ctx, meeting) && !vexaMeetingId) throw new ApiError("provider_unavailable", "Capture provider returned an invalid meeting identity.");
+      const dispatched = await recordCapture(ctx, meeting, {
+        silence_timeout_ms: ctx.config.vexa.maxTimeLeftAloneMs,
+        live_transcription_requested: !usesAttributedCapture(ctx, meeting),
+      });
+      const { meeting: updated, changed } = await transition(ctx, dispatched, "joining", {
+        // Platform is request-derived and allowlisted. A provider response must not replace it.
+        vexaPlatform,
+        vexaNativeMeetingId,
+        ...(vexaMeetingId ? { vexaMeetingId } : {}),
+        ...(safeVexaBotId(created.bot_container_id) ? { vexaBotId: safeVexaBotId(created.bot_container_id) } : {}),
+      });
+      if (changed) {
+        ctx.log.info("bot dispatched", { meetingId, stage: "dispatch_admitted" });
+        await startPollChain(ctx, meetingId, ctx.config.vexa.pollIntervalMs);
+        // Worker-side join deadline: Vexa's own awaiting_admission timeout is opaque; without this a
+        // never-admitted bot leaves the meeting in joining/waiting_for_admission forever.
+        await ctx.queue.push({ type: "meeting.join_deadline", meetingId }, ctx.config.joinTimeoutSeconds * 1000);
+      } else if (updated.status === "cancelled" && vexaNativeMeetingId) {
+        // Stopped while we were dispatching the bot: don't leave it orphaned in Vexa.
+        await ctx.vexa.stopBot(vexaPlatform, vexaNativeMeetingId).catch(() => {});
+      }
+    } catch (e) {
+      await handleStartError(ctx, meeting, e, attempt, continueStart);
+    }
+  } finally {
+    clearInterval(renewal);
+    // No continuation was enqueued: free the lease so heartbeat reconciliation can start a fresh
+    // chain on the next heartbeat instead of waiting out the TTL.
+    if (!chainAlive) await ctx.queue.releaseStartLease(meetingId, token).catch(() => {});
   }
 }
 
-async function handleStartError(ctx: AppContext, meeting: MeetingRow, e: unknown, attempt: number) {
+type ContinueStart = (delayMs: number, nextAttempt: number) => Promise<void>;
+
+async function handleStartError(ctx: AppContext, meeting: MeetingRow, e: unknown, attempt: number, continueStart: ContinueStart) {
   const retryable = e instanceof ApiError && (e.code === "provider_unavailable" || e.code === "provider_timeout");
   const vexa5xx = e instanceof VexaHttpError && e.status >= 500;
   if ((retryable || vexa5xx) && attempt < MAX_START_ATTEMPTS) {
     ctx.log.warn("vexa createBot failed, retrying", { meetingId: meeting.id, attempt, stage: "create", code: e instanceof ApiError ? e.code : "provider_error" });
-    await ctx.queue.push({ type: "meeting.start", meetingId: meeting.id, attempt: attempt + 1 }, 1_000 * attempt);
-    return;
+    await continueStart(1_000 * attempt, attempt + 1);
   }
   ctx.log.error("vexa createBot failed", { meetingId: meeting.id, stage: "create", code: e instanceof ApiError ? e.code : "provider_error" });
   const code = e instanceof ApiError ? e.code : e instanceof VexaHttpError && e.status === 409 ? "meeting_join_failed" : "provider_unavailable";
@@ -166,18 +207,18 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
   // chain job that finds the meeting gone or finished still frees the lease it carried so a
   // recover/stop wakeup inside the TTL window is not swallowed as a duplicate of a dead chain.
   const token = pollToken ?? crypto.randomUUID();
-  if (!(await ctx.queue.claimPollLease(meetingId, token, pollLeaseTtlMs(ctx)))) return;
+  if (!(await ctx.queue.claimPollLease(meetingId, token, chainLeaseTtlMs(ctx)))) return;
   let chainAlive = false;
   const continuePoll = async (delayMs: number, attempt = recoveryAttempt, nextStagingAttempt = stagingAttempt) => {
     // Re-verify and extend ownership to cover the delay plus the next job's own TTL before the
     // push lands. If the lease was lost (or Redis is down), letting this hop fail is cheaper than
     // spawning a chain that cannot renew: the job exits chainless and reconciliation re-arms it.
-    if (await ctx.queue.renewPollLease(meetingId, token, delayMs + pollLeaseTtlMs(ctx))) {
+    if (await ctx.queue.renewPollLease(meetingId, token, delayMs + chainLeaseTtlMs(ctx))) {
       const job: Job = { type: "meeting.poll", meetingId, recoveryAttempt: attempt, ...(nextStagingAttempt ? { stagingAttempt: nextStagingAttempt } : {}), pollToken: token };
       await ctx.queue.push(job, delayMs);
       // Re-verify after the push; a wakeup cannot claim a live lease, so failure here means the
       // lease was already lost and the just-pushed hop must not survive as a zombie chain.
-      if (await ctx.queue.renewPollLease(meetingId, token, delayMs + pollLeaseTtlMs(ctx))) {
+      if (await ctx.queue.renewPollLease(meetingId, token, delayMs + chainLeaseTtlMs(ctx))) {
         chainAlive = true;
         return;
       }
@@ -189,8 +230,8 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
   // (Vexa calls may take up to the request timeout) and through queue backpressure. A failed beat
   // only means Redis or ownership is gone; continuePoll's own renewal is the authoritative gate.
   const renewal = setInterval(() => {
-    ctx.queue.renewPollLease(meetingId, token, pollLeaseTtlMs(ctx)).catch(() => {});
-  }, Math.max(10, Math.floor(pollLeaseTtlMs(ctx) / 3)));
+    ctx.queue.renewPollLease(meetingId, token, chainLeaseTtlMs(ctx)).catch(() => {});
+  }, Math.max(10, Math.floor(chainLeaseTtlMs(ctx) / 3)));
   try {
     const meeting = await getMeetingById(ctx, meetingId);
     if (!meeting || isTerminal(meeting.status as MeetingStatus)) return;
@@ -358,13 +399,13 @@ async function recoverFromRecording(ctx: AppContext, meeting: MeetingRow, vexa: 
   await finalize(ctx, meeting, vexa, segments, true, recoveryAttempt, continuePoll, true);
 }
 
-async function handleSignalStart(ctx: AppContext, meeting: MeetingRow, attempt: number) {
+async function handleSignalStart(ctx: AppContext, meeting: MeetingRow, attempt: number, continueStart: ContinueStart) {
   try {
     if (!meeting.signalCapability) throw new ApiError("capture_failed", "Signal call capability is unavailable.");
     const capability = meeting.signalCapability;
     const reserved = await reserveSignalSeat(ctx, meeting.id);
     // A full rig is a queue, not a failure: wait for a seat until the join deadline would elapse.
-    if (!reserved) return await requeueForSignalSeat(ctx, meeting, attempt, "capacity");
+    if (!reserved) return await requeueForSignalSeat(ctx, meeting, attempt, "capacity", continueStart);
     meeting = reserved;
     // Reconstruct at the last possible boundary; never emit this URL in a log or persisted field.
     const callUrl = `${meeting.meetingUrl}#${openSignalCapability(capability, ctx.config.signal.capabilityKey)}`;
@@ -375,7 +416,7 @@ async function handleSignalStart(ctx: AppContext, meeting: MeetingRow, attempt: 
       // The worker is the authority on its own seats and provisioning. When it says "busy" or "not
       // ready", give the PTX seat back rather than holding it against a capture that never started.
       if (error instanceof ApiError && (error.code === "provider_unavailable" || error.code === "provider_timeout") && (await releaseSignalSeat(ctx, meeting.id))) {
-        return await requeueForSignalSeat(ctx, meeting, attempt, error.code);
+        return await requeueForSignalSeat(ctx, meeting, attempt, error.code, continueStart);
       }
       throw error;
     }
@@ -400,11 +441,11 @@ async function handleSignalStart(ctx: AppContext, meeting: MeetingRow, attempt: 
  * exceed JOIN_TIMEOUT_SECONDS, at which point the meeting fails as provider_unavailable — the same
  * deadline a dispatched meeting gets for admission.
  */
-async function requeueForSignalSeat(ctx: AppContext, meeting: MeetingRow, attempt: number, reason: string) {
+async function requeueForSignalSeat(ctx: AppContext, meeting: MeetingRow, attempt: number, reason: string, continueStart: ContinueStart) {
   const delayMs = Math.max(ctx.config.vexa.pollIntervalMs, 1_000);
   if (attempt * delayMs < ctx.config.joinTimeoutSeconds * 1000) {
     ctx.log.info("waiting for a signal capture seat", { meetingId: meeting.id, attempt, reason });
-    await ctx.queue.push({ type: "meeting.start", meetingId: meeting.id, attempt: attempt + 1 }, delayMs);
+    await continueStart(delayMs, attempt + 1);
     return;
   }
   const fresh = (await getMeetingById(ctx, meeting.id)) ?? meeting;

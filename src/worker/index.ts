@@ -12,7 +12,7 @@ export type JobOutcome = "processed" | "noop" | "deferred";
 export async function processJob(ctx: AppContext, job: Job): Promise<JobOutcome> {
   switch (job.type) {
     case "meeting.start":
-      await handleMeetingStart(ctx, job.meetingId, job.attempt ?? 1); return "processed";
+      await handleMeetingStart(ctx, job.meetingId, job.attempt ?? 1, job.startToken); return "processed";
     case "meeting.poll":
       await handleMeetingPoll(ctx, job.meetingId, job.recoveryAttempt ?? 1, job.pollToken, job.stagingAttempt ?? 0); return "processed";
     case "meeting.join_deadline":
@@ -63,6 +63,10 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number; hea
     for (const meeting of rows) {
       if (owned.has(meeting.id)) continue;
       if (meeting.status === "queued") {
+        // A live start lease means a meeting.start chain (e.g. a Signal seat wait) already
+        // re-enqueues itself; pushing another start would fork a new chain every heartbeat and
+        // restart its attempt counter, so the join timeout would never bound the total (TC-570).
+        if (await ctx.queue.hasStartLease(meeting.id).catch(() => false)) continue;
         await ctx.queue.push({ type: "meeting.start", meetingId: meeting.id }).catch(() => {});
         continue;
       }

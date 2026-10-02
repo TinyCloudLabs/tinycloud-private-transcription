@@ -1,7 +1,7 @@
 import { RedisClient } from "bun";
 
 export type Job =
-  | { type: "meeting.start"; meetingId: string; attempt?: number }
+  | { type: "meeting.start"; meetingId: string; attempt?: number; startToken?: string }
   | { type: "meeting.poll"; meetingId: string; recoveryAttempt?: number; stagingAttempt?: number; pollToken?: string }
   | { type: "meeting.join_deadline"; meetingId: string }
   | { type: "attributed.batch"; meetingId: string; batchId: string }
@@ -15,6 +15,7 @@ export type Job =
 export class Queue {
   private readonly ready: string;
   private readonly delayed: string;
+  private readonly startLease: (meetingId: string) => string;
   private readonly pollLease: (meetingId: string) => string;
 
   constructor(
@@ -24,6 +25,7 @@ export class Queue {
     this.ready = `${prefix}:jobs:ready`;
     this.delayed = `${prefix}:jobs:delayed`;
     this.pollLease = (meetingId) => `${prefix}:poll:${meetingId}`;
+    this.startLease = (meetingId) => `${prefix}:start:${meetingId}`;
   }
 
   async push(job: Job, delayMs = 0, dedupKey?: string): Promise<void> {
@@ -83,6 +85,71 @@ export class Queue {
     await this.redis.del(this.ready, this.delayed);
   }
 
+  /** Claims the lease when absent, or refreshes it while this chain still holds it. */
+  private async claimLease(key: string, token: string, ttlMs: number): Promise<boolean> {
+    return (await this.redis.send("EVAL", [
+      `if redis.call("exists", KEYS[1]) == 0 then return redis.call("set", KEYS[1], ARGV[1], "PX", ARGV[2]) and 1 or 0 end
+       if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("set", KEYS[1], ARGV[1], "PX", ARGV[2]) and 1 or 0 end
+       return 0`,
+      "1",
+      key,
+      token,
+      String(Math.max(1, Math.floor(ttlMs))),
+    ])) === 1;
+  }
+
+  /**
+   * Refreshes the lease only while this chain holds it. Unlike a claim it never creates an
+   * absent key: a chain that lost ownership (TTL expiry while a long job ran, or a competing chain
+   * claimed first) gets false and must stop instead of silently taking the lease back.
+   */
+  private async renewLease(key: string, token: string, ttlMs: number): Promise<boolean> {
+    return (await this.redis.send("EVAL", [
+      `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("set", KEYS[1], ARGV[1], "PX", ARGV[2], "XX") and 1 or 0 end return 0`,
+      "1",
+      key,
+      token,
+      String(Math.max(1, Math.floor(ttlMs))),
+    ])) === 1;
+  }
+
+  /** Deletes the lease only while this chain still holds it. */
+  private async releaseLease(key: string, token: string): Promise<void> {
+    await this.redis.send("EVAL", [
+      `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) end return 0`,
+      "1",
+      key,
+      token,
+    ]);
+  }
+
+  /**
+   * Per-meeting start lease. Exactly one meeting.start chain may be live: a wakeup with no token
+   * claims only when no lease exists, a chain's own delayed continuation refreshes the lease it
+   * holds, and anything else (a heartbeat push that raced the chain) exits without re-enqueueing.
+   * While a Signal meeting waits for a capture seat the chain re-enqueues itself, so a heartbeat
+   * that pushed unconditionally would fork a new chain every interval (TC-570). An orphaned lease
+   * expires on its own and lets reconciliation start a fresh chain.
+   */
+  async claimStartLease(meetingId: string, token: string, ttlMs: number): Promise<boolean> {
+    return this.claimLease(this.startLease(meetingId), token, ttlMs);
+  }
+
+  /** Refreshes the lease only while this start chain holds it. */
+  async renewStartLease(meetingId: string, token: string, ttlMs: number): Promise<boolean> {
+    return this.renewLease(this.startLease(meetingId), token, ttlMs);
+  }
+
+  /** Deletes the start lease only while this chain still holds it. */
+  async releaseStartLease(meetingId: string, token: string): Promise<void> {
+    return this.releaseLease(this.startLease(meetingId), token);
+  }
+
+  /** True while some meeting.start chain owns the lease, live or orphaned. */
+  async hasStartLease(meetingId: string): Promise<boolean> {
+    return this.redis.exists(this.startLease(meetingId));
+  }
+
   /**
    * Per-meeting poll lease. Exactly one meeting.poll chain may be live: a wakeup with no token
    * claims only when no lease exists, a chain's own delayed continuation refreshes the lease it
@@ -91,40 +158,17 @@ export class Queue {
    * or dropped job lets reconciliation start a fresh chain once the lease expires.
    */
   async claimPollLease(meetingId: string, token: string, ttlMs: number): Promise<boolean> {
-    return (await this.redis.send("EVAL", [
-      `if redis.call("exists", KEYS[1]) == 0 then return redis.call("set", KEYS[1], ARGV[1], "PX", ARGV[2]) and 1 or 0 end
-       if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("set", KEYS[1], ARGV[1], "PX", ARGV[2]) and 1 or 0 end
-       return 0`,
-      "1",
-      this.pollLease(meetingId),
-      token,
-      String(Math.max(1, Math.floor(ttlMs))),
-    ])) === 1;
+    return this.claimLease(this.pollLease(meetingId), token, ttlMs);
   }
 
-  /**
-   * Refreshes the lease only while this chain holds it. Unlike claimPollLease it never creates an
-   * absent key: a chain that lost ownership (TTL expiry while a long job ran, or a competing chain
-   * claimed first) gets false and must stop instead of silently taking the lease back.
-   */
+  /** Refreshes the lease only while this poll chain holds it. */
   async renewPollLease(meetingId: string, token: string, ttlMs: number): Promise<boolean> {
-    return (await this.redis.send("EVAL", [
-      `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("set", KEYS[1], ARGV[1], "PX", ARGV[2], "XX") and 1 or 0 end return 0`,
-      "1",
-      this.pollLease(meetingId),
-      token,
-      String(Math.max(1, Math.floor(ttlMs))),
-    ])) === 1;
+    return this.renewLease(this.pollLease(meetingId), token, ttlMs);
   }
 
-  /** Deletes the lease only while this chain still holds it. */
+  /** Deletes the poll lease only while this chain still holds it. */
   async releasePollLease(meetingId: string, token: string): Promise<void> {
-    await this.redis.send("EVAL", [
-      `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) end return 0`,
-      "1",
-      this.pollLease(meetingId),
-      token,
-    ]);
+    return this.releaseLease(this.pollLease(meetingId), token);
   }
 
   /** True while some meeting.poll chain owns the lease, live or orphaned. */
