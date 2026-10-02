@@ -18,7 +18,7 @@ export async function processJob(ctx: AppContext, job: Job): Promise<JobOutcome>
     case "meeting.join_deadline":
       await handleJoinDeadline(ctx, job.meetingId); return "processed";
     case "attributed.batch":
-      return processAttributedBatch(ctx, job.meetingId, job.batchId, job.fetchAttempt ?? 0);
+      return processAttributedBatch(ctx, job.meetingId, job.batchId);
     case "attributed.finalize":
       return (await finalizeAttributedRun(ctx, job.meetingId)) ? "processed" : "noop";
     case "webhook.deliver":

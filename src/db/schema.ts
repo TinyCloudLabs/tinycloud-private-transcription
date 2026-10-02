@@ -100,7 +100,7 @@ export const attributedBatches = pgTable("attributed_batches", {
   batchJson: jsonb("batch_json").notNull(),
   status: text("status").notNull().default("pending"), // pending | claimed | completed | silence | unresolved | failed | ambiguous
   attempts: integer("attempts").notNull().default(0),
-  /** Range-fetch attempts are durable so finalize/reconcile requeues cannot reset the bound (TC-576). */
+  /** Failed range fetches only; durable so finalize/reconcile requeues cannot reset the bound (TC-576). */
   fetchAttempts: integer("fetch_attempts").notNull().default(0),
   claimToken: text("claim_token"),
   /** Present only while this batch has been durably admitted to an external Tinfoil request. */

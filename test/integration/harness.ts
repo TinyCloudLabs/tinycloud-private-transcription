@@ -66,7 +66,9 @@ export async function startHarness(
     ...(opts.attributedTranscriptionEnabled !== undefined ? { attributedTranscriptionEnabled: opts.attributedTranscriptionEnabled } : {}),
   };
   const db = await runMigrations(config.databaseUrl);
-  await db.execute(sql`truncate table webhook_deliveries, transcripts, meetings, api_keys, projects cascade`);
+  // attributed_worker_readiness is included: a prior harness's stopped worker row stays "live"
+  // for the 15s staleness window and would fail this harness's readiness checks.
+  await db.execute(sql`truncate table webhook_deliveries, transcripts, meetings, api_keys, projects, attributed_worker_readiness cascade`);
   const redis = new RedisClient(config.redisUrl);
   const queue = new Queue(redis, `test:${crypto.randomUUID()}`);
   const ctx = createContext({

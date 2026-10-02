@@ -138,9 +138,7 @@ export async function stageAttributedManifest(ctx: AppContext, meetingId: string
 
 async function claimBatch(ctx: AppContext, batchId: string) {
   const token = crypto.randomUUID();
-  // The fetch counter is incremented under the claim itself so a finalize or reconcile wakeup
-  // that requeues this pending batch cannot reset the durable bound (TC-576).
-  const [batch] = await ctx.db.update(batchesTable).set({ status: "claimed", claimToken: token, claimedAt: new Date(), fetchAttempts: sql`${batchesTable.fetchAttempts} + 1`, updatedAt: new Date() })
+  const [batch] = await ctx.db.update(batchesTable).set({ status: "claimed", claimToken: token, claimedAt: new Date(), updatedAt: new Date() })
     .where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "pending"), sql`${batchesTable.attempts} < ${ATTEMPT_LIMIT}`)).returning();
   return batch ? { batch, token } : null;
 }
@@ -209,9 +207,22 @@ async function releaseBatchClaim(ctx: AppContext, batchId: string, token: string
   return !!released;
 }
 
+/**
+ * Releases the claim and counts one failed range fetch in a single guarded update, so finalize and
+ * reconcile wakeups that requeue this pending batch cannot reset the durable retry bound (TC-576).
+ * Returns the requeued row while failures remain under MAX_FETCH_ATTEMPTS; undefined means the
+ * bound is spent (or the claim was lost) and the caller must settle instead of retrying.
+ */
+async function releaseFailedFetch(ctx: AppContext, batchId: string, token: string) {
+  const [released] = await ctx.db.update(batchesTable).set({ status: "pending", claimToken: null, claimedAt: null, fetchAttempts: sql`${batchesTable.fetchAttempts} + 1`, updatedAt: new Date() })
+    .where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "claimed"), eq(batchesTable.claimToken, token),
+      sql`${batchesTable.dispatchToken} is null`, sql`${batchesTable.fetchAttempts} < ${MAX_FETCH_ATTEMPTS}`)).returning();
+  return released;
+}
+
 export type AttributedJobOutcome = "processed" | "noop" | "deferred";
 
-export async function processAttributedBatch(ctx: AppContext, meetingId: string, batchId: string, fetchAttempt = 0): Promise<AttributedJobOutcome> {
+export async function processAttributedBatch(ctx: AppContext, meetingId: string, batchId: string): Promise<AttributedJobOutcome> {
   const [stored] = await ctx.db.select().from(batchesTable).where(and(eq(batchesTable.id, batchId), eq(batchesTable.meetingId, meetingId)));
   if (!stored || stored.status !== "pending") return "noop";
   // Readiness is checked before any claim, fetch, or attempt; an operator can configure Tinfoil later.
@@ -226,14 +237,12 @@ export async function processAttributedBatch(ctx: AppContext, meetingId: string,
     let prepared;
     try { prepared = await readAttributedBatch(spec, async (range) => (await ctx.vexa.fetchBytes(range.path!)).bytes); }
     catch {
-      // A fetch/checksum failure happens before any paid call; bounded requeue is safe (L3). The
-      // bound is the durable per-batch counter (each claim counted one started fetch), floored by
-      // the queue payload so a stale in-flight job cannot restart the budget.
-      const fetchAttempts = Math.max(fetchAttempt, claimed.batch.fetchAttempts);
-      if (fetchAttempts <= MAX_FETCH_ATTEMPTS && await releaseBatchClaim(ctx, batchId, claimed.token)) {
-        await ctx.queue.push({ type: "attributed.batch", meetingId, batchId, fetchAttempt: fetchAttempts + 1 }, ctx.config.vexa.pollIntervalMs);
-        // No finalize wakeup here: finalize would see the batch pending and requeue it, which the
-        // durable counter bounds but is still needless churn.
+      // A fetch/checksum failure happens before any paid call; bounded requeue is safe (L3). Only
+      // the failed fetch spends the durable retry budget — capacity deferrals and other non-failure
+      // requeues release through releaseBatchClaim and never count (TC-576). No finalize wakeup:
+      // it would just requeue the already-pending batch, which the durable counter bounds anyway.
+      if (await releaseFailedFetch(ctx, batchId, claimed.token)) {
+        await ctx.queue.push({ type: "attributed.batch", meetingId, batchId }, ctx.config.vexa.pollIntervalMs);
         return "deferred";
       }
       await settle(ctx, batchId, claimed.token, "failed", meetingId, spec); return done("processed");
@@ -244,8 +253,11 @@ export async function processAttributedBatch(ctx: AppContext, meetingId: string,
     await recordAttributedWorkerReadiness(ctx, ctx.attributedWorkerHealthy, "heartbeat");
     const eligibility = await admitTinfoilDispatch(ctx, meetingId, batchId, claimed.token);
     if (eligibility.kind === "capacity") {
+      // Requeue only the delayed batch job. An immediate finalize wakeup here re-pushed the
+      // pending batch with no delay, re-fetching retained audio hundreds of times a second
+      // while the batch simply waited on dispatch capacity (TC-576).
       if (await releaseBatchClaim(ctx, batchId, claimed.token)) await ctx.queue.push({ type: "attributed.batch", meetingId, batchId }, ctx.config.vexa.pollIntervalMs);
-      return done("deferred");
+      return "deferred";
     }
     if (eligibility.kind === "ineligible") {
       // The durable owner went terminal while this job was queued/fetching.  Preserve the
@@ -309,7 +321,9 @@ export async function finalizeAttributedRun(ctx: AppContext, meetingId: string):
   }
   const pending = rows.filter((row) => row.status === "pending");
   if (pending.length) {
-    for (const row of pending) await ctx.queue.push({ type: "attributed.batch", meetingId, batchId: row.id }).catch(() => {});
+    // Delayed like the batch's own requeues: an immediate push re-fetches retained audio in a
+    // tight loop while the batch is merely waiting on dispatch capacity (TC-576).
+    for (const row of pending) await ctx.queue.push({ type: "attributed.batch", meetingId, batchId: row.id }, ctx.config.vexa.pollIntervalMs).catch(() => {});
     return false;
   }
   const meeting = await getMeetingById(ctx, meetingId);

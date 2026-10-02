@@ -323,6 +323,8 @@ test("0017+ migrations are additive: every pre-existing column, row and meeting 
     await before.execute(sql`INSERT INTO projects (id, name, webhook_secret) VALUES ('demo', 'demo', 'whsec_legacy')`);
     await before.execute(sql`INSERT INTO api_keys (id, project_id, key_hash, scopes) VALUES ('key_cli', 'demo', ${hashApiKey(key)}, ARRAY['meetings:*'])`);
     await before.execute(sql`INSERT INTO meetings (id, project_id, meeting_url, platform, status) VALUES ('mtg_upgrade', 'demo', 'https://meet.jit.si/x', 'jitsi', 'processing')`);
+    // A pending attributed batch row from before 0019 must survive the additive column untouched.
+    await before.execute(sql`INSERT INTO attributed_batches (id, meeting_id, ordinal, batch_json) VALUES ('mtg_upgrade:batch:0', 'mtg_upgrade', 0, '{"ranges":[]}'::jsonb)`);
     const schemaBefore = await columns(before);
     const rowsBefore = await before.execute(sql`SELECT * FROM meetings`);
     await before.$client.close();
@@ -336,6 +338,8 @@ test("0017+ migrations are additive: every pre-existing column, row and meeting 
       .filter((c) => columnsBefore.has(`${c.table_name}.${c.column_name}`));
     expect(schemaAfter).toEqual(schemaBefore as never);
     expect(await db.execute(sql`SELECT * FROM meetings`)).toEqual(rowsBefore);
+    expect(await db.execute(sql`SELECT id, status, attempts, fetch_attempts FROM attributed_batches`))
+      .toEqual([{ id: "mtg_upgrade:batch:0", status: "pending", attempts: 0, fetch_attempts: 0 }]);
     // 0017 and 0018 applied in one run: the singleton is seeded and closed (the meeting role never reads it).
     expect(await db.execute(sql`SELECT id, mode FROM transcription_admission`)).toEqual([{ id: 1, mode: "closed" }]);
     expect(await db.execute(sql`SELECT id, attempt_id FROM provider_dispatch_slots`)).toEqual([{ id: 1, attempt_id: null }]);

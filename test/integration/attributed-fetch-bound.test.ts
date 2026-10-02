@@ -2,7 +2,7 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
-import { attributedBatches, attributedTranscriptionRuns, meetings } from "../../src/db/schema.ts";
+import { attributedBatches, attributedTranscriptionRuns, meetings, tinfoilDispatchSlots } from "../../src/db/schema.ts";
 import { finalizeAttributedRun, reconcileAttributedRuns } from "../../src/services/attributed-transcription.ts";
 import { startHarness, type Harness } from "./harness.ts";
 
@@ -21,6 +21,14 @@ beforeAll(async () => {
 });
 afterAll(async () => h.stop());
 
+const rangeSpec = (vexaMeetingId: number, path: string) => ({
+  version: 1, meeting_id: String(vexaMeetingId), sequence: 0, idempotency_key: "r0",
+  speaker_key: "alice", speaker_name: "Alice",
+  attribution: { source: "glow-bound", confidence: .9 }, clock_origin_ms: 0, start_ms: 0, end_ms: 1000,
+  audio_duration_ms: 1000, channel: 0, turn_generation: 1, codec: "pcm_f32le", sample_rate: 16000,
+  channels: 1, byte_count: pcm.byteLength, sha256, state: "uploaded", path,
+});
+
 // MAX_FETCH_ATTEMPTS is 3: a permanently missing range may be fetched 4 times total. The bound
 // lives on the batch row, so finalize/reconcile requeues (which carry no fetch counter) must not
 // extend it (TC-576).
@@ -34,11 +42,7 @@ test("a permanently missing range is fetched at most MAX_FETCH_ATTEMPTS + 1 time
   await h.vexa.control("google_meet", native, {
     status: "completed", completion_reason: "stopped",
     attributed_audio_capability: { requested_version: 1, supported_version: 1, status: "supported" },
-    attributed_audio_manifest: { version: 1, meeting_id: String(bot.id), state: "closed", clock_origin: "first_admitted_capture_epoch_ms", clock_origin_ms: 0, ranges: [
-      { version: 1, meeting_id: String(bot.id), sequence: 0, idempotency_key: "r0", speaker_key: "alice", speaker_name: "Alice",
-        attribution: { source: "glow-bound", confidence: .9 }, clock_origin_ms: 0, start_ms: 0, end_ms: 1000, audio_duration_ms: 1000,
-        channel: 0, turn_generation: 1, codec: "pcm_f32le", sample_rate: 16000, channels: 1, byte_count: pcm.byteLength, sha256, state: "uploaded", path },
-    ] },
+    attributed_audio_manifest: { version: 1, meeting_id: String(bot.id), state: "closed", clock_origin: "first_admitted_capture_epoch_ms", clock_origin_ms: 0, ranges: [rangeSpec(bot.id, path)] },
     // No attributed_audio_base64: every range fetch 404s.
   });
   // While retries run, hammer the wakeup paths that used to reset the counter: a direct finalize
@@ -71,7 +75,60 @@ test("a permanently missing range is fetched at most MAX_FETCH_ATTEMPTS + 1 time
   await reconcileAttributedRuns(h.ctx);
   await h.waitFor(async () => (await h.ctx.queue.pending()).delayed.length === 0 || null, { timeoutMs: 10_000 }).catch(() => {});
   expect(h.vexa.requests.filter((request) => request.path === path).length).toBe(4);
-});
+}, 60_000);
+
+// Only failed range fetches spend the durable retry budget: a batch deferred on dispatch capacity
+// must still retry after a later transient 404, and waiting on capacity must not re-fetch retained
+// audio in a tight loop (TC-576).
+test("capacity deferrals do not spend the fetch budget and requeue at the poll interval", async () => {
+  const baselineTinfoilCalls = tinfoilCalls;
+  const created = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://meet.google.com/fetch-bound-2" } });
+  const { id } = await created.json();
+  const native = "fetch-bound-2";
+  const bot = await h.waitFor(async () => h.vexa.meetings.get(`google_meet/${native}`) ?? null, { timeoutMs: 30_000 });
+  const path = `/meetings/${bot.id}/attributed-audio/ranges/0`;
+  // Hold both dispatch slots so every admitted-path hop defers on capacity.
+  await h.ctx.db.update(tinfoilDispatchSlots).set({ claimToken: "held", claimedAt: new Date(), ownerId: "other-worker" });
+  await h.vexa.control("google_meet", native, {
+    status: "completed", completion_reason: "stopped",
+    attributed_audio_capability: { requested_version: 1, supported_version: 1, status: "supported" },
+    attributed_audio_manifest: { version: 1, meeting_id: String(bot.id), state: "closed", clock_origin: "first_admitted_capture_epoch_ms", clock_origin_ms: 0, ranges: [rangeSpec(bot.id, path)] },
+    attributed_audio_base64: { [path]: Buffer.from(pcm).toString("base64") },
+  });
+  const batch = await h.waitFor(async () => {
+    const [row] = await h.ctx.db.select().from(attributedBatches).where(eq(attributedBatches.meetingId, id));
+    return row?.status === "pending" ? row : null;
+  }, { timeoutMs: 30_000, label: "batch deferred on capacity" });
+  // Measure the requeue rate against the wall clock — this test deliberately times real dequeue
+  // cadence, which fake timers cannot drive. ~20 fetches/sec at a 50 ms poll interval vs ~170/sec
+  // when the capacity branch re-pushed through an immediate finalize wakeup.
+  const fetchesAt = () => h.vexa.requests.filter((request) => request.path === path).length;
+  await h.waitFor(async () => fetchesAt() >= 3 || null, { timeoutMs: 30_000, label: "capacity churn live" });
+  const before = fetchesAt();
+  await Bun.sleep(1000);
+  expect(fetchesAt() - before).toBeLessThanOrEqual(40);
+  const [stillPending] = await h.ctx.db.select().from(attributedBatches).where(eq(attributedBatches.id, batch.id));
+  expect(stillPending.status).toBe("pending");
+  expect(stillPending.fetchAttempts).toBe(0);
+  // One transient 404 while still capacity-blocked spends exactly one retry.
+  await h.vexa.control("google_meet", native, { attributed_audio_base64: {} });
+  await h.waitFor(async () => {
+    const [row] = await h.ctx.db.select().from(attributedBatches).where(eq(attributedBatches.id, batch.id));
+    return row && row.fetchAttempts >= 1 ? row : null;
+  }, { timeoutMs: 30_000, label: "transient fetch failure counted once" });
+  // Audio returns and capacity opens: the batch completes on its first paid call.
+  await h.vexa.control("google_meet", native, { attributed_audio_base64: { [path]: Buffer.from(pcm).toString("base64") } });
+  await h.ctx.db.update(tinfoilDispatchSlots).set({ claimToken: null, claimedAt: null, ownerId: null });
+  await h.waitFor(async () => {
+    const body = await (await h.api(`/v1/meetings/${id}`)).json(); return body.status === "completed" ? body : null;
+  }, { timeoutMs: 30_000, label: "meeting completed after capacity cleared" });
+  const [settled] = await h.ctx.db.select().from(attributedBatches).where(eq(attributedBatches.id, batch.id));
+  expect(settled.status).toBe("completed");
+  expect(settled.attempts).toBe(1);
+  expect(settled.fetchAttempts).toBeLessThanOrEqual(3);
+  expect(settled.fetchAttempts).toBeGreaterThanOrEqual(1);
+  expect(tinfoilCalls).toBe(baselineTinfoilCalls + 1);
+}, 60_000);
 
 // reconcileAttributedRuns polls run-less and fallback processing meetings so a lost chain wakeup
 // self-heals — but while a poll lease is live that push is pure queue churn and must be skipped,
@@ -141,4 +198,4 @@ test("attributed reconciliation never pushes a tokenless poll while a lease is l
   await h.waitFor(async () => {
     const body = await (await h.api(`/v1/meetings/${id}`)).json(); return body.status === "failed" ? body : null;
   }, { timeoutMs: 30_000, label: "fallback meeting failed" });
-});
+}, 60_000);
