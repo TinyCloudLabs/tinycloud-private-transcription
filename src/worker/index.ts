@@ -1,6 +1,6 @@
 import { createContext, type AppContext } from "../context.ts";
 import { inArray } from "drizzle-orm";
-import { meetings } from "../db/schema.ts";
+import { attributedTranscriptionRuns, meetings } from "../db/schema.ts";
 import { deliverWebhook, reconcileWebhookDeliveries } from "../webhooks/dispatcher.ts";
 import { handleJoinDeadline, handleMeetingPoll, handleMeetingStart } from "./meeting-job.ts";
 import { finalizeAttributedRun, processAttributedBatch, reconcileAttributedRuns, recordAttributedWorkerReadiness } from "../services/attributed-transcription.ts";
@@ -14,11 +14,11 @@ export async function processJob(ctx: AppContext, job: Job): Promise<JobOutcome>
     case "meeting.start":
       await handleMeetingStart(ctx, job.meetingId, job.attempt ?? 1); return "processed";
     case "meeting.poll":
-      await handleMeetingPoll(ctx, job.meetingId, job.recoveryAttempt ?? 1); return "processed";
+      await handleMeetingPoll(ctx, job.meetingId, job.recoveryAttempt ?? 1, job.pollToken, job.stagingAttempt ?? 0); return "processed";
     case "meeting.join_deadline":
       await handleJoinDeadline(ctx, job.meetingId); return "processed";
     case "attributed.batch":
-      return processAttributedBatch(ctx, job.meetingId, job.batchId);
+      return processAttributedBatch(ctx, job.meetingId, job.batchId, job.fetchAttempt ?? 0);
     case "attributed.finalize":
       return (await finalizeAttributedRun(ctx, job.meetingId)) ? "processed" : "noop";
     case "webhook.deliver":
@@ -44,16 +44,30 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number; hea
 
   // Redis is a wakeup transport, not the work ledger. This repairs lost enqueue acknowledgements
   // for Signal and the feature-off path without relaxing attributed publication's own ledger.
+  // A live poll lease means a meeting.poll chain already re-enqueues itself; pushing another poll
+  // then would start a second perpetual chain (TC-558), so those meetings are skipped. An
+  // orphaned lease expires on its own and the next heartbeat starts a fresh chain.
   const reconcileMeetingWakeups = async () => {
     const rows = await ctx.db.select().from(meetings).where(inArray(meetings.status, [
       "queued", "joining", "waiting_for_admission", "in_progress", "processing",
     ]));
+    // Attributed Google Meet meetings that already own a run are driven by attributed batch/finalize
+    // jobs and reconcileAttributedRuns. One still in staging retries has no run yet and needs this
+    // poll repair like any other meeting, or a lost wakeup would strand it in processing.
+    const attributedProcessing = attributedEnabled
+      ? rows.filter((m) => m.platform === "google_meet" && m.status === "processing").map((m) => m.id) : [];
+    const owned = new Set(attributedProcessing.length
+      ? (await ctx.db.select({ meetingId: attributedTranscriptionRuns.meetingId }).from(attributedTranscriptionRuns)
+        .where(inArray(attributedTranscriptionRuns.meetingId, attributedProcessing))).map((r) => r.meetingId)
+      : []);
     for (const meeting of rows) {
-      if (attributedEnabled && meeting.platform === "google_meet" && meeting.status === "processing") continue;
-      const job = meeting.status === "queued"
-        ? { type: "meeting.start" as const, meetingId: meeting.id }
-        : { type: "meeting.poll" as const, meetingId: meeting.id };
-      await ctx.queue.push(job).catch(() => {});
+      if (owned.has(meeting.id)) continue;
+      if (meeting.status === "queued") {
+        await ctx.queue.push({ type: "meeting.start", meetingId: meeting.id }).catch(() => {});
+        continue;
+      }
+      if (await ctx.queue.hasPollLease(meeting.id).catch(() => false)) continue;
+      await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id }).catch(() => {});
     }
   };
 

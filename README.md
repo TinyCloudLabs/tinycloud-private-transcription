@@ -210,6 +210,8 @@ curl -s -X POST localhost:18056/_mock/meetings/jitsi/TinyCloudDemo -H 'Content-T
 raw body with the project's webhook secret (printed by `create-key`). Retries: immediate, 1m, 5m, 30m, 2h,
 persisted in `webhook_deliveries`. Webhook failure never changes meeting status.
 
+When some captured audio is missing, a speaker is unknown, or the transcript was recovered from the mixed recording, `GET /v1/meetings/{id}` and `meeting.completed` also carry `"transcript_partial": true` (and the transcript body carries `"partial": true`).
+
 ### Errors
 
 `{"error":{"type":"meeting_join_failed","code":"waiting_room_timeout","message":"…"}}`. Codes:
