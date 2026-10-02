@@ -8,12 +8,13 @@ type DbSession = Pick<Db, "update" | "select" | "insert" | "delete" | "execute">
 
 /**
  * Re-admission bound: an admission may be taken over only after its owner's heartbeat is stale
- * by more than the longest possible gap between beats. The owner refreshes admitted_at between
- * chunk waves; a wave is bounded by per-request timeout × retries plus margin (default Tinfoil
- * config ≈ 3 attempts × 120 s ≈ 6 minutes). A heart-beating owner can therefore never be
- * overlapped by a re-admission; only a dead one can.
+ * (no `admitted_at` refresh for `config.recordingRecovery.admissionMs`). The window must exceed
+ * the longest possible gap between beats — one dispatch wave's worst-case duration (bounded by
+ * `TranscriptionProvider.maxRequestWaveMs` ≈ per-request timeout × retries) plus the heartbeat
+ * freshness margin — because a late heartbeat acknowledgement is fenced out before its wave
+ * can be dispatched (TC-574). A heart-beating owner can therefore never be overlapped by a
+ * re-admission; only a dead one can.
  */
-export const RECOVERY_ADMISSION_MS = 10 * 60_000;
 /** A crashed admission permits at most one bounded re-admission (TC-574). */
 export const MAX_RECOVERY_ADMISSIONS = 2;
 
@@ -36,19 +37,22 @@ export type RecoveryAdmission =
  * never repeat the paid request unboundedly.
  */
 export async function admitRecordingRecovery(ctx: AppContext, meetingId: string): Promise<RecoveryAdmission> {
+  const admissionMs = ctx.config.recordingRecovery.admissionMs;
   return ctx.db.transaction(async (tx) => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`recording_recovery:${meetingId}`}))`);
     const [meeting] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
     if (!meeting || meeting.status !== "processing" || meeting.dispatchBlocked) return { kind: "ineligible" };
     const [run] = await tx.select().from(recordingRecoveryRuns).where(eq(recordingRecoveryRuns.meetingId, meetingId)).for("update");
     const token = crypto.randomUUID();
-    const now = new Date();
+    // Staleness is judged on the database clock so workers never disagree about the window.
+    const [clock] = await tx.execute(sql`select now() as now`);
+    const now = new Date((clock as { now: Date }).now);
     if (!run) {
       await tx.insert(recordingRecoveryRuns).values({ meetingId, ownerToken: token, admittedAt: now, admissions: 1 });
       return { kind: "admitted", token };
     }
     if (run.outcome) return { kind: "settled", outcome: run.outcome as RecoveryOutcome };
-    const stale = !run.admittedAt || now.getTime() - run.admittedAt.getTime() > RECOVERY_ADMISSION_MS;
+    const stale = !run.admittedAt || now.getTime() - run.admittedAt.getTime() > admissionMs;
     // A freed slot (released before dispatch, or reset by explicit recovery) is re-granted
     // without spending the bounded takeover budget; the floor keeps a fresh round at 1.
     if (!run.ownerToken) {
@@ -73,12 +77,29 @@ export async function admitRecordingRecovery(ctx: AppContext, meetingId: string)
 }
 
 /**
+ * True while a recovery admission is live for this meeting (owned, unsettled, not yet stale).
+ * Runs inside the same advisory lock as `admitRecordingRecovery` so a poll hop can never race
+ * an uncommitted grant: a hop arriving mid-admission waits for the transaction, then observes
+ * the granted row. Terminal poll-path writes must check this before failing a meeting (TC-574).
+ */
+export async function hasLiveRecordingRecovery(ctx: AppContext, meetingId: string): Promise<boolean> {
+  return ctx.db.transaction(async (tx) => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`recording_recovery:${meetingId}`}))`);
+    const [run] = await tx.select().from(recordingRecoveryRuns).where(eq(recordingRecoveryRuns.meetingId, meetingId));
+    if (!run?.ownerToken || run.outcome || !run.admittedAt) return false;
+    const [clock] = await tx.execute(sql`select now() as now`);
+    const now = new Date((clock as { now: Date }).now);
+    return now.getTime() - run.admittedAt.getTime() <= ctx.config.recordingRecovery.admissionMs;
+  });
+}
+
+/**
  * The owning admission heartbeats its timestamp. False means the fence no longer names this
  * token (settled or re-admitted elsewhere); the caller must stop dispatching paid requests.
  */
 export async function heartbeatRecordingRecovery(ctx: AppContext, meetingId: string, token: string): Promise<boolean> {
   const [beat] = await ctx.db.update(recordingRecoveryRuns)
-    .set({ admittedAt: new Date(), updatedAt: new Date() })
+    .set({ admittedAt: sql`now()`, updatedAt: sql`now()` })
     .where(and(eq(recordingRecoveryRuns.meetingId, meetingId), eq(recordingRecoveryRuns.ownerToken, token), isNull(recordingRecoveryRuns.outcome)))
     .returning();
   return !!beat;
@@ -87,7 +108,7 @@ export async function heartbeatRecordingRecovery(ctx: AppContext, meetingId: str
 /** Frees an admission that never reached the paid call (e.g. the recording was not ready). */
 export async function releaseRecordingRecovery(ctx: AppContext, meetingId: string, token: string): Promise<void> {
   await ctx.db.update(recordingRecoveryRuns)
-    .set({ ownerToken: null, admittedAt: null, updatedAt: new Date() })
+    .set({ ownerToken: null, admittedAt: null, updatedAt: sql`now()` })
     .where(and(eq(recordingRecoveryRuns.meetingId, meetingId), eq(recordingRecoveryRuns.ownerToken, token), isNull(recordingRecoveryRuns.outcome)));
 }
 
@@ -99,7 +120,7 @@ export async function releaseRecordingRecovery(ctx: AppContext, meetingId: strin
  */
 export async function settleRecordingRecovery(ctx: AppContext, meetingId: string, token: string, outcome: "succeeded" | "failed" | "ambiguous"): Promise<void> {
   await ctx.db.update(recordingRecoveryRuns)
-    .set({ outcome, updatedAt: new Date() })
+    .set({ outcome, updatedAt: sql`now()` })
     .where(and(eq(recordingRecoveryRuns.meetingId, meetingId), eq(recordingRecoveryRuns.ownerToken, token), isNull(recordingRecoveryRuns.outcome)));
 }
 
@@ -107,6 +128,6 @@ export async function settleRecordingRecovery(ctx: AppContext, meetingId: string
  *  (unsettled) admission is left untouched so duplicate recover calls cannot reset it. */
 export async function resetRecordingRecovery(db: DbSession, meetingId: string): Promise<void> {
   await db.update(recordingRecoveryRuns)
-    .set({ ownerToken: null, admittedAt: null, admissions: 0, outcome: null, updatedAt: new Date() })
+    .set({ ownerToken: null, admittedAt: null, admissions: 0, outcome: null, updatedAt: sql`now()` })
     .where(and(eq(recordingRecoveryRuns.meetingId, meetingId), isNotNull(recordingRecoveryRuns.outcome)));
 }

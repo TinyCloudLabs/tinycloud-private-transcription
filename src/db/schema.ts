@@ -143,9 +143,9 @@ export const recordingRecoveryRuns = pgTable("recording_recovery_runs", {
   /** Process-unique token owning the current admission; the paid call may leave only under it. */
   ownerToken: text("owner_token"),
   admittedAt: timestamp("admitted_at", { withTimezone: true }),
-  /** Total grants of the paid-call slot; every grant permits at most one provider request. */
+  /** Total grants of the paid-call slot; every grant covers one multi-chunk recovery transcription. */
   admissions: integer("admissions").notNull().default(0),
-  /** Terminal once set: succeeded | ambiguous | exhausted. */
+  /** Terminal once set: succeeded | failed | ambiguous | exhausted. */
   outcome: text("outcome"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

@@ -20,5 +20,13 @@ export interface AudioBlob { bytes: Uint8Array; filename: string; contentType: s
 
 export interface TranscriptionProvider {
   readonly name: string;
+  /**
+   * Worst-case duration of one dispatch wave inside `transcribe` (per-request timeout × retry
+   * budget, serialized waves only). The paid-call fence uses it to bound a heartbeat
+   * acknowledgement's freshness: an ack older than the admission window minus this bound can no
+   * longer guarantee its wave stays inside the owner's admission (TC-574). Providers that send
+   * at most one request per transcribe call may omit it (0).
+   */
+  readonly maxRequestWaveMs?: number;
   transcribe(input: TranscriptionInput): Promise<NormalizedTranscript>;
 }

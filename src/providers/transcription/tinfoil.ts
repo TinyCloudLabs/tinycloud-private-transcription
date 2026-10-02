@@ -46,9 +46,21 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
   calls = 0;
   lastStats: TinfoilStats | null = null;
   private readonly fetchImpl: typeof fetch;
+  /**
+   * Worst case for one dispatch wave: every attempt in the retry budget times out and sleeps its
+   * backoff. Sibling requests share the wall clock (a wave is concurrent), so the bound is the
+   * per-request bound, not a per-chunk sum.
+   */
+  readonly maxRequestWaveMs: number;
 
   constructor(private readonly opts: TinfoilOptions) {
     this.fetchImpl = opts.fetch ?? fetch;
+    const timeout = this.opts.timeoutMs ?? 120_000;
+    const retries = Math.max(0, this.opts.maxRetries ?? 2);
+    const delay = this.opts.retryDelayMs ?? 250;
+    let backoff = 0;
+    for (let attempt = 0; attempt < retries; attempt++) backoff += delay * 4 ** attempt;
+    this.maxRequestWaveMs = (retries + 1) * timeout + backoff;
   }
 
   /** Text-only operation for a Vexa-owned, already-attributed PCM batch. */

@@ -14,7 +14,7 @@ import { attributedTranscriptionRuns, meetings } from "../db/schema.ts";
 import { normalizeSegments } from "../domain/transcript.ts";
 import { openSignalCapability } from "../providers/signal/capability.ts";
 import { AttributedStagingError, markAttributedRecovery, resumeAttributedRun, stageAttributedManifest, type AttributedStageOutcome } from "../services/attributed-transcription.ts";
-import { admitRecordingRecovery, heartbeatRecordingRecovery, releaseRecordingRecovery, settleRecordingRecovery } from "../services/recording-recovery.ts";
+import { admitRecordingRecovery, hasLiveRecordingRecovery, heartbeatRecordingRecovery, releaseRecordingRecovery, settleRecordingRecovery } from "../services/recording-recovery.ts";
 import type { VexaAttributedAudioManifest, VexaTranscriptionResponse } from "../providers/vexa/types.ts";
 import type { TranscriptionInput } from "../providers/transcription/types.ts";
 import type { Job } from "./queue.ts";
@@ -280,12 +280,24 @@ type ContinuePoll = (delayMs: number, attempt?: number, nextStagingAttempt?: num
 async function pollMeeting(ctx: AppContext, meeting: MeetingRow, recoveryAttempt: number, continuePoll: ContinuePoll, stagingAttempt: number, stillOwnsLease: () => Promise<boolean>): Promise<void> {
   if (meeting.platform === "signal") return handleSignalPoll(ctx, meeting, continuePoll);
   if (!meeting.vexaPlatform || !meeting.vexaNativeMeetingId) return;
+  // A live whole-recovery admission means a paid call owns this meeting's outcome right now.
+  // Any terminal write on the early transcript/status path (provider 404s, provider-reported
+  // failures) must defer to it: failing the meeting mid-call would discard an in-flight paid
+  // result and strand the admission as "ambiguous" (TC-574). The check rides the same advisory
+  // lock as the admission grant, so a hop cannot slip between grant and check.
+  const deferForLiveRecovery = async (stage: string, code: string): Promise<boolean> => {
+    if (!(await hasLiveRecordingRecovery(ctx, meeting.id))) return false;
+    ctx.log.warn("live recording recovery admission; deferring terminal write", { meetingId: meeting.id, stage, code });
+    await continuePoll(ctx.config.vexa.pollIntervalMs);
+    return true;
+  };
 
   let vexa;
   try {
     vexa = await ctx.vexa.getTranscript(meeting.vexaPlatform, meeting.vexaNativeMeetingId);
   } catch (e) {
     if (e instanceof VexaHttpError && e.notFound) {
+      if (await deferForLiveRecovery("poll", "provider_not_found")) return;
       meeting = await recordCapture(ctx, meeting, { provider_record_missing_at: new Date().toISOString() });
       ctx.log.warn("capture provider record missing", { meetingId: meeting.id, stage: "poll", code: "provider_not_found" });
       const { meeting: failed } = await failMeeting(ctx, meeting, "capture_failed", "The capture provider lost track of this meeting.");
@@ -312,6 +324,7 @@ async function pollMeeting(ctx: AppContext, meeting: MeetingRow, recoveryAttempt
   );
   if (mapped === "failed" && !failedAfterAdmission) {
     const f = mapVexaFailure(reason);
+    if (await deferForLiveRecovery("poll", f.code)) return;
     const { meeting: failed, changed } = await failMeeting(ctx, meeting, f.code, f.message);
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
     return;
@@ -335,6 +348,7 @@ async function pollMeeting(ctx: AppContext, meeting: MeetingRow, recoveryAttempt
   try {
     segments = adaptVexaSegments(vexa);
   } catch {
+    if (await deferForLiveRecovery("poll", "transcription_failed")) return;
     const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "The capture provider returned an invalid transcript.");
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
     return;
@@ -343,6 +357,7 @@ async function pollMeeting(ctx: AppContext, meeting: MeetingRow, recoveryAttempt
   const recover = !!ctx.transcriptRecovery && isMateriallyIncomplete(vexa, segments);
   if (!hasLiveWords && !recover) {
     const failure = reason ? mapVexaFailure(reason) : { code: "capture_failed" as const, message: "No usable audio was captured for this meeting." };
+    if (await deferForLiveRecovery("poll", failure.code)) return;
     const { meeting: failed, changed } = await failMeeting(ctx, meeting, failure.code, failure.message);
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
     return;
@@ -616,10 +631,21 @@ async function finalize(
         return;
       }
       admission = granted;
+      // Freshness bound (TC-574): an acknowledgement that committed on time but arrived late —
+      // its update landed while a stale re-admission was already possible — must not authorize
+      // the next wave. The owner can only be re-admitted once `admitted_at` has aged past
+      // admissionMs, so a heartbeat round trip is honored only while enough of the window
+      // remains to run one full wave plus margin.
+      const waveBoundMs = ctx.transcriptRecovery?.maxRequestWaveMs ?? 0;
+      const marginMs = Math.min(5_000, Math.floor(ctx.config.recordingRecovery.admissionMs * 0.1));
+      const ackBudgetMs = Math.max(0, ctx.config.recordingRecovery.admissionMs - waveBoundMs - marginMs);
       input.dispatchHeartbeat = async () => {
+        const startedAt = Date.now();
         const alive = await heartbeatRecordingRecovery(ctx, meeting.id, granted.token);
-        if (!alive) admissionAlive = false;
-        return alive;
+        await ctx.recoveryHeartbeatDelay?.(meeting.id);
+        const fresh = Date.now() - startedAt <= ackBudgetMs;
+        if (!alive || !fresh) admissionAlive = false;
+        return alive && fresh;
       };
       // Paid work may only leave under a live lease (TC-574): a zombie chain that lost its
       // token to another worker frees its admission and exits.

@@ -19,29 +19,31 @@ let failNextStatus: number | null = null;
 
 const recordingBase64 = Buffer.from(pcmToWav(new Int16Array(PCM_RATE).fill(2_000), PCM_RATE)).toString("base64");
 
+const paidFetch = (async () => {
+  inflight++;
+  maxInflight = Math.max(maxInflight, inflight);
+  paidCalls++;
+  onFirstCall?.();
+  try {
+    if (gate) await gate.promise;
+    if (failNextStatus) {
+      const status = failNextStatus;
+      failNextStatus = null;
+      return new Response("rejected", { status });
+    }
+    return Response.json({ text: "Recovered remarks.", language: "en", duration: 5 });
+  } finally {
+    inflight--;
+  }
+}) as unknown as typeof fetch;
+
 beforeAll(async () => {
   h = await startHarness({
     transcriptRecovery: new TinfoilTranscriptionProvider({
       baseUrl: "https://tinfoil.test",
       apiKey: "test",
       model: "voxtral-small-24b",
-      fetch: (async () => {
-        inflight++;
-        maxInflight = Math.max(maxInflight, inflight);
-        paidCalls++;
-        onFirstCall?.();
-        try {
-          if (gate) await gate.promise;
-          if (failNextStatus) {
-            const status = failNextStatus;
-            failNextStatus = null;
-            return new Response("rejected", { status });
-          }
-          return Response.json({ text: "Recovered remarks.", language: "en", duration: 5 });
-        } finally {
-          inflight--;
-        }
-      }) as unknown as typeof fetch,
+      fetch: paidFetch,
     }),
     // Shared Redis connections must not idle in a 1 s BRPOP while lease renewals race; see
     // test/integration/poll-lease.test.ts for the same constraint.
@@ -51,10 +53,10 @@ beforeAll(async () => {
 });
 afterAll(() => h.stop());
 
-const waitStatus = (id: string, status: string) => h.waitFor(async () => {
+const waitStatus = (id: string, status: string, timeoutMs = 5_000) => h.waitFor(async () => {
   const body = await (await h.api(`/v1/meetings/${id}`)).json();
   return body.status === status ? body : null;
-});
+}, { timeoutMs, label: `status ${status}` });
 
 const recoveryRun = async (id: string) =>
   (await h.ctx.db.execute(sql`select owner_token, admitted_at, admissions, outcome from recording_recovery_runs where meeting_id = ${id}`))[0] as
@@ -317,4 +319,115 @@ test("recover on a live admission is a no-op wakeup and never resets the round",
     gate = null;
   }
   expect(paidCalls).toBe(1);
+}, 20_000);
+
+test("a delayed heartbeat acknowledgement cannot authorize a wave after takeover", async () => {
+  paidCalls = 0; inflight = 0; maxInflight = 0;
+  gate = Promise.withResolvers<void>();
+  const releaseGate = gate.resolve;
+
+  // Small admission window with a short-wave provider so a delayed ack is reproducible in test
+  // time: admissionMs=800, wave bound=200 (timeout 100 × 1 attempt + 100 backoff), margin=80,
+  // so a heartbeat round trip must resolve within ~520 ms to authorize its wave.
+  const origRecovery = h.ctx.transcriptRecovery;
+  const origAdmission = h.ctx.config.recordingRecovery.admissionMs;
+  const origDelay = h.ctx.recoveryHeartbeatDelay;
+  let beats = 0;
+  h.ctx.transcriptRecovery = new TinfoilTranscriptionProvider({
+    baseUrl: "https://tinfoil.test",
+    apiKey: "test",
+    model: "voxtral-small-24b",
+    fetch: paidFetch,
+    wholeChunkSec: 1,
+    concurrency: 1,
+    timeoutMs: 100,
+    maxRetries: 1,
+    retryDelayMs: 100,
+  });
+  h.ctx.config.recordingRecovery.admissionMs = 800;
+  // Every heartbeat after the first resolves >800 ms late: even though its CAS committed while
+  // the owner still held the admission, the acknowledgement no longer leaves room for a wave,
+  // so each admission pays for exactly one wave (one call) and never overlaps a re-admission.
+  h.ctx.recoveryHeartbeatDelay = async () => {
+    if (++beats >= 2) await Bun.sleep(1_000);
+  };
+
+  const res = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/LateAck" } });
+  const { id: meetingId } = await res.json();
+  try {
+    await h.waitFor(async () => h.vexa.meetings.has("jitsi/LateAck@jitsi.local") ? true : null, { timeoutMs: 2_000, label: "bot dispatch" });
+    await h.vexa.control("jitsi", "LateAck@jitsi.local", { status: "active" });
+    // A ~2.5 s recording at wholeChunkSec 1 yields 3 single-chunk waves; wave 2+ of each
+    // admission is withheld by the late acknowledgement.
+    await h.vexa.control("jitsi", "LateAck@jitsi.local", {
+      status: "completed",
+      completion_reason: "stopped",
+      start_time: "2026-10-02T10:00:00.000Z",
+      end_time: "2026-10-02T10:02:00.000Z",
+      segments: [{ start: 110, end: 120, text: "Only the ending survived.", speaker: "Alice", completed: true }],
+      recording_base64: Buffer.from(pcmToWav(new Int16Array(Math.floor(PCM_RATE * 2.5)).fill(2_000), PCM_RATE)).toString("base64"),
+    });
+
+    await h.waitFor(async () => inflight === 1 ? true : null, { timeoutMs: 4_000, label: "paid call in flight" });
+    releaseGate();
+    await waitStatus(meetingId, "completed", 20_000);
+  } finally {
+    releaseGate();
+    gate = null;
+    h.ctx.transcriptRecovery = origRecovery;
+    h.ctx.config.recordingRecovery.admissionMs = origAdmission;
+    h.ctx.recoveryHeartbeatDelay = origDelay;
+  }
+  // Each admission dispatches only the wave whose heartbeat returned fresh — the delayed
+  // acknowledgements withheld every later wave, so exactly one paid call ran and nothing ever
+  // overlapped. The spent round then settles exhausted and the meeting completes on the
+  // native transcript.
+  expect(paidCalls).toBe(1);
+  expect(maxInflight).toBe(1);
+  expect(await recoveryRun(meetingId)).toMatchObject({ admissions: 2, outcome: "exhausted" });
+}, 30_000);
+
+test("a competing poll cannot fail a meeting while a paid admission is live", async () => {
+  paidCalls = 0; inflight = 0; maxInflight = 0;
+  gate = Promise.withResolvers<void>();
+  const releaseGate = gate.resolve;
+
+  const res = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/Poll404" } });
+  const { id: meetingId } = await res.json();
+  const injection = injectRenewalFailure(meetingId);
+  const second: { worker: WorkerHandle | null } = { worker: null };
+  try {
+    await h.waitFor(async () => h.vexa.meetings.has("jitsi/Poll404@jitsi.local") ? true : null, { timeoutMs: 2_000, label: "bot dispatch" });
+    await h.vexa.control("jitsi", "Poll404@jitsi.local", { status: "active" });
+    second.worker = startWorker(h.ctx, { popTimeoutSec: .05, heartbeatIntervalMs: 25 });
+    onFirstCall = () => injection.arm();
+    await incompleteCapture("Poll404@jitsi.local");
+    await h.waitFor(async () => inflight === 1 ? true : null, { timeoutMs: 4_000, label: "paid call in flight" });
+
+    // Worker A holds the admission inside the gated paid call; its lease expires under injected
+    // renewal failures, so worker B takes the poll chain over.
+    await h.waitFor(async () => {
+      const owner = await leaseOwner(meetingId);
+      return owner && injection.token() && owner !== injection.token() ? owner : null;
+    }, { timeoutMs: 4_000, label: "lease takeover" });
+
+    // Now the provider loses the transcript record: B's next poll hop must defer on the live
+    // admission instead of failing the meeting under A's in-flight paid call.
+    await h.vexa.control("jitsi", "Poll404@jitsi.local", { transcript_missing: true });
+    await Bun.sleep(300); // several takeover hops land on the 404 while the call stays in flight
+    const meeting = await h.ctx.db.execute(sql`select status from meetings where id = ${meetingId}`) as unknown as { status: string }[];
+    expect(meeting[0]!.status).toBe("processing");
+
+    releaseGate();
+    await waitStatus(meetingId, "completed");
+  } finally {
+    releaseGate();
+    gate = null;
+    onFirstCall = null;
+    await second.worker?.stop();
+    injection.restore();
+  }
+  expect(paidCalls).toBe(1);
+  expect(maxInflight).toBe(1);
+  expect(await recoveryRun(meetingId)).toMatchObject({ admissions: 1, outcome: "succeeded" });
 }, 20_000);

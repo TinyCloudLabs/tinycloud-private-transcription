@@ -25,6 +25,8 @@ interface MockMeeting extends VexaMeetingResponse {
   automatic_leave?: VexaMeetingCreate["automatic_leave"];
   recording_enabled?: boolean;
   recording?: { bytes: Uint8Array; contentType: string };
+  /** Test-only: forces GET /transcripts to 404 while the meeting row and recording remain. */
+  transcript_missing?: boolean;
   attributed_audio_manifest?: AttributedManifest;
   attributed_audio?: Map<string, Uint8Array>;
   /** Deletable via DELETE /meetings (real Vexa: idle/scheduled rows only). */
@@ -120,7 +122,7 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
 
   app.get("/transcripts/:platform/:native_meeting_id", (c) => {
     const m = meetings.get(key(c.req.param("platform"), c.req.param("native_meeting_id")));
-    if (!m) return c.json({ detail: "Meeting not found" }, 404);
+    if (!m || m.transcript_missing) return c.json({ detail: "Meeting not found" }, 404);
     return c.json({
       id: m.id,
       platform: m.platform,
@@ -175,9 +177,10 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       append_segments?: VexaTranscriptionSegment[];
       completion_reason?: VexaCompletionReason | null;
       failure_stage?: MockMeeting["failure_stage"];
-      planned?: boolean;
       recording_base64?: string;
       recording_content_type?: string;
+      transcript_missing?: boolean;
+      planned?: boolean;
       start_time?: string | null;
       end_time?: string | null;
       attributed_audio_manifest?: AttributedManifest;
@@ -185,6 +188,7 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       attributed_audio_capability?: { requested_version: 1; supported_version: 1; status: "supported" };
     };
     if (body.recording_base64 !== undefined) m.recording = { bytes: new Uint8Array(Buffer.from(body.recording_base64, "base64")), contentType: body.recording_content_type ?? "audio/wav" };
+    if (body.transcript_missing !== undefined) m.transcript_missing = body.transcript_missing;
     if (body.status) {
       m.status = body.status;
       if (["active", "completed"].includes(body.status) && !m.start_time) m.start_time = now();

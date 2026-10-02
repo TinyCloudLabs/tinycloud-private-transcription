@@ -86,6 +86,16 @@ export const config = {
     apiKey: env("TINFOIL_API_KEY", ""),
     model: env("TINFOIL_MODEL", "voxtral-small-24b"),
   },
+  /** Durable paid-call fence for whole-recording recovery (TC-574). */
+  recordingRecovery: {
+    /**
+     * How long one admission may own the paid transcription slot without a heartbeat before a
+     * competing poll may re-admit it. Must comfortably exceed one dispatch wave's worst-case
+     * duration (see TranscriptionProvider.maxRequestWaveMs) plus the heartbeat freshness margin;
+     * the worker treats an acknowledgement older than the leftover budget as a fence miss.
+     */
+    admissionMs: Number(env("RECORDING_RECOVERY_ADMISSION_MS", "600000")),
+  },
   logLevel: env("LOG_LEVEL", "info"),
   /**
    * Sealed JSON array of `{id, project, scopes, sha256}` (hashes only) that the API makes the exact set of

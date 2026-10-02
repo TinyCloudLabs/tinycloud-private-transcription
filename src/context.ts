@@ -28,6 +28,8 @@ export interface AppContext {
   attributedWorkerId: string;
   /** Publication failures are sticky until this worker performs a real successful recovery. */
   attributedWorkerHealthy: boolean;
+  /** Test seam: delays a recovery-fence heartbeat acknowledgement to exercise freshness bounds. */
+  recoveryHeartbeatDelay?: (meetingId: string) => Promise<void> | void;
 }
 
 export const DEFAULT_WEBHOOK_RETRY_DELAYS_MS = [0, 60_000, 5 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
@@ -53,5 +55,6 @@ export function createContext(overrides: Partial<AppContext> & { config?: Config
     attributedReconciliationReady: overrides.attributedReconciliationReady ?? !cfg.attributedTranscriptionEnabled,
     attributedWorkerId: overrides.attributedWorkerId ?? `attributed-worker:${process.pid}:${crypto.randomUUID()}`,
     attributedWorkerHealthy: overrides.attributedWorkerHealthy ?? true,
+    ...(overrides.recoveryHeartbeatDelay ? { recoveryHeartbeatDelay: overrides.recoveryHeartbeatDelay } : {}),
   };
 }
