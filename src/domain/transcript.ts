@@ -32,6 +32,8 @@ export interface NormalizedTranscript {
   speakers: Speaker[];
   segments: Segment[];
   text: string;
+  /** Additive marker: ranges without usable audio, or a mixed-recording fallback for a failed manifest. */
+  partial?: boolean;
 }
 
 const UNKNOWN = "Unknown";

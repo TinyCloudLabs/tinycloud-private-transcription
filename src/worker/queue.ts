@@ -2,9 +2,9 @@ import { RedisClient } from "bun";
 
 export type Job =
   | { type: "meeting.start"; meetingId: string; attempt?: number }
-  | { type: "meeting.poll"; meetingId: string; recoveryAttempt?: number }
+  | { type: "meeting.poll"; meetingId: string; recoveryAttempt?: number; stagingAttempt?: number }
   | { type: "meeting.join_deadline"; meetingId: string }
-  | { type: "attributed.batch"; meetingId: string; batchId: string }
+  | { type: "attributed.batch"; meetingId: string; batchId: string; fetchAttempt?: number }
   | { type: "attributed.finalize"; meetingId: string }
   | { type: "webhook.deliver"; deliveryId: string; claimToken: string };
 

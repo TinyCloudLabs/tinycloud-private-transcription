@@ -214,7 +214,7 @@ export async function storeTranscript(
 ) {
   // Bun's SQL driver binds a JavaScript object as a JSON string. Cast that JSON text explicitly so
   // Postgres stores a jsonb object instead of a jsonb string containing encoded JSON.
-  const segmentsJson = sql`${JSON.stringify({ speakers: t.speakers, segments: t.segments, text: t.text })}::text::jsonb`;
+  const segmentsJson = sql`${JSON.stringify({ speakers: t.speakers, segments: t.segments, text: t.text, ...(t.partial ? { partial: true } : {}) })}::text::jsonb`;
   const row = {
     language: t.language,
     durationSeconds: t.duration_seconds,
@@ -238,7 +238,7 @@ export async function completeMeetingWithTranscript(
   const result = await ctx.db.transaction(async (tx) => {
     const [current] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
     if (!current || current.status !== "processing") return { meeting: current ?? null, changed: false, deliveryId: null };
-    const payload = { speakers: t.speakers, segments: t.segments, text: t.text };
+    const payload = { speakers: t.speakers, segments: t.segments, text: t.text, ...(t.partial ? { partial: true } : {}) };
     const segmentsJson = sql`${JSON.stringify(payload)}::text::jsonb`;
     await tx.insert(transcripts).values({ meetingId, language: t.language, durationSeconds: t.duration_seconds, segmentsJson, provider })
       .onConflictDoUpdate({ target: transcripts.meetingId, set: { language: t.language, durationSeconds: t.duration_seconds, segmentsJson, provider } });
@@ -497,10 +497,17 @@ export function serializeMeeting(m: MeetingRow, transcript: TranscriptRow | null
   };
 }
 
+/** An unresolved-speaker range or recording fallback marks the transcript partial, never failed. */
+export function transcriptIsPartial(t: TranscriptRow): boolean {
+  const value: unknown = typeof t.segmentsJson === "string" ? JSON.parse(t.segmentsJson) : t.segmentsJson;
+  return !!value && typeof value === "object" && "partial" in value && value.partial === true;
+}
+
 /** The provider that produced the stored Vexa transcript. */
 export function transcriptProviderFields(t: TranscriptRow) {
   return {
     transcript_provider: t.provider,
+    ...(transcriptIsPartial(t) ? { transcript_partial: true } : {}),
   };
 }
 
@@ -515,7 +522,7 @@ export function serializeTranscript(m: MeetingRow, t: TranscriptRow) {
   // jsonb drivers return objects for new rows. Earlier writers double-encoded this value, so
   // accept a legacy JSON string on reads until those rows are naturally replaced.
   const value = typeof t.segmentsJson === "string" ? JSON.parse(t.segmentsJson) : t.segmentsJson;
-  const body = value as { speakers: unknown[]; segments: unknown[]; text: string };
+  const body = value as { speakers: unknown[]; segments: unknown[]; text: string; partial?: boolean };
   return {
     meeting_id: m.id,
     status: "completed",
@@ -526,6 +533,7 @@ export function serializeTranscript(m: MeetingRow, t: TranscriptRow) {
     speakers: body.speakers,
     segments: body.segments,
     text: body.text,
+    ...(body.partial === true ? { partial: true } : {}),
     created_at: t.createdAt.toISOString(),
   };
 }

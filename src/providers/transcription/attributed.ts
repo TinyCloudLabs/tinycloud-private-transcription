@@ -103,7 +103,9 @@ export function attributedBatches(unordered: AttributedManifest, vexaMeetingId: 
     active.delete(key);
   };
   for (const range of manifest.ranges) {
-    if (range.state !== "uploaded" || range.attribution.source === "unresolved") continue;
+    // Only producer-failed ranges (no uploaded audio) are skipped. Unresolved-speaker ranges
+    // still carry sealed audio and publish under an unknown speaker rather than vetoing text.
+    if (range.state !== "uploaded") continue;
     const key = [range.speaker_key, range.speaker_name, range.attribution.source, range.attribution.confidence, range.codec, range.sample_rate, range.channel].join("\u0000");
     let current = active.get(key);
     if (current) {
@@ -151,8 +153,16 @@ export async function transcribeAttributedManifest(manifest: AttributedManifest,
   const raw = [];
   for (const batch of attributedBatches(manifest, vexaMeetingId)) {
     const prepared = await readAttributedBatch(batch, read), response = prepared.silent ? { text: "" } : await textOnly(prepared.pcm, batch);
-    if (response.text.trim()) raw.push({ start: batch.start_ms / 1000, end: batch.end_ms / 1000, text: response.text, speaker: batch.speaker_name, speakerKey: batch.speaker_key,
-      attribution: batch.attribution.source === "glow-bound" && batch.attribution.confidence > 0 ? "identified" as const : "provisional" as const, language: response.language ?? null });
+    if (response.text.trim()) raw.push({ start: batch.start_ms / 1000, end: batch.end_ms / 1000, text: response.text, ...batchSpeaker(batch), language: response.language ?? null });
   }
   return normalizeSegments(raw, language);
+}
+
+/** Unresolved attribution keeps its text but publishes under an unknown speaker. */
+export function batchSpeaker(batch: AttributedBatch): { speaker: string; speakerKey: string; attribution: "identified" | "provisional" | "unknown" } {
+  return batch.attribution.source === "unresolved"
+    // The provider's speaker_key can collide with a named participant's key, so unresolved
+    // ranges get their own namespace: they must never inherit someone else's speaker_id.
+    ? { speaker: "Unknown", speakerKey: `unresolved:${batch.speaker_key}`, attribution: "unknown" }
+    : { speaker: batch.speaker_name, speakerKey: batch.speaker_key, attribution: batch.attribution.source === "glow-bound" && batch.attribution.confidence > 0 ? "identified" : "provisional" };
 }

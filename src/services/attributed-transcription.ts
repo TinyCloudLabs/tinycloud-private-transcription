@@ -2,12 +2,12 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import type { AppContext } from "../context.ts";
 import { attributedAttempts, attributedBatches as batchesTable, attributedRanges, attributedTranscriptionRuns, attributedWorkerReadiness, meetings, tinfoilDispatchSlots, transcripts, webhookDeliveries } from "../db/schema.ts";
 import { normalizeSegments } from "../domain/transcript.ts";
-import { attributedBatches, bySequence, readAttributedBatch, type AttributedBatch, type AttributedCapability, type AttributedManifest } from "../providers/transcription/attributed.ts";
+import { attributedBatches, batchSpeaker, bySequence, readAttributedBatch, type AttributedBatch, type AttributedCapability, type AttributedManifest } from "../providers/transcription/attributed.ts";
 import { safeTinfoilLanguage, TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
-import { failMeeting, getMeetingById } from "./meetings.ts";
+import { getMeetingById } from "./meetings.ts";
 import { enqueueMeetingWebhook, webhookDeliveryValues, wakeWebhookDelivery } from "../webhooks/dispatcher.ts";
 
-const ATTEMPT_LIMIT = 1, CLAIM_MS = 5 * 60_000, SLOT_CLAIM_MS = 10 * 60_000;
+const ATTEMPT_LIMIT = 1, CLAIM_MS = 5 * 60_000, SLOT_CLAIM_MS = 10 * 60_000, MAX_FETCH_ATTEMPTS = 3;
 const READINESS_STALE_MS = 15_000;
 type AttributedReadinessStage = "startup" | "reconciled" | "reconciliation_failed" | "heartbeat" | "publication_failed" | "published" | "stopped";
 const json = (value: unknown) => sql`${JSON.stringify(value)}::text::jsonb`;
@@ -58,36 +58,80 @@ export async function attributedWorkerReady(ctx: AppContext): Promise<boolean> {
   }
 }
 
-/** Immutable insert is serialized even when no run row exists yet. */
-export async function stageAttributedManifest(ctx: AppContext, meetingId: string, vexaMeetingId: number, fetched: AttributedManifest, capability: unknown): Promise<void> {
-  if (!capabilityOk(capability)) throw new Error("attributed_capability_not_supported");
-  const specs = attributedBatches(fetched, vexaMeetingId);
+/** Staging failure classes, surfaced only as fixed log codes — never provider text. */
+export type AttributedStagingReason = "open" | "invalid" | "conflict" | "capability" | "transport" | "db";
+export class AttributedStagingError extends Error {
+  constructor(readonly reason: AttributedStagingReason, cause?: unknown) {
+    super(`attributed_staging_${reason}`);
+    this.name = "AttributedStagingError";
+    this.cause = cause;
+  }
+}
+
+/** Resume any in-flight ledger work under a staged run. Redis is a wakeup, never authority. */
+export async function resumeAttributedRun(ctx: AppContext, meetingId: string): Promise<void> {
+  const pending = (await ctx.db.select({ id: batchesTable.id }).from(batchesTable)
+    .where(and(eq(batchesTable.meetingId, meetingId), eq(batchesTable.status, "pending")))).map((row) => row.id);
+  for (const batchId of pending) await ctx.queue.push({ type: "attributed.batch", meetingId, batchId }).catch(() => {});
+  await ctx.queue.push({ type: "attributed.finalize", meetingId }).catch(() => {});
+}
+
+/**
+ * Durable marker that this meeting's manifest could not be staged and the retained mixed
+ * recording owns finalization. Serialized on the attributed advisory lock so a concurrent
+ * poll can never stage over it; a later poll resumes the fallback instead of re-staging.
+ * The marker stores only the producer-supplied manifest or an empty object.
+ */
+export async function markAttributedRecovery(ctx: AppContext, meetingId: string, manifest: AttributedManifest | null): Promise<"fallback" | "resumed" | "ineligible"> {
+  return ctx.db.transaction(async (tx) => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`attributed:${meetingId}`}))`);
+    const [meeting] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
+    if (!meeting || meeting.status !== "processing" || meeting.dispatchBlocked) return "ineligible";
+    const existing = await tx.select().from(attributedTranscriptionRuns).where(eq(attributedTranscriptionRuns.meetingId, meetingId)).for("update");
+    // A real run owns the ledger; a prior fallback marker still owns finalization.
+    if (existing[0]) return existing[0].status === "fallback" ? "fallback" : "resumed";
+    await tx.insert(attributedTranscriptionRuns).values({ meetingId, status: "fallback", manifestJson: json(manifest ?? {}) });
+    return "fallback";
+  });
+}
+
+/**
+ * Immutable insert is serialized even when no run row exists yet. Any existing run row —
+ * staged, finished, or a recovery marker — wins over the fetched manifest and is resumed
+ * rather than re-verified: the ledger is authoritative once committed.
+ */
+export type AttributedStageOutcome = "staged" | "resumed" | "ineligible";
+export async function stageAttributedManifest(ctx: AppContext, meetingId: string, vexaMeetingId: number, fetched: AttributedManifest, capability: unknown): Promise<AttributedStageOutcome> {
   // Persist and compare in sequence order so a re-read in a different array order is not a conflict.
   const manifest = bySequence(fetched);
   const staged = await ctx.db.transaction(async (tx) => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`attributed:${meetingId}`}))`);
     const [meeting] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
-    if (!meeting || meeting.status !== "processing" || meeting.dispatchBlocked) return false;
+    if (!meeting || meeting.status !== "processing" || meeting.dispatchBlocked) return "ineligible" as const;
     const existing = await tx.select().from(attributedTranscriptionRuns).where(eq(attributedTranscriptionRuns.meetingId, meetingId)).for("update");
+    // The committed ledger outranks the fetched manifest: resume it rather than re-verify.
     if (existing[0]) {
-      if (canonical(existing[0].manifestJson) !== canonical(manifest)) throw new Error("attributed_manifest_conflict");
-      return false;
+      if (existing[0].status === "processing" && canonical(existing[0].manifestJson) !== canonical(manifest)) ctx.log.warn("attributed manifest conflict; resuming the staged ledger", { meetingId, stage: "attributed_staging", code: "conflict" });
+      return "resumed" as const;
+    }
+    if (!capabilityOk(capability)) throw new AttributedStagingError("capability");
+    if (manifest?.state === "open") throw new AttributedStagingError("open");
+    let specs: AttributedBatch[];
+    try {
+      specs = attributedBatches(manifest, vexaMeetingId);
+    } catch (e) {
+      throw new AttributedStagingError("invalid", e);
     }
     await tx.insert(attributedTranscriptionRuns).values({ meetingId, status: "processing", manifestJson: json(manifest) });
-    for (const range of manifest.ranges) await tx.insert(attributedRanges).values({ meetingId, sequence: range.sequence, rangeJson: json(range), status: range.state === "failed" || range.attribution.source === "unresolved" ? "unresolved" : "pending" });
+    for (const range of manifest.ranges) await tx.insert(attributedRanges).values({ meetingId, sequence: range.sequence, rangeJson: json(range), status: range.state === "failed" ? "failed" : "pending" });
     for (const [ordinal, batch] of specs.entries()) await tx.insert(batchesTable).values({ id: `${meetingId}:batch:${ordinal}`, meetingId, ordinal, batchJson: json(batch) });
-    return true;
+    return "staged" as const;
   });
+  if (staged === "ineligible") return staged;
   // A staging transaction can commit just before its Redis wakeup is lost.  Existing immutable
   // state is therefore resumed explicitly, rather than treated as a no-op.
-  const pending = staged
-    ? specs.map((_, ordinal) => `${meetingId}:batch:${ordinal}`)
-    : (await ctx.db.select({ id: batchesTable.id }).from(batchesTable)
-      .where(and(eq(batchesTable.meetingId, meetingId), eq(batchesTable.status, "pending")))).map((row) => row.id);
-  // Redis acknowledges only a wakeup, never admission. A lost acknowledgement after this
-  // transaction must leave retained unpaid work pending for the durable reconciler, not fail it.
-  for (const batchId of pending) await ctx.queue.push({ type: "attributed.batch", meetingId, batchId }).catch(() => {});
-  await ctx.queue.push({ type: "attributed.finalize", meetingId }).catch(() => {});
+  await resumeAttributedRun(ctx, meetingId);
+  return staged;
 }
 
 async function claimBatch(ctx: AppContext, batchId: string) {
@@ -163,7 +207,7 @@ async function releaseBatchClaim(ctx: AppContext, batchId: string, token: string
 
 export type AttributedJobOutcome = "processed" | "noop" | "deferred";
 
-export async function processAttributedBatch(ctx: AppContext, meetingId: string, batchId: string): Promise<AttributedJobOutcome> {
+export async function processAttributedBatch(ctx: AppContext, meetingId: string, batchId: string, fetchAttempt = 0): Promise<AttributedJobOutcome> {
   const [stored] = await ctx.db.select().from(batchesTable).where(and(eq(batchesTable.id, batchId), eq(batchesTable.meetingId, meetingId)));
   if (!stored || stored.status !== "pending") return "noop";
   // Readiness is checked before any claim, fetch, or attempt; an operator can configure Tinfoil later.
@@ -177,7 +221,14 @@ export async function processAttributedBatch(ctx: AppContext, meetingId: string,
     };
     let prepared;
     try { prepared = await readAttributedBatch(spec, async (range) => (await ctx.vexa.fetchBytes(range.path!)).bytes); }
-    catch { await settle(ctx, batchId, claimed.token, "failed", meetingId, spec); return done("processed"); }
+    catch {
+      // A fetch/checksum failure happens before any paid call; bounded requeue is safe (L3).
+      if (fetchAttempt < MAX_FETCH_ATTEMPTS && await releaseBatchClaim(ctx, batchId, claimed.token)) {
+        await ctx.queue.push({ type: "attributed.batch", meetingId, batchId, fetchAttempt: fetchAttempt + 1 }, ctx.config.vexa.pollIntervalMs);
+        return done("deferred");
+      }
+      await settle(ctx, batchId, claimed.token, "failed", meetingId, spec); return done("processed");
+    }
     if (prepared.silent) { await settle(ctx, batchId, claimed.token, "silence", meetingId, spec, { text: "", language: null }); return done("processed"); }
     // Make the process identity durable before it can own a paid request. This also lets a
     // recovery scanner distinguish a paused continuation from a dead worker.
@@ -252,19 +303,10 @@ export async function finalizeAttributedRun(ctx: AppContext, meetingId: string):
     for (const row of pending) await ctx.queue.push({ type: "attributed.batch", meetingId, batchId: row.id }).catch(() => {});
     return false;
   }
-  const ranges = await ctx.db.select().from(attributedRanges).where(eq(attributedRanges.meetingId, meetingId));
   const meeting = await getMeetingById(ctx, meetingId);
   if (!meeting || meeting.status === "completed" || meeting.status === "failed") return false;
-  if (rows.some((row) => !["completed", "silence"].includes(row.status)) || ranges.some((row) => !["completed", "silence"].includes(row.status))) {
-    await ctx.db.update(attributedTranscriptionRuns).set({ status: "partial", updatedAt: new Date() }).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
-    const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Attributed evidence is unresolved; canonical transcript was not published.");
-    if (changed) {
-      ctx.attributedWorkerHealthy = false;
-      await recordAttributedWorkerReadiness(ctx, false, "publication_failed");
-      await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
-    }
-    return changed;
-  }
+  // Unresolved-speaker audio is transcribed as an unknown speaker; ranges without usable audio
+  // publish as a partial transcript. Neither vetoes the resolved text (TC-559).
   return publish(ctx, meetingId);
 }
 
@@ -309,25 +351,44 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
       || batches.length !== expected.length || batches.some((batch) => canonical(batch.batchJson) !== canonical(expectedByOrdinal.get(batch.ordinal)))
       || batches.some((batch) => batch.ordinal < 0 || !expectedByOrdinal.has(batch.ordinal));
     if (invalidLedger) return reject();
-    const raw: Array<{ start: number; end: number; text: string; speaker: string; speakerKey: string; attribution: "identified" | "provisional"; language: string | null }> = [];
+    const raw: Array<{ start: number; end: number; text: string; speaker: string; speakerKey: string; attribution: "identified" | "provisional" | "unknown"; language: string | null }> = [];
+    // Batches without usable audio lose only their own ranges; publication continues as partial.
+    const settledRangeStatus: Record<string, string> = { completed: "completed", silence: "silence", failed: "failed", ambiguous: "unresolved" };
+    let partial = false;
     for (const batch of batches) {
       const spec = expectedByOrdinal.get(batch.ordinal)!;
       const batchRanges = spec.ranges;
       const ledgerRanges = batchRanges.map((range) => ranges.find((row) => row.sequence === range.sequence));
-      if (ledgerRanges.some((row) => !row || row.status !== batch.status) || !["completed", "silence"].includes(batch.status)) return reject();
+      const rangeStatus = settledRangeStatus[batch.status];
+      if (!rangeStatus || ledgerRanges.some((row) => !row || row.status !== rangeStatus)) return reject();
       const rowsForBatch = attemptByBatch.get(batch.id) ?? [];
       const result = object<{ text?: unknown; language?: unknown }>(batch.resultJson ?? {});
       if (batch.status === "completed") {
         if (batch.attempts !== 1 || rowsForBatch.length !== 1 || rowsForBatch[0]!.attributed_attempts.ordinal !== 1
             || rowsForBatch[0]!.attributed_attempts.status !== "succeeded" || !rowsForBatch[0]!.attributed_attempts.completedAt
             || typeof result.text !== "string" || !result.text.trim() || (result.language !== null && result.language !== undefined && !safeTinfoilLanguage(result.language))) return reject();
-        raw.push({ start: spec.start_ms / 1000, end: spec.end_ms / 1000, text: result.text, speaker: spec.speaker_name, speakerKey: spec.speaker_key,
-          attribution: spec.attribution.source === "glow-bound" && spec.attribution.confidence > 0 ? "identified" : "provisional", language: typeof result.language === "string" ? result.language : null });
-      } else if (batch.attempts !== 0 || rowsForBatch.length !== 0 || result.text !== "") return reject();
+        const speaker = batchSpeaker(spec);
+        // Unresolved speech publishes under an unknown speaker — degraded, not failed (SPEC).
+        if (speaker.attribution === "unknown") partial = true;
+        raw.push({ start: spec.start_ms / 1000, end: spec.end_ms / 1000, text: result.text, ...speaker, language: typeof result.language === "string" ? result.language : null });
+      } else if (batch.status === "silence") {
+        if (batch.attempts !== 0 || rowsForBatch.length !== 0 || result.text !== "") return reject();
+      } else {
+        // failed | ambiguous: attempts must be durable and terminal, never re-sent.
+        if (batch.attempts !== rowsForBatch.length || batch.attempts > 1
+            || (batch.attempts === 1 && rowsForBatch[0]!.attributed_attempts.ordinal !== 1)
+            || rowsForBatch.some((row) => !["failed", "ambiguous"].includes(row.attributed_attempts.status) || !row.attributed_attempts.completedAt)) return reject();
+        partial = true;
+      }
     }
-    if (ranges.some((row) => !["completed", "silence"].includes(row.status))) return reject();
+    // Producer-failed ranges were never batched; their absence marks the transcript partial.
+    const batchedSequences = new Set(expected.flatMap((batch) => batch.ranges.map((range) => range.sequence)));
+    const skipped = ranges.filter((row) => !batchedSequences.has(row.sequence));
+    if (skipped.some((row) => !["failed", "unresolved"].includes(row.status))) return reject();
+    if (skipped.length) partial = true;
     const transcript = normalizeSegments(raw.sort((a, b) => a.start - b.start || a.end - b.end), meeting.language);
-    const payload = { speakers: transcript.speakers, segments: transcript.segments, text: transcript.text };
+    if (partial && !transcript.text.trim()) return reject();
+    const payload = { speakers: transcript.speakers, segments: transcript.segments, text: transcript.text, ...(partial ? { partial: true } : {}) };
     const existing = await tx.select().from(transcripts).where(eq(transcripts.meetingId, meetingId)).for("update");
     if (existing[0] && (existing[0].provider !== "tinfoil-attributed" || canonical(existing[0].segmentsJson) !== canonical(payload)
         || existing[0].language !== transcript.language || existing[0].durationSeconds !== transcript.duration_seconds)) {
@@ -384,11 +445,14 @@ export async function reconcileAttributedRuns(ctx: AppContext): Promise<void> {
   for (const run of runs) await ctx.queue.push({ type: "attributed.finalize", meetingId: run.meetingId });
   // If a process died after moving the meeting to processing but before staging its immutable
   // producer manifest, Vexa remains the retained source of truth.  Polling it reconstructs the
-  // manifest; an existing run instead takes the explicit resume path above.
+  // manifest; an existing run instead takes the explicit resume path above. A run already marked
+  // "fallback" keeps polling so the retained mixed recording completes finalization.
   const processing = await ctx.db.select().from(meetings)
     .where(and(eq(meetings.status, "processing"), eq(meetings.platform, "google_meet")));
-  const staged = new Set(runs.map((run) => run.meetingId));
-  for (const meeting of processing) if (!staged.has(meeting.id) && meeting.vexaMeetingId != null) {
+  const resumable = new Set(runs.map((run) => run.meetingId));
+  const fallback = new Set((await ctx.db.select({ meetingId: attributedTranscriptionRuns.meetingId }).from(attributedTranscriptionRuns)
+    .where(eq(attributedTranscriptionRuns.status, "fallback"))).map((run) => run.meetingId));
+  for (const meeting of processing) if ((!resumable.has(meeting.id) || fallback.has(meeting.id)) && meeting.vexaMeetingId != null) {
     await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id });
   }
 }

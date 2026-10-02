@@ -10,11 +10,11 @@ import { completeMeetingWithTranscript, failMeeting, getMeetingById, transition 
 import { enqueueMeetingWebhook } from "../webhooks/dispatcher.ts";
 import { observeCapture, recordCapture } from "../services/capture.ts";
 import { and, eq, isNull, sql } from "drizzle-orm";
-import { meetings } from "../db/schema.ts";
+import { attributedTranscriptionRuns, meetings } from "../db/schema.ts";
 import { normalizeSegments } from "../domain/transcript.ts";
 import { openSignalCapability } from "../providers/signal/capability.ts";
-import { stageAttributedManifest } from "../services/attributed-transcription.ts";
-import type { VexaTranscriptionResponse } from "../providers/vexa/types.ts";
+import { AttributedStagingError, markAttributedRecovery, resumeAttributedRun, stageAttributedManifest, type AttributedStageOutcome } from "../services/attributed-transcription.ts";
+import type { VexaAttributedAudioManifest, VexaTranscriptionResponse } from "../providers/vexa/types.ts";
 
 const MAX_START_ATTEMPTS = 3;
 const MAX_RECOVERY_ATTEMPTS = 3;
@@ -134,7 +134,7 @@ export async function handleJoinDeadline(ctx: AppContext, meetingId: string): Pr
 }
 
 /** Job: meeting.poll — sync status from Vexa; finalize when the bot has left. */
-export async function handleMeetingPoll(ctx: AppContext, meetingId: string, recoveryAttempt = 1): Promise<void> {
+export async function handleMeetingPoll(ctx: AppContext, meetingId: string, recoveryAttempt = 1, stagingAttempt = 0): Promise<void> {
   let meeting = await getMeetingById(ctx, meetingId);
   if (!meeting || isTerminal(meeting.status as MeetingStatus)) return;
   if (meeting.platform === "signal") return handleSignalPoll(ctx, meeting);
@@ -184,23 +184,10 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
   }
 
   if (usesAttributedCapture(ctx, meeting)) {
-    const vexaMeetingId = meeting.vexaMeetingId;
-    if (!vexaMeetingId) {
-      const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Attributed capture identity is unavailable.");
-      if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
-      return;
-    }
-    ({ meeting } = await transition(ctx, meeting, "processing"));
-    try {
-      // Sealed producer evidence is the only enabled-path source of canonical text.
-      await stageAttributedManifest(ctx, meeting.id, vexaMeetingId, await ctx.vexa.getAttributedAudio(vexaMeetingId), vexa.data?.attributed_audio_capability);
-    } catch (e) {
-      ctx.log.error("attributed manifest staging failed", { meetingId, vexaMeetingId, error: String(e) });
-      const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Attributed source evidence could not be reconciled.");
-      if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
-    }
+    await handleAttributedCompletion(ctx, meeting, vexa, recoveryAttempt, stagingAttempt);
     return;
   }
+
 
   // Feature-off is the pre-existing native/recovery finalization path.
   let segments: ReturnType<typeof adaptVexaSegments>;
@@ -221,6 +208,85 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
   }
   ({ meeting } = await transition(ctx, meeting, "processing"));
   await finalize(ctx, meeting, vexa, segments, recover, recoveryAttempt);
+}
+/**
+ * Attributed finalization. A committed run is always resumed on its own ledger and never
+ * re-sent to the paid provider. Whole-recording recovery is only reachable once no run exists
+ * AND the manifest is verifiably non-stageable (open after bounded retries, invalid, missing
+ * capability or capture identity); the durable `fallback` marker is committed under the same
+ * advisory lock as staging so the two paths cannot interleave (TC-559).
+ */
+const MAX_STAGING_ATTEMPTS = 3;
+const STAGING_RETRYABLE = new Set(["open", "transport", "db"]);
+
+async function handleAttributedCompletion(ctx: AppContext, meeting: MeetingRow, vexa: VexaTranscriptionResponse, recoveryAttempt: number, stagingAttempt: number) {
+  ({ meeting } = await transition(ctx, meeting, "processing"));
+  const vexaMeetingId = meeting.vexaMeetingId;
+  if (!vexaMeetingId) {
+    // Without the capture identity no manifest can be verified at all.
+    const outcome = await markAttributedRecovery(ctx, meeting.id, null);
+    if (outcome === "ineligible") return;
+    if (outcome === "resumed") { await resumeAttributedRun(ctx, meeting.id); return; }
+    return recoverFromRecording(ctx, meeting, vexa, recoveryAttempt);
+  }
+  const [existing] = await ctx.db.select().from(attributedTranscriptionRuns).where(eq(attributedTranscriptionRuns.meetingId, meeting.id));
+  if (existing) {
+    if (existing.status === "fallback") return recoverFromRecording(ctx, meeting, vexa, recoveryAttempt);
+    if (existing.status !== "processing") return;
+    // The ledger already owns this meeting; a re-staged or conflicting manifest is never
+    // verified again and never falls back to the recording.
+    return resumeAttributedRun(ctx, meeting.id);
+  }
+  let fetched: VexaAttributedAudioManifest;
+  try {
+    fetched = await ctx.vexa.getAttributedAudio(vexaMeetingId);
+  } catch (e) {
+    if (stagingAttempt + 1 < MAX_STAGING_ATTEMPTS) {
+      ctx.log.warn("attributed manifest fetch failed; retrying", { meetingId: meeting.id, stage: "attributed_staging", staging_attempt: stagingAttempt + 1, code: e instanceof ApiError || e instanceof VexaHttpError ? "transport" : "db" });
+      await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id, recoveryAttempt, stagingAttempt: stagingAttempt + 1 }, ctx.config.vexa.pollIntervalMs);
+      return;
+    }
+    ctx.log.error("attributed manifest staging failed", { meetingId: meeting.id, stage: "attributed_staging", code: e instanceof ApiError || e instanceof VexaHttpError ? "transport" : "db" });
+    const outcome = await markAttributedRecovery(ctx, meeting.id, null);
+    if (outcome === "ineligible") return;
+    if (outcome === "resumed") { await resumeAttributedRun(ctx, meeting.id); return; }
+    return recoverFromRecording(ctx, meeting, vexa, recoveryAttempt);
+  }
+  let outcome: AttributedStageOutcome | "ineligible" | "fallback";
+  try {
+    // Sealed producer evidence is the preferred enabled-path source of canonical text.
+    outcome = await stageAttributedManifest(ctx, meeting.id, vexaMeetingId, fetched, vexa.data?.attributed_audio_capability);
+  } catch (e) {
+    const reason = e instanceof AttributedStagingError ? e.reason : "db";
+    if (STAGING_RETRYABLE.has(reason) && stagingAttempt + 1 < MAX_STAGING_ATTEMPTS) {
+      ctx.log.warn("attributed manifest not stageable yet; retrying", { meetingId: meeting.id, stage: "attributed_staging", staging_attempt: stagingAttempt + 1, code: reason });
+      await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id, recoveryAttempt, stagingAttempt: stagingAttempt + 1 }, ctx.config.vexa.pollIntervalMs);
+      return;
+    }
+    ctx.log.error("attributed manifest staging failed", { meetingId: meeting.id, stage: "attributed_staging", code: reason });
+    outcome = await markAttributedRecovery(ctx, meeting.id, fetched);
+  }
+  if (outcome === "ineligible") return;
+  if (outcome === "resumed") { await resumeAttributedRun(ctx, meeting.id); return; }
+  if (outcome === "staged") return;
+  return recoverFromRecording(ctx, meeting, vexa, recoveryAttempt);
+}
+
+/** Completes the meeting from the retained mixed recording when no attributed run exists. */
+async function recoverFromRecording(ctx: AppContext, meeting: MeetingRow, vexa: VexaTranscriptionResponse, recoveryAttempt: number) {
+  if (meeting.status !== "processing") return;
+  if (!ctx.transcriptRecovery) {
+    const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Attributed source evidence could not be reconciled.");
+    if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+    return;
+  }
+  let segments: ReturnType<typeof adaptVexaSegments>;
+  try {
+    segments = adaptVexaSegments(vexa);
+  } catch {
+    segments = [];
+  }
+  await finalize(ctx, meeting, vexa, segments, true, recoveryAttempt, true);
 }
 
 async function handleSignalStart(ctx: AppContext, meeting: MeetingRow, attempt: number) {
@@ -338,6 +404,7 @@ async function finalize(
   vexaSegments: ReturnType<typeof adaptVexaSegments>,
   recover: boolean,
   recoveryAttempt: number,
+  degraded = false,
 ) {
   const input = {
     meetingId: meeting.id,
@@ -348,6 +415,7 @@ async function finalize(
   try {
     const provider = recover ? ctx.transcriptRecovery! : ctx.transcription;
     const transcript = await provider.transcribe(input);
+    if (degraded) transcript.partial = true;
     if (!transcript.text.trim()) {
       throw new ApiError("transcription_failed", "Transcription provider returned no words");
     }
@@ -364,6 +432,7 @@ async function finalize(
     if (recover && vexaSegments.some((segment) => segment.text.trim().length > 0)) {
       ctx.log.warn("recording recovery exhausted; preserving vexa transcript", { meetingId: meeting.id, recoveryAttempt, stage: "recording_recovery", code: "provider_error" });
       const transcript = await ctx.transcription.transcribe(input);
+      if (degraded) transcript.partial = true;
       if (transcript.text.trim()) {
         await completeMeetingWithTranscript(ctx, meeting.id, transcript, ctx.transcription.name);
         return;

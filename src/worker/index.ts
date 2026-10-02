@@ -14,11 +14,11 @@ export async function processJob(ctx: AppContext, job: Job): Promise<JobOutcome>
     case "meeting.start":
       await handleMeetingStart(ctx, job.meetingId, job.attempt ?? 1); return "processed";
     case "meeting.poll":
-      await handleMeetingPoll(ctx, job.meetingId, job.recoveryAttempt ?? 1); return "processed";
+      await handleMeetingPoll(ctx, job.meetingId, job.recoveryAttempt ?? 1, job.stagingAttempt ?? 0); return "processed";
     case "meeting.join_deadline":
       await handleJoinDeadline(ctx, job.meetingId); return "processed";
     case "attributed.batch":
-      return processAttributedBatch(ctx, job.meetingId, job.batchId);
+      return processAttributedBatch(ctx, job.meetingId, job.batchId, job.fetchAttempt ?? 0);
     case "attributed.finalize":
       return (await finalizeAttributedRun(ctx, job.meetingId)) ? "processed" : "noop";
     case "webhook.deliver":

@@ -60,6 +60,10 @@ capture-provider record back to `processing` and retries Vexa-segment finalizati
  "segments":[{"id":"seg_001","speaker_id":"speaker_0","speaker_name":"Alice","start":0.0,"end":3.2,"text":"…"}],
  "text":"Alice: …","created_at":"…"}
 ```
+`partial: true` is added when the transcript degraded: unresolved-speaker ranges published under an
+unknown speaker, producer-failed ranges skipped, or the mixed recording recovered because the
+attributed manifest could not be staged. `GET /v1/meetings/{id}` and `meeting.completed` webhooks
+then also carry `transcript_partial: true`.
 `speaker_id` is stable within a meeting only. `provider` is `"vexa"`: Vexa owns the transcript and speaker attribution, while TinyCloud normalizes the completed segments. `DELETE /v1/meetings/{id}` removes our record + transcript and the Vexa meeting.
 `GET /health` → `{status:"ok","checks":{postgres,redis,vexa,bot_capacity:{running,max},transcription_provider}}` (`bot_capacity.max` from `VEXA_MAX_CONCURRENT_BOTS`).
 
