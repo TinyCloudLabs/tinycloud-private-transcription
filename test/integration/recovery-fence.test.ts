@@ -2,7 +2,7 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { sql } from "drizzle-orm";
 import { TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
 import { PCM_RATE, pcmToWav } from "../../src/providers/transcription/audio.ts";
-import { admitRecordingRecovery, heartbeatRecordingRecovery } from "../../src/services/recording-recovery.ts";
+import { admitRecordingRecovery, heartbeatRecordingRecovery, releaseRecordingRecovery } from "../../src/services/recording-recovery.ts";
 import { startWorker, type WorkerHandle } from "../../src/worker/index.ts";
 import { startHarness, type Harness } from "./harness.ts";
 
@@ -321,18 +321,16 @@ test("recover on a live admission is a no-op wakeup and never resets the round",
   expect(paidCalls).toBe(1);
 }, 20_000);
 
-test("a delayed heartbeat acknowledgement cannot authorize a wave after takeover", async () => {
-  paidCalls = 0; inflight = 0; maxInflight = 0;
-  gate = Promise.withResolvers<void>();
-  const releaseGate = gate.resolve;
+// Lets a test re-gate the next paid call while the first is still resolving.
+let gateAfterFirst: { promise: Promise<void>; resolve: () => void } | null = null;
 
-  // Small admission window with a short-wave provider so a delayed ack is reproducible in test
-  // time: admissionMs=800, wave bound=200 (timeout 100 × 1 attempt + 100 backoff), margin=80,
-  // so a heartbeat round trip must resolve within ~520 ms to authorize its wave.
-  const origRecovery = h.ctx.transcriptRecovery;
-  const origAdmission = h.ctx.config.recordingRecovery.admissionMs;
-  const origDelay = h.ctx.recoveryHeartbeatDelay;
-  let beats = 0;
+/** Installs a short-wave recovery provider with a small admission window for heartbeat tests. */
+const smallWindowRecovery = (admissionMs = 800) => {
+  const previous = {
+    transcriptRecovery: h.ctx.transcriptRecovery,
+    admissionMs: h.ctx.config.recordingRecovery.admissionMs,
+    delay: h.ctx.recoveryHeartbeatDelay,
+  };
   h.ctx.transcriptRecovery = new TinfoilTranscriptionProvider({
     baseUrl: "https://tinfoil.test",
     apiKey: "test",
@@ -344,12 +342,43 @@ test("a delayed heartbeat acknowledgement cannot authorize a wave after takeover
     maxRetries: 1,
     retryDelayMs: 100,
   });
-  h.ctx.config.recordingRecovery.admissionMs = 800;
-  // Every heartbeat after the first resolves >800 ms late: even though its CAS committed while
-  // the owner still held the admission, the acknowledgement no longer leaves room for a wave,
-  // so each admission pays for exactly one wave (one call) and never overlaps a re-admission.
+  h.ctx.config.recordingRecovery.admissionMs = admissionMs;
+  return () => {
+    h.ctx.transcriptRecovery = previous.transcriptRecovery;
+    h.ctx.config.recordingRecovery.admissionMs = previous.admissionMs;
+    h.ctx.recoveryHeartbeatDelay = previous.delay;
+  };
+};
+
+/** ~2.5 s of loud PCM — three single-chunk waves under wholeChunkSec 1. */
+const threeWaveRecording = () =>
+  Buffer.from(pcmToWav(new Int16Array(Math.floor(PCM_RATE * 2.5)).fill(2_000), PCM_RATE)).toString("base64");
+
+const incompleteThreeWaveCapture = (native: string) =>
+  h.vexa.control("jitsi", native, {
+    status: "completed",
+    completion_reason: "stopped",
+    start_time: "2026-10-02T10:00:00.000Z",
+    end_time: "2026-10-02T10:02:00.000Z",
+    segments: [{ start: 110, end: 120, text: "Only the ending survived.", speaker: "Alice", completed: true }],
+    recording_base64: threeWaveRecording(),
+  });
+
+test("a delayed heartbeat acknowledgement cannot authorize a wave after takeover", async () => {
+  paidCalls = 0; inflight = 0; maxInflight = 0;
+  gate = Promise.withResolvers<void>();
+  const releaseGate = gate.resolve;
+  const restore = smallWindowRecovery();
+  let beats = 0;
+  // The second heartbeat's acknowledgement resolves only after the 800 ms admission window has
+  // lapsed — its CAS committed on time, but the stale row may already be re-admitted, so the
+  // ack must not authorize admission 1's next wave.
+  const heldAck = Promise.withResolvers<void>();
   h.ctx.recoveryHeartbeatDelay = async () => {
-    if (++beats >= 2) await Bun.sleep(1_000);
+    if (++beats === 2) {
+      await Bun.sleep(1_000);
+      heldAck.resolve();
+    }
   };
 
   const res = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/LateAck" } });
@@ -357,38 +386,119 @@ test("a delayed heartbeat acknowledgement cannot authorize a wave after takeover
   try {
     await h.waitFor(async () => h.vexa.meetings.has("jitsi/LateAck@jitsi.local") ? true : null, { timeoutMs: 2_000, label: "bot dispatch" });
     await h.vexa.control("jitsi", "LateAck@jitsi.local", { status: "active" });
-    // A ~2.5 s recording at wholeChunkSec 1 yields 3 single-chunk waves; wave 2+ of each
-    // admission is withheld by the late acknowledgement.
-    await h.vexa.control("jitsi", "LateAck@jitsi.local", {
-      status: "completed",
-      completion_reason: "stopped",
-      start_time: "2026-10-02T10:00:00.000Z",
-      end_time: "2026-10-02T10:02:00.000Z",
-      segments: [{ start: 110, end: 120, text: "Only the ending survived.", speaker: "Alice", completed: true }],
-      recording_base64: Buffer.from(pcmToWav(new Int16Array(Math.floor(PCM_RATE * 2.5)).fill(2_000), PCM_RATE)).toString("base64"),
-    });
+    await incompleteThreeWaveCapture("LateAck@jitsi.local");
 
     await h.waitFor(async () => inflight === 1 ? true : null, { timeoutMs: 4_000, label: "paid call in flight" });
+    // Re-gate before releasing call 1 so the next paid call is observable.
+    gateAfterFirst = Promise.withResolvers<void>();
+    gate = gateAfterFirst;
     releaseGate();
+    // The second heartbeat's acknowledgement resolves on its own after the 800 ms window lapses.
+    // The withheld wave ends admission 1's job, which frees the poll lease; the reconciler
+    // re-arms a chain that re-admits the now-stale row and reaches the paid boundary.
+    await h.waitFor(async () => paidCalls === 2 ? true : null, { timeoutMs: 8_000, label: "re-admitted paid call" });
+    // Call 2 belongs to the re-admitted owner; the late ack never authorized admission 1's wave.
+    expect(await recoveryRun(meetingId)).toMatchObject({ admissions: 2 });
+    expect(maxInflight).toBe(1);
+    gateAfterFirst.resolve();
     await waitStatus(meetingId, "completed", 20_000);
   } finally {
-    releaseGate();
+    heldAck.resolve();
+    gateAfterFirst?.resolve();
+    gateAfterFirst = null;
     gate = null;
-    h.ctx.transcriptRecovery = origRecovery;
-    h.ctx.config.recordingRecovery.admissionMs = origAdmission;
-    h.ctx.recoveryHeartbeatDelay = origDelay;
+    restore();
   }
-  // Each admission dispatches only the wave whose heartbeat returned fresh — the delayed
-  // acknowledgements withheld every later wave, so exactly one paid call ran and nothing ever
-  // overlapped. The spent round then settles exhausted and the meeting completes on the
-  // native transcript.
-  expect(paidCalls).toBe(1);
+  // Admission 1 paid for exactly one wave; the re-admitted owner paid for its own fresh-heartbeat
+  // waves. Neither call overlapped another.
   expect(maxInflight).toBe(1);
-  expect(await recoveryRun(meetingId)).toMatchObject({ admissions: 2, outcome: "exhausted" });
+  expect(await recoveryRun(meetingId)).toMatchObject({ admissions: 2, outcome: "succeeded" });
+}, 30_000);
+
+test("a live-but-late first heartbeat frees its admission without spending the re-admission", async () => {
+  paidCalls = 0; inflight = 0; maxInflight = 0;
+  gate = null;
+  const restore = smallWindowRecovery();
+  let beats = 0;
+  // The very first heartbeat's acknowledgement resolves past the freshness budget: nothing paid
+  // has left yet, so the admission is released — the next poll re-grants the freed slot without
+  // consuming the bounded takeover count.
+  h.ctx.recoveryHeartbeatDelay = async () => {
+    if (++beats === 1) await Bun.sleep(1_000);
+  };
+
+  const res = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/LateFirstBeat" } });
+  const { id: meetingId } = await res.json();
+  try {
+    await h.waitFor(async () => h.vexa.meetings.has("jitsi/LateFirstBeat@jitsi.local") ? true : null, { timeoutMs: 2_000, label: "bot dispatch" });
+    await h.vexa.control("jitsi", "LateFirstBeat@jitsi.local", { status: "active" });
+    await incompleteThreeWaveCapture("LateFirstBeat@jitsi.local");
+    await waitStatus(meetingId, "completed", 20_000);
+  } finally {
+    gate = null;
+    restore();
+  }
+  // The released slot was re-granted (admissions stays 1), the fresh beats drove all three waves,
+  // and the outcome is a clean success — not the exhaustion a held-until-stale admission costs.
+  expect(paidCalls).toBe(3);
+  expect(maxInflight).toBe(1);
+  expect(await recoveryRun(meetingId)).toMatchObject({ admissions: 1, outcome: "succeeded" });
+}, 30_000);
+
+test("a backward wall-clock step cannot resurrect an expired heartbeat acknowledgement", async () => {
+  paidCalls = 0; inflight = 0; maxInflight = 0;
+  gate = Promise.withResolvers<void>();
+  const releaseGate = gate.resolve;
+  const restore = smallWindowRecovery();
+  const realDateNow = Date.now;
+  let beats = 0;
+  // Admission 1's second heartbeat is held past the 800 ms window while the worker's wall clock
+  // reads 2 s in the past — a Date.now-based freshness check computes a negative round trip and
+  // would authorize a wave competing with the re-admitted owner's call. Restored on beat 3.
+  const heldAck = Promise.withResolvers<void>();
+  h.ctx.recoveryHeartbeatDelay = async () => {
+    const beat = ++beats;
+    if (beat === 2) {
+      Date.now = () => realDateNow() - 2_000;
+      await Bun.sleep(1_000);
+      heldAck.resolve();
+    }
+    if (beat === 3) Date.now = realDateNow;
+  };
+
+  const res = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/ClockStep" } });
+  const { id: meetingId } = await res.json();
+  try {
+    await h.waitFor(async () => h.vexa.meetings.has("jitsi/ClockStep@jitsi.local") ? true : null, { timeoutMs: 2_000, label: "bot dispatch" });
+    await h.vexa.control("jitsi", "ClockStep@jitsi.local", { status: "active" });
+    await incompleteThreeWaveCapture("ClockStep@jitsi.local");
+    await h.waitFor(async () => inflight === 1 ? true : null, { timeoutMs: 4_000, label: "paid call in flight" });
+    gateAfterFirst = Promise.withResolvers<void>();
+    gate = gateAfterFirst;
+    releaseGate();
+    // The correct (monotonic) check withholds the stepped-clock ack; the job exits, frees the
+    // poll lease, and the reconciler re-arms a chain that re-admits the stale row.
+    await heldAck.promise;
+    await h.waitFor(async () => paidCalls === 2 ? true : null, { timeoutMs: 8_000, label: "re-admitted paid call" });
+    expect(await recoveryRun(meetingId)).toMatchObject({ admissions: 2 });
+    expect(maxInflight).toBe(1);
+    gateAfterFirst.resolve();
+    await waitStatus(meetingId, "completed", 20_000);
+  } finally {
+    Date.now = realDateNow;
+    heldAck.resolve();
+    gateAfterFirst?.resolve();
+    gateAfterFirst = null;
+    gate = null;
+    restore();
+  }
+  expect(maxInflight).toBe(1);
+  expect(await recoveryRun(meetingId)).toMatchObject({ admissions: 2, outcome: "succeeded" });
 }, 30_000);
 
 test("a competing poll cannot fail a meeting while a paid admission is live", async () => {
   paidCalls = 0; inflight = 0; maxInflight = 0;
+
   gate = Promise.withResolvers<void>();
   const releaseGate = gate.resolve;
 
@@ -431,3 +541,54 @@ test("a competing poll cannot fail a meeting while a paid admission is live", as
   expect(maxInflight).toBe(1);
   expect(await recoveryRun(meetingId)).toMatchObject({ admissions: 1, outcome: "succeeded" });
 }, 20_000);
+
+test("check-and-fail is serialized with admission: a live one defers, a committed fail forecloses", async () => {
+  paidCalls = 0; inflight = 0; maxInflight = 0;
+  gate = null;
+
+  const res = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/SerializedFail" } });
+  const { id: meetingId } = await res.json();
+  try {
+    await h.waitFor(async () => h.vexa.meetings.has("jitsi/SerializedFail@jitsi.local") ? true : null, { timeoutMs: 2_000, label: "bot dispatch" });
+    await h.vexa.control("jitsi", "SerializedFail@jitsi.local", { status: "active" });
+    await waitStatus(meetingId, "in_progress");
+    // Stand the meeting in the same state a poll hop reaches right before an admission.
+    await h.ctx.db.execute(sql`update meetings set status = 'processing' where id = ${meetingId}`);
+
+    // Case A: a live admission owns the outcome — the provider 404 must defer, never fail.
+    const admission = await admitRecordingRecovery(h.ctx, meetingId);
+    expect(admission).toMatchObject({ kind: "admitted" });
+    await h.vexa.control("jitsi", "SerializedFail@jitsi.local", { transcript_missing: true });
+    await Bun.sleep(300); // several poll hops hit the 404 while the admission is live
+    const liveRow = await h.ctx.db.execute(sql`select status from meetings where id = ${meetingId}`) as unknown as { status: string }[];
+    expect(liveRow[0]!.status).toBe("processing");
+    // No hop may grant a second admission or dispatch paid work while the slot is live.
+    expect(await recoveryRun(meetingId)).toMatchObject({ admissions: 1 });
+
+    // Case B: once the owner frees the slot, the next hop's failure write commits under the same
+    // lock the admission needs — a later grant can only observe a non-processing meeting.
+    await releaseRecordingRecovery(h.ctx, meetingId, (admission as { token: string }).token);
+    await waitStatus(meetingId, "failed");
+    expect(await admitRecordingRecovery(h.ctx, meetingId)).toEqual({ kind: "ineligible" });
+    expect(await recoveryRun(meetingId)).toMatchObject({ admissions: 1 });
+  } finally {
+    gate = null;
+  }
+}, 20_000);
+
+test("worker startup rejects an admission window too small for a dispatch wave", () => {
+  const origAdmission = h.ctx.config.recordingRecovery.admissionMs;
+  try {
+    // The default 600 s window exceeds the default Tinfoil wave bound (~361 s) plus margin.
+    const worker = startWorker(h.ctx, { popTimeoutSec: .05 });
+    void worker.stop();
+    // A window at or below wave bound + margin can never cover a wave; NaN is defence-in-depth
+    // (config parsing already rejects non-integer env values).
+    h.ctx.config.recordingRecovery.admissionMs = 200;
+    expect(() => startWorker(h.ctx)).toThrow(/RECORDING_RECOVERY_ADMISSION_MS/);
+    h.ctx.config.recordingRecovery.admissionMs = Number.NaN;
+    expect(() => startWorker(h.ctx)).toThrow(/RECORDING_RECOVERY_ADMISSION_MS/);
+  } finally {
+    h.ctx.config.recordingRecovery.admissionMs = origAdmission;
+  }
+});

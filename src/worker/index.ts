@@ -5,6 +5,7 @@ import { deliverWebhook, reconcileWebhookDeliveries } from "../webhooks/dispatch
 import { handleJoinDeadline, handleMeetingPoll, handleMeetingStart } from "./meeting-job.ts";
 import { finalizeAttributedRun, processAttributedBatch, reconcileAttributedRuns, recordAttributedWorkerReadiness } from "../services/attributed-transcription.ts";
 import { TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
+import { recoveryAckBudgetMs } from "../services/recording-recovery.ts";
 import type { Job } from "./queue.ts";
 
 export type JobOutcome = "processed" | "noop" | "deferred";
@@ -32,6 +33,12 @@ export interface WorkerHandle {
 
 /** Runs the queue loop until stopped. Errors are retried without turning this process into an idle worker. */
 export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number; heartbeatIntervalMs?: number } = {}): WorkerHandle {
+  // The recovery fence can only fence a wave if the admission window exceeds that wave's worst
+  // case plus margin; refuse to run rather than silently strand meetings or under-fence (TC-574).
+  if (ctx.transcriptRecovery && !(recoveryAckBudgetMs(ctx) > 0)) {
+    throw new Error(`RECORDING_RECOVERY_ADMISSION_MS (${ctx.config.recordingRecovery.admissionMs}) must exceed the recovery provider's max dispatch wave plus margin`);
+  }
+
   let running = true;
   const attributedEnabled = ctx.config.attributedTranscriptionEnabled;
   let reconciliationInFlight = false;

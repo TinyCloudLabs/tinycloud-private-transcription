@@ -1,7 +1,9 @@
 import { and, eq, isNotNull, isNull, sql } from "drizzle-orm";
 import type { AppContext } from "../context.ts";
 import type { Db } from "../db/client.ts";
-import { meetings, recordingRecoveryRuns } from "../db/schema.ts";
+import { attributedBatches, attributedTranscriptionRuns, meetings, recordingRecoveryRuns, type MeetingRow } from "../db/schema.ts";
+import type { ErrorCode } from "../domain/errors.ts";
+import { canTransition, type MeetingStatus } from "../domain/state.ts";
 
 /** What `db.transaction` hands to its callback; structurally a Db without transaction(). */
 type DbSession = Pick<Db, "update" | "select" | "insert" | "delete" | "execute">;
@@ -77,20 +79,72 @@ export async function admitRecordingRecovery(ctx: AppContext, meetingId: string)
 }
 
 /**
- * True while a recovery admission is live for this meeting (owned, unsettled, not yet stale).
- * Runs inside the same advisory lock as `admitRecordingRecovery` so a poll hop can never race
- * an uncommitted grant: a hop arriving mid-admission waits for the transaction, then observes
- * the granted row. Terminal poll-path writes must check this before failing a meeting (TC-574).
+ * How much of the heartbeat round trip may elapse before the acknowledgement is stale: the
+ * admission window minus one full dispatch wave (the provider's worst-case `maxRequestWaveMs`)
+ * and a margin that scales with the window. A non-positive budget means the configured window
+ * can never cover a wave — workers refuse to start rather than strand meetings (TC-574).
  */
-export async function hasLiveRecordingRecovery(ctx: AppContext, meetingId: string): Promise<boolean> {
-  return ctx.db.transaction(async (tx) => {
-    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`recording_recovery:${meetingId}`}))`);
-    const [run] = await tx.select().from(recordingRecoveryRuns).where(eq(recordingRecoveryRuns.meetingId, meetingId));
-    if (!run?.ownerToken || run.outcome || !run.admittedAt) return false;
-    const [clock] = await tx.execute(sql`select now() as now`);
-    const now = new Date((clock as { now: Date }).now);
-    return now.getTime() - run.admittedAt.getTime() <= ctx.config.recordingRecovery.admissionMs;
-  });
+export function recoveryAckBudgetMs(ctx: AppContext): number {
+  const admissionMs = ctx.config.recordingRecovery.admissionMs;
+  const waveMs = ctx.transcriptRecovery?.maxRequestWaveMs ?? 0;
+  const marginMs = Math.min(5_000, Math.floor(admissionMs * 0.1));
+  return admissionMs - waveMs - marginMs;
+}
+
+/**
+ * The serialized counterpart of `admitRecordingRecovery` for terminal failure writes (TC-574):
+ * under the same advisory lock, a live foreign admission defers the write (a paid call may be
+ * in flight and owns the outcome), otherwise the meeting's failure transition commits inside
+ * the lock so a later admission observes a non-processing meeting and is always ineligible.
+ * Returns "deferred" or the transition result ({meeting, changed}); callers mirror `failMeeting`.
+ */
+export async function failMeetingUnlessRecoveryLive(
+  ctx: AppContext,
+  meeting: MeetingRow,
+  code: ErrorCode,
+  message: string,
+): Promise<{ meeting: MeetingRow; changed: boolean } | "deferred"> {
+  for (;;) {
+    const result = await ctx.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`recording_recovery:${meeting.id}`}))`);
+      const [run] = await tx.select().from(recordingRecoveryRuns).where(eq(recordingRecoveryRuns.meetingId, meeting.id));
+      if (run?.ownerToken && !run.outcome && run.admittedAt) {
+        const [clock] = await tx.execute(sql`select now() as now`);
+        const now = new Date((clock as { now: Date }).now);
+        if (now.getTime() - run.admittedAt.getTime() <= ctx.config.recordingRecovery.admissionMs) {
+          return { deferred: true as const, waiting: false as const };
+        }
+      }
+      // The meeting row lock and the conditional update mirror terminalTransition, including the
+      // attributed dispatch-ledger wait, so the failure write keeps every existing guarantee.
+      const [current] = await tx.select().from(meetings).where(eq(meetings.id, meeting.id)).for("update");
+      if (!current || current.status !== meeting.status || !canTransition(current.status as MeetingStatus, "failed")) {
+        return { deferred: false as const, waiting: false as const, meeting: current ?? meeting, changed: false };
+      }
+      const [run2] = await tx.select().from(attributedTranscriptionRuns)
+        .where(eq(attributedTranscriptionRuns.meetingId, meeting.id)).for("update");
+      if (run2) {
+        const active = await tx.select({ id: attributedBatches.id }).from(attributedBatches)
+          .where(and(eq(attributedBatches.meetingId, meeting.id), isNotNull(attributedBatches.dispatchToken))).for("update");
+        if (active.length) return { deferred: false as const, waiting: true as const };
+      }
+      const patch: Partial<typeof meetings.$inferInsert> = { status: "failed", errorCode: code, errorMessage: message };
+      if (!meeting.endedAt) patch.endedAt = new Date();
+      if (meeting.platform === "signal") patch.signalCapability = null;
+      const [row] = await tx.update(meetings).set(patch)
+        .where(and(eq(meetings.id, meeting.id), eq(meetings.status, meeting.status))).returning();
+      return row
+        ? { deferred: false as const, waiting: false as const, meeting: row, changed: true }
+        : { deferred: false as const, waiting: false as const, meeting: current, changed: false };
+    });
+    if (result.deferred) return "deferred";
+    if (!result.waiting) {
+      if (result.changed) ctx.log.info("meeting status changed", { meetingId: result.meeting.id, stage: "status_transition" });
+      return { meeting: result.meeting, changed: result.changed };
+    }
+    // A paid attributed request is still in flight; retry once its dispatch marker settles.
+    await Bun.sleep(10);
+  }
 }
 
 /**

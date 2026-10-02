@@ -94,7 +94,7 @@ export const config = {
      * duration (see TranscriptionProvider.maxRequestWaveMs) plus the heartbeat freshness margin;
      * the worker treats an acknowledgement older than the leftover budget as a fence miss.
      */
-    admissionMs: Number(env("RECORDING_RECOVERY_ADMISSION_MS", "600000")),
+    admissionMs: positiveIntegerEnv("RECORDING_RECOVERY_ADMISSION_MS", "600000"),
   },
   logLevel: env("LOG_LEVEL", "info"),
   /**
