@@ -20,7 +20,7 @@ const bytesFor = (start: number, end: number, voiced = true) => {
   if (voiced) pcm.fill(.1);
   return new Uint8Array(pcm.buffer);
 };
-const range = (sequence: number, speaker_key: string, speaker_name: string, start_ms: number, end_ms: number, source: "glow-bound" | "provisional" = "glow-bound", voiced = true) => {
+const range = (sequence: number, speaker_key: string, speaker_name: string, start_ms: number, end_ms: number, source: "glow-bound" | "provisional" | "unresolved" = "glow-bound", voiced = true) => {
   const bytes = bytesFor(start_ms, end_ms, voiced);
   return { version: 1 as const, meeting_id: "m", sequence, idempotency_key: `r${sequence}`, speaker_key, speaker_name,
     attribution: { source, confidence: source === "glow-bound" ? .9 : 0 }, start_ms, end_ms, codec: "pcm_f32le" as const,
@@ -59,6 +59,20 @@ test("open, failed, absolute, and oversized evidence are rejected before fetch",
   expect(attributedBatches(manifest([({ ...one, state: "failed", path: undefined } as unknown as typeof one)]), 1)).toEqual([]);
   expect(() => attributedBatches(manifest([{ ...one, path: "s3://bucket/x" }]), 1)).toThrow();
   expect(() => attributedBatches(manifest([range(0, "a", "Alice", 0, 120000)]), 1)).toThrow();
+});
+
+test("unresolved-speaker ranges batch and transcribe as an unknown speaker (TC-559)", async () => {
+  // The unresolved range shares the named participant's speaker_key: publication must still give
+  // it a distinct speaker_id, never Alice's (M2).
+  const unresolved = (sequence: number, start_ms: number) => range(sequence, "a", "", start_ms, start_ms + 1_000, "unresolved");
+  const named = range(0, "a", "Alice", 0, 1_000);
+  const input = manifest([named, unresolved(1, 2_000), unresolved(2, 4_000)]);
+  const batches = attributedBatches(input, 1);
+  expect(batches).toHaveLength(2);
+  const transcript = await transcribeAttributedManifest(input, async (item) => bytesFor(item.start_ms, item.end_ms), async (_pcm, batch) => ({ text: batch.speaker_name || "mystery" }), "en", 1);
+  expect(transcript.segments.map((s) => [s.speaker_name, s.attribution])).toEqual([["Alice", "identified"], ["Unknown", "unknown"]]);
+  expect(transcript.segments[1]!.speaker_id).not.toBe(transcript.segments[0]!.speaker_id);
+  expect(transcript.speakers).toHaveLength(2);
 });
 
 test("requires the exact numeric Vexa meeting identity even for empty evidence", () => {
