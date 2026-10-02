@@ -291,18 +291,21 @@ describe("recording recovery and transcript JSON compatibility", () => {
     const originalGetTranscript = h.ctx.vexa.getTranscript.bind(h.ctx.vexa);
     const originalPush = h.ctx.queue.push.bind(h.ctx.queue);
     const originalClaim = h.ctx.queue.claimPollLease.bind(h.ctx.queue);
+    const originalRenew = h.ctx.queue.renewPollLease.bind(h.ctx.queue);
     const pushed: Array<{ job: Parameters<typeof originalPush>[0]; delayMs: number | undefined }> = [];
     try {
       h.ctx.vexa.getTranscript = async () => { throw new ApiError("provider_timeout", "temporary transcript timeout"); };
       h.ctx.queue.push = async (job, delayMs) => { pushed.push({ job, delayMs }); };
-      // This direct call stands in for a chain-owned poll job: claim the lease rather than racing
-      // the meeting's live chain for it.
+      // This direct call stands in for a chain-owned poll job: claim and renew as if this test
+      // held the lease rather than racing the meeting's live chain for it.
       h.ctx.queue.claimPollLease = async () => true;
+      h.ctx.queue.renewPollLease = async () => true;
       await handleMeetingPoll(h.ctx, id, 3, "test-token");
     } finally {
       h.ctx.vexa.getTranscript = originalGetTranscript;
       h.ctx.queue.push = originalPush;
       h.ctx.queue.claimPollLease = originalClaim;
+      h.ctx.queue.renewPollLease = originalRenew;
     }
     expect(pushed).toContainEqual({
       job: { type: "meeting.poll", meetingId: id, recoveryAttempt: 3, pollToken: "test-token" },

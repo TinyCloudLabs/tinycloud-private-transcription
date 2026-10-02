@@ -60,6 +60,17 @@ export class Queue {
     return JSON.parse(res[1]) as Job;
   }
 
+  /** Deletes every delayed member with exactly this payload; returns how many were removed. */
+  async removeDelayed(job: Job): Promise<number> {
+    const payload = JSON.stringify(job);
+    const members = await this.redis.zrangebyscore(this.delayed, "-inf", "+inf");
+    let removed = 0;
+    for (const member of members) {
+      if (member.slice(0, payload.length + 1) === `${payload}|`) removed += await this.redis.zrem(this.delayed, member);
+    }
+    return removed;
+  }
+
   async size(): Promise<{ ready: number; delayed: number }> {
     return { ready: await this.redis.llen(this.ready), delayed: await this.redis.zcard(this.delayed) };
   }
@@ -80,6 +91,21 @@ export class Queue {
       `if redis.call("exists", KEYS[1]) == 0 then return redis.call("set", KEYS[1], ARGV[1], "PX", ARGV[2]) and 1 or 0 end
        if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("set", KEYS[1], ARGV[1], "PX", ARGV[2]) and 1 or 0 end
        return 0`,
+      "1",
+      this.pollLease(meetingId),
+      token,
+      String(Math.max(1, Math.floor(ttlMs))),
+    ])) === 1;
+  }
+
+  /**
+   * Refreshes the lease only while this chain holds it. Unlike claimPollLease it never creates an
+   * absent key: a chain that lost ownership (TTL expiry while a long job ran, or a competing chain
+   * claimed first) gets false and must stop instead of silently taking the lease back.
+   */
+  async renewPollLease(meetingId: string, token: string, ttlMs: number): Promise<boolean> {
+    return (await this.redis.send("EVAL", [
+      `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("set", KEYS[1], ARGV[1], "PX", ARGV[2], "XX") and 1 or 0 end return 0`,
       "1",
       this.pollLease(meetingId),
       token,

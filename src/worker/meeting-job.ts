@@ -15,6 +15,7 @@ import { normalizeSegments } from "../domain/transcript.ts";
 import { openSignalCapability } from "../providers/signal/capability.ts";
 import { stageAttributedManifest } from "../services/attributed-transcription.ts";
 import type { VexaTranscriptionResponse } from "../providers/vexa/types.ts";
+import type { Job } from "./queue.ts";
 
 const MAX_START_ATTEMPTS = 3;
 const MAX_RECOVERY_ATTEMPTS = 3;
@@ -28,21 +29,29 @@ const safeProviderNativeId = (value: unknown): string | undefined =>
 const safeVexaMeetingId = (value: unknown): number | undefined =>
   typeof value === "number" && Number.isSafeInteger(value) && value > 0 && value <= 2_147_483_647 ? value : undefined;
 
-// One delayed hop plus slack: long enough that a live chain never loses its own lease, short
-// enough that heartbeat reconciliation re-creates a crashed chain without operator action.
+// The TTL bounds how long an orphaned lease (worker crash, dropped job) can suppress wakeup
+// reconciliation before expiry re-arms it — it never bounds how long a job may run, because the
+// owning job renews it continuously (see handleMeetingPoll). Three poll intervals keeps repairs at
+// ~3x the normal wakeup latency while giving each renewal two missed-beat margin, independent of
+// the Vexa request timeout (15 s by default) since renewal covers provider stalls too.
 const pollLeaseTtlMs = (ctx: AppContext) => ctx.config.vexa.pollIntervalMs * 3;
 
 /**
  * Starts a poll chain for a freshly dispatched capture. The lease is claimed before the delayed
  * job lands so the job already owns the chain; a live lease means a chain is polling already and
  * needs no wakeup. If Redis blips mid-claim a tokenless job is still pushed — it no-ops on a live
- * lease and claims an expired one itself.
+ * lease and claims an expired one itself. After pushing, ownership is re-verified so a wakeup that
+ * raced in between cannot ride the fresh chain's tail.
  */
 async function startPollChain(ctx: AppContext, meetingId: string, delayMs: number): Promise<void> {
   const token = crypto.randomUUID();
   const claimed = await ctx.queue.claimPollLease(meetingId, token, pollLeaseTtlMs(ctx)).catch(() => null);
   if (claimed === false) return;
-  await ctx.queue.push({ type: "meeting.poll", meetingId, ...(claimed ? { pollToken: token } : {}) }, delayMs);
+  const job: Job = { type: "meeting.poll", meetingId, ...(claimed ? { pollToken: token } : {}) };
+  await ctx.queue.push(job, delayMs);
+  if (claimed && !(await ctx.queue.renewPollLease(meetingId, token, delayMs + pollLeaseTtlMs(ctx)).catch(() => false))) {
+    await ctx.queue.removeDelayed(job).catch(() => {});
+  }
 }
 
 /** Job: meeting.start — ask Vexa to send a bot. */
@@ -150,23 +159,43 @@ export async function handleJoinDeadline(ctx: AppContext, meetingId: string): Pr
   if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
 }
 
-/** Job: meeting.poll — sync status from Vexa; finalize when the bot has left. */
 export async function handleMeetingPoll(ctx: AppContext, meetingId: string, recoveryAttempt = 1, pollToken?: string): Promise<void> {
-  const meeting = await getMeetingById(ctx, meetingId);
-  if (!meeting || isTerminal(meeting.status as MeetingStatus)) return;
-  // One live poll chain per meeting. A chain's delayed continuation refreshes the lease it holds;
-  // any other wakeup (heartbeat reconciliation, API recovery) claims only when no chain is live.
-  // A job that cannot claim is a duplicate of a live chain and must not re-enqueue itself.
+  // One live poll chain per meeting. Claim before anything else (including the meeting read):
+  // every millisecond between pop and claim eats the lease TTL the previous hop reserved, and a
+  // chain job that finds the meeting gone or finished still frees the lease it carried so a
+  // recover/stop wakeup inside the TTL window is not swallowed as a duplicate of a dead chain.
   const token = pollToken ?? crypto.randomUUID();
   if (!(await ctx.queue.claimPollLease(meetingId, token, pollLeaseTtlMs(ctx)))) return;
   let chainAlive = false;
   const continuePoll = async (delayMs: number, attempt = recoveryAttempt) => {
-    await ctx.queue.push({ type: "meeting.poll", meetingId, recoveryAttempt: attempt, pollToken: token }, delayMs);
-    chainAlive = true;
+    // Re-verify and extend ownership to cover the delay plus the next job's own TTL before the
+    // push lands. If the lease was lost (or Redis is down), letting this hop fail is cheaper than
+    // spawning a chain that cannot renew: the job exits chainless and reconciliation re-arms it.
+    if (await ctx.queue.renewPollLease(meetingId, token, delayMs + pollLeaseTtlMs(ctx))) {
+      const job: Job = { type: "meeting.poll", meetingId, recoveryAttempt: attempt, pollToken: token };
+      await ctx.queue.push(job, delayMs);
+      // Re-verify after the push; a wakeup cannot claim a live lease, so failure here means the
+      // lease was already lost and the just-pushed hop must not survive as a zombie chain.
+      if (await ctx.queue.renewPollLease(meetingId, token, delayMs + pollLeaseTtlMs(ctx))) {
+        chainAlive = true;
+        return;
+      }
+      await ctx.queue.removeDelayed(job).catch(() => {});
+    }
+    ctx.log.warn("poll chain lost its lease; not re-enqueueing", { meetingId, stage: "poll", code: "lease_lost" });
   };
+  // Renewal while the job works keeps the lease alive through provider stalls longer than the TTL
+  // (Vexa calls may take up to the request timeout) and through queue backpressure. A failed beat
+  // only means Redis or ownership is gone; continuePoll's own renewal is the authoritative gate.
+  const renewal = setInterval(() => {
+    ctx.queue.renewPollLease(meetingId, token, pollLeaseTtlMs(ctx)).catch(() => {});
+  }, Math.max(10, Math.floor(pollLeaseTtlMs(ctx) / 3)));
   try {
+    const meeting = await getMeetingById(ctx, meetingId);
+    if (!meeting || isTerminal(meeting.status as MeetingStatus)) return;
     await pollMeeting(ctx, meeting, recoveryAttempt, continuePoll);
   } finally {
+    clearInterval(renewal);
     // No continuation was enqueued: free the lease so heartbeat reconciliation can start a fresh
     // chain on the next heartbeat instead of waiting out the TTL.
     if (!chainAlive) await ctx.queue.releasePollLease(meetingId, token).catch(() => {});
