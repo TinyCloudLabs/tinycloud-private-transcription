@@ -66,7 +66,11 @@ export async function startHarness(
     ...(opts.attributedTranscriptionEnabled !== undefined ? { attributedTranscriptionEnabled: opts.attributedTranscriptionEnabled } : {}),
   };
   const db = await runMigrations(config.databaseUrl);
-  await db.execute(sql`truncate table webhook_deliveries, transcripts, meetings, api_keys, projects cascade`);
+  // attributed_worker_readiness and tinfoil_dispatch_slots are included: a prior harness's stopped
+  // worker stays "live" for the 15s staleness window and held slots would block this harness's
+  // dispatch admission. Slots are migration-seeded singleton rows, so they are re-seeded below.
+  await db.execute(sql`truncate table webhook_deliveries, transcripts, meetings, api_keys, projects, attributed_worker_readiness, tinfoil_dispatch_slots cascade`);
+  await db.execute(sql`insert into tinfoil_dispatch_slots (id) values (0), (1) on conflict do nothing`);
   const redis = new RedisClient(config.redisUrl);
   const queue = new Queue(redis, `test:${crypto.randomUUID()}`);
   const ctx = createContext({

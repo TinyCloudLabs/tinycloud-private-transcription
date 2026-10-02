@@ -18,7 +18,7 @@ export async function processJob(ctx: AppContext, job: Job): Promise<JobOutcome>
     case "meeting.join_deadline":
       await handleJoinDeadline(ctx, job.meetingId); return "processed";
     case "attributed.batch":
-      return processAttributedBatch(ctx, job.meetingId, job.batchId, job.fetchAttempt ?? 0);
+      return processAttributedBatch(ctx, job.meetingId, job.batchId);
     case "attributed.finalize":
       return (await finalizeAttributedRun(ctx, job.meetingId)) ? "processed" : "noop";
     case "webhook.deliver":
@@ -146,7 +146,9 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number; hea
       if (!job) continue;
       try {
         if (attributedEnabled && !ctx.attributedReconciliationReady && job.type.startsWith("attributed.")) {
-          await ctx.queue.push(job, 1_000);
+          // Batch jobs requeue deduped so piled-up wakeups behind the gate collapse into one
+          // delayed retry per batch; other attributed jobs keep their own entry (TC-576).
+          await ctx.queue.push(job, 1_000, job.type === "attributed.batch" ? `batch:${job.batchId}` : undefined);
         } else {
           const outcome = await processJob(ctx, job);
           if (job.type.startsWith("attributed.")) {

@@ -32,7 +32,9 @@ export const config = {
     /** Real gateway of the capture rig (infra/README.md). Tests point this at the in-process mock (:18056 when run standalone). */
     baseUrl: env("VEXA_BASE_URL", "http://localhost:18066"),
     apiKey: env("VEXA_API_KEY", ""),
-    pollIntervalMs: Number(env("VEXA_POLL_INTERVAL_MS", "5000")),
+    // Strictly positive: every attributed requeue delay is derived from it, and delayMs <= 0 would
+    // bypass the delayed-queue dedupe and reintroduce the capacity-wait hot loop (TC-576).
+    pollIntervalMs: positiveIntegerEnv("VEXA_POLL_INTERVAL_MS", "5000"),
     /** Per-meeting Vexa remote-participant audio silence window before the bot completes with `left_alone`. */
     maxTimeLeftAloneMs: positiveIntegerEnv("VEXA_MAX_TIME_LEFT_ALONE_MS", "300000"),
     /** Provisioned bot ceiling (matches `max_concurrent_bots` in infra/dstack/app-compose.yaml). Reported in /health. */

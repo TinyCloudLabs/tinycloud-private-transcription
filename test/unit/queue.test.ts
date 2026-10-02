@@ -51,3 +51,15 @@ test("pending() reports ready and delayed jobs separately", async () => {
   expect(delayed).toHaveLength(1);
   expect(delayed[0].job).toEqual({ type: "meeting.poll", meetingId: "p2", pollToken: "t" });
 });
+test("deduped delayed pushes keep one entry and re-add after promotion", async () => {
+  const batchId = `b-${crypto.randomUUID()}`;
+  const job = { type: "attributed.batch", meetingId: "m", batchId } as const;
+  await q.push(job, 60, `batch:${batchId}`);
+  await q.push(job, 60_000, `batch:${batchId}`); // folds into the first entry, not a second member
+  expect((await q.pending()).delayed.filter((e) => e.job.type === "attributed.batch" && e.job.batchId === batchId)).toHaveLength(1);
+  // Promotion removes the member, so the same key re-adds for the next delayed retry.
+  await Bun.sleep(70); // real promotion window: the delayed set is wall-clock scored
+  expect(await q.pop(1)).toEqual(job);
+  await q.push(job, 60_000, `batch:${batchId}`);
+  expect((await q.pending()).delayed.filter((e) => e.job.type === "attributed.batch" && e.job.batchId === batchId)).toHaveLength(1);
+});

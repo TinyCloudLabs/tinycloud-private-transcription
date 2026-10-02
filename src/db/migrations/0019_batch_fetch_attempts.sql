@@ -1,0 +1,1 @@
+ALTER TABLE "attributed_batches" ADD COLUMN "fetch_attempts" integer DEFAULT 0 NOT NULL;
