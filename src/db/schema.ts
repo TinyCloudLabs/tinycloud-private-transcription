@@ -133,6 +133,25 @@ export const tinfoilDispatchSlots = pgTable("tinfoil_dispatch_slots", {
   ownerId: text("owner_id"),
 });
 
+/**
+ * Durable paid-call fence for whole-recording recovery (TC-574). One row per meeting: a live
+ * owner token admits exactly one in-flight recovery transcription; a recorded outcome is
+ * terminal, and a stale owner may be re-admitted only while `admissions` stays under its bound.
+ */
+export const recordingRecoveryRuns = pgTable("recording_recovery_runs", {
+  meetingId: text("meeting_id").primaryKey().references(() => meetings.id, { onDelete: "cascade" }),
+  /** Process-unique token owning the current admission; the paid call may leave only under it. */
+  ownerToken: text("owner_token"),
+  admittedAt: timestamp("admitted_at", { withTimezone: true }),
+  /** Total grants of the paid-call slot; every grant covers one multi-chunk recovery transcription. */
+  admissions: integer("admissions").notNull().default(0),
+  /** Terminal once set: succeeded | failed | ambiguous | exhausted. */
+  outcome: text("outcome"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+
 /** A PostgreSQL-backed worker heartbeat; API and worker commonly run in separate processes. */
 export const attributedWorkerReadiness = pgTable("attributed_worker_readiness", {
   id: text("id").primaryKey(),

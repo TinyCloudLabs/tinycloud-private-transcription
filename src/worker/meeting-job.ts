@@ -14,7 +14,9 @@ import { attributedTranscriptionRuns, meetings } from "../db/schema.ts";
 import { normalizeSegments } from "../domain/transcript.ts";
 import { openSignalCapability } from "../providers/signal/capability.ts";
 import { AttributedStagingError, markAttributedRecovery, resumeAttributedRun, stageAttributedManifest, type AttributedStageOutcome } from "../services/attributed-transcription.ts";
+import { admitRecordingRecovery, failMeetingUnlessRecoveryLive, heartbeatRecordingRecovery, recoveryAckBudgetMs, releaseRecordingRecovery, settleRecordingRecovery } from "../services/recording-recovery.ts";
 import type { VexaAttributedAudioManifest, VexaTranscriptionResponse } from "../providers/vexa/types.ts";
+import type { TranscriptionInput } from "../providers/transcription/types.ts";
 import type { Job } from "./queue.ts";
 
 const MAX_START_ATTEMPTS = 3;
@@ -214,17 +216,25 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
   // A tracked wakeup deletes only its own marker; untracked tokenless jobs carry no wakeupId.
   if (wakeupId) await ctx.queue.releasePollWakeup(meetingId, wakeupId).catch(() => {});
   if (!(await ctx.queue.claimPollLease(meetingId, token, chainLeaseTtlMs(ctx)))) return;
+  // Lease loss observed anywhere downstream (a renewal that definitively returns false). Once
+  // ownership is gone it cannot come back under this token, so the flag only ever turns on.
+  let leaseLost = false;
   let chainAlive = false;
+  const noteRenewal = (renewed: boolean) => {
+    // A definitive false means the token no longer owns the lease; it can never own it again.
+    if (!renewed) leaseLost = true;
+    return renewed;
+  };
   const continuePoll = async (delayMs: number, attempt = recoveryAttempt, nextStagingAttempt = stagingAttempt) => {
     // Re-verify and extend ownership to cover the delay plus the next job's own TTL before the
     // push lands. If the lease was lost (or Redis is down), letting this hop fail is cheaper than
     // spawning a chain that cannot renew: the job exits chainless and reconciliation re-arms it.
-    if (await ctx.queue.renewPollLease(meetingId, token, delayMs + chainLeaseTtlMs(ctx))) {
+    if (noteRenewal(await ctx.queue.renewPollLease(meetingId, token, delayMs + chainLeaseTtlMs(ctx)))) {
       const job: Job = { type: "meeting.poll", meetingId, recoveryAttempt: attempt, ...(nextStagingAttempt ? { stagingAttempt: nextStagingAttempt } : {}), pollToken: token };
       await ctx.queue.push(job, delayMs);
       // Re-verify after the push; a wakeup cannot claim a live lease, so failure here means the
       // lease was already lost and the just-pushed hop must not survive as a zombie chain.
-      if (await ctx.queue.renewPollLease(meetingId, token, delayMs + chainLeaseTtlMs(ctx))) {
+      if (noteRenewal(await ctx.queue.renewPollLease(meetingId, token, delayMs + chainLeaseTtlMs(ctx)))) {
         chainAlive = true;
         return;
       }
@@ -232,16 +242,32 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
     }
     ctx.log.warn("poll chain lost its lease; not re-enqueueing", { meetingId, stage: "poll", code: "lease_lost" });
   };
+  /**
+   * Fail-closed ownership re-check at paid work boundaries (TC-574). A definitive false — or a
+   * prior renewal's definitive false — marks this chain a zombie; a Redis error is treated the
+   * same because an unverifiable lease may already be owned by another worker. Losing chains
+   * must exit: the new owner's poll or heartbeat reconciliation continues the meeting.
+   */
+  const stillOwnsLease = async (): Promise<boolean> => {
+    if (leaseLost) return false;
+    try {
+      if (noteRenewal(await ctx.queue.renewPollLease(meetingId, token, chainLeaseTtlMs(ctx)))) return true;
+    } catch {
+      // Ownership is unverifiable without Redis; paid work stays skipped either way.
+    }
+    ctx.log.warn("poll chain lost its lease before paid work; skipping", { meetingId, stage: "poll", code: "lease_lost" });
+    return false;
+  };
   // Renewal while the job works keeps the lease alive through provider stalls longer than the TTL
   // (Vexa calls may take up to the request timeout) and through queue backpressure. A failed beat
   // only means Redis or ownership is gone; continuePoll's own renewal is the authoritative gate.
   const renewal = setInterval(() => {
-    ctx.queue.renewPollLease(meetingId, token, chainLeaseTtlMs(ctx)).catch(() => {});
+    ctx.queue.renewPollLease(meetingId, token, chainLeaseTtlMs(ctx)).then(noteRenewal).catch(() => {});
   }, Math.max(10, Math.floor(chainLeaseTtlMs(ctx) / 3)));
   try {
     const meeting = await getMeetingById(ctx, meetingId);
     if (!meeting || isTerminal(meeting.status as MeetingStatus)) return;
-    await pollMeeting(ctx, meeting, recoveryAttempt, continuePoll, stagingAttempt);
+    await pollMeeting(ctx, meeting, recoveryAttempt, continuePoll, stagingAttempt, stillOwnsLease);
   } finally {
     clearInterval(renewal);
     // No continuation was enqueued: free the lease so heartbeat reconciliation can start a fresh
@@ -251,11 +277,9 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
 }
 
 type ContinuePoll = (delayMs: number, attempt?: number, nextStagingAttempt?: number) => Promise<void>;
-
-async function pollMeeting(ctx: AppContext, meeting: MeetingRow, recoveryAttempt: number, continuePoll: ContinuePoll, stagingAttempt = 0): Promise<void> {
+async function pollMeeting(ctx: AppContext, meeting: MeetingRow, recoveryAttempt: number, continuePoll: ContinuePoll, stagingAttempt: number, stillOwnsLease: () => Promise<boolean>): Promise<void> {
   if (meeting.platform === "signal") return handleSignalPoll(ctx, meeting, continuePoll);
   if (!meeting.vexaPlatform || !meeting.vexaNativeMeetingId) return;
-
   let vexa;
   try {
     vexa = await ctx.vexa.getTranscript(meeting.vexaPlatform, meeting.vexaNativeMeetingId);
@@ -263,15 +287,20 @@ async function pollMeeting(ctx: AppContext, meeting: MeetingRow, recoveryAttempt
     if (e instanceof VexaHttpError && e.notFound) {
       meeting = await recordCapture(ctx, meeting, { provider_record_missing_at: new Date().toISOString() });
       ctx.log.warn("capture provider record missing", { meetingId: meeting.id, stage: "poll", code: "provider_not_found" });
-      const { meeting: failed } = await failMeeting(ctx, meeting, "capture_failed", "The capture provider lost track of this meeting.");
-      await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+      // Check-and-fail run under the recovery advisory lock: a live paid admission defers the
+      // write; otherwise the transition commits before any admission can grant (TC-574).
+      const out = await failMeetingUnlessRecoveryLive(ctx, meeting, "capture_failed", "The capture provider lost track of this meeting.");
+      if (out === "deferred") {
+        await continuePoll(ctx.config.vexa.pollIntervalMs);
+        return;
+      }
+      if (out.changed) await enqueueMeetingWebhook(ctx, out.meeting, "meeting.failed");
       return;
     }
     ctx.log.warn("vexa poll failed; will retry", { meetingId: meeting.id, stage: "poll", code: e instanceof ApiError ? e.code : "provider_error" });
     await continuePoll(ctx.config.vexa.pollIntervalMs);
     return;
   }
-
   meeting = await observeCapture(ctx, meeting, vexa);
 
   // completion_reason lives under `data` on transcript rows (top-level only on MeetingResponse rows).
@@ -287,8 +316,12 @@ async function pollMeeting(ctx: AppContext, meeting: MeetingRow, recoveryAttempt
   );
   if (mapped === "failed" && !failedAfterAdmission) {
     const f = mapVexaFailure(reason);
-    const { meeting: failed, changed } = await failMeeting(ctx, meeting, f.code, f.message);
-    if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+    const out = await failMeetingUnlessRecoveryLive(ctx, meeting, f.code, f.message);
+    if (out === "deferred") {
+      await continuePoll(ctx.config.vexa.pollIntervalMs);
+      return;
+    }
+    if (out.changed) await enqueueMeetingWebhook(ctx, out.meeting, "meeting.failed");
     return;
   }
 
@@ -300,7 +333,7 @@ async function pollMeeting(ctx: AppContext, meeting: MeetingRow, recoveryAttempt
   }
 
   if (usesAttributedCapture(ctx, meeting)) {
-    await handleAttributedCompletion(ctx, meeting, vexa, recoveryAttempt, stagingAttempt, continuePoll);
+    await handleAttributedCompletion(ctx, meeting, vexa, recoveryAttempt, stagingAttempt, continuePoll, stillOwnsLease);
     return;
   }
 
@@ -310,20 +343,28 @@ async function pollMeeting(ctx: AppContext, meeting: MeetingRow, recoveryAttempt
   try {
     segments = adaptVexaSegments(vexa);
   } catch {
-    const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "The capture provider returned an invalid transcript.");
-    if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+    const out = await failMeetingUnlessRecoveryLive(ctx, meeting, "transcription_failed", "The capture provider returned an invalid transcript.");
+    if (out === "deferred") {
+      await continuePoll(ctx.config.vexa.pollIntervalMs);
+      return;
+    }
+    if (out.changed) await enqueueMeetingWebhook(ctx, out.meeting, "meeting.failed");
     return;
   }
   const hasLiveWords = segments.some((segment) => segment.text.trim().length > 0);
   const recover = !!ctx.transcriptRecovery && isMateriallyIncomplete(vexa, segments);
   if (!hasLiveWords && !recover) {
     const failure = reason ? mapVexaFailure(reason) : { code: "capture_failed" as const, message: "No usable audio was captured for this meeting." };
-    const { meeting: failed, changed } = await failMeeting(ctx, meeting, failure.code, failure.message);
-    if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+    const out = await failMeetingUnlessRecoveryLive(ctx, meeting, failure.code, failure.message);
+    if (out === "deferred") {
+      await continuePoll(ctx.config.vexa.pollIntervalMs);
+      return;
+    }
+    if (out.changed) await enqueueMeetingWebhook(ctx, out.meeting, "meeting.failed");
     return;
   }
   ({ meeting } = await transition(ctx, meeting, "processing"));
-  await finalize(ctx, meeting, vexa, segments, recover, recoveryAttempt, continuePoll);
+  await finalize(ctx, meeting, vexa, segments, recover, recoveryAttempt, continuePoll, stillOwnsLease);
 }
 /**
  * Attributed finalization. A committed run is always resumed on its own ledger and never
@@ -335,7 +376,7 @@ async function pollMeeting(ctx: AppContext, meeting: MeetingRow, recoveryAttempt
 const MAX_STAGING_ATTEMPTS = 3;
 const STAGING_RETRYABLE = new Set(["open", "transport", "db"]);
 
-async function handleAttributedCompletion(ctx: AppContext, meeting: MeetingRow, vexa: VexaTranscriptionResponse, recoveryAttempt: number, stagingAttempt: number, continuePoll: ContinuePoll) {
+async function handleAttributedCompletion(ctx: AppContext, meeting: MeetingRow, vexa: VexaTranscriptionResponse, recoveryAttempt: number, stagingAttempt: number, continuePoll: ContinuePoll, stillOwnsLease: () => Promise<boolean>) {
   ({ meeting } = await transition(ctx, meeting, "processing"));
   const vexaMeetingId = meeting.vexaMeetingId;
   if (!vexaMeetingId) {
@@ -343,11 +384,11 @@ async function handleAttributedCompletion(ctx: AppContext, meeting: MeetingRow, 
     const outcome = await markAttributedRecovery(ctx, meeting.id);
     if (outcome === "ineligible") return;
     if (outcome === "resumed") { await resumeAttributedRun(ctx, meeting.id); return; }
-    return recoverFromRecording(ctx, meeting, vexa, recoveryAttempt, continuePoll);
+    return recoverFromRecording(ctx, meeting, vexa, recoveryAttempt, continuePoll, stillOwnsLease);
   }
   const [existing] = await ctx.db.select().from(attributedTranscriptionRuns).where(eq(attributedTranscriptionRuns.meetingId, meeting.id));
   if (existing) {
-    if (existing.status === "fallback") return recoverFromRecording(ctx, meeting, vexa, recoveryAttempt, continuePoll);
+    if (existing.status === "fallback") return recoverFromRecording(ctx, meeting, vexa, recoveryAttempt, continuePoll, stillOwnsLease);
     if (existing.status !== "processing") return;
     // The ledger already owns this meeting; a re-staged or conflicting manifest is never
     // verified again and never falls back to the recording.
@@ -366,7 +407,7 @@ async function handleAttributedCompletion(ctx: AppContext, meeting: MeetingRow, 
     const outcome = await markAttributedRecovery(ctx, meeting.id);
     if (outcome === "ineligible") return;
     if (outcome === "resumed") { await resumeAttributedRun(ctx, meeting.id); return; }
-    return recoverFromRecording(ctx, meeting, vexa, recoveryAttempt, continuePoll);
+    return recoverFromRecording(ctx, meeting, vexa, recoveryAttempt, continuePoll, stillOwnsLease);
   }
   let outcome: AttributedStageOutcome | "ineligible" | "fallback";
   try {
@@ -385,11 +426,11 @@ async function handleAttributedCompletion(ctx: AppContext, meeting: MeetingRow, 
   if (outcome === "ineligible") return;
   if (outcome === "resumed") { await resumeAttributedRun(ctx, meeting.id); return; }
   if (outcome === "staged") return;
-  return recoverFromRecording(ctx, meeting, vexa, recoveryAttempt, continuePoll);
+  return recoverFromRecording(ctx, meeting, vexa, recoveryAttempt, continuePoll, stillOwnsLease);
 }
 
 /** Completes the meeting from the retained mixed recording when no attributed run exists. */
-async function recoverFromRecording(ctx: AppContext, meeting: MeetingRow, vexa: VexaTranscriptionResponse, recoveryAttempt: number, continuePoll: ContinuePoll) {
+async function recoverFromRecording(ctx: AppContext, meeting: MeetingRow, vexa: VexaTranscriptionResponse, recoveryAttempt: number, continuePoll: ContinuePoll, stillOwnsLease: () => Promise<boolean>) {
   if (meeting.status !== "processing") return;
   if (!ctx.transcriptRecovery) {
     const { meeting: failed, changed } = await failMeeting(ctx, meeting, "transcription_failed", "Attributed source evidence could not be reconciled.");
@@ -402,7 +443,7 @@ async function recoverFromRecording(ctx: AppContext, meeting: MeetingRow, vexa: 
   } catch {
     segments = [];
   }
-  await finalize(ctx, meeting, vexa, segments, true, recoveryAttempt, continuePoll, true);
+  await finalize(ctx, meeting, vexa, segments, true, recoveryAttempt, continuePoll, stillOwnsLease, true);
 }
 
 async function handleSignalStart(ctx: AppContext, meeting: MeetingRow, attempt: number, continueStart: ContinueStart) {
@@ -526,30 +567,15 @@ async function finalize(
   recover: boolean,
   recoveryAttempt: number,
   continuePoll: (delayMs: number, attempt?: number) => Promise<void>,
+  stillOwnsLease: () => Promise<boolean>,
   degraded = false,
 ) {
-  const input = {
-    meetingId: meeting.id,
-    language: meeting.language,
-    vexaSegments,
-    fetchAudio: () => fetchVexaAudio(ctx, vexa),
-  };
-  try {
-    const provider = recover ? ctx.transcriptRecovery! : ctx.transcription;
-    const transcript = await provider.transcribe(input);
-    if (degraded) transcript.partial = true;
-    if (!transcript.text.trim()) {
-      throw new ApiError("transcription_failed", "Transcription provider returned no words");
-    }
-    await completeMeetingWithTranscript(ctx, meeting.id, transcript, provider.name);
-  } catch (e) {
-    if (recover && e instanceof RecoveryRecordingNotReadyError && recoveryAttempt < MAX_RECOVERY_ATTEMPTS) {
-      ctx.log.warn("vexa recording is not ready; retrying recovery", { meetingId: meeting.id, recoveryAttempt });
-      await continuePoll(ctx.config.vexa.pollIntervalMs * recoveryAttempt, recoveryAttempt + 1);
-      return;
-    }
-    if (recover && vexaSegments.some((segment) => segment.text.trim().length > 0)) {
-      ctx.log.warn("recording recovery exhausted; preserving vexa transcript", { meetingId: meeting.id, recoveryAttempt, stage: "recording_recovery", code: "provider_error" });
+  // Ends the meeting without re-entering the paid call, in precedence order: preserve the
+  // unpaid native transcript when it has words, then fail the meeting. Used when the paid
+  // request's outcome is already settled (failed/ambiguous/exhausted) or the paid call errored.
+  const settleWithoutPaidResult = async (notReady: boolean, code?: string): Promise<void> => {
+    if (vexaSegments.some((segment) => segment.text.trim().length > 0)) {
+      ctx.log.warn("recording recovery unavailable; preserving vexa transcript", { meetingId: meeting.id, recoveryAttempt, stage: "recording_recovery", code: "provider_error" });
       const transcript = await ctx.transcription.transcribe(input);
       if (degraded) transcript.partial = true;
       if (transcript.text.trim()) {
@@ -557,14 +583,14 @@ async function finalize(
         return;
       }
     }
-    if (recover && e instanceof RecoveryRecordingNotReadyError) {
+    if (notReady) {
       const failure = mapVexaFailure(completionReasonOf(vexa));
       ctx.log.error("recording recovery exhausted without retained audio", { meetingId: meeting.id, recoveryAttempt });
       const { meeting: failed, changed } = await failMeeting(ctx, meeting, failure.code, failure.message);
       if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
       return;
     }
-    ctx.log.error("transcription failed", { meetingId: meeting.id, stage: "transcription", code: e instanceof ApiError ? e.code : "provider_error" });
+    ctx.log.error("transcription failed", { meetingId: meeting.id, stage: "transcription", code: code ?? "provider_error" });
     const { meeting: failed, changed } = await failMeeting(
       ctx,
       meeting,
@@ -572,6 +598,126 @@ async function finalize(
       "Transcription could not be completed for this meeting.",
     );
     if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+  };
+
+  const input: TranscriptionInput = {
+    meetingId: meeting.id,
+    language: meeting.language,
+    vexaSegments,
+    fetchAudio: () => fetchVexaAudio(ctx, vexa),
+  };
+  let admission: { token: string } | null = null;
+  let admissionAlive = true;
+  // True once the paid provider request may have left this process; anything before it is
+  // unpaid work and frees the admission instead of settling it.
+  let dispatched = false;
+  try {
+    if (recover) {
+      // The admission row is checked before any Vexa fetch: a live foreign admission defers
+      // without spending a readiness attempt or risking a competing failure write (TC-574).
+      // Failures inside this gate (the admission transaction, the deferral enqueue) are job
+      // errors, not transcription failures: they must never settle the meeting.
+      const granted = await admitRecordingRecovery(ctx, meeting.id);
+      if (granted.kind === "ineligible") return;
+      if (granted.kind === "deferred") {
+        // Another worker's admission owns the paid call right now; re-check on the next hop.
+        await continuePoll(ctx.config.vexa.pollIntervalMs);
+        return;
+      }
+      if (granted.kind === "settled") {
+        // The durable outcome is terminal and only ever records "succeeded" once publication
+        // moved the meeting, so a settled row while still processing means the paid request
+        // ended without canonical text: end on the native transcript or a failure.
+        await settleWithoutPaidResult(false);
+        return;
+      }
+      admission = granted;
+      // Freshness bound (TC-574): an acknowledgement that committed on time but arrived late —
+      // its update landed while a stale re-admission was already possible — must not authorize
+      // the next wave. The owner can only be re-admitted once `admitted_at` has aged past
+      // admissionMs, so a heartbeat round trip is honored only while enough of the window
+      // remains to run one full wave plus margin. Elapsed time is monotonic (performance.now):
+      // a backward wall-clock step must never resurrect an expired acknowledgement.
+      const ackBudgetMs = recoveryAckBudgetMs(ctx);
+      let firstBeat = true;
+      input.dispatchHeartbeat = async () => {
+        const startedAt = performance.now();
+        // A non-positive budget means the configured window can never cover a wave; nothing is
+        // authorized, including a same-millisecond ack.
+        const alive = ackBudgetMs > 0 && await heartbeatRecordingRecovery(ctx, meeting.id, granted.token);
+        await ctx.recoveryHeartbeatDelay?.(meeting.id);
+        const fresh = alive && performance.now() - startedAt <= ackBudgetMs;
+        // The first beat precedes any paid dispatch: a live-but-late ack frees the slot so a
+        // waiting poll retries immediately instead of spending the bounded re-admission (Opus).
+        const first = firstBeat;
+        firstBeat = false;
+        if (alive && !fresh && first) await releaseRecordingRecovery(ctx, meeting.id, granted.token).catch(() => {});
+        if (!fresh) admissionAlive = false;
+        return fresh;
+      };
+      // Paid work may only leave under a live lease (TC-574): a zombie chain that lost its
+      // token to another worker frees its admission and exits.
+      if (!(await stillOwnsLease())) {
+        await releaseRecordingRecovery(ctx, meeting.id, granted.token);
+        return;
+      }
+      // Between admission and dispatch only unpaid local work runs: fetching and decoding the
+      // retained recording. A not-ready recording frees the slot and retries on the next hop.
+      const audio = await fetchVexaAudio(ctx, vexa);
+      input.fetchAudio = async () => audio;
+      dispatched = true;
+    }
+    const provider = recover ? ctx.transcriptRecovery! : ctx.transcription;
+    const transcript = await provider.transcribe(input);
+    if (degraded) transcript.partial = true;
+    if (!transcript.text.trim()) {
+      throw new ApiError("transcription_failed", "Transcription provider returned no words");
+    }
+    // The fence no longer names this call: publication belongs to whoever took the admission.
+    if (admission && !admissionAlive) return;
+    const { changed } = await completeMeetingWithTranscript(ctx, meeting.id, transcript, provider.name);
+    // "succeeded" only when publication moved the meeting; otherwise the call's outcome is
+    // genuinely uncertain (its result may already be stored by another path) and stays fenced.
+    if (admission) await settleRecordingRecovery(ctx, meeting.id, admission.token, changed ? "succeeded" : "ambiguous");
+  } catch (e) {
+    if (!admission) {
+      // Recovery gate errors (admission transaction, deferral enqueue) and unpaid native-path
+      // failures never write a recovery outcome: a live foreign admission owns the meeting.
+      if (recover) throw e;
+      ctx.log.error("transcription failed", { meetingId: meeting.id, stage: "transcription", code: e instanceof ApiError ? e.code : "provider_error" });
+      const { meeting: failed, changed } = await failMeeting(
+        ctx,
+        meeting,
+        "transcription_failed",
+        "Transcription could not be completed for this meeting.",
+      );
+      if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+      return;
+    }
+    if (recover && e instanceof RecoveryRecordingNotReadyError && recoveryAttempt < MAX_RECOVERY_ATTEMPTS) {
+      // Pre-dispatch only: the admission is freed so a concurrent poll is never locked out of
+      // retrying a not-ready recording.
+      await releaseRecordingRecovery(ctx, meeting.id, admission.token).catch(() => {});
+      ctx.log.warn("vexa recording is not ready; retrying recovery", { meetingId: meeting.id, recoveryAttempt });
+      await continuePoll(ctx.config.vexa.pollIntervalMs * recoveryAttempt, recoveryAttempt + 1);
+      return;
+    }
+    if (!admissionAlive) {
+      // The admission was settled or re-admitted by another worker; it owns the meeting now.
+      ctx.log.warn("recording recovery admission lost during paid call", { meetingId: meeting.id, stage: "recording_recovery", code: "admission_lost" });
+      return;
+    }
+    if (!dispatched) {
+      // The error happened before the paid request could leave: free the slot.
+      await releaseRecordingRecovery(ctx, meeting.id, admission.token).catch(() => {});
+    } else {
+      // The provider was (or may have been) dispatched: a definitive failure (rejection,
+      // unusable recording, empty text) is recorded "failed"; timeouts and transport errors
+      // stay "ambiguous" because the remote outcome is unknown. The call is never re-sent.
+      await settleRecordingRecovery(ctx, meeting.id, admission.token,
+        e instanceof ApiError && e.code === "transcription_failed" ? "failed" : "ambiguous").catch(() => {});
+    }
+    await settleWithoutPaidResult(e instanceof RecoveryRecordingNotReadyError, e instanceof ApiError ? e.code : undefined);
   }
 }
 

@@ -2,12 +2,14 @@ import { and, eq, isNotNull, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { AppContext } from "../context.ts";
 import { attributedBatches, attributedTranscriptionRuns, meetings, transcripts, type MeetingRow, type TranscriptRow } from "../db/schema.ts";
+import type { Db } from "../db/client.ts";
 import { ApiError, type ErrorCode, errorTypeFor } from "../domain/errors.ts";
 import { newMeetingId } from "../domain/ids.ts";
 import { detectPlatform, type Platform } from "../domain/platform.ts";
 import { canTransition, isTerminal, type MeetingStatus } from "../domain/state.ts";
 import type { NormalizedTranscript } from "../domain/transcript.ts";
 import { recordCapture } from "./capture.ts";
+import { resetRecordingRecovery } from "./recording-recovery.ts";
 import { VexaHttpError } from "../providers/vexa/client.ts";
 import { sealSignalCapability } from "../providers/signal/capability.ts";
 import { wakeWebhookDelivery, webhookDeliveryValues } from "../webhooks/dispatcher.ts";
@@ -152,7 +154,11 @@ export async function transition(
   if (to === "completed") patch.completedAt = now;
   // The Signal fragment is only needed until a terminal worker result. It must not outlive capture.
   if (isTerminal(to) && meeting.platform === "signal") patch.signalCapability = null;
-  if (isTerminal(to)) return terminalTransition(ctx, meeting, to, patch);
+  if (isTerminal(to)) {
+    const out = await terminalTransition(ctx, meeting, to, patch);
+    // Unguarded transitions never defer; the union is for failMeetingUnlessRecoveryLive.
+    return out === "deferred" ? { meeting, changed: false } : out;
+  }
   const [row] = await ctx.db
     .update(meetings)
     .set(patch)
@@ -169,32 +175,40 @@ export async function transition(
  * transitions serialize on the meeting row and wait for that marker to settle. This gives a real
  * ordering fence without holding a database transaction open around a provider request.
  */
-async function terminalTransition(
+export async function terminalTransition(
   ctx: AppContext,
   meeting: MeetingRow,
   to: MeetingStatus,
   patch: Partial<typeof meetings.$inferInsert>,
-): Promise<{ meeting: MeetingRow; changed: boolean }> {
+  /**
+   * Optional serialized preamble inside each attempt's transaction, evaluated before the
+   * meeting row lock is taken so callers that need additional locks keep a consistent
+   * acquisition order. Returning "deferred" abandons the attempt without waiting or writing.
+   */
+  guard?: (tx: Pick<Db, "update" | "select" | "insert" | "delete" | "execute">) => Promise<"deferred" | void>,
+): Promise<{ meeting: MeetingRow; changed: boolean } | "deferred"> {
   for (;;) {
-    const result = await ctx.db.transaction(async (tx) => {
+    const result: { meeting: MeetingRow; changed: boolean; waiting: boolean; deferred: boolean } = await ctx.db.transaction(async (tx) => {
+      if (await guard?.(tx)) return { meeting, changed: false, waiting: false, deferred: true };
       const [current] = await tx.select().from(meetings).where(eq(meetings.id, meeting.id)).for("update");
       if (!current || current.status !== meeting.status || !canTransition(current.status as MeetingStatus, to)) {
-        return { meeting: current ?? meeting, changed: false, waiting: false };
+        return { meeting: current ?? meeting, changed: false, waiting: false, deferred: false };
       }
       const [run] = await tx.select().from(attributedTranscriptionRuns)
         .where(eq(attributedTranscriptionRuns.meetingId, meeting.id)).for("update");
       if (run) {
         const active = await tx.select({ id: attributedBatches.id }).from(attributedBatches)
           .where(and(eq(attributedBatches.meetingId, meeting.id), isNotNull(attributedBatches.dispatchToken))).for("update");
-        if (active.length) return { meeting: current, changed: false, waiting: true };
+        if (active.length) return { meeting: current, changed: false, waiting: true, deferred: false };
       }
       const [row] = await tx.update(meetings).set(patch)
         .where(and(eq(meetings.id, meeting.id), eq(meetings.status, meeting.status))).returning();
-      return row ? { meeting: row, changed: true, waiting: false } : { meeting: current, changed: false, waiting: false };
+      return { meeting: row ?? current, changed: !!row, waiting: false, deferred: false };
     });
+    if (result.deferred) return "deferred";
     if (!result.waiting) {
       if (result.changed) ctx.log.info("meeting status changed", { meetingId: result.meeting.id, stage: "status_transition" });
-      return result;
+      return { meeting: result.meeting, changed: result.changed };
     }
     // No transaction is held while a provider call is in flight. A settled request clears its
     // marker atomically; an abandoned process is recovered by the durable claim reconciler.
@@ -306,15 +320,22 @@ export async function recoverMeeting(ctx: AppContext, meeting: MeetingRow): Prom
   if (!hasRetainedCapture) {
     throw new ApiError("invalid_request", "This meeting has no retained capture-provider record to recover.");
   }
-  const [updated] = await ctx.db
-    .update(meetings)
-    .set({
-      status: "processing",
-      errorCode: null,
-      errorMessage: null,
-    })
-    .where(and(eq(meetings.id, meeting.id), eq(meetings.projectId, meeting.projectId), eq(meetings.status, "failed")))
-    .returning();
+  const updated = await ctx.db.transaction(async (tx) => {
+    const [row] = await tx
+      .update(meetings)
+      .set({
+        status: "processing",
+        errorCode: null,
+        errorMessage: null,
+      })
+      .where(and(eq(meetings.id, meeting.id), eq(meetings.projectId, meeting.projectId), eq(meetings.status, "failed")))
+      .returning();
+    // A recovered meeting gets a fresh bounded recording-recovery round — but only over a
+    // terminal outcome (TC-574): a live or unsettled admission is never reset, and the CAS on
+    // status keeps duplicate recover calls from doing either transition or reset twice.
+    if (row) await resetRecordingRecovery(tx, meeting.id);
+    return row ?? null;
+  });
   if (!updated) return (await getMeetingById(ctx, meeting.id)) ?? meeting;
   await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id }).catch(() => {
     // The processing row is durable and the worker scanner handles both lost acknowledgements and

@@ -46,9 +46,21 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
   calls = 0;
   lastStats: TinfoilStats | null = null;
   private readonly fetchImpl: typeof fetch;
+  /**
+   * Worst case for one dispatch wave: every attempt in the retry budget times out and sleeps its
+   * backoff. Sibling requests share the wall clock (a wave is concurrent), so the bound is the
+   * per-request bound, not a per-chunk sum.
+   */
+  readonly maxRequestWaveMs: number;
 
   constructor(private readonly opts: TinfoilOptions) {
     this.fetchImpl = opts.fetch ?? fetch;
+    const timeout = this.opts.timeoutMs ?? 120_000;
+    const retries = Math.max(0, this.opts.maxRetries ?? 2);
+    const delay = this.opts.retryDelayMs ?? 250;
+    let backoff = 0;
+    for (let attempt = 0; attempt < retries; attempt++) backoff += delay * 4 ** attempt;
+    this.maxRequestWaveMs = (retries + 1) * timeout + backoff;
   }
 
   /** Text-only operation for a Vexa-owned, already-attributed PCM batch. */
@@ -92,7 +104,12 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
 
     // Submit fixed-size waves. A failed chunk rejects the meeting-level attempt before any later
     // wave is scheduled, while sibling requests already in flight are still allowed to settle.
+    // Between waves the caller's dispatch fence is heart-beaten: when it returns false this call
+    // stops before another paid request can overlap whoever took the admission over.
     for (let offset = 0; offset < chunks.length; offset += concurrency) {
+      if (input.dispatchHeartbeat && !(await input.dispatchHeartbeat())) {
+        throw new ApiError("provider_unavailable", "Transcription dispatch fence was lost");
+      }
       const wave = chunks.slice(offset, offset + concurrency);
       const settled = await Promise.allSettled(wave.map(async (chunk, waveIndex) => {
         const index = offset + waveIndex;

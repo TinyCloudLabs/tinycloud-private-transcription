@@ -5,6 +5,7 @@ import { deliverWebhook, reconcileWebhookDeliveries } from "../webhooks/dispatch
 import { handleJoinDeadline, handleMeetingPoll, handleMeetingStart } from "./meeting-job.ts";
 import { finalizeAttributedRun, processAttributedBatch, reconcileAttributedRuns, recordAttributedWorkerReadiness } from "../services/attributed-transcription.ts";
 import { TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
+import { MIN_RECOVERY_ACK_BUDGET_MS, recoveryAckBudgetMs } from "../services/recording-recovery.ts";
 import type { Job } from "./queue.ts";
 
 export type JobOutcome = "processed" | "noop" | "deferred";
@@ -32,6 +33,15 @@ export interface WorkerHandle {
 
 /** Runs the queue loop until stopped. Errors are retried without turning this process into an idle worker. */
 export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number; heartbeatIntervalMs?: number } = {}): WorkerHandle {
+  // The recovery fence can only fence a wave if the admission window exceeds that wave's worst
+  // case plus margin — and still leaves a real acknowledgement budget. A window that barely
+  // clears the wave passes a positivity check yet marks every heartbeat ack stale, turning the
+  // first-beat release into an admit → release → re-admit livelock with no paid call (TC-574);
+  // refuse to run rather than silently strand meetings or under-fence.
+  if (ctx.transcriptRecovery && !(recoveryAckBudgetMs(ctx) >= MIN_RECOVERY_ACK_BUDGET_MS)) {
+    throw new Error(`RECORDING_RECOVERY_ADMISSION_MS (${ctx.config.recordingRecovery.admissionMs}) must leave at least ${MIN_RECOVERY_ACK_BUDGET_MS} ms after the recovery provider's max dispatch wave and margin`);
+  }
+
   let running = true;
   const attributedEnabled = ctx.config.attributedTranscriptionEnabled;
   let reconciliationInFlight = false;
