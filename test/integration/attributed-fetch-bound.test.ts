@@ -145,6 +145,73 @@ test("capacity deferrals do not spend the fetch budget and requeue at the poll i
   }
 }, 60_000);
 
+// The worker readiness gate requeues gated attributed.batch jobs on the delayed set. Without the
+// batch dedup key, piled-up wakeups each kept their own entry and fired back-to-back once the gate
+// opened, burning the whole fetch budget in milliseconds (TC-576, Astra N1).
+test("readiness-gated batch wakeups fold into one delayed retry", async () => {
+  const baselineTinfoilCalls = tinfoilCalls;
+  const recovery = h.ctx.transcriptRecovery;
+  // transcriptRecovery null keeps the worker's reconcile from ever marking itself ready, so the
+  // attributed.* readiness gate stays shut deterministically without racing a heartbeat.
+  h.ctx.transcriptRecovery = null;
+  h.ctx.attributedReconciliationReady = false;
+  try {
+    const created = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://meet.google.com/fetch-bound-3" } });
+    const { id } = await created.json();
+    const native = "fetch-bound-3";
+    const bot = await h.waitFor(async () => h.vexa.meetings.get(`google_meet/${native}`) ?? null, { timeoutMs: 30_000 });
+    const path = `/meetings/${bot.id}/attributed-audio/ranges/0`;
+    await h.vexa.control("google_meet", native, {
+      status: "completed", completion_reason: "stopped",
+      attributed_audio_capability: { requested_version: 1, supported_version: 1, status: "supported" },
+      attributed_audio_manifest: { version: 1, meeting_id: String(bot.id), state: "closed", clock_origin: "first_admitted_capture_epoch_ms", clock_origin_ms: 0, ranges: [rangeSpec(bot.id, path)] },
+      // No attributed_audio_base64 yet: a brief audio outage while the gate opens.
+    });
+    const batch = await h.waitFor(async () => {
+      const [row] = await h.ctx.db.select().from(attributedBatches).where(eq(attributedBatches.meetingId, id));
+      return row?.status === "pending" ? row : null;
+    }, { timeoutMs: 30_000, label: "batch staged behind the gate" });
+    // Pile on wakeups: staging's resume pushes, manual pushes, and the gated 1s requeues must all
+    // fold into a single delayed entry for this batch.
+    const delayedFor = async () => (await h.ctx.queue.pending()).delayed
+      .filter((entry) => entry.job.type === "attributed.batch" && entry.job.batchId === batch.id).length;
+    // Each pop lands behind the shut gate and is requeued delayed; the dedup key must fold them.
+    // Sustained pressure matters: without the key each gated requeue is a fresh member, so a single
+    // early sample would miss the pile-up. Real wall-clock spacing — the worker's pop/promote
+    // cadence is what folds or accumulates these entries.
+    let sawEntry = false;
+    for (let i = 0; i < 12; i++) {
+      await h.ctx.queue.push({ type: "attributed.batch", meetingId: id, batchId: batch.id });
+      await Bun.sleep(60);
+      const count = await delayedFor();
+      expect(count).toBeLessThanOrEqual(1);
+      sawEntry ||= count === 1;
+    }
+    expect(sawEntry).toBe(true);
+    // Readiness returns while the range still 404s: the single pending retry runs and fails once.
+    h.ctx.transcriptRecovery = recovery;
+    h.ctx.attributedReconciliationReady = true;
+    await h.waitFor(async () => {
+      const [row] = await h.ctx.db.select().from(attributedBatches).where(eq(attributedBatches.id, batch.id));
+      return row && row.fetchAttempts >= 1 ? row : null;
+    }, { timeoutMs: 30_000, label: "first gated retry failed once" });
+    // Audio arrives before more failures can land: the surviving retry completes on one paid call.
+    await h.vexa.control("google_meet", native, { attributed_audio_base64: { [path]: Buffer.from(pcm).toString("base64") } });
+    expect(await delayedFor()).toBeLessThanOrEqual(1);
+    await h.waitFor(async () => {
+      const body = await (await h.api(`/v1/meetings/${id}`)).json(); return body.status === "completed" ? body : null;
+    }, { timeoutMs: 30_000, label: "meeting completed after gate opened" });
+    const [settled] = await h.ctx.db.select().from(attributedBatches).where(eq(attributedBatches.id, batch.id));
+    expect(settled.status).toBe("completed");
+    expect(settled.attempts).toBe(1);
+    expect(settled.fetchAttempts).toBeLessThanOrEqual(3);
+    expect(tinfoilCalls).toBe(baselineTinfoilCalls + 1);
+  } finally {
+    h.ctx.transcriptRecovery = recovery;
+    h.ctx.attributedReconciliationReady = true;
+  }
+}, 60_000);
+
 // reconcileAttributedRuns polls run-less and fallback processing meetings so a lost chain wakeup
 // self-heals — but while a poll lease is live that push is pure queue churn and must be skipped,
 // as reconcileMeetingWakeups already does (TC-576).
