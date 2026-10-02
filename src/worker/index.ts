@@ -14,7 +14,7 @@ export async function processJob(ctx: AppContext, job: Job): Promise<JobOutcome>
     case "meeting.start":
       await handleMeetingStart(ctx, job.meetingId, job.attempt ?? 1); return "processed";
     case "meeting.poll":
-      await handleMeetingPoll(ctx, job.meetingId, job.recoveryAttempt ?? 1); return "processed";
+      await handleMeetingPoll(ctx, job.meetingId, job.recoveryAttempt ?? 1, job.pollToken); return "processed";
     case "meeting.join_deadline":
       await handleJoinDeadline(ctx, job.meetingId); return "processed";
     case "attributed.batch":
@@ -44,16 +44,21 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number; hea
 
   // Redis is a wakeup transport, not the work ledger. This repairs lost enqueue acknowledgements
   // for Signal and the feature-off path without relaxing attributed publication's own ledger.
+  // A live poll lease means a meeting.poll chain already re-enqueues itself; pushing another poll
+  // then would start a second perpetual chain (TC-558), so those meetings are skipped. An
+  // orphaned lease expires on its own and the next heartbeat starts a fresh chain.
   const reconcileMeetingWakeups = async () => {
     const rows = await ctx.db.select().from(meetings).where(inArray(meetings.status, [
       "queued", "joining", "waiting_for_admission", "in_progress", "processing",
     ]));
     for (const meeting of rows) {
       if (attributedEnabled && meeting.platform === "google_meet" && meeting.status === "processing") continue;
-      const job = meeting.status === "queued"
-        ? { type: "meeting.start" as const, meetingId: meeting.id }
-        : { type: "meeting.poll" as const, meetingId: meeting.id };
-      await ctx.queue.push(job).catch(() => {});
+      if (meeting.status === "queued") {
+        await ctx.queue.push({ type: "meeting.start", meetingId: meeting.id }).catch(() => {});
+        continue;
+      }
+      if (await ctx.queue.hasPollLease(meeting.id).catch(() => false)) continue;
+      await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id }).catch(() => {});
     }
   };
 

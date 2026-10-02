@@ -2,7 +2,7 @@ import { RedisClient } from "bun";
 
 export type Job =
   | { type: "meeting.start"; meetingId: string; attempt?: number }
-  | { type: "meeting.poll"; meetingId: string; recoveryAttempt?: number }
+  | { type: "meeting.poll"; meetingId: string; recoveryAttempt?: number; pollToken?: string }
   | { type: "meeting.join_deadline"; meetingId: string }
   | { type: "attributed.batch"; meetingId: string; batchId: string }
   | { type: "attributed.finalize"; meetingId: string }
@@ -15,6 +15,7 @@ export type Job =
 export class Queue {
   private readonly ready: string;
   private readonly delayed: string;
+  private readonly pollLease: (meetingId: string) => string;
 
   constructor(
     private readonly redis: RedisClient,
@@ -22,6 +23,7 @@ export class Queue {
   ) {
     this.ready = `${prefix}:jobs:ready`;
     this.delayed = `${prefix}:jobs:delayed`;
+    this.pollLease = (meetingId) => `${prefix}:poll:${meetingId}`;
   }
 
   async push(job: Job, delayMs = 0): Promise<void> {
@@ -64,5 +66,47 @@ export class Queue {
 
   async clear() {
     await this.redis.del(this.ready, this.delayed);
+  }
+
+  /**
+   * Per-meeting poll lease. Exactly one meeting.poll chain may be live: a wakeup with no token
+   * claims only when no lease exists, a chain's own delayed continuation refreshes the lease it
+   * holds, and anything else (a heartbeat push that raced the chain) exits without re-enqueueing.
+   * The TTL outlives one delayed hop so an active chain never loses its own lease, yet a crashed
+   * or dropped job lets reconciliation start a fresh chain once the lease expires.
+   */
+  async claimPollLease(meetingId: string, token: string, ttlMs: number): Promise<boolean> {
+    return (await this.redis.send("EVAL", [
+      `if redis.call("exists", KEYS[1]) == 0 then return redis.call("set", KEYS[1], ARGV[1], "PX", ARGV[2]) and 1 or 0 end
+       if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("set", KEYS[1], ARGV[1], "PX", ARGV[2]) and 1 or 0 end
+       return 0`,
+      "1",
+      this.pollLease(meetingId),
+      token,
+      String(Math.max(1, Math.floor(ttlMs))),
+    ])) === 1;
+  }
+
+  /** Deletes the lease only while this chain still holds it. */
+  async releasePollLease(meetingId: string, token: string): Promise<void> {
+    await this.redis.send("EVAL", [
+      `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) end return 0`,
+      "1",
+      this.pollLease(meetingId),
+      token,
+    ]);
+  }
+
+  /** True while some meeting.poll chain owns the lease, live or orphaned. */
+  async hasPollLease(meetingId: string): Promise<boolean> {
+    return this.redis.exists(this.pollLease(meetingId));
+  }
+
+  /** Ready and delayed jobs; delayed members keep their dedup suffix so each push is counted. */
+  async pending(): Promise<{ ready: Job[]; delayed: { job: Job; runAt: number }[] }> {
+    const ready = (await this.redis.lrange(this.ready, 0, -1)).map((raw) => JSON.parse(raw) as Job);
+    const delayedRows = (await this.redis.zrangebyscore(this.delayed, "-inf", "+inf", "WITHSCORES")) as unknown as [string, number][];
+    const delayed = delayedRows.map(([member, score]) => ({ job: JSON.parse(member.slice(0, member.lastIndexOf("|"))) as Job, runAt: Number(score) }));
+    return { ready, delayed };
   }
 }
