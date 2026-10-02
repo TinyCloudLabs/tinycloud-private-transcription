@@ -80,8 +80,8 @@ describe("infra/dstack/app-compose.yaml", () => {
 
   test("pins every deploy and runtime-pulled image to an approved immutable digest", () => {
     const expected = {
-      api: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:calendar-autojoin-666c3111d4d47547050d06b637ac0eef74229e89@sha256:df9d4425eb5def3bcffff9b162934e4dc104784816f3531e66b0c3d0cf10eec3",
-      worker: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:calendar-autojoin-666c3111d4d47547050d06b637ac0eef74229e89@sha256:df9d4425eb5def3bcffff9b162934e4dc104784816f3531e66b0c3d0cf10eec3",
+      api: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:4e33c2f65935a7e2d05de384d8f584e8fa027afc@sha256:ffe80cd739d6e34e4656ee5e6e7ca6dcc2b775b75d819ef890f9ec39f8372d69",
+      worker: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:4e33c2f65935a7e2d05de384d8f584e8fa027afc@sha256:ffe80cd739d6e34e4656ee5e6e7ca6dcc2b775b75d819ef890f9ec39f8372d69",
       "signal-capture": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f",
       "signal-capture-2": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f",
       "signal-capture-3": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f",
@@ -94,7 +94,7 @@ describe("infra/dstack/app-compose.yaml", () => {
       minio: "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
       "minio-init": "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727",
       "admin-api": "vexaai/v012-admin-api:v012@sha256:4c702354384eafe3a933cd537a106b7c15067cfd368a5f6da1a6e675e7e03e04",
-      "bot-image-keeper": "ghcr.io/tinycloudlabs/vexa/bot:tc-36f0304@sha256:2c6393d4cdb3b5b6172569e3c8b33b902c841beed5e1a548fddb8d9358200857",
+      "bot-image-keeper": "ghcr.io/tinycloudlabs/vexa/bot:tc-78e5ae2@sha256:6e0ed2c52b57b82188dba429e91ec0c2d810d7efe4fabfa86c8fe3f45daec5e6",
       runtime: "vexaai/v012-runtime:v012@sha256:a1f6448fbb380b9433364e8b572ec25a12aa4f274bf403f1d83a89cbf5812f2d",
       whisper: "fedirz/faster-whisper-server:latest-cpu@sha256:760e5e43d427dc6cfbbc4731934b908b7de9c7e6d5309c6a1f0c8c923a5b6030",
       "meeting-api": "ghcr.io/tinycloudlabs/vexa/meeting-api:tc-36f0304@sha256:2f6f0c162402f13b72569d1a9f5bfb792af75f88b60b9178db85d468405d19e2",
@@ -109,7 +109,7 @@ describe("infra/dstack/app-compose.yaml", () => {
 
     const runtime = serviceEnv("runtime");
     expect(runtime).toContain(
-      "BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-36f0304@sha256:2c6393d4cdb3b5b6172569e3c8b33b902c841beed5e1a548fddb8d9358200857}",
+      "BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-78e5ae2@sha256:6e0ed2c52b57b82188dba429e91ec0c2d810d7efe4fabfa86c8fe3f45daec5e6}",
     );
     expect(runtime).toContain(
       "AGENT_IMAGE: ${VEXA_AGENT_IMAGE:-vexaai/v012-agent-api:v012@sha256:6eb37574b33aab233aabbe5907e06e106bae44a403e5df781a436da8201a928d}",
@@ -132,7 +132,7 @@ describe("infra/dstack/app-compose.yaml", () => {
 
   test("pins the Vexa bot, meeting-api, and gateway to the accepted fork commits and digests", () => {
     expect(compose).toContain(
-      "ghcr.io/tinycloudlabs/vexa/bot:tc-36f0304@sha256:2c6393d4cdb3b5b6172569e3c8b33b902c841beed5e1a548fddb8d9358200857",
+      "ghcr.io/tinycloudlabs/vexa/bot:tc-78e5ae2@sha256:6e0ed2c52b57b82188dba429e91ec0c2d810d7efe4fabfa86c8fe3f45daec5e6",
     );
     expect(compose).toContain(
       "ghcr.io/tinycloudlabs/vexa/meeting-api:tc-36f0304@sha256:2f6f0c162402f13b72569d1a9f5bfb792af75f88b60b9178db85d468405d19e2",
