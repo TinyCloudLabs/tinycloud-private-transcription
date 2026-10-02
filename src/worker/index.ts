@@ -2,7 +2,7 @@ import { createContext, type AppContext } from "../context.ts";
 import { inArray } from "drizzle-orm";
 import { attributedTranscriptionRuns, meetings } from "../db/schema.ts";
 import { deliverWebhook, reconcileWebhookDeliveries } from "../webhooks/dispatcher.ts";
-import { handleJoinDeadline, handleMeetingPoll, handleMeetingStart } from "./meeting-job.ts";
+import { handleJoinDeadline, handleMeetingPoll, handleMeetingStart, chainLeaseTtlMs } from "./meeting-job.ts";
 import { finalizeAttributedRun, processAttributedBatch, reconcileAttributedRuns, recordAttributedWorkerReadiness } from "../services/attributed-transcription.ts";
 import { TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
 import type { Job } from "./queue.ts";
@@ -67,10 +67,15 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number; hea
         // re-enqueues itself; pushing another start would fork a new chain every heartbeat and
         // restart its attempt counter, so the join timeout would never bound the total (TC-570).
         if (await ctx.queue.hasStartLease(meeting.id).catch(() => false)) continue;
+        // A chain hop blocked behind other work cannot renew its lease: once it expires, this
+        // scanner sees a leaseless queued meeting again. The wakeup marker bounds that to one
+        // outstanding tokenless push per window instead of one per heartbeat.
+        if (!(await ctx.queue.claimStartWakeup(meeting.id, chainLeaseTtlMs(ctx)).catch(() => true))) continue;
         await ctx.queue.push({ type: "meeting.start", meetingId: meeting.id }).catch(() => {});
         continue;
       }
       if (await ctx.queue.hasPollLease(meeting.id).catch(() => false)) continue;
+      if (!(await ctx.queue.claimPollWakeup(meeting.id, chainLeaseTtlMs(ctx)).catch(() => true))) continue;
       await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id }).catch(() => {});
     }
   };

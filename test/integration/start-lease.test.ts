@@ -6,6 +6,7 @@
  */
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import type { SignalCaptureAdapter, SignalCaptureSnapshot } from "../../src/providers/signal/adapter.ts";
+import { VexaHttpError, type VexaClient } from "../../src/providers/vexa/client.ts";
 import { meetings } from "../../src/db/schema.ts";
 import { startHarness, type Harness } from "./harness.ts";
 import type { Job } from "../../src/worker/queue.ts";
@@ -26,14 +27,14 @@ class FakeSignalCapture implements SignalCaptureAdapter {
 
 let h: Harness;
 let signal: FakeSignalCapture;
-
 beforeAll(async () => {
   signal = new FakeSignalCapture();
   h = await startHarness({
-    enabledPlatforms: ["signal"],
+    enabledPlatforms: ["signal", "jitsi"],
     signal,
     signalCapabilityKey: Buffer.alloc(32, 7).toString("base64"),
-    // Attempts are spaced max(pollIntervalMs, 1000) = 1s; attempt*delay >= 4s fails the wait.
+    // Attempts are spaced max(pollIntervalMs, 1000) = 1s; the seat-wait deadline is
+    // createdAt + joinTimeoutSeconds (4 s), so each wait fails roughly 4 s after create.
     joinTimeoutSeconds: 4,
     workerHeartbeatIntervalMs: 25,
     workerPopTimeoutSec: .05,
@@ -165,4 +166,107 @@ test("a dropped seat-wait continuation is re-armed by heartbeat after the lease 
   }, { timeoutMs: 2_000, label: "meeting cancelled" });
   await h.waitFor(async () => (await h.ctx.queue.hasStartLease(meetingId)) ? null : true, { timeoutMs: 2_000, label: "lease released on exit" });
   await h.waitFor(async () => (await pendingStarts(meetingId)) === 0 ? true : null, { timeoutMs: 2_000, label: "no starts pending" });
+}, 15_000);
+
+test("a retryable createBot failure retries under the lease instead of failing the meeting", async () => {
+  const nativeId = "TransientStart@jitsi.local";
+  const originalCreateBot = h.ctx.vexa.createBot.bind(h.ctx.vexa);
+  let calls = 0;
+  h.ctx.vexa.createBot = async (input: Parameters<VexaClient["createBot"]>[0]) => {
+    if (input.native_meeting_id !== nativeId) return originalCreateBot(input);
+    calls++;
+    if (calls === 1) throw new VexaHttpError(503);
+    return originalCreateBot(input);
+  };
+  try {
+    const res = await h.api("/v1/meetings", {
+      method: "POST",
+      json: { meeting_url: "https://jitsi.local/TransientStart", webhook_url: h.webhook.url },
+    });
+    expect(res.status).toBe(201);
+    const meetingId = (await res.json()).id as string;
+
+    // Attempt 1 gets a retryable 503; the chain's delayed retry (attempt 2, +1 s) must run the
+    // dispatch path again. A missing return after the retry push would also fail the meeting.
+    const joined = await h.waitFor(async () => {
+      const body = await meetingOf(h, meetingId);
+      return body.status === "joining" ? body : null;
+    }, { timeoutMs: 4_000, label: "joining after transient 503" });
+    expect(joined.error).toBeFalsy();
+    expect(calls).toBe(2);
+    // A few heartbeats settle: the retry path must not emit meeting.failed at all.
+    await Bun.sleep(300);
+    const failures = h.webhook.received.filter((w) => w.body.type === "meeting.failed" && w.body.data.meeting_id === meetingId);
+    expect(failures).toHaveLength(0);
+    expect(await h.ctx.queue.hasStartLease(meetingId)).toBe(false);
+  } finally {
+    h.ctx.vexa.createBot = originalCreateBot;
+  }
+}, 15_000);
+
+test("a blocked consumer coalesces tokenless start and poll wakeups", async () => {
+  // An in-progress jitsi meeting polls every 50 ms; stalling every getTranscript call for 400 ms
+  // backs the serial consumer up so delayed chain hops land behind real work and their leases
+  // expire (delay + TTL ≈ 1.15 s for start, 200 ms for poll) before being consumed. Without
+  // wakeup markers the heartbeat pushes a fresh tokenless wakeup every 25 ms while blocked.
+  const res = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/WakeupLoad" } });
+  expect(res.status).toBe(201);
+  const pollId = (await res.json()).id as string;
+  await h.waitFor(async () => h.vexa.meetings.has("jitsi/WakeupLoad@jitsi.local") ? true : null, { timeoutMs: 2_000, label: "bot dispatch" });
+  await h.vexa.control("jitsi", "WakeupLoad@jitsi.local", { status: "active" });
+  await h.waitFor(async () => {
+    const body = await meetingOf(h, pollId);
+    return body.status === "in_progress" ? true : null;
+  }, { timeoutMs: 3_000, label: "poll chain running" });
+
+  const originalGetTranscript = h.ctx.vexa.getTranscript.bind(h.ctx.vexa);
+  let blocking = false;
+  h.ctx.vexa.getTranscript = async (platform: string, nativeId: string) => {
+    // Real delay: the point is that consumer work outlasts the lease TTL, which fake timers
+    // cannot express.
+    if (blocking) await Bun.sleep(400);
+    return originalGetTranscript(platform, nativeId);
+  };
+
+  const counts = { startWakeups: 0, pollWakeups: 0 };
+  const originalPush = h.ctx.queue.push.bind(h.ctx.queue);
+  h.ctx.queue.push = async (job: Job, delayMs = 0) => {
+    if (job.type === "meeting.start" && !job.startToken) counts.startWakeups++;
+    if (job.type === "meeting.poll" && job.meetingId === pollId && !job.pollToken) counts.pollWakeups++;
+    return originalPush(job, delayMs);
+  };
+
+  try {
+    blocking = true;
+    // The signal meeting's seat-wait hop is due ~1 s after create with a lease expiring ~150 ms
+    // later; the 2 s stall guarantees it sits ready past expiry so heartbeats reach the marker.
+    const startId = await createSignalMeeting();
+    try {
+      let maxPending = 0;
+      const deadline = Date.now() + 2_000;
+      while (Date.now() < deadline) {
+        maxPending = Math.max(maxPending, await pendingStarts(startId));
+        await Bun.sleep(25);
+      }
+      blocking = false;
+      // Marker windows: a tokenless wakeup is pushed at most once per chain-lease TTL (150 ms)
+      // while the consumer is stalled — ~2 s / 150 ms ≈ 14 pushes total, versus one per 25 ms
+      // heartbeat (~80) without the marker. Both kinds must be coalesced and the chains must
+      // actually resume (a consumed wakeup claims the expired lease itself).
+      expect(counts.startWakeups).toBeGreaterThan(0);
+      expect(counts.startWakeups).toBeLessThanOrEqual(20);
+      expect(counts.pollWakeups).toBeGreaterThan(0);
+      expect(counts.pollWakeups).toBeLessThanOrEqual(20);
+      await h.waitFor(async () => (await pendingStarts(startId)) <= 1 ? true : null, { timeoutMs: 3_000, label: "wakeups drained" });
+      await h.waitFor(async () => (await h.ctx.queue.hasStartLease(startId)) ? true : null, { timeoutMs: 2_000, label: "start chain re-armed" });
+      expect(maxPending).toBeLessThanOrEqual(20);
+      const stopped = await h.api(`/v1/meetings/${startId}/stop`, { method: "POST" });
+      expect(stopped.status).toBe(200);
+    } finally {
+      blocking = false;
+    }
+  } finally {
+    h.ctx.queue.push = originalPush;
+    h.ctx.vexa.getTranscript = originalGetTranscript;
+  }
 }, 15_000);

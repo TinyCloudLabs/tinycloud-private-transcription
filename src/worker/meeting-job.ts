@@ -36,7 +36,7 @@ const safeVexaMeetingId = (value: unknown): number | undefined =>
 // missed-beat margin, independent of the Vexa request timeout (15 s by default) since renewal
 // covers provider stalls too. Start chains share the TTL: seat waits re-enqueue at most one
 // poll interval out and a start job's provider call is bounded by the same timeout.
-const chainLeaseTtlMs = (ctx: AppContext) => ctx.config.vexa.pollIntervalMs * 3;
+export const chainLeaseTtlMs = (ctx: AppContext) => ctx.config.vexa.pollIntervalMs * 3;
 
 /**
  * Starts a poll chain for a freshly dispatched capture. The lease is claimed before the delayed
@@ -160,6 +160,7 @@ async function handleStartError(ctx: AppContext, meeting: MeetingRow, e: unknown
   if ((retryable || vexa5xx) && attempt < MAX_START_ATTEMPTS) {
     ctx.log.warn("vexa createBot failed, retrying", { meetingId: meeting.id, attempt, stage: "create", code: e instanceof ApiError ? e.code : "provider_error" });
     await continueStart(1_000 * attempt, attempt + 1);
+    return;
   }
   ctx.log.error("vexa createBot failed", { meetingId: meeting.id, stage: "create", code: e instanceof ApiError ? e.code : "provider_error" });
   const code = e instanceof ApiError ? e.code : e instanceof VexaHttpError && e.status === 409 ? "meeting_join_failed" : "provider_unavailable";
@@ -169,8 +170,8 @@ async function handleStartError(ctx: AppContext, meeting: MeetingRow, e: unknown
       : e instanceof ApiError
         ? e.message
         : "Meeting capture provider is unavailable.";
-  const { meeting: failed } = await failMeeting(ctx, meeting, code, message);
-  await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+  const { meeting: failed, changed } = await failMeeting(ctx, meeting, code, message);
+  if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
 }
 
 /**
@@ -437,15 +438,20 @@ async function handleSignalStart(ctx: AppContext, meeting: MeetingRow, attempt: 
 }
 
 /**
- * Bounded wait for a Signal seat. Attempts are spaced by the poll interval and stop once they would
- * exceed JOIN_TIMEOUT_SECONDS, at which point the meeting fails as provider_unavailable — the same
- * deadline a dispatched meeting gets for admission.
+ * Bounded wait for a Signal seat. Attempts are spaced by the poll interval and the wait ends at
+ * a durable deadline — createdAt + JOIN_TIMEOUT_SECONDS — the same one a dispatched meeting gets
+ * for admission. The deadline rides the row, not the attempt counter, so a replacement chain
+ * (lease expiry, worker restart) cannot restart the budget.
  */
 async function requeueForSignalSeat(ctx: AppContext, meeting: MeetingRow, attempt: number, reason: string, continueStart: ContinueStart) {
   const delayMs = Math.max(ctx.config.vexa.pollIntervalMs, 1_000);
-  if (attempt * delayMs < ctx.config.joinTimeoutSeconds * 1000) {
+  const deadlineMs = meeting.createdAt.getTime() + ctx.config.joinTimeoutSeconds * 1000;
+  if (Date.now() + delayMs <= deadlineMs) {
     ctx.log.info("waiting for a signal capture seat", { meetingId: meeting.id, attempt, reason });
-    await continueStart(delayMs, attempt + 1);
+    // A queue/Redis failure inside continueStart must not fail the meeting: the chain ends
+    // leaseless and heartbeat reconciliation re-arms it (see the comment on continueStart).
+    await continueStart(delayMs, attempt + 1).catch(() =>
+      ctx.log.warn("signal seat wait lost its wakeup; reconciliation will re-arm", { meetingId: meeting.id, stage: "start", code: "queue_unavailable" }));
     return;
   }
   const fresh = (await getMeetingById(ctx, meeting.id)) ?? meeting;

@@ -17,6 +17,8 @@ export class Queue {
   private readonly delayed: string;
   private readonly startLease: (meetingId: string) => string;
   private readonly pollLease: (meetingId: string) => string;
+  private readonly startWakeup: (meetingId: string) => string;
+  private readonly pollWakeup: (meetingId: string) => string;
 
   constructor(
     private readonly redis: RedisClient,
@@ -26,6 +28,8 @@ export class Queue {
     this.delayed = `${prefix}:jobs:delayed`;
     this.pollLease = (meetingId) => `${prefix}:poll:${meetingId}`;
     this.startLease = (meetingId) => `${prefix}:start:${meetingId}`;
+    this.startWakeup = (meetingId) => `${prefix}:wake:start:${meetingId}`;
+    this.pollWakeup = (meetingId) => `${prefix}:wake:poll:${meetingId}`;
   }
 
   async push(job: Job, delayMs = 0, dedupKey?: string): Promise<void> {
@@ -123,6 +127,11 @@ export class Queue {
     ]);
   }
 
+  /** Claims the short-lived wakeup marker: true when no tokenless wakeup is already outstanding. */
+  private async claimWakeup(key: string, ttlMs: number): Promise<boolean> {
+    return (await this.redis.send("SET", [key, "1", "PX", String(Math.max(1, Math.floor(ttlMs))), "NX"])) === "OK";
+  }
+
   /**
    * Per-meeting start lease. Exactly one meeting.start chain may be live: a wakeup with no token
    * claims only when no lease exists, a chain's own delayed continuation refreshes the lease it
@@ -151,6 +160,18 @@ export class Queue {
   }
 
   /**
+   * Coalesces tokenless meeting.start wakeups while the consumer is blocked. A start chain whose
+   * continuation sits in the ready queue behind unrelated work cannot renew its lease; once the
+   * lease expires, reconciliation would otherwise push a fresh wakeup every heartbeat and the
+   * pending start count would grow unboundedly until the consumer catches up. Taking this marker
+   * before the push leaves at most one outstanding wakeup per marker window; the marker's expiry
+   * matches the chain-lease TTL so a genuinely lost wakeup is re-armed on the next reconciliation.
+   */
+  async claimStartWakeup(meetingId: string, ttlMs: number): Promise<boolean> {
+    return this.claimWakeup(this.startWakeup(meetingId), ttlMs);
+  }
+
+  /**
    * Per-meeting poll lease. Exactly one meeting.poll chain may be live: a wakeup with no token
    * claims only when no lease exists, a chain's own delayed continuation refreshes the lease it
    * holds, and anything else (a heartbeat push that raced the chain) exits without re-enqueueing.
@@ -169,6 +190,11 @@ export class Queue {
   /** Deletes the poll lease only while this chain still holds it. */
   async releasePollLease(meetingId: string, token: string): Promise<void> {
     return this.releaseLease(this.pollLease(meetingId), token);
+  }
+
+  /** Coalesces tokenless meeting.poll wakeups while the consumer is blocked; see claimStartWakeup. */
+  async claimPollWakeup(meetingId: string, ttlMs: number): Promise<boolean> {
+    return this.claimWakeup(this.pollWakeup(meetingId), ttlMs);
   }
 
   /** True while some meeting.poll chain owns the lease, live or orphaned. */
