@@ -278,14 +278,14 @@ transcript is never promoted as the canonical diarized result. The remaining Vex
 their unchanged upstream v0.12 images.
 
 - **Branches**: `tinycloud` = current upstream (`59e2c413`) + the selected TinyCloud overlay, currently
-  at `36f03047`. `main` tracks upstream untouched. The separate local rig remains pinned by
+  at `78e5ae24` (TC-560 attributed-audio retry on top of `36f03047`). `main` tracks upstream untouched. The separate local rig remains pinned by
   `infra/vexa/upstream` and `infra/vexa/UPSTREAM_PIN` until that fixture is refreshed.
 - **The patch**: `core/meetings/modules/record-chunker` — `createRecordingTap` builds a dynamic mix
   (`DynamicElementMixer`): the recorder starts immediately (even with zero audio elements) and a 2 s
   rescan (live-mixer parity) attaches new elements / detaches ended ones. Pinned by the module's
   `dynamic-tap.smoke.test.ts`.
-- **Images**: bot, meeting-api, and gateway use
-  `ghcr.io/tinycloudlabs/vexa/<component>:tc-36f0304`. The release commit includes the accepted runtime
+- **Images**: meeting-api and gateway use `ghcr.io/tinycloudlabs/vexa/<component>:tc-36f0304`; the bot
+  uses `ghcr.io/tinycloudlabs/vexa/bot:tc-78e5ae2` (TC-560). The release commit includes the accepted runtime
   changes plus the workflow's missing pnpm toolchain correction. All are pinned by digest in
   `infra/dstack/app-compose.yaml`. The bot workflow is `tinycloud-bot-image`; the older
   `ghcr.io/tinycloudlabs/vexa-bot` package was created while the fork was private, is stuck private,
