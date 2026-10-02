@@ -156,7 +156,7 @@ test("0004-0015 retain production retry, fallback, terminal delivery, and deleti
     expect(signalColumns).toEqual({ count: 2 });
 
     const [migrationCount] = await db.execute(sql`SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`);
-    expect(migrationCount).toEqual({ count: 19 });
+    expect(migrationCount).toEqual({ count: 20 });
 
     const [deletionAdmission] = await db.execute(sql`
       SELECT count(*)::int AS count
@@ -302,7 +302,7 @@ test("0016 keeps every pre-enforcement key working on meeting routes and grants 
   }
 }, 30_000);
 
-test("0017 (batch transcription) is additive: every pre-existing table, row and meeting route is unchanged", async () => {
+test("0017+ migrations are additive: every pre-existing column, row and meeting route is unchanged", async () => {
   const databaseName = `ptx_batch_${crypto.randomUUID().replaceAll("-", "")}`;
   const databaseUrl = new URL(config.databaseUrl);
   databaseUrl.pathname = `/${databaseName}`;
@@ -328,8 +328,12 @@ test("0017 (batch transcription) is additive: every pre-existing table, row and 
     await before.$client.close();
 
     db = await runMigrations(databaseUrl.toString());
-    const tablesBefore = new Set((schemaBefore as { table_name: string }[]).map((c) => c.table_name));
-    const schemaAfter = (await columns(db) as { table_name: string }[]).filter((c) => tablesBefore.has(c.table_name));
+    // 0019 adds attributed_batches.fetch_attempts; additive columns on pre-existing tables are
+    // allowed, so compare only the columns that already existed.
+    const columnsBefore = new Set((schemaBefore as { table_name: string; column_name: string }[])
+      .map((c) => `${c.table_name}.${c.column_name}`));
+    const schemaAfter = (await columns(db) as { table_name: string; column_name: string }[])
+      .filter((c) => columnsBefore.has(`${c.table_name}.${c.column_name}`));
     expect(schemaAfter).toEqual(schemaBefore as never);
     expect(await db.execute(sql`SELECT * FROM meetings`)).toEqual(rowsBefore);
     // 0017 and 0018 applied in one run: the singleton is seeded and closed (the meeting role never reads it).

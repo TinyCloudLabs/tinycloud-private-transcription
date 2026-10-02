@@ -134,6 +134,13 @@
       "when": 1790706219951,
       "tag": "0018_batch_admission_closed",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1790950577372,
+      "tag": "0019_batch_fetch_attempts",
+      "breakpoints": true
     }
   ]
 }

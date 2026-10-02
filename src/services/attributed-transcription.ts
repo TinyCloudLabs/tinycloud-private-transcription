@@ -138,7 +138,9 @@ export async function stageAttributedManifest(ctx: AppContext, meetingId: string
 
 async function claimBatch(ctx: AppContext, batchId: string) {
   const token = crypto.randomUUID();
-  const [batch] = await ctx.db.update(batchesTable).set({ status: "claimed", claimToken: token, claimedAt: new Date(), updatedAt: new Date() })
+  // The fetch counter is incremented under the claim itself so a finalize or reconcile wakeup
+  // that requeues this pending batch cannot reset the durable bound (TC-576).
+  const [batch] = await ctx.db.update(batchesTable).set({ status: "claimed", claimToken: token, claimedAt: new Date(), fetchAttempts: sql`${batchesTable.fetchAttempts} + 1`, updatedAt: new Date() })
     .where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "pending"), sql`${batchesTable.attempts} < ${ATTEMPT_LIMIT}`)).returning();
   return batch ? { batch, token } : null;
 }
@@ -224,11 +226,14 @@ export async function processAttributedBatch(ctx: AppContext, meetingId: string,
     let prepared;
     try { prepared = await readAttributedBatch(spec, async (range) => (await ctx.vexa.fetchBytes(range.path!)).bytes); }
     catch {
-      // A fetch/checksum failure happens before any paid call; bounded requeue is safe (L3).
-      if (fetchAttempt < MAX_FETCH_ATTEMPTS && await releaseBatchClaim(ctx, batchId, claimed.token)) {
-        await ctx.queue.push({ type: "attributed.batch", meetingId, batchId, fetchAttempt: fetchAttempt + 1 }, ctx.config.vexa.pollIntervalMs);
-        // No finalize wakeup here: finalize would see the batch pending and requeue it with the
-        // fetch counter reset, turning a bounded retry into a hot loop.
+      // A fetch/checksum failure happens before any paid call; bounded requeue is safe (L3). The
+      // bound is the durable per-batch counter (each claim counted one started fetch), floored by
+      // the queue payload so a stale in-flight job cannot restart the budget.
+      const fetchAttempts = Math.max(fetchAttempt, claimed.batch.fetchAttempts);
+      if (fetchAttempts <= MAX_FETCH_ATTEMPTS && await releaseBatchClaim(ctx, batchId, claimed.token)) {
+        await ctx.queue.push({ type: "attributed.batch", meetingId, batchId, fetchAttempt: fetchAttempts + 1 }, ctx.config.vexa.pollIntervalMs);
+        // No finalize wakeup here: finalize would see the batch pending and requeue it, which the
+        // durable counter bounds but is still needless churn.
         return "deferred";
       }
       await settle(ctx, batchId, claimed.token, "failed", meetingId, spec); return done("processed");
@@ -456,7 +461,11 @@ export async function reconcileAttributedRuns(ctx: AppContext): Promise<void> {
   const resumable = new Set(runs.map((run) => run.meetingId));
   const fallback = new Set((await ctx.db.select({ meetingId: attributedTranscriptionRuns.meetingId }).from(attributedTranscriptionRuns)
     .where(eq(attributedTranscriptionRuns.status, "fallback"))).map((run) => run.meetingId));
-  for (const meeting of processing) if ((!resumable.has(meeting.id) || fallback.has(meeting.id)) && meeting.vexaMeetingId != null) {
+  for (const meeting of processing) {
+    if ((resumable.has(meeting.id) && !fallback.has(meeting.id)) || meeting.vexaMeetingId == null) continue;
+    // A live lease means a meeting.poll chain already re-enqueues itself; a tokenless push would
+    // only no-op against it (reconcileMeetingWakeups skips the same way, TC-576).
+    if (await ctx.queue.hasPollLease(meeting.id).catch(() => false)) continue;
     await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id });
   }
 }
