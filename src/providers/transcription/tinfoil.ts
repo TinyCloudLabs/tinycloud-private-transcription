@@ -92,7 +92,12 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
 
     // Submit fixed-size waves. A failed chunk rejects the meeting-level attempt before any later
     // wave is scheduled, while sibling requests already in flight are still allowed to settle.
+    // Between waves the caller's dispatch fence is heart-beaten: when it returns false this call
+    // stops before another paid request can overlap whoever took the admission over.
     for (let offset = 0; offset < chunks.length; offset += concurrency) {
+      if (input.dispatchHeartbeat && !(await input.dispatchHeartbeat())) {
+        throw new ApiError("provider_unavailable", "Transcription dispatch fence was lost");
+      }
       const wave = chunks.slice(offset, offset + concurrency);
       const settled = await Promise.allSettled(wave.map(async (chunk, waveIndex) => {
         const index = offset + waveIndex;

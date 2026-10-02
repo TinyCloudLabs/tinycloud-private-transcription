@@ -156,7 +156,7 @@ test("0004-0015 retain production retry, fallback, terminal delivery, and deleti
     expect(signalColumns).toEqual({ count: 2 });
 
     const [migrationCount] = await db.execute(sql`SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`);
-    expect(migrationCount).toEqual({ count: 20 });
+    expect(migrationCount).toEqual({ count: 21 });
 
     const [deletionAdmission] = await db.execute(sql`
       SELECT count(*)::int AS count

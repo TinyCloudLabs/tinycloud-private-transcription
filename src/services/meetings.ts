@@ -8,6 +8,7 @@ import { detectPlatform, type Platform } from "../domain/platform.ts";
 import { canTransition, isTerminal, type MeetingStatus } from "../domain/state.ts";
 import type { NormalizedTranscript } from "../domain/transcript.ts";
 import { recordCapture } from "./capture.ts";
+import { resetRecordingRecovery } from "./recording-recovery.ts";
 import { VexaHttpError } from "../providers/vexa/client.ts";
 import { sealSignalCapability } from "../providers/signal/capability.ts";
 import { wakeWebhookDelivery, webhookDeliveryValues } from "../webhooks/dispatcher.ts";
@@ -306,15 +307,22 @@ export async function recoverMeeting(ctx: AppContext, meeting: MeetingRow): Prom
   if (!hasRetainedCapture) {
     throw new ApiError("invalid_request", "This meeting has no retained capture-provider record to recover.");
   }
-  const [updated] = await ctx.db
-    .update(meetings)
-    .set({
-      status: "processing",
-      errorCode: null,
-      errorMessage: null,
-    })
-    .where(and(eq(meetings.id, meeting.id), eq(meetings.projectId, meeting.projectId), eq(meetings.status, "failed")))
-    .returning();
+  const updated = await ctx.db.transaction(async (tx) => {
+    const [row] = await tx
+      .update(meetings)
+      .set({
+        status: "processing",
+        errorCode: null,
+        errorMessage: null,
+      })
+      .where(and(eq(meetings.id, meeting.id), eq(meetings.projectId, meeting.projectId), eq(meetings.status, "failed")))
+      .returning();
+    // A recovered meeting gets a fresh bounded recording-recovery round — but only over a
+    // terminal outcome (TC-574): a live or unsettled admission is never reset, and the CAS on
+    // status keeps duplicate recover calls from doing either transition or reset twice.
+    if (row) await resetRecordingRecovery(tx, meeting.id);
+    return row ?? null;
+  });
   if (!updated) return (await getMeetingById(ctx, meeting.id)) ?? meeting;
   await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id }).catch(() => {
     // The processing row is durable and the worker scanner handles both lost acknowledgements and
