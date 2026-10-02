@@ -20,7 +20,7 @@ test("config load rejects an invalid RECORDING_RECOVERY_ADMISSION_MS", () => {
   // Load the real config module in a fresh process so its module-level env parse runs.
   for (const value of ["0", "-1", "1.5", "bad"]) {
     const proc = Bun.spawnSync(
-      ["bun", "-e", 'await import("./src/config.ts")'],
+      [process.execPath, "-e", 'await import("./src/config.ts")'],
       {
         cwd: new URL("../..", import.meta.url).pathname,
         env: { ...process.env, RECORDING_RECOVERY_ADMISSION_MS: value },

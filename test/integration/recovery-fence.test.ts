@@ -573,11 +573,13 @@ test("check-and-fail is serialized with admission: a live one defers, a committe
     expect(await admitRecordingRecovery(h.ctx, meetingId)).toEqual({ kind: "ineligible" });
     expect(await recoveryRun(meetingId)).toMatchObject({ admissions: 1 });
 
-    // Concurrent contention: for each round's processing meeting, many admit/fail pairs race.
-    // Whichever serialized winner commits first decides the meeting — every later admit sees a
-    // failed row, every later fail defers on a live admission. The postcondition is the fence
-    // itself: a round may never end both failed AND holding a granted admission.
-    for (let round = 0; round < 6; round++) {
+    // Concurrent contention: each round parks a blocker transaction holding the meeting's
+    // recording_recovery advisory lock, queues admit/fail calls behind it, then releases — every
+    // contender starts from the same instant, which is the interleaving a reintroduced
+    // check-then-fail (unlocked) race needs to lose. Whichever serialized winner commits first
+    // decides the meeting: later admits see a failed row, later fails defer on a live admission.
+    // The postcondition is the fence itself: a round may never end failed AND granted.
+    for (let round = 0; round < 10; round++) {
       const barrageId = `mtg_fencerr_${round}`;
       await h.ctx.db.insert(meetings).values({
         id: barrageId,
@@ -590,11 +592,21 @@ test("check-and-fail is serialized with admission: a live one defers, a committe
       await h.ctx.queue.claimPollLease(barrageId, `fence-race-${round}`, 60_000);
       try {
         const [row] = await h.ctx.db.select().from(meetings).where(eq(meetings.id, barrageId));
+        // Hold the advisory lock so every racing call piles up at the same lock, then release.
+        const unblock = Promise.withResolvers<void>();
+        const blocker = h.ctx.db.transaction(async (tx) => {
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`recording_recovery:${barrageId}`}))`);
+          await unblock.promise;
+        });
+        await Bun.sleep(25); // let the blocker's lock land before contenders queue
         const pairs = Array.from({ length: 12 }, (_, i) =>
           i % 2 === 0
             ? admitRecordingRecovery(h.ctx, barrageId)
             : failMeetingUnlessRecoveryLive(h.ctx, row!, "capture_failed", "racing failure write"));
+        await Bun.sleep(25); // all contenders are parked on the lock now
+        unblock.resolve();
         const results = await Promise.all(pairs);
+        await blocker;
         const grants = results.filter((r) => (r as { kind?: string }).kind === "admitted").length;
         const [final] = await h.ctx.db.select({ status: meetings.status }).from(meetings).where(eq(meetings.id, barrageId));
         expect(final!.status === "failed" && grants > 0).toBe(false);
@@ -615,8 +627,9 @@ test("worker startup requires a real acknowledgement budget, not just a positive
     // The default 600 s window leaves ~234 s of acknowledgement budget.
     const worker = startWorker(h.ctx, { popTimeoutSec: .05 });
     void worker.stop();
-    // Opus's repro: 366251 clears the 365250 wave + 5000 margin guard by 1 ms and was accepted;
-    // a 1 ms budget marks every heartbeat ack stale and livelocks admit → release → re-admit.
+    // Opus's repro: 366251 clears the 361250 wave + 5000 margin by exactly 1 ms and was
+    // accepted; a 1 ms budget marks every heartbeat ack stale and livelocks admit → release →
+    // re-admit.
     h.ctx.config.recordingRecovery.admissionMs = waveMs + 5_001;
     expect(recoveryAckBudgetMs(h.ctx)).toBe(1);
     expect(() => startWorker(h.ctx)).toThrow(/RECORDING_RECOVERY_ADMISSION_MS/);
