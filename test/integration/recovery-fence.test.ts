@@ -1,8 +1,9 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
+import { meetings } from "../../src/db/schema.ts";
 import { TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
 import { PCM_RATE, pcmToWav } from "../../src/providers/transcription/audio.ts";
-import { admitRecordingRecovery, heartbeatRecordingRecovery, releaseRecordingRecovery } from "../../src/services/recording-recovery.ts";
+import { admitRecordingRecovery, failMeetingUnlessRecoveryLive, heartbeatRecordingRecovery, MIN_RECOVERY_ACK_BUDGET_MS, recoveryAckBudgetMs, releaseRecordingRecovery } from "../../src/services/recording-recovery.ts";
 import { startWorker, type WorkerHandle } from "../../src/worker/index.ts";
 import { startHarness, type Harness } from "./harness.ts";
 
@@ -571,21 +572,59 @@ test("check-and-fail is serialized with admission: a live one defers, a committe
     await waitStatus(meetingId, "failed");
     expect(await admitRecordingRecovery(h.ctx, meetingId)).toEqual({ kind: "ineligible" });
     expect(await recoveryRun(meetingId)).toMatchObject({ admissions: 1 });
+
+    // Concurrent contention: for each round's processing meeting, many admit/fail pairs race.
+    // Whichever serialized winner commits first decides the meeting — every later admit sees a
+    // failed row, every later fail defers on a live admission. The postcondition is the fence
+    // itself: a round may never end both failed AND holding a granted admission.
+    for (let round = 0; round < 6; round++) {
+      const barrageId = `mtg_fencerr_${round}`;
+      await h.ctx.db.insert(meetings).values({
+        id: barrageId,
+        projectId: "demo",
+        platform: "jitsi",
+        status: "processing",
+        meetingUrl: `https://jitsi.local/FenceRace${round}`,
+      });
+      // A held poll lease keeps the reconciler from pushing worker hops into the race.
+      await h.ctx.queue.claimPollLease(barrageId, `fence-race-${round}`, 60_000);
+      try {
+        const [row] = await h.ctx.db.select().from(meetings).where(eq(meetings.id, barrageId));
+        const pairs = Array.from({ length: 12 }, (_, i) =>
+          i % 2 === 0
+            ? admitRecordingRecovery(h.ctx, barrageId)
+            : failMeetingUnlessRecoveryLive(h.ctx, row!, "capture_failed", "racing failure write"));
+        const results = await Promise.all(pairs);
+        const grants = results.filter((r) => (r as { kind?: string }).kind === "admitted").length;
+        const [final] = await h.ctx.db.select({ status: meetings.status }).from(meetings).where(eq(meetings.id, barrageId));
+        expect(final!.status === "failed" && grants > 0).toBe(false);
+      } finally {
+        await h.ctx.db.execute(sql`update meetings set status = 'failed' where id = ${barrageId} and status = 'processing'`);
+        await h.ctx.queue.releasePollLease(barrageId, `fence-race-${round}`);
+      }
+    }
   } finally {
     gate = null;
   }
 }, 20_000);
 
-test("worker startup rejects an admission window too small for a dispatch wave", () => {
+test("worker startup requires a real acknowledgement budget, not just a positive one", () => {
   const origAdmission = h.ctx.config.recordingRecovery.admissionMs;
+  const waveMs = h.ctx.transcriptRecovery!.maxRequestWaveMs!;
   try {
-    // The default 600 s window exceeds the default Tinfoil wave bound (~361 s) plus margin.
+    // The default 600 s window leaves ~234 s of acknowledgement budget.
     const worker = startWorker(h.ctx, { popTimeoutSec: .05 });
     void worker.stop();
-    // A window at or below wave bound + margin can never cover a wave; NaN is defence-in-depth
-    // (config parsing already rejects non-integer env values).
-    h.ctx.config.recordingRecovery.admissionMs = 200;
+    // Opus's repro: 366251 clears the 365250 wave + 5000 margin guard by 1 ms and was accepted;
+    // a 1 ms budget marks every heartbeat ack stale and livelocks admit → release → re-admit.
+    h.ctx.config.recordingRecovery.admissionMs = waveMs + 5_001;
+    expect(recoveryAckBudgetMs(h.ctx)).toBe(1);
     expect(() => startWorker(h.ctx)).toThrow(/RECORDING_RECOVERY_ADMISSION_MS/);
+    // The floor is the named minimum budget, not the wave bound.
+    h.ctx.config.recordingRecovery.admissionMs = waveMs + 5_000 + MIN_RECOVERY_ACK_BUDGET_MS;
+    const ok = startWorker(h.ctx, { popTimeoutSec: .05 });
+    void ok.stop();
+    // NaN is defence-in-depth (config parsing already rejects non-integer env values).
     h.ctx.config.recordingRecovery.admissionMs = Number.NaN;
     expect(() => startWorker(h.ctx)).toThrow(/RECORDING_RECOVERY_ADMISSION_MS/);
   } finally {

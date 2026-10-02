@@ -1,9 +1,9 @@
 import { and, eq, isNotNull, isNull, sql } from "drizzle-orm";
 import type { AppContext } from "../context.ts";
 import type { Db } from "../db/client.ts";
-import { attributedBatches, attributedTranscriptionRuns, meetings, recordingRecoveryRuns, type MeetingRow } from "../db/schema.ts";
+import { meetings, recordingRecoveryRuns, type MeetingRow } from "../db/schema.ts";
 import type { ErrorCode } from "../domain/errors.ts";
-import { canTransition, type MeetingStatus } from "../domain/state.ts";
+import { terminalTransition } from "./meetings.ts";
 
 /** What `db.transaction` hands to its callback; structurally a Db without transaction(). */
 type DbSession = Pick<Db, "update" | "select" | "insert" | "delete" | "execute">;
@@ -92,6 +92,14 @@ export function recoveryAckBudgetMs(ctx: AppContext): number {
 }
 
 /**
+ * Minimum leftover acknowledgement budget a worker may start with. A tiny budget still passes
+ * a strict positivity check yet can never cover a real heartbeat round trip: every ack lands
+ * "late", and the first-beat release turns each miss into admit → release → re-admit churn —
+ * a livelock that never reaches the paid call (TC-574). Well above any loopback round trip.
+ */
+export const MIN_RECOVERY_ACK_BUDGET_MS = 30_000;
+
+/**
  * The serialized counterpart of `admitRecordingRecovery` for terminal failure writes (TC-574):
  * under the same advisory lock, a live foreign admission defers the write (a paid call may be
  * in flight and owns the outcome), otherwise the meeting's failure transition commits inside
@@ -104,47 +112,25 @@ export async function failMeetingUnlessRecoveryLive(
   code: ErrorCode,
   message: string,
 ): Promise<{ meeting: MeetingRow; changed: boolean } | "deferred"> {
-  for (;;) {
-    const result = await ctx.db.transaction(async (tx) => {
-      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`recording_recovery:${meeting.id}`}))`);
-      const [run] = await tx.select().from(recordingRecoveryRuns).where(eq(recordingRecoveryRuns.meetingId, meeting.id));
-      if (run?.ownerToken && !run.outcome && run.admittedAt) {
-        const [clock] = await tx.execute(sql`select now() as now`);
-        const now = new Date((clock as { now: Date }).now);
-        if (now.getTime() - run.admittedAt.getTime() <= ctx.config.recordingRecovery.admissionMs) {
-          return { deferred: true as const, waiting: false as const };
-        }
+  // Built once, like failMeeting's patch, so endedAt reflects the call, not the last retry.
+  const patch: Partial<typeof meetings.$inferInsert> = { status: "failed", errorCode: code, errorMessage: message };
+  if (!meeting.endedAt) patch.endedAt = new Date();
+  if (meeting.platform === "signal") patch.signalCapability = null;
+  return terminalTransition(ctx, meeting, "failed", patch, async (tx) => {
+    // The live-admission check runs inside terminalTransition's transaction ahead of the
+    // meeting row lock, keeping lock acquisition order identical for every contender: the
+    // advisory lock serializes the check with admitRecordingRecovery, so a committed failure
+    // can only ever be observed by a later admission as a non-processing meeting.
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`recording_recovery:${meeting.id}`}))`);
+    const [run] = await tx.select().from(recordingRecoveryRuns).where(eq(recordingRecoveryRuns.meetingId, meeting.id));
+    if (run?.ownerToken && !run.outcome && run.admittedAt) {
+      const [clock] = await tx.execute(sql`select now() as now`);
+      const now = new Date((clock as { now: Date }).now);
+      if (now.getTime() - run.admittedAt.getTime() <= ctx.config.recordingRecovery.admissionMs) {
+        return "deferred";
       }
-      // The meeting row lock and the conditional update mirror terminalTransition, including the
-      // attributed dispatch-ledger wait, so the failure write keeps every existing guarantee.
-      const [current] = await tx.select().from(meetings).where(eq(meetings.id, meeting.id)).for("update");
-      if (!current || current.status !== meeting.status || !canTransition(current.status as MeetingStatus, "failed")) {
-        return { deferred: false as const, waiting: false as const, meeting: current ?? meeting, changed: false };
-      }
-      const [run2] = await tx.select().from(attributedTranscriptionRuns)
-        .where(eq(attributedTranscriptionRuns.meetingId, meeting.id)).for("update");
-      if (run2) {
-        const active = await tx.select({ id: attributedBatches.id }).from(attributedBatches)
-          .where(and(eq(attributedBatches.meetingId, meeting.id), isNotNull(attributedBatches.dispatchToken))).for("update");
-        if (active.length) return { deferred: false as const, waiting: true as const };
-      }
-      const patch: Partial<typeof meetings.$inferInsert> = { status: "failed", errorCode: code, errorMessage: message };
-      if (!meeting.endedAt) patch.endedAt = new Date();
-      if (meeting.platform === "signal") patch.signalCapability = null;
-      const [row] = await tx.update(meetings).set(patch)
-        .where(and(eq(meetings.id, meeting.id), eq(meetings.status, meeting.status))).returning();
-      return row
-        ? { deferred: false as const, waiting: false as const, meeting: row, changed: true }
-        : { deferred: false as const, waiting: false as const, meeting: current, changed: false };
-    });
-    if (result.deferred) return "deferred";
-    if (!result.waiting) {
-      if (result.changed) ctx.log.info("meeting status changed", { meetingId: result.meeting.id, stage: "status_transition" });
-      return { meeting: result.meeting, changed: result.changed };
     }
-    // A paid attributed request is still in flight; retry once its dispatch marker settles.
-    await Bun.sleep(10);
-  }
+  });
 }
 
 /**
