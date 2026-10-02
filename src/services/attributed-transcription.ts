@@ -80,7 +80,7 @@ export async function resumeAttributedRun(ctx: AppContext, meetingId: string): P
  * Durable marker that this meeting's manifest could not be staged and the retained mixed
  * recording owns finalization. Serialized on the attributed advisory lock so a concurrent
  * poll can never stage over it; a later poll resumes the fallback instead of re-staging.
- * The marker stores only the producer-supplied manifest or an empty object.
+ * The marker always stores an empty manifest: the fetched one is unvalidated provider data here.
  */
 export async function markAttributedRecovery(ctx: AppContext, meetingId: string): Promise<"fallback" | "resumed" | "ineligible"> {
   return ctx.db.transaction(async (tx) => {
