@@ -12,9 +12,9 @@ export type JobOutcome = "processed" | "noop" | "deferred";
 export async function processJob(ctx: AppContext, job: Job): Promise<JobOutcome> {
   switch (job.type) {
     case "meeting.start":
-      await handleMeetingStart(ctx, job.meetingId, job.attempt ?? 1, job.startToken); return "processed";
+      await handleMeetingStart(ctx, job.meetingId, job.attempt ?? 1, job.startToken, job.wakeupId); return "processed";
     case "meeting.poll":
-      await handleMeetingPoll(ctx, job.meetingId, job.recoveryAttempt ?? 1, job.pollToken, job.stagingAttempt ?? 0); return "processed";
+      await handleMeetingPoll(ctx, job.meetingId, job.recoveryAttempt ?? 1, job.pollToken, job.stagingAttempt ?? 0, job.wakeupId); return "processed";
     case "meeting.join_deadline":
       await handleJoinDeadline(ctx, job.meetingId); return "processed";
     case "attributed.batch":
@@ -68,23 +68,25 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number; hea
         // restart its attempt counter, so the join timeout would never bound the total (TC-570).
         if (await ctx.queue.hasStartLease(meeting.id).catch(() => false)) continue;
         // A chain hop blocked behind other work cannot renew its lease: once it expires, this
-        // scanner sees a leaseless queued meeting again. The wakeup marker tracks the one
-        // outstanding tokenless push so a stalled consumer does not accumulate wakeups; it is
-        // deleted when the wakeup job is consumed or when the push definitely failed.
-        if (!(await ctx.queue.claimStartWakeup(meeting.id).catch(() => true))) continue;
+        // scanner sees a leaseless queued meeting again. The wakeup marker tracks one outstanding
+        // tokenless push so a stalled consumer does not accumulate wakeups; the job deletes it
+        // when consumed and a failed push releases it so the next heartbeat retries.
+        const startWakeup = await ctx.queue.acquireStartWakeup(meeting.id).catch(() => null);
+        if (!startWakeup) continue;
         try {
-          await ctx.queue.push({ type: "meeting.start", meetingId: meeting.id });
+          await ctx.queue.push(startWakeup);
         } catch {
-          await ctx.queue.clearStartWakeup(meeting.id).catch(() => {});
+          if (startWakeup.wakeupId) await ctx.queue.releaseStartWakeup(meeting.id, startWakeup.wakeupId).catch(() => {});
         }
         continue;
       }
       if (await ctx.queue.hasPollLease(meeting.id).catch(() => false)) continue;
-      if (!(await ctx.queue.claimPollWakeup(meeting.id).catch(() => true))) continue;
+      const pollWakeup = await ctx.queue.acquirePollWakeup(meeting.id).catch(() => null);
+      if (!pollWakeup) continue;
       try {
-        await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id });
+        await ctx.queue.push(pollWakeup);
       } catch {
-        await ctx.queue.clearPollWakeup(meeting.id).catch(() => {});
+        if (pollWakeup.wakeupId) await ctx.queue.releasePollWakeup(meeting.id, pollWakeup.wakeupId).catch(() => {});
       }
     }
   };

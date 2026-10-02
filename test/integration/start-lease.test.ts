@@ -10,6 +10,7 @@ import { VexaHttpError, type VexaClient } from "../../src/providers/vexa/client.
 import { meetings } from "../../src/db/schema.ts";
 import { startHarness, type Harness } from "./harness.ts";
 import type { Job } from "../../src/worker/queue.ts";
+import { handleMeetingPoll } from "../../src/worker/meeting-job.ts";
 
 const capability = "bcdf-ghkm-npqr-stxz-cbdg-fhkn-mqps-rtzx";
 const meetingOf = async (h: Harness, id: string) => (await h.api(`/v1/meetings/${id}`)).json();
@@ -330,3 +331,51 @@ test("a failed wakeup push frees the marker so the next heartbeat retries", asyn
     h.ctx.queue.push = originalPush;
   }
 }, 15_000);
+
+test("a lost tracked wakeup is re-pushed by the next heartbeat via orphan detection", async () => {
+  // The seat-wait chain's continuation is dropped; after its lease expires the heartbeat claims
+  // the marker and pushes a tracked wakeup — which we swallow after Redis "accepted" it (worker
+  // crash between pop and handler entry). The marker stays held with no job behind it; the next
+  // heartbeat must detect the orphan (marker held, payload absent from the ready list) and push a
+  // fresh wakeup rather than waiting out the 2-minute safety TTL.
+  const meetingId = await createSignalMeeting();
+  await h.waitFor(async () => (await h.ctx.queue.hasStartLease(meetingId)) ? true : null, { timeoutMs: 2_000, label: "seat-wait chain claimed" });
+
+  let dropContinuation = false;
+  let loseWakeup = false;
+  const originalPush = h.ctx.queue.push.bind(h.ctx.queue);
+  h.ctx.queue.push = async (job: Job, delayMs = 0) => {
+    if (job.type === "meeting.start" && job.meetingId === meetingId) {
+      if (job.startToken) {
+        if (!dropContinuation) { dropContinuation = true; return; }
+      } else if (job.wakeupId && !loseWakeup) {
+        loseWakeup = true;
+        return; // accepted-and-lost: marker claimed, job never lands
+      }
+    }
+    return originalPush(job, delayMs);
+  };
+  try {
+    await h.waitFor(async () => dropContinuation ? true : null, { timeoutMs: 3_000, label: "continuation dropped" });
+    await h.waitFor(async () => loseWakeup ? true : null, { timeoutMs: 3_000, label: "wakeup lost after accept" });
+    expect(await h.ctx.queue.hasStartWakeup(meetingId)).toBe(true);
+    // Heartbeats run every 25 ms; orphan detection must re-arm the chain promptly.
+    await h.waitFor(async () => (await h.ctx.queue.hasStartLease(meetingId)) ? true : null, { timeoutMs: 3_000, label: "orphan marker repaired" });
+    const stopped = await h.api(`/v1/meetings/${meetingId}/stop`, { method: "POST" });
+    expect(stopped.status).toBe(200);
+  } finally {
+    h.ctx.queue.push = originalPush;
+  }
+}, 15_000);
+
+test("an untracked tokenless job does not clear another wakeup's marker", async () => {
+  // Marker ownership: a recovery/stop/create push carries no wakeupId. Consuming it must leave a
+  // tracked wakeup's marker intact so the tracked job stays the single outstanding wakeup.
+  const meetingId = `untracked-${crypto.randomUUID()}`;
+  const tracked = await h.ctx.queue.acquirePollWakeup(meetingId);
+  expect(tracked?.wakeupId).toBeTruthy();
+  await handleMeetingPoll(h.ctx, meetingId); // untracked: no pollToken, no wakeupId
+  expect(await h.ctx.queue.hasPollWakeup(meetingId)).toBe(true);
+  await h.ctx.queue.releasePollWakeup(meetingId, tracked!.wakeupId!);
+  expect(await h.ctx.queue.hasPollWakeup(meetingId)).toBe(false);
+});

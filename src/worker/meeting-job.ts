@@ -63,11 +63,11 @@ async function startPollChain(ctx: AppContext, meetingId: string, delayMs: numbe
  * counter and the join-timeout bound fires once). A wakeup that cannot claim exits; an orphaned
  * lease expires and reconciliation starts a fresh chain.
  */
-export async function handleMeetingStart(ctx: AppContext, meetingId: string, attempt = 1, startToken?: string): Promise<void> {
+export async function handleMeetingStart(ctx: AppContext, meetingId: string, attempt = 1, startToken?: string, wakeupId?: string): Promise<void> {
   const token = startToken ?? crypto.randomUUID();
-  // This job was the tracked wakeup: free its marker before claiming so a subsequent heartbeat
-  // can repair a claim failure without waiting out the safety-net TTL.
-  if (!startToken) await ctx.queue.clearStartWakeup(meetingId).catch(() => {});
+  // A tracked wakeup deletes only its own marker: untracked tokenless jobs (create/stop/recover
+  // pushes) carry no wakeupId and must not free a marker they do not own.
+  if (wakeupId) await ctx.queue.releaseStartWakeup(meetingId, wakeupId).catch(() => {});
   if (!(await ctx.queue.claimStartLease(meetingId, token, chainLeaseTtlMs(ctx)))) return;
   let chainAlive = false;
   const continueStart = async (delayMs: number, nextAttempt: number) => {
@@ -205,14 +205,14 @@ export async function handleJoinDeadline(ctx: AppContext, meetingId: string): Pr
 }
 
 /** Job: meeting.poll — sync status from Vexa; finalize when the bot has left. */
-export async function handleMeetingPoll(ctx: AppContext, meetingId: string, recoveryAttempt = 1, pollToken?: string, stagingAttempt = 0): Promise<void> {
+export async function handleMeetingPoll(ctx: AppContext, meetingId: string, recoveryAttempt = 1, pollToken?: string, stagingAttempt = 0, wakeupId?: string): Promise<void> {
   // One live poll chain per meeting. Claim before anything else (including the meeting read):
   // every millisecond between pop and claim eats the lease TTL the previous hop reserved, and a
   // chain job that finds the meeting gone or finished still frees the lease it carried so a
+  // recover/stop wakeup inside the TTL window is not swallowed as a duplicate of a dead chain.
   const token = pollToken ?? crypto.randomUUID();
-  // This job was the tracked wakeup: free its marker before claiming so a subsequent heartbeat
-  // can repair a claim failure without waiting out the safety-net TTL.
-  if (!pollToken) await ctx.queue.clearPollWakeup(meetingId).catch(() => {});
+  // A tracked wakeup deletes only its own marker; untracked tokenless jobs carry no wakeupId.
+  if (wakeupId) await ctx.queue.releasePollWakeup(meetingId, wakeupId).catch(() => {});
   if (!(await ctx.queue.claimPollLease(meetingId, token, chainLeaseTtlMs(ctx)))) return;
   let chainAlive = false;
   const continuePoll = async (delayMs: number, attempt = recoveryAttempt, nextStagingAttempt = stagingAttempt) => {

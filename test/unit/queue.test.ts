@@ -63,3 +63,34 @@ test("deduped delayed pushes keep one entry and re-add after promotion", async (
   await q.push(job, 60_000, `batch:${batchId}`);
   expect((await q.pending()).delayed.filter((e) => e.job.type === "attributed.batch" && e.job.batchId === batchId)).toHaveLength(1);
 });
+
+test("wakeup markers are owned by wakeupId and orphaned markers re-acquire", async () => {
+  // Fresh prefix: marker assertions must not share the ready list with other tests.
+  const wq = new Queue(redis, `test:${crypto.randomUUID()}`);
+  const meetingId = `wake-${crypto.randomUUID()}`;
+  // A tracked wakeup claims the marker; a second acquire is coalesced while its job is queued.
+  const first = await wq.acquireStartWakeup(meetingId);
+  expect(first).toMatchObject({ type: "meeting.start", meetingId });
+  expect(first!.wakeupId).toBeTruthy();
+  await wq.push(first!);
+  expect(await wq.acquireStartWakeup(meetingId)).toBeNull();
+  // An untracked release (wrong/foreign wakeupId) must not free the marker — the compare-and-delete
+  // is what keeps a consumed untracked job from exposing a tracked wakeup.
+  await wq.releaseStartWakeup(meetingId, "foreign");
+  expect(await wq.hasStartWakeup(meetingId)).toBe(true);
+  // Consuming the job frees exactly its own marker.
+  await wq.pop(1);
+  await wq.releaseStartWakeup(meetingId, first!.wakeupId!);
+  expect(await wq.hasStartWakeup(meetingId)).toBe(false);
+
+  // A pushed-but-lost wakeup leaves an orphaned marker; acquire detects the missing payload and
+  // re-claims in the same pass instead of waiting out the safety-net TTL.
+  const lost = await wq.acquireStartWakeup(meetingId);
+  await wq.push(lost!);
+  await wq.pop(1); // simulate a worker crash between pop and handler entry: job gone, marker held
+  const repaired = await wq.acquireStartWakeup(meetingId);
+  expect(repaired?.wakeupId).toBeTruthy();
+  expect(repaired!.wakeupId).not.toBe(lost!.wakeupId);
+  await wq.releaseStartWakeup(meetingId, repaired!.wakeupId!);
+  expect(await wq.hasStartWakeup(meetingId)).toBe(false);
+});
