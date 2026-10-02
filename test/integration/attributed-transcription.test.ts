@@ -198,6 +198,8 @@ test("an open manifest degrades to the mixed recording instead of failing (TC-55
   // recording-owned meeting and never re-stage.
   const [run] = await h.ctx.db.select().from(attributedTranscriptionRuns).where(eq(attributedTranscriptionRuns.meetingId, id));
   expect(run.status).toBe("fallback");
+  // The marker never persists the unvalidated provider manifest.
+  expect(run.manifestJson).toEqual({});
   const [rangeCount] = await h.ctx.db.execute<{ n: number }>(sql`select count(*)::int as n from attributed_ranges where meeting_id = ${id}`);
   expect(rangeCount.n).toBe(0);
 });

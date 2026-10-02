@@ -1,6 +1,6 @@
 import { createContext, type AppContext } from "../context.ts";
 import { inArray } from "drizzle-orm";
-import { meetings } from "../db/schema.ts";
+import { attributedTranscriptionRuns, meetings } from "../db/schema.ts";
 import { deliverWebhook, reconcileWebhookDeliveries } from "../webhooks/dispatcher.ts";
 import { handleJoinDeadline, handleMeetingPoll, handleMeetingStart } from "./meeting-job.ts";
 import { finalizeAttributedRun, processAttributedBatch, reconcileAttributedRuns, recordAttributedWorkerReadiness } from "../services/attributed-transcription.ts";
@@ -51,8 +51,17 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number; hea
     const rows = await ctx.db.select().from(meetings).where(inArray(meetings.status, [
       "queued", "joining", "waiting_for_admission", "in_progress", "processing",
     ]));
+    // Attributed Google Meet meetings that already own a run are driven by attributed batch/finalize
+    // jobs and reconcileAttributedRuns. One still in staging retries has no run yet and needs this
+    // poll repair like any other meeting, or a lost wakeup would strand it in processing.
+    const attributedProcessing = attributedEnabled
+      ? rows.filter((m) => m.platform === "google_meet" && m.status === "processing").map((m) => m.id) : [];
+    const owned = new Set(attributedProcessing.length
+      ? (await ctx.db.select({ meetingId: attributedTranscriptionRuns.meetingId }).from(attributedTranscriptionRuns)
+        .where(inArray(attributedTranscriptionRuns.meetingId, attributedProcessing))).map((r) => r.meetingId)
+      : []);
     for (const meeting of rows) {
-      if (attributedEnabled && meeting.platform === "google_meet" && meeting.status === "processing") continue;
+      if (owned.has(meeting.id)) continue;
       if (meeting.status === "queued") {
         await ctx.queue.push({ type: "meeting.start", meetingId: meeting.id }).catch(() => {});
         continue;

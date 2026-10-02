@@ -82,7 +82,7 @@ export async function resumeAttributedRun(ctx: AppContext, meetingId: string): P
  * poll can never stage over it; a later poll resumes the fallback instead of re-staging.
  * The marker stores only the producer-supplied manifest or an empty object.
  */
-export async function markAttributedRecovery(ctx: AppContext, meetingId: string, manifest: AttributedManifest | null): Promise<"fallback" | "resumed" | "ineligible"> {
+export async function markAttributedRecovery(ctx: AppContext, meetingId: string): Promise<"fallback" | "resumed" | "ineligible"> {
   return ctx.db.transaction(async (tx) => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`attributed:${meetingId}`}))`);
     const [meeting] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
@@ -90,7 +90,9 @@ export async function markAttributedRecovery(ctx: AppContext, meetingId: string,
     const existing = await tx.select().from(attributedTranscriptionRuns).where(eq(attributedTranscriptionRuns.meetingId, meetingId)).for("update");
     // A real run owns the ledger; a prior fallback marker still owns finalization.
     if (existing[0]) return existing[0].status === "fallback" ? "fallback" : "resumed";
-    await tx.insert(attributedTranscriptionRuns).values({ meetingId, status: "fallback", manifestJson: json(manifest ?? {}) });
+    // The marker never stores the fetched manifest: on this path it is unvalidated or rejected
+    // provider data, which must not become SQL data. Nothing reads the marker's manifest.
+    await tx.insert(attributedTranscriptionRuns).values({ meetingId, status: "fallback", manifestJson: json({}) });
     return "fallback";
   });
 }
@@ -225,7 +227,9 @@ export async function processAttributedBatch(ctx: AppContext, meetingId: string,
       // A fetch/checksum failure happens before any paid call; bounded requeue is safe (L3).
       if (fetchAttempt < MAX_FETCH_ATTEMPTS && await releaseBatchClaim(ctx, batchId, claimed.token)) {
         await ctx.queue.push({ type: "attributed.batch", meetingId, batchId, fetchAttempt: fetchAttempt + 1 }, ctx.config.vexa.pollIntervalMs);
-        return done("deferred");
+        // No finalize wakeup here: finalize would see the batch pending and requeue it with the
+        // fetch counter reset, turning a bounded retry into a hot loop.
+        return "deferred";
       }
       await settle(ctx, batchId, claimed.token, "failed", meetingId, spec); return done("processed");
     }

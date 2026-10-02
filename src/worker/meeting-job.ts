@@ -49,7 +49,7 @@ async function startPollChain(ctx: AppContext, meetingId: string, delayMs: numbe
   if (claimed === false) return;
   const job: Job = { type: "meeting.poll", meetingId, ...(claimed ? { pollToken: token } : {}) };
   await ctx.queue.push(job, delayMs);
-  if (claimed && !(await ctx.queue.renewPollLease(meetingId, token, delayMs + pollLeaseTtlMs(ctx)).catch(() => false))) {
+  if (claimed && (await ctx.queue.renewPollLease(meetingId, token, delayMs + pollLeaseTtlMs(ctx)).catch(() => null)) === false) {
     await ctx.queue.removeDelayed(job).catch(() => {});
   }
 }
@@ -168,7 +168,7 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
   const token = pollToken ?? crypto.randomUUID();
   if (!(await ctx.queue.claimPollLease(meetingId, token, pollLeaseTtlMs(ctx)))) return;
   let chainAlive = false;
-  const continuePoll = async (delayMs: number, attempt = recoveryAttempt, nextStagingAttempt = 0) => {
+  const continuePoll = async (delayMs: number, attempt = recoveryAttempt, nextStagingAttempt = stagingAttempt) => {
     // Re-verify and extend ownership to cover the delay plus the next job's own TTL before the
     // push lands. If the lease was lost (or Redis is down), letting this hop fail is cheaper than
     // spawning a chain that cannot renew: the job exits chainless and reconciliation re-arms it.
@@ -293,7 +293,7 @@ async function handleAttributedCompletion(ctx: AppContext, meeting: MeetingRow, 
   const vexaMeetingId = meeting.vexaMeetingId;
   if (!vexaMeetingId) {
     // Without the capture identity no manifest can be verified at all.
-    const outcome = await markAttributedRecovery(ctx, meeting.id, null);
+    const outcome = await markAttributedRecovery(ctx, meeting.id);
     if (outcome === "ineligible") return;
     if (outcome === "resumed") { await resumeAttributedRun(ctx, meeting.id); return; }
     return recoverFromRecording(ctx, meeting, vexa, recoveryAttempt, continuePoll);
@@ -311,12 +311,12 @@ async function handleAttributedCompletion(ctx: AppContext, meeting: MeetingRow, 
     fetched = await ctx.vexa.getAttributedAudio(vexaMeetingId);
   } catch (e) {
     if (stagingAttempt + 1 < MAX_STAGING_ATTEMPTS) {
-      ctx.log.warn("attributed manifest fetch failed; retrying", { meetingId: meeting.id, stage: "attributed_staging", staging_attempt: stagingAttempt + 1, code: e instanceof ApiError || e instanceof VexaHttpError ? "transport" : "db" });
+      ctx.log.warn("attributed manifest fetch failed; retrying", { meetingId: meeting.id, stage: "attributed_staging", staging_attempt: stagingAttempt + 1, code: "transport" });
       await continuePoll(ctx.config.vexa.pollIntervalMs, recoveryAttempt, stagingAttempt + 1);
       return;
     }
-    ctx.log.error("attributed manifest staging failed", { meetingId: meeting.id, stage: "attributed_staging", code: e instanceof ApiError || e instanceof VexaHttpError ? "transport" : "db" });
-    const outcome = await markAttributedRecovery(ctx, meeting.id, null);
+    ctx.log.error("attributed manifest staging failed", { meetingId: meeting.id, stage: "attributed_staging", code: "transport" });
+    const outcome = await markAttributedRecovery(ctx, meeting.id);
     if (outcome === "ineligible") return;
     if (outcome === "resumed") { await resumeAttributedRun(ctx, meeting.id); return; }
     return recoverFromRecording(ctx, meeting, vexa, recoveryAttempt, continuePoll);
@@ -333,7 +333,7 @@ async function handleAttributedCompletion(ctx: AppContext, meeting: MeetingRow, 
       return;
     }
     ctx.log.error("attributed manifest staging failed", { meetingId: meeting.id, stage: "attributed_staging", code: reason });
-    outcome = await markAttributedRecovery(ctx, meeting.id, fetched);
+    outcome = await markAttributedRecovery(ctx, meeting.id);
   }
   if (outcome === "ineligible") return;
   if (outcome === "resumed") { await resumeAttributedRun(ctx, meeting.id); return; }
