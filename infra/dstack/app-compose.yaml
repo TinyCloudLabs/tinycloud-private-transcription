@@ -28,7 +28,7 @@
 services:
   # ─── ours ────────────────────────────────────────────────────────────────────────────────────
   api:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:4e33c2f65935a7e2d05de384d8f584e8fa027afc@sha256:ffe80cd739d6e34e4656ee5e6e7ca6dcc2b775b75d819ef890f9ec39f8372d69
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:4ab56da733a18d84d2a110b5bdd94f996720b82c@sha256:30d5c33f3ad5b420e6e97f48bd3e8c3df21624c08f55f77ac8117df7598c682a
     # VEXA_API_KEY is minted at first boot by `vexa-provision` (below) into a shared volume.
     command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal-capability/capability-key); exec bun run src/api/server.ts"]
     restart: unless-stopped
@@ -79,7 +79,7 @@ services:
     networks: [ptx, vexa]
 
   worker:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:4e33c2f65935a7e2d05de384d8f584e8fa027afc@sha256:ffe80cd739d6e34e4656ee5e6e7ca6dcc2b775b75d819ef890f9ec39f8372d69
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:4ab56da733a18d84d2a110b5bdd94f996720b82c@sha256:30d5c33f3ad5b420e6e97f48bd3e8c3df21624c08f55f77ac8117df7598c682a
     command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && [ -s /run/signal-control-1/token ] && [ -s /run/signal-control-2/token ] && [ -s /run/signal-control-3/token ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && [ -s /run/signal-control-1/token ] && [ -s /run/signal-control-2/token ] && [ -s /run/signal-control-3/token ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal-capability/capability-key); exec bun run src/worker/index.ts"]
     restart: unless-stopped
     environment:
