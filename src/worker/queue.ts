@@ -8,6 +8,14 @@ export type Job =
   | { type: "attributed.finalize"; meetingId: string }
   | { type: "webhook.deliver"; deliveryId: string; claimToken: string };
 
+// A wakeup marker's TTL is only a lost-job safety net: a consumed wakeup deletes its marker at
+// handler entry, so at most one tokenless wakeup per meeting is outstanding no matter how long
+// the consumer is blocked. If the job was pushed but never ran — a worker crash between pop and
+// handler — the marker is the only record that a repair is already queued; expiry restores
+// heartbeat repair. The trade-off: shorter resumes wakeup pushes sooner while the consumer is
+// stalled, longer delays repairing a genuinely lost wakeup.
+const WAKEUP_MARKER_TTL_MS = 120_000;
+
 /**
  * Minimal Redis-backed queue: a ready list plus a delayed sorted set (score = run-at ms).
  * `pop` promotes due delayed jobs then blocks on the ready list.
@@ -127,9 +135,9 @@ export class Queue {
     ]);
   }
 
-  /** Claims the short-lived wakeup marker: true when no tokenless wakeup is already outstanding. */
-  private async claimWakeup(key: string, ttlMs: number): Promise<boolean> {
-    return (await this.redis.send("SET", [key, "1", "PX", String(Math.max(1, Math.floor(ttlMs))), "NX"])) === "OK";
+  /** Claims the wakeup marker: true when no tokenless wakeup is already outstanding. */
+  private async claimWakeup(key: string): Promise<boolean> {
+    return (await this.redis.send("SET", [key, "1", "PX", String(WAKEUP_MARKER_TTL_MS), "NX"])) === "OK";
   }
 
   /**
@@ -160,15 +168,25 @@ export class Queue {
   }
 
   /**
-   * Coalesces tokenless meeting.start wakeups while the consumer is blocked. A start chain whose
-   * continuation sits in the ready queue behind unrelated work cannot renew its lease; once the
-   * lease expires, reconciliation would otherwise push a fresh wakeup every heartbeat and the
-   * pending start count would grow unboundedly until the consumer catches up. Taking this marker
-   * before the push leaves at most one outstanding wakeup per marker window; the marker's expiry
-   * matches the chain-lease TTL so a genuinely lost wakeup is re-armed on the next reconciliation.
+   * Tracks an outstanding tokenless meeting.start wakeup. A start chain whose continuation sits
+   * in the ready queue behind unrelated work cannot renew its lease; once the lease expires,
+   * reconciliation would otherwise push a fresh wakeup every heartbeat and pending starts would
+   * grow unboundedly until the consumer catches up. Claimed before the push, deleted when the
+   * wakeup is consumed (handleMeetingStart) or when the push throws; the TTL only repairs a wakeup
+   * whose job was lost entirely (see WAKEUP_MARKER_TTL_MS).
    */
-  async claimStartWakeup(meetingId: string, ttlMs: number): Promise<boolean> {
-    return this.claimWakeup(this.startWakeup(meetingId), ttlMs);
+  async claimStartWakeup(meetingId: string): Promise<boolean> {
+    return this.claimWakeup(this.startWakeup(meetingId));
+  }
+
+  /** Frees the wakeup slot when its job was consumed or its push failed. */
+  async clearStartWakeup(meetingId: string): Promise<void> {
+    await this.redis.del(this.startWakeup(meetingId));
+  }
+
+  /** True while a tokenless meeting.start wakeup is outstanding (or its marker is orphaned). */
+  async hasStartWakeup(meetingId: string): Promise<boolean> {
+    return this.redis.exists(this.startWakeup(meetingId));
   }
 
   /**
@@ -193,8 +211,18 @@ export class Queue {
   }
 
   /** Coalesces tokenless meeting.poll wakeups while the consumer is blocked; see claimStartWakeup. */
-  async claimPollWakeup(meetingId: string, ttlMs: number): Promise<boolean> {
-    return this.claimWakeup(this.pollWakeup(meetingId), ttlMs);
+  async claimPollWakeup(meetingId: string): Promise<boolean> {
+    return this.claimWakeup(this.pollWakeup(meetingId));
+  }
+
+  /** Frees the poll wakeup slot when its job was consumed or its push failed. */
+  async clearPollWakeup(meetingId: string): Promise<void> {
+    await this.redis.del(this.pollWakeup(meetingId));
+  }
+
+  /** True while a tokenless meeting.poll wakeup is outstanding (or its marker is orphaned). */
+  async hasPollWakeup(meetingId: string): Promise<boolean> {
+    return this.redis.exists(this.pollWakeup(meetingId));
   }
 
   /** True while some meeting.poll chain owns the lease, live or orphaned. */

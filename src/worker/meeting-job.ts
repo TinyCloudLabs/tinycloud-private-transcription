@@ -36,7 +36,7 @@ const safeVexaMeetingId = (value: unknown): number | undefined =>
 // missed-beat margin, independent of the Vexa request timeout (15 s by default) since renewal
 // covers provider stalls too. Start chains share the TTL: seat waits re-enqueue at most one
 // poll interval out and a start job's provider call is bounded by the same timeout.
-export const chainLeaseTtlMs = (ctx: AppContext) => ctx.config.vexa.pollIntervalMs * 3;
+const chainLeaseTtlMs = (ctx: AppContext) => ctx.config.vexa.pollIntervalMs * 3;
 
 /**
  * Starts a poll chain for a freshly dispatched capture. The lease is claimed before the delayed
@@ -65,6 +65,9 @@ async function startPollChain(ctx: AppContext, meetingId: string, delayMs: numbe
  */
 export async function handleMeetingStart(ctx: AppContext, meetingId: string, attempt = 1, startToken?: string): Promise<void> {
   const token = startToken ?? crypto.randomUUID();
+  // This job was the tracked wakeup: free its marker before claiming so a subsequent heartbeat
+  // can repair a claim failure without waiting out the safety-net TTL.
+  if (!startToken) await ctx.queue.clearStartWakeup(meetingId).catch(() => {});
   if (!(await ctx.queue.claimStartLease(meetingId, token, chainLeaseTtlMs(ctx)))) return;
   let chainAlive = false;
   const continueStart = async (delayMs: number, nextAttempt: number) => {
@@ -206,8 +209,10 @@ export async function handleMeetingPoll(ctx: AppContext, meetingId: string, reco
   // One live poll chain per meeting. Claim before anything else (including the meeting read):
   // every millisecond between pop and claim eats the lease TTL the previous hop reserved, and a
   // chain job that finds the meeting gone or finished still frees the lease it carried so a
-  // recover/stop wakeup inside the TTL window is not swallowed as a duplicate of a dead chain.
   const token = pollToken ?? crypto.randomUUID();
+  // This job was the tracked wakeup: free its marker before claiming so a subsequent heartbeat
+  // can repair a claim failure without waiting out the safety-net TTL.
+  if (!pollToken) await ctx.queue.clearPollWakeup(meetingId).catch(() => {});
   if (!(await ctx.queue.claimPollLease(meetingId, token, chainLeaseTtlMs(ctx)))) return;
   let chainAlive = false;
   const continuePoll = async (delayMs: number, attempt = recoveryAttempt, nextStagingAttempt = stagingAttempt) => {

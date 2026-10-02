@@ -154,7 +154,9 @@ test("a dropped seat-wait continuation is re-armed by heartbeat after the lease 
     h.ctx.queue.push = originalPush;
   }
   // The repair was reconciliation's tokenless wakeup; the resumed chain re-enqueues itself.
+  // The consumed wakeup cleared its marker at handler entry — no safety-net TTL wait.
   expect(counted.wakeups).toBeGreaterThanOrEqual(1);
+  await h.waitFor(async () => (await h.ctx.queue.hasStartWakeup(meetingId)) ? null : true, { timeoutMs: 2_000, label: "wakeup marker cleared on consume" });
   await h.waitFor(async () => (await h.ctx.queue.hasStartLease(meetingId)) ? true : null, { timeoutMs: 2_000, label: "lease re-claimed" });
 
   // Cancel before the join timeout so this meeting does not add a second failure webhook.
@@ -207,8 +209,9 @@ test("a retryable createBot failure retries under the lease instead of failing t
 test("a blocked consumer coalesces tokenless start and poll wakeups", async () => {
   // An in-progress jitsi meeting polls every 50 ms; stalling every getTranscript call for 400 ms
   // backs the serial consumer up so delayed chain hops land behind real work and their leases
-  // expire (delay + TTL ≈ 1.15 s for start, 200 ms for poll) before being consumed. Without
-  // wakeup markers the heartbeat pushes a fresh tokenless wakeup every 25 ms while blocked.
+  // expire (delay + TTL ≈ 1.15 s for start, 200 ms for poll) before being consumed. A tokenless
+  // wakeup is tracked by its marker from push until consume: no matter how long the stall lasts,
+  // at most one is outstanding per meeting.
   const res = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://jitsi.local/WakeupLoad" } });
   expect(res.status).toBe(201);
   const pollId = (await res.json()).id as string;
@@ -228,6 +231,15 @@ test("a blocked consumer coalesces tokenless start and poll wakeups", async () =
     return originalGetTranscript(platform, nativeId);
   };
 
+  // Pending tokenless wakeups for one meeting: the tracked-wakeup invariant the marker enforces.
+  const pendingTokenless = async (type: "meeting.start" | "meeting.poll", meetingId: string) => {
+    const { ready, delayed } = await h.ctx.queue.pending();
+    const isWakeup = (j: Job) =>
+      (type === "meeting.start" ? j.type === "meeting.start" && j.meetingId === meetingId && !j.startToken
+        : j.type === "meeting.poll" && j.meetingId === meetingId && !j.pollToken);
+    return ready.filter(isWakeup).length + delayed.filter((d) => isWakeup(d.job)).length;
+  };
+
   const counts = { startWakeups: 0, pollWakeups: 0 };
   const originalPush = h.ctx.queue.push.bind(h.ctx.queue);
   h.ctx.queue.push = async (job: Job, delayMs = 0) => {
@@ -237,29 +249,39 @@ test("a blocked consumer coalesces tokenless start and poll wakeups", async () =
   };
 
   try {
-    blocking = true;
-    // The signal meeting's seat-wait hop is due ~1 s after create with a lease expiring ~150 ms
-    // later; the 2 s stall guarantees it sits ready past expiry so heartbeats reach the marker.
+    // Establish the seat-wait chain BEFORE the stall so its create-time push is consumed; the
+    // stall then covers several hop cycles (its 1 s hop lands mid-stall and its lease expires
+    // ~150 ms later) — several chain-lease TTL windows, far short of the 2 min safety TTL.
     const startId = await createSignalMeeting();
+    await h.waitFor(async () => (await h.ctx.queue.hasStartLease(startId)) ? true : null, { timeoutMs: 2_000, label: "seat-wait chain claimed" });
+
     try {
-      let maxPending = 0;
+      blocking = true;
+      let maxTokenlessStarts = 0;
+      let maxTokenlessPolls = 0;
       const deadline = Date.now() + 2_000;
       while (Date.now() < deadline) {
-        maxPending = Math.max(maxPending, await pendingStarts(startId));
+        maxTokenlessStarts = Math.max(maxTokenlessStarts, await pendingTokenless("meeting.start", startId));
+        maxTokenlessPolls = Math.max(maxTokenlessPolls, await pendingTokenless("meeting.poll", pollId));
         await Bun.sleep(25);
       }
       blocking = false;
-      // Marker windows: a tokenless wakeup is pushed at most once per chain-lease TTL (150 ms)
-      // while the consumer is stalled — ~2 s / 150 ms ≈ 14 pushes total, versus one per 25 ms
-      // heartbeat (~80) without the marker. Both kinds must be coalesced and the chains must
-      // actually resume (a consumed wakeup claims the expired lease itself).
+      // Push count over the whole wrap window: the create-time push (not marker-tracked), a
+      // possible pre-claim heartbeat push, and the stall's marker wakeup ≈ 3 — versus one per
+      // 25 ms heartbeat (~80) without the marker. The hard invariant is the pending counts: at
+      // most ONE outstanding tokenless wakeup per meeting while blocked.
       expect(counts.startWakeups).toBeGreaterThan(0);
-      expect(counts.startWakeups).toBeLessThanOrEqual(20);
+      expect(counts.startWakeups).toBeLessThanOrEqual(4);
       expect(counts.pollWakeups).toBeGreaterThan(0);
-      expect(counts.pollWakeups).toBeLessThanOrEqual(20);
+      expect(counts.pollWakeups).toBeLessThanOrEqual(4);
+      expect(maxTokenlessStarts).toBeLessThanOrEqual(1);
+      expect(maxTokenlessPolls).toBeLessThanOrEqual(1);
+      // After the stall the chains actually resume: a consumed wakeup claims the expired lease
+      // itself (or the surviving hop does) and the marker is gone.
       await h.waitFor(async () => (await pendingStarts(startId)) <= 1 ? true : null, { timeoutMs: 3_000, label: "wakeups drained" });
       await h.waitFor(async () => (await h.ctx.queue.hasStartLease(startId)) ? true : null, { timeoutMs: 2_000, label: "start chain re-armed" });
-      expect(maxPending).toBeLessThanOrEqual(20);
+      await h.waitFor(async () => (await h.ctx.queue.hasStartWakeup(startId)) ? null : true, { timeoutMs: 2_000, label: "start marker cleared" });
+      await h.waitFor(async () => (await h.ctx.queue.hasPollWakeup(pollId)) ? null : true, { timeoutMs: 2_000, label: "poll marker cleared" });
       const stopped = await h.api(`/v1/meetings/${startId}/stop`, { method: "POST" });
       expect(stopped.status).toBe(200);
     } finally {
@@ -268,5 +290,43 @@ test("a blocked consumer coalesces tokenless start and poll wakeups", async () =
   } finally {
     h.ctx.queue.push = originalPush;
     h.ctx.vexa.getTranscript = originalGetTranscript;
+  }
+}, 15_000);
+
+test("a failed wakeup push frees the marker so the next heartbeat retries", async () => {
+  // No seat is free, so this meeting's start chain re-enqueues. Dropping one continuation orphans
+  // the lease; when it expires the heartbeat claims the wakeup marker and pushes — and we make
+  // that push throw. The marker must be released so the very next heartbeat retries instead of
+  // waiting out the 2-minute safety TTL.
+  const meetingId = await createSignalMeeting();
+  await h.waitFor(async () => (await h.ctx.queue.hasStartLease(meetingId)) ? true : null, { timeoutMs: 2_000, label: "seat-wait chain claimed" });
+
+  let dropContinuation = false;
+  let failWakeupPush = false;
+  let failedPushes = 0;
+  const originalPush = h.ctx.queue.push.bind(h.ctx.queue);
+  h.ctx.queue.push = async (job: Job, delayMs = 0) => {
+    if (job.type === "meeting.start" && job.meetingId === meetingId) {
+      if (job.startToken) {
+        if (!dropContinuation) { dropContinuation = true; return; }
+      } else if (!failWakeupPush) {
+        failWakeupPush = true;
+        failedPushes++;
+        throw new Error("redis temporarily unavailable");
+      }
+    }
+    return originalPush(job, delayMs);
+  };
+  try {
+    await h.waitFor(async () => dropContinuation ? true : null, { timeoutMs: 3_000, label: "continuation dropped" });
+    await h.waitFor(async () => failedPushes > 0 ? true : null, { timeoutMs: 4_000, label: "wakeup push failed" });
+    // The failed push released its marker; the following heartbeat pushes a working wakeup whose
+    // job claims the expired lease and re-arms the chain — well under the marker TTL.
+    await h.waitFor(async () => (await h.ctx.queue.hasStartLease(meetingId)) ? true : null, { timeoutMs: 3_000, label: "chain re-armed after failed push" });
+    await h.waitFor(async () => (await h.ctx.queue.hasStartWakeup(meetingId)) ? null : true, { timeoutMs: 2_000, label: "marker cleared" });
+    const stopped = await h.api(`/v1/meetings/${meetingId}/stop`, { method: "POST" });
+    expect(stopped.status).toBe(200);
+  } finally {
+    h.ctx.queue.push = originalPush;
   }
 }, 15_000);
