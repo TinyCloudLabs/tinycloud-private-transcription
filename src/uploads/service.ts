@@ -32,9 +32,11 @@ export interface CreateTranscriptionInput {
   language: string | null;
   channel_mode: "separate" | "mixed";
   channel_labels: string[];
+  /** Downmix to mono and label speaker turns (contract C2). Only accepted when `diarizationAvailable`. */
+  diarize: boolean;
 }
 
-const CREATE_FIELDS = ["content_type", "byte_size", "sha256", "language", "channel_mode", "channel_labels"];
+const CREATE_FIELDS = ["content_type", "byte_size", "sha256", "language", "channel_mode", "channel_labels", "diarize"];
 
 export function parseCreateBody(raw: unknown, maxBytes: number): CreateTranscriptionInput {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new BatchError("invalid_request", "Request body must be a JSON object");
@@ -53,22 +55,35 @@ export function parseCreateBody(raw: unknown, maxBytes: number): CreateTranscrip
   if (language !== null && (typeof language !== "string" || language.length > 35 || !LANGUAGE.test(language))) {
     throw new BatchError("invalid_request", "language must be a BCP-47 language tag such as en or pt-BR");
   }
-  const channelMode = body.channel_mode ?? "separate";
+  const diarize = body.diarize ?? false;
+  if (typeof diarize !== "boolean") throw new BatchError("invalid_request", "diarize must be a boolean");
+  // Diarization works on a mono downmix, so it defaults to mixed and cannot be combined with separate channels.
+  const channelMode = body.channel_mode ?? (diarize ? "mixed" : "separate");
   if (channelMode !== "separate" && channelMode !== "mixed") throw new BatchError("invalid_request", "channel_mode must be separate or mixed");
+  if (diarize && channelMode === "separate") throw new BatchError("invalid_request", "diarize cannot be combined with channel_mode separate");
   const labels = body.channel_labels ?? ["Speaker 1", "Speaker 2"];
   if (!Array.isArray(labels) || labels.length < 1 || labels.length > 2 || !labels.every((label) => typeof label === "string" && LABEL.test(label))) {
     throw new BatchError("invalid_request", "channel_labels must be 1 or 2 strings of 1 to 64 printable characters");
   }
-  return { content_type: body.content_type as UploadContentType, byte_size: body.byte_size, sha256: body.sha256, language, channel_mode: channelMode, channel_labels: labels as string[] };
+  return {
+    content_type: body.content_type as UploadContentType, byte_size: body.byte_size, sha256: body.sha256, language, channel_mode: channelMode,
+    channel_labels: labels as string[], diarize,
+  };
 }
 
 const canonical = (value: unknown): string =>
   Array.isArray(value) ? `[${value.map(canonical).join(",")}]`
     : value && typeof value === "object" ? `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`).join(",")}}`
       : JSON.stringify(value);
-/** The tenant is part of the hash: replaying another tenant's key is an idempotency_conflict, never a read. */
-export const hashCreateRequest = (input: CreateTranscriptionInput, tenantRef: string) =>
-  createHash("sha256").update(canonical({ ...input, tenant_ref: tenantRef })).digest("hex");
+/**
+ * The tenant is part of the hash: replaying another tenant's key is an idempotency_conflict, never a read.
+ * `diarize: false` is left out so the hash of every request made before the field existed is unchanged.
+ */
+export const hashCreateRequest = ({ diarize, ...input }: CreateTranscriptionInput, tenantRef: string) =>
+  createHash("sha256").update(canonical({ ...input, ...(diarize ? { diarize } : {}), tenant_ref: tenantRef })).digest("hex");
+
+/** Whether this deployment can diarize. No diarization stage is installed yet (TC-595 adds it). */
+export const diarizationAvailable = (_ctx: BatchContext): boolean => false;
 
 export async function readiness(ctx: BatchContext) {
   const providerConfigured = ctx.provider !== null;
@@ -150,6 +165,9 @@ export async function createTranscription(
   idempotencyKey: string,
   input: CreateTranscriptionInput,
 ): Promise<CreateResult> {
+  if (input.diarize && !diarizationAvailable(ctx)) {
+    throw new BatchError("diarization_unavailable", "Speaker diarization is not available on this service");
+  }
   const requestHash = hashCreateRequest(input, tenantRef);
   if (await replayCreate(ctx, ctx.db, projectId, idempotencyKey, requestHash, false)) {
     const replayed = await ctx.db.transaction((tx) => replayCreate(ctx, tx, projectId, idempotencyKey, requestHash, true));
