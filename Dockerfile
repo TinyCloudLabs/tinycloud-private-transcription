@@ -12,7 +12,7 @@ RUN set -eu; \
     wget -q -O sherpa-onnx.LICENSE https://raw.githubusercontent.com/k2-fsa/sherpa-onnx/v1.13.8/LICENSE; \
     wget -q -O onnxruntime.LICENSE https://raw.githubusercontent.com/microsoft/onnxruntime/v1.28.2/LICENSE; \
     wget -q -O onnxruntime.ThirdPartyNotices.txt https://raw.githubusercontent.com/microsoft/onnxruntime/v1.28.2/ThirdPartyNotices.txt; \
-    wget -q -O TitaNet-S.CC-BY-4.0.LICENSE https://creativecommons.org/licenses/by/4.0/legalcode.txt; \
+    wget -q -O NeMo.LICENSE https://raw.githubusercontent.com/NVIDIA/NeMo/v1.19.0/LICENSE; \
     printf '%s  %s\n' \
       d0f96c8b65c6cd0974fada22737e337de81bc8cd2abbec2e39caf358b1eec5fc sherpa-onnx.tar.bz2 \
       24615ee884c897d9d2ba09bb4d30da6bb1b15e685065962db5b02e76e4996488 segmentation.tar.bz2 \
@@ -20,7 +20,7 @@ RUN set -eu; \
       cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30 sherpa-onnx.LICENSE \
       2f07c72751aed99790b8a4869cf2311df85a860b22ded05fa22803587a48922c onnxruntime.LICENSE \
       0e07b95f3a8d6230037707c5c4a2b554d12c4cb67369669ac255635528ffcee2 onnxruntime.ThirdPartyNotices.txt \
-      9ba9550ad48438d0836ddab3da480b3b69ffa0aac7b7878b5a0039e7ab429411 TitaNet-S.CC-BY-4.0.LICENSE \
+      43070e2d4e532684de521b885f385d0841030efa2b1a20bafb76133a5e1379c1 NeMo.LICENSE \
       | sha256sum -c -; \
     tar -xjf sherpa-onnx.tar.bz2; \
     tar -xjf segmentation.tar.bz2; \
