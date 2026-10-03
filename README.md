@@ -284,7 +284,7 @@ their unchanged upstream v0.12 images.
   (`DynamicElementMixer`): the recorder starts immediately (even with zero audio elements) and a 2 s
   rescan (live-mixer parity) attaches new elements / detaches ended ones. Pinned by the module's
   `dynamic-tap.smoke.test.ts`.
-- **Images**: meeting-api and gateway use `ghcr.io/tinycloudlabs/vexa/<component>:tc-36f0304`; the bot
+- **Images**: meeting-api uses `ghcr.io/tinycloudlabs/vexa/meeting-api:tc-c8d7f33` (TC-583: per-range table, stop-then-start deploys only) and gateway uses `ghcr.io/tinycloudlabs/vexa/gateway:tc-36f0304`; the bot
   uses `ghcr.io/tinycloudlabs/vexa/bot:tc-429a94e` (TC-560, TC-582). The release commit includes the accepted runtime
   changes plus the workflow's missing pnpm toolchain correction. All are pinned by digest in
   `infra/dstack/app-compose.yaml`. The bot workflow is `tinycloud-bot-image`; the older

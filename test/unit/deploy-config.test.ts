@@ -97,7 +97,7 @@ describe("infra/dstack/app-compose.yaml", () => {
       "bot-image-keeper": "ghcr.io/tinycloudlabs/vexa/bot:tc-429a94e@sha256:7c48312c11bee1ac66b1461215bacf4bbf06a05f2ac02af3546f1ee41efea16e",
       runtime: "vexaai/v012-runtime:v012@sha256:a1f6448fbb380b9433364e8b572ec25a12aa4f274bf403f1d83a89cbf5812f2d",
       whisper: "fedirz/faster-whisper-server:latest-cpu@sha256:760e5e43d427dc6cfbbc4731934b908b7de9c7e6d5309c6a1f0c8c923a5b6030",
-      "meeting-api": "ghcr.io/tinycloudlabs/vexa/meeting-api:tc-36f0304@sha256:2f6f0c162402f13b72569d1a9f5bfb792af75f88b60b9178db85d468405d19e2",
+      "meeting-api": "ghcr.io/tinycloudlabs/vexa/meeting-api:tc-c8d7f33@sha256:944c2c36d1ba8617d1c49eae5453750a14db2587ba53f40533f8bcfdcfa37566",
       gateway: "ghcr.io/tinycloudlabs/vexa/gateway:tc-36f0304@sha256:0e82c34a3f5838d6f592c71d6e8bebe4e79d3d0414160261def07a57971ef238",
       "vexa-provision": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
     } as const;
@@ -135,7 +135,7 @@ describe("infra/dstack/app-compose.yaml", () => {
       "ghcr.io/tinycloudlabs/vexa/bot:tc-429a94e@sha256:7c48312c11bee1ac66b1461215bacf4bbf06a05f2ac02af3546f1ee41efea16e",
     );
     expect(compose).toContain(
-      "ghcr.io/tinycloudlabs/vexa/meeting-api:tc-36f0304@sha256:2f6f0c162402f13b72569d1a9f5bfb792af75f88b60b9178db85d468405d19e2",
+      "ghcr.io/tinycloudlabs/vexa/meeting-api:tc-c8d7f33@sha256:944c2c36d1ba8617d1c49eae5453750a14db2587ba53f40533f8bcfdcfa37566",
     );
     expect(compose).toContain(
       "ghcr.io/tinycloudlabs/vexa/gateway:tc-36f0304@sha256:0e82c34a3f5838d6f592c71d6e8bebe4e79d3d0414160261def07a57971ef238",
