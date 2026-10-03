@@ -395,3 +395,40 @@ test("0018: a fresh install starts with admission closed; an existing deployment
     await rm(fixture, { recursive: true, force: true });
   }
 }, 30_000);
+
+test("0021: batch jobs queued before diarization existed stay non-diarized", async () => {
+  const databaseName = `ptx_diarize_${crypto.randomUUID().replaceAll("-", "")}`;
+  const databaseUrl = new URL(config.databaseUrl);
+  databaseUrl.pathname = `/${databaseName}`;
+  const adminUrl = new URL(config.databaseUrl);
+  adminUrl.pathname = "/postgres";
+  const admin = new SQL(adminUrl.toString());
+  // Every migration through 0020: a batch deployment with a job in flight when the diarization image rolls out.
+  const fixture = await productionMigrationsFixture(21);
+  let db: Db | undefined;
+  try {
+    await admin.unsafe(`CREATE DATABASE "${databaseName}"`);
+    const before = createDb(databaseUrl.toString());
+    await migrate(before, { migrationsFolder: fixture });
+    await before.execute(sql`INSERT INTO projects (id, name, webhook_secret) VALUES ('tinychat', 'tinychat', 'whsec_legacy')`);
+    await before.execute(sql`
+      INSERT INTO transcriptions (id, project_id, tenant_ref, status, idempotency_key, request_hash, content_type, byte_size,
+        sha256, channel_mode, channel_labels, upload_deadline_at)
+      VALUES ('trn_legacy', 'tinychat', ${"a".repeat(64)}, 'processing', 'k', 'h', 'audio/mpeg', 10, ${"b".repeat(64)},
+        'mixed', '["Speaker 1"]'::jsonb, now())`);
+    await before.execute(sql`
+      INSERT INTO transcription_regions (transcription_id, ordinal, channel, start_ms, end_ms, status, generation)
+      VALUES ('trn_legacy', 0, 0, 0, 1000, 'pending', 1)`);
+    await before.$client.close();
+
+    db = await runMigrations(databaseUrl.toString());
+    // The worker resumes it on the VAD path and assembles channel_N speakers, exactly as before.
+    expect(await db.execute(sql`SELECT id, status, diarize FROM transcriptions`)).toEqual([{ id: "trn_legacy", status: "processing", diarize: false }]);
+    expect(await db.execute(sql`SELECT ordinal, status, speaker FROM transcription_regions`)).toEqual([{ ordinal: 0, status: "pending", speaker: null }]);
+  } finally {
+    await db?.$client.close();
+    await admin.unsafe(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`);
+    await admin.close();
+    await rm(fixture, { recursive: true, force: true });
+  }
+}, 30_000);
