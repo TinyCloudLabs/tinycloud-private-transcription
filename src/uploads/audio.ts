@@ -12,11 +12,40 @@ export interface ProbeResult {
 
 export type ProbeFailure = "invalid_audio" | "recording_too_long" | "unsupported_recording";
 
+/** ffprobe `format_name` must contain the demuxer for the declared type (it lists every alias, e.g. `mov,mp4,m4a,…`). */
 const FORMAT_FOR: Record<UploadContentType, RegExp> = {
   "audio/mpeg": /(^|,)mp3(,|$)/,
   "audio/wav": /(^|,)wav(,|$)/,
   "audio/ogg": /(^|,)ogg(,|$)/,
+  "audio/mp4": /(^|,)mp4(,|$)/,
+  "audio/webm": /(^|,)webm(,|$)/,
+  "audio/flac": /(^|,)flac(,|$)/,
 };
+
+/**
+ * End of the last audio packet, for containers that carry no duration (browser MediaRecorder WebM has neither a
+ * Duration element nor Cues). Demuxes packet headers only; nothing is decoded.
+ */
+async function scanDuration(path: string, ffprobePath: string): Promise<number> {
+  const proc = Bun.spawn(
+    [ffprobePath, "-v", "error", "-select_streams", "a:0", "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0", path],
+    { stdin: "ignore", stdout: "pipe", stderr: "ignore" },
+  );
+  let end = Number.NaN;
+  let tail = "";
+  const decoder = new TextDecoder();
+  const consume = (line: string) => {
+    const [pts, duration] = line.split(",").map(Number);
+    if (Number.isFinite(pts)) end = Math.max(Number.isFinite(end) ? end : 0, pts! + (Number.isFinite(duration) ? duration! : 0));
+  };
+  for await (const chunk of proc.stdout) {
+    const lines = (tail + decoder.decode(chunk, { stream: true })).split("\n");
+    tail = lines.pop()!;
+    for (const line of lines) consume(line);
+  }
+  consume(tail);
+  return (await proc.exited) === 0 ? end : Number.NaN;
+}
 
 /** Reads container facts with ffprobe. Never reads or logs content. */
 export async function probeAudio(
@@ -40,9 +69,13 @@ export async function probeAudio(
   }
   const audio = (parsed.streams ?? []).filter((stream) => stream.codec_type === "audio");
   const format = parsed.format?.format_name ?? "";
-  const duration = Number(parsed.format?.duration);
-  if (audio.length !== 1 || !FORMAT_FOR[contentType].test(format) || !Number.isFinite(duration) || duration <= 0) {
+  if (audio.length !== 1 || !FORMAT_FOR[contentType].test(format)) {
     return { ok: false, code: "invalid_audio", message: "The recording is not a single-stream audio file of the declared type" };
+  }
+  const declared = Number(parsed.format?.duration);
+  const duration = Number.isFinite(declared) && declared > 0 ? declared : await scanDuration(path, ffprobePath);
+  if (!Number.isFinite(duration) || duration <= 0) {
+    return { ok: false, code: "invalid_audio", message: "The recording could not be read as audio" };
   }
   const channels = audio[0]!.channels ?? 0;
   if (!Number.isSafeInteger(channels) || channels < 1 || channels > limits.maxChannels) {

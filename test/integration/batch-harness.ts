@@ -186,16 +186,32 @@ export async function startBatchHarness(opts: { config?: DeepPartial<BatchConfig
 
 const fixtureCache = new Map<string, Uint8Array>();
 
+type Fixture = "stereo" | "mono_wav" | "silent_wav" | "three_channel_wav" | "over_cap_mp3" | "stereo_dense"
+  | "stereo_m4a" | "stereo_webm" | "stereo_webm_no_duration" | "stereo_flac" | "stereo_mp4_with_video";
+
+// ch0 speaks 0.5–2.5 s, ch1 speaks 3.5–5.5 s; 7 s stereo. Re-encoded per container below. Inputs and graph only:
+// `-map` is an output option, so it has to follow any further input.
+const STEREO = ["-f", "lavfi", "-i", "sine=f=440:d=2", "-f", "lavfi", "-i", "sine=f=660:d=2", "-filter_complex",
+  "[0]adelay=500,apad=whole_dur=7[a];[1]adelay=3500,apad=whole_dur=7[b];[a][b]amerge=inputs=2[out]"];
+
 /** Deterministic audio made with ffmpeg (no host TTS). Tones stand in for speech: the VAD is energy-based. */
-export async function audio(kind: "stereo" | "mono_wav" | "silent_wav" | "three_channel_wav" | "over_cap_mp3" | "stereo_dense"): Promise<Uint8Array> {
+export async function audio(kind: Fixture): Promise<Uint8Array> {
   const cached = fixtureCache.get(kind);
   if (cached) return cached;
   const dir = await mkdtemp(join(tmpdir(), "ptx-batch-fixture-"));
-  const out = join(dir, kind.endsWith("wav") ? "out.wav" : "out.mp3");
-  const args: Record<typeof kind, string[]> = {
-    // ch0 speaks 0.5–2.5 s, ch1 speaks 3.5–5.5 s; 7 s, 128 kbps stereo mp3.
-    stereo: ["-f", "lavfi", "-i", "sine=f=440:d=2", "-f", "lavfi", "-i", "sine=f=660:d=2", "-filter_complex",
-      "[0]adelay=500,apad=whole_dur=7[a];[1]adelay=3500,apad=whole_dur=7[b];[a][b]amerge=inputs=2[out]", "-map", "[out]", "-ar", "44100", "-c:a", "libmp3lame", "-b:a", "128k"],
+  const ext = kind.endsWith("wav") ? "wav" : kind === "stereo_m4a" ? "m4a" : kind.startsWith("stereo_webm") ? "webm"
+    : kind === "stereo_flac" ? "flac" : kind === "stereo_mp4_with_video" ? "mp4" : "mp3";
+  const out = join(dir, `out.${ext}`);
+  const args: Record<Fixture, string[]> = {
+    stereo: [...STEREO, "-map", "[out]", "-ar", "44100", "-c:a", "libmp3lame", "-b:a", "128k"],
+    stereo_m4a: [...STEREO, "-map", "[out]", "-ar", "44100", "-c:a", "aac", "-b:a", "64k"],
+    stereo_webm: [...STEREO, "-map", "[out]", "-ar", "48000", "-c:a", "libopus", "-b:a", "32k"],
+    // What browser MediaRecorder writes: no Duration element and no Cues, so ffprobe reports duration N/A.
+    stereo_webm_no_duration: [...STEREO, "-map", "[out]", "-ar", "48000", "-c:a", "libopus", "-b:a", "32k", "-live", "1"],
+    stereo_flac: [...STEREO, "-map", "[out]", "-ar", "16000", "-c:a", "flac"],
+    // A video track next to the audio (screen recordings, phone videos) is ignored.
+    stereo_mp4_with_video: [...STEREO, "-f", "lavfi", "-i", "color=c=black:s=64x64:r=5:d=7", "-map", "[out]", "-map", "2:v", "-c:v", "mpeg4",
+      "-ar", "44100", "-c:a", "aac", "-b:a", "64k"],
     // Four alternating turns per channel: 8 regions.
     stereo_dense: ["-f", "lavfi", "-i", "sine=f=440:d=16", "-f", "lavfi", "-i", "sine=f=660:d=16", "-filter_complex",
       "[0]volume='if(lt(mod(t,4),1.5),1,0)':eval=frame,apad=whole_dur=16[a];[1]volume='if(between(mod(t,4),2,3.5),1,0)':eval=frame,apad=whole_dur=16[b];[a][b]amerge=inputs=2[out]",

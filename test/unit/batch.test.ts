@@ -3,9 +3,10 @@ import { parseRole } from "../../src/config.ts";
 import { TRANSCRIPTION_ID, newTranscriptionId } from "../../src/domain/ids.ts";
 import { digestEquals, generateCapability, hashCapability, matchCapability } from "../../src/uploads/capability.ts";
 import { batchConfigFromEnv, MAX_UPLOAD_BYTES } from "../../src/uploads/config.ts";
+import { corsOriginMatcher, parseCorsOrigins } from "../../src/uploads/cors.ts";
 import { faultsFromEnv, noFaults, SimulatedCrash } from "../../src/uploads/faults.ts";
 import { BatchTinfoilClient, parseRetryAfter, type ProviderOutcome } from "../../src/uploads/provider.ts";
-import { parseCreateBody } from "../../src/uploads/service.ts";
+import { hashCreateRequest, parseCreateBody } from "../../src/uploads/service.ts";
 import { regionsFromEnergies, VAD } from "../../src/uploads/vad.ts";
 
 describe("role", () => {
@@ -55,12 +56,46 @@ describe("ids and capabilities", () => {
 describe("create body", () => {
   const ok = { content_type: "audio/mpeg", byte_size: 10, sha256: "a".repeat(64) };
   test("defaults and strictness", () => {
-    expect(parseCreateBody(ok, MAX_UPLOAD_BYTES)).toEqual({ ...ok, language: null, channel_mode: "separate", channel_labels: ["Speaker 1", "Speaker 2"] } as never);
+    expect(parseCreateBody(ok, MAX_UPLOAD_BYTES)).toEqual({ ...ok, language: null, channel_mode: "separate", channel_labels: ["Speaker 1", "Speaker 2"], diarize: false } as never);
     expect(() => parseCreateBody({ ...ok, byte_size: MAX_UPLOAD_BYTES + 1 }, MAX_UPLOAD_BYTES)).toThrow("at most");
     expect(() => parseCreateBody({ ...ok, byte_size: 1.5 }, MAX_UPLOAD_BYTES)).toThrow("positive integer");
     expect(() => parseCreateBody({ ...ok, channel_labels: ["a\u0000"] }, MAX_UPLOAD_BYTES)).toThrow("channel_labels");
     expect(() => parseCreateBody({ ...ok, webhook_url: "x" }, MAX_UPLOAD_BYTES)).toThrow("Unknown field");
     expect(() => parseCreateBody([], MAX_UPLOAD_BYTES)).toThrow("JSON object");
+  });
+
+  test("diarize defaults to a mono mix and refuses separate channels", () => {
+    expect(parseCreateBody({ ...ok, diarize: true }, MAX_UPLOAD_BYTES)).toMatchObject({ diarize: true, channel_mode: "mixed" });
+    expect(() => parseCreateBody({ ...ok, diarize: true, channel_mode: "separate" }, MAX_UPLOAD_BYTES)).toThrow("channel_mode separate");
+    expect(() => parseCreateBody({ ...ok, diarize: "yes" }, MAX_UPLOAD_BYTES)).toThrow("boolean");
+  });
+
+  test("the idempotency hash of a request without diarize is unchanged by the new field", () => {
+    // Pinned from the hash before `diarize` existed: replays of jobs created by an older image must still match.
+    const input = parseCreateBody(ok, MAX_UPLOAD_BYTES);
+    expect(hashCreateRequest(input, "b".repeat(64))).toBe("48383384fc4a7b2592af0fa0dc9f31323fb9946f01bd20c2ddc0585f971c799b");
+    expect(hashCreateRequest(parseCreateBody({ ...ok, diarize: true }, MAX_UPLOAD_BYTES), "b".repeat(64))).not.toBe(hashCreateRequest(parseCreateBody({ ...ok, channel_mode: "mixed" }, MAX_UPLOAD_BYTES), "b".repeat(64)));
+  });
+});
+
+describe("upload CORS origins", () => {
+  test("parses exact and single-label wildcard origins; malformed entries fail fast", () => {
+    expect(parseCorsOrigins("")).toEqual([]);
+    expect(parseCorsOrigins(" https://tinycloud.chat , https://*.tinychat-4jq.pages.dev,tauri://localhost,http://localhost:5173"))
+      .toEqual(["https://tinycloud.chat", "https://*.tinychat-4jq.pages.dev", "tauri://localhost", "http://localhost:5173"]);
+    for (const bad of ["*", "https://tinycloud.chat/", "https://Tinycloud.chat", "tinycloud.chat", "https://*.*.x.dev", "https://a.*.x.dev", "https://x.dev,,https://y.dev", "https://*"]) {
+      expect(() => parseCorsOrigins(bad)).toThrow("BATCH_CORS_ORIGINS");
+    }
+  });
+
+  test("a wildcard matches exactly one leading label of the same scheme", () => {
+    const allowed = corsOriginMatcher(parseCorsOrigins("https://tinycloud.chat,https://*.tinychat-4jq.pages.dev"));
+    expect(allowed("https://tinycloud.chat")).toBe(true);
+    expect(allowed("https://feat-x.tinychat-4jq.pages.dev")).toBe(true);
+    for (const origin of ["https://tinychat-4jq.pages.dev", "https://a.b.tinychat-4jq.pages.dev", "http://feat-x.tinychat-4jq.pages.dev",
+      "https://feat-x.tinychat-4jq.pages.dev.evil.com", "https://eviltinychat-4jq.pages.dev", "https://tinycloud.chat.evil.com", "null"]) {
+      expect({ origin, allowed: allowed(origin) }).toEqual({ origin, allowed: false });
+    }
   });
 });
 

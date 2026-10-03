@@ -4,6 +4,7 @@
  */
 export type BatchErrorCode =
   | "invalid_request"
+  | "diarization_unavailable"
   | "unauthorized"
   | "insufficient_scope"
   | "idempotency_conflict"
@@ -28,6 +29,8 @@ export type BatchErrorCode =
 
 const TABLE: Record<BatchErrorCode, { status: number; type: string }> = {
   invalid_request: { status: 400, type: "invalid_request_error" },
+  // `diarize: true` while this deployment has no diarization stage (capabilities report `diarization: false`).
+  diarization_unavailable: { status: 400, type: "invalid_request_error" },
   unauthorized: { status: 401, type: "authentication_error" },
   insufficient_scope: { status: 403, type: "authentication_error" },
   idempotency_conflict: { status: 409, type: "invalid_request_error" },

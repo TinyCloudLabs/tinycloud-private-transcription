@@ -83,6 +83,21 @@ describe("single-slot arbiter", () => {
     expect(await exists(jobDir(h.uploadDir, id))).toBe(false);
   });
 
+  test("m4a, webm (with and without a duration), flac and mp4 with a video track transcribe like the mp3", async () => {
+    const cases = [
+      ["stereo_m4a", "audio/mp4"], ["stereo_webm", "audio/webm"], ["stereo_webm_no_duration", "audio/webm"], ["stereo_flac", "audio/flac"],
+      ["stereo_mp4_with_video", "audio/mp4"],
+    ] as const;
+    for (const [fixture, contentType] of cases) {
+      const id = await h.submit(await audio(fixture), { contentType });
+      expect(await h.row(id)).toMatchObject({ channels: 2, durationSeconds: expect.closeTo(7, 0) });
+      await h.work();
+      const body = await (await result(id)).json();
+      expect({ fixture, status: body.status, speakers: body.segments.map((s: { speaker_id: string }) => s.speaker_id) })
+        .toEqual({ fixture, status: "completed", speakers: ["channel_0", "channel_1"] });
+    }
+  });
+
   test("mixed channel mode and mono recordings produce one speaker", async () => {
     const id = await h.submit(await audio("mono_wav"), { contentType: "audio/wav" });
     await h.work();

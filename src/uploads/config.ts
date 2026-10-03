@@ -1,10 +1,11 @@
 import { positiveIntegerEnv } from "../config.ts";
+import { parseCorsOrigins } from "./cors.ts";
 
 /** 2 h at 128 kbps stereo + 5% (the same formula Exo uses for its 8 h local cap). */
 export const MAX_UPLOAD_BYTES = 120_960_000;
 export const MAX_DURATION_SECONDS = 7_200;
 export const MAX_CHANNELS = 2;
-export const CONTENT_TYPES = ["audio/mpeg", "audio/wav", "audio/ogg"] as const;
+export const CONTENT_TYPES = ["audio/mpeg", "audio/wav", "audio/ogg", "audio/mp4", "audio/webm", "audio/flac"] as const;
 export type UploadContentType = (typeof CONTENT_TYPES)[number];
 
 /**
@@ -20,6 +21,8 @@ export interface BatchConfig {
   ffmpegPath: string;
   ffprobePath: string;
   tinfoil: { baseUrl: string; apiKey: string; model: string; timeoutMs: number };
+  /** BATCH_CORS_ORIGINS: browser origins allowed to PUT /uploads/{id} directly. Empty → no CORS headers. */
+  corsOrigins: string[];
   limits: {
     maxBytes: number;
     maxDurationSeconds: number;
@@ -91,6 +94,7 @@ export function batchConfigFromEnv(): BatchConfig {
       model: str("BATCH_TINFOIL_MODEL", "voxtral-small-24b"),
       timeoutMs: positiveIntegerEnv("BATCH_TINFOIL_TIMEOUT_MS", "180000"),
     },
+    corsOrigins: parseCorsOrigins(str("BATCH_CORS_ORIGINS", "")),
     limits: {
       maxBytes: MAX_UPLOAD_BYTES,
       maxDurationSeconds: MAX_DURATION_SECONDS,
