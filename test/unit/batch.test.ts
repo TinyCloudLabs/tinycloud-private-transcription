@@ -1,9 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { parseRole } from "../../src/config.ts";
 import { TRANSCRIPTION_ID, newTranscriptionId } from "../../src/domain/ids.ts";
 import { digestEquals, generateCapability, hashCapability, matchCapability } from "../../src/uploads/capability.ts";
 import { batchConfigFromEnv, MAX_UPLOAD_BYTES } from "../../src/uploads/config.ts";
 import { corsOriginMatcher, parseCorsOrigins } from "../../src/uploads/cors.ts";
+import { parseSegments, SherpaDiarizer, speakerTurns } from "../../src/uploads/diarize.ts";
 import { faultsFromEnv, noFaults, SimulatedCrash } from "../../src/uploads/faults.ts";
 import { BatchTinfoilClient, parseRetryAfter, type ProviderOutcome } from "../../src/uploads/provider.ts";
 import { hashCreateRequest, parseCreateBody } from "../../src/uploads/service.ts";
@@ -177,5 +182,70 @@ describe("VAD regions", () => {
     for (const r of regions) expect(r.endMs - r.startMs).toBeLessThanOrEqual(VAD.maxMs);
     expect(regions.at(-1)!.endMs).toBe(80_250);
     for (let i = 1; i < regions.length; i++) expect(regions[i]!.startMs).toBe(regions[i - 1]!.endMs);
+  });
+});
+
+describe("speaker turns", () => {
+  const speech = (seconds: number) => new Float64Array(seconds * 10).fill(-20);
+  const seg = (start: number, end: number, speaker: number) => ({ startMs: start * 1000, endMs: end * 1000, speaker });
+
+  test("overlapped speech stays with the turn it interrupts; a handover cuts where the current speaker stops", () => {
+    expect(speakerTurns([seg(0, 10, 0), seg(4, 5, 1)], speech(12))).toEqual([{ startMs: 0, endMs: 10_250, speaker: 0 }]);
+    expect(speakerTurns([seg(0, 5, 0), seg(4.5, 9, 1)], speech(12)))
+      .toEqual([{ startMs: 0, endMs: 5_000, speaker: 0 }, { startMs: 5_000, endMs: 9_250, speaker: 1 }]);
+    expect(speakerTurns([], speech(12))).toEqual([]);
+  });
+
+  test("same-speaker gaps under 1 s merge; padding stops at the midpoint of a gap", () => {
+    expect(speakerTurns([seg(0, 2, 0), seg(2.8, 4, 0)], speech(6))).toEqual([{ startMs: 0, endMs: 4_250, speaker: 0 }]);
+    expect(speakerTurns([seg(0, 2, 0), seg(3.2, 4, 0)], speech(6)))
+      .toEqual([{ startMs: 0, endMs: 2_250, speaker: 0 }, { startMs: 2_950, endMs: 4_250, speaker: 0 }]);
+  });
+
+  test("turns under 0.4 s fold into the nearer neighbour less than 1 s away; an isolated short turn is kept", () => {
+    // A 0.3 s blip between two turns of one speaker joins them.
+    expect(speakerTurns([seg(0, 3, 0), seg(3, 3.3, 1), seg(3.3, 6, 0)], speech(8))).toEqual([{ startMs: 0, endMs: 6_250, speaker: 0 }]);
+    // Between two other speakers it goes to the nearer (0.1 s before it, not 0.4 s after).
+    expect(speakerTurns([seg(0, 3, 0), seg(3.1, 3.4, 1), seg(3.8, 6, 2)], speech(8)))
+      .toEqual([{ startMs: 0, endMs: 3_600, speaker: 0 }, { startMs: 3_600, endMs: 6_250, speaker: 2 }]);
+    expect(speakerTurns([seg(0, 3, 0), seg(5, 5.3, 1)], speech(8)))
+      .toEqual([{ startMs: 0, endMs: 3_250, speaker: 0 }, { startMs: 4_750, endMs: 5_550, speaker: 1 }]);
+  });
+
+  test("turns longer than 30 s split at their quietest frame and keep their speaker", () => {
+    const e = speech(100);
+    e[250] = -35; // quieter frame at 25.0 s (inside the 20–30 s window)
+    expect(speakerTurns([seg(0, 80, 4)], e)).toEqual([
+      { startMs: 0, endMs: 25_050, speaker: 4 }, { startMs: 25_050, endMs: 54_950, speaker: 4 }, { startMs: 54_950, endMs: 80_250, speaker: 4 },
+    ]);
+  });
+
+  test("reads the CLI's segment lines and nothing else", () => {
+    const stdout = "OfflineSpeakerDiarizationConfig(segmentation=…)\nStarted\n6.730 -- 9.937 speaker_00\n7.979 -- 8.283 speaker_01\n10.038 -- 10.983 speaker_03\n";
+    expect(parseSegments(stdout)).toEqual([
+      { startMs: 6_730, endMs: 9_937, speaker: 0 }, { startMs: 7_979, endMs: 8_283, speaker: 1 }, { startMs: 10_038, endMs: 10_983, speaker: 3 },
+    ]);
+  });
+
+  test("an over-split clustering is clustered again into 32 speakers; the WAV handed to the CLI is removed", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ptx-diarizer-"));
+    try {
+      // Stand-in CLI: 40 speakers by threshold, 32 when the cluster count is fixed. Records each invocation.
+      const command = join(dir, "diarize");
+      await writeFile(command, [
+        "#!/bin/sh",
+        `echo "$*" >> ${dir}/calls`,
+        'case "$*" in *num-clusters=32*) n=32 ;; *) n=40 ;; esac',
+        'i=0; while [ $i -lt $n ]; do echo "$i.000 -- $i.500 speaker_$i"; i=$((i + 1)); done',
+      ].join("\n"), { mode: 0o755 });
+      const pcm = join(dir, "ch0.pcm");
+      await writeFile(pcm, new Uint8Array(32_000));
+      const segments = await new SherpaDiarizer({ command, segmentation: "s.onnx", embedding: "e.onnx" }).diarize(pcm, new AbortController().signal);
+      expect(new Set(segments.map((s) => s.speaker)).size).toBe(32);
+      expect((await readFile(join(dir, "calls"), "utf8")).trim().split("\n")).toHaveLength(2);
+      expect(existsSync(`${pcm}.wav`)).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

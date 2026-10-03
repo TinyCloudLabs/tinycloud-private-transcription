@@ -209,6 +209,8 @@ export const transcriptions = pgTable(
     language: text("language"),
     channelMode: text("channel_mode").notNull(),
     channelLabels: jsonb("channel_labels").$type<string[]>().notNull(),
+    /** Downmixed to mono and split into speaker turns by the diarization stage (create `diarize: true`). */
+    diarize: boolean("diarize").notNull().default(false),
     /** Absolute: an upload that has not been accepted by then fails upload_expired. */
     uploadDeadlineAt: timestamp("upload_deadline_at", { withTimezone: true }).notNull(),
     /** The single live PUT (serializes uploads). Heartbeats never extend past upload_lease_hard_expires_at. */
@@ -264,11 +266,13 @@ export const transcriptionCapabilities = pgTable("transcription_capabilities", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [index("transcription_capabilities_job_idx").on(t.transcriptionId)]);
 
-/** VAD regions, one provider request each. Text is content: nulled on DELETE and transcript expiry. */
+/** VAD regions (or speaker turns of a diarized job), one provider request each. Text is content: nulled on DELETE and transcript expiry. */
 export const transcriptionRegions = pgTable("transcription_regions", {
   transcriptionId: text("transcription_id").notNull().references(() => transcriptions.id, { onDelete: "cascade" }),
   ordinal: integer("ordinal").notNull(),
   channel: integer("channel").notNull(),
+  /** Diarizer speaker label of a diarized job's turn (renumbered by first appearance at assembly); null otherwise. */
+  speaker: integer("speaker"),
   startMs: integer("start_ms").notNull(),
   endMs: integer("end_ms").notNull(),
   status: text("status").notNull().default("pending"), // pending | completed | failed | ambiguous

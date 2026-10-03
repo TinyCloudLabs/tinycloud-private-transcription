@@ -103,13 +103,17 @@ GET  /v1/transcriptions/capabilities            {max_bytes,max_duration_seconds:
 PUT  /uploads/{id}   Authorization: Bearer <capability>   Content-Length = byte_size   Content-Type = content_type
 GET|PUT /v1/admin/admission  (admin:*)          {"mode":"open|drain|closed"} → {mode, active:{awaiting_upload,queued,processing}, retention_lag_seconds}
 ```
-`<job>` = `{id, object:"transcription", status, content_type, byte_size, language, channel_mode, channel_labels,
+`<job>` = `{id, object:"transcription", status, content_type, byte_size, language, channel_mode, channel_labels, diarize,
 duration_seconds, channels, progress:{stage, queue_position, regions_completed, regions_total}, retention:{audio:
 not_received|stored|deletion_pending|deleted, audio_deleted_at, transcript_expires_at, transcript_deleted_at},
 error:{type,code,message}|null, created_at, upload_deadline_at, uploaded_at, processing_started_at, finished_at}`.
-Completed result: `{id, status, language, duration_seconds, provider:"tinfoil", model, channels, speakers:[{id:
-"channel_N", name, channel}], segments:[{id, speaker_id, channel, start, end, text}], text, stats:{tinfoil_calls,
-tinfoil_audio_seconds}}`. Timestamps are region-level (VAD regions, below).
+Completed result: `{id, status, language, duration_seconds, provider:"tinfoil", model, channels, diarized, speakers:[{id,
+name, channel}], segments:[{id, speaker_id, channel, start, end, text}], text, stats:{tinfoil_calls,
+tinfoil_audio_seconds}}`. Without `diarize`, `diarized` is false, speakers are `channel_N` (named by `channel_labels`) and
+timestamps are region-level (VAD regions, below). With `diarize`, `diarized` is true, `channels` is 1, speakers are
+`{id:"speaker_N", name:"Speaker N+1", channel:0}` (N 0–31, numbered by first appearance; only speakers with text are
+listed) and every segment is one speaker turn on channel 0, in time order. Results stored before `diarized` existed
+are returned with `diarized: false`.
 
 `content_type` → container: `audio/mpeg` mp3, `audio/wav` WAV, `audio/ogg` Ogg (Vorbis/Opus/FLAC), `audio/mp4`
 MP4/M4A (any `mov,mp4,m4a` demux), `audio/webm` WebM/Matroska, `audio/flac` FLAC. `channel_mode` defaults to `separate`,
@@ -178,6 +182,16 @@ decodes to 16 kHz PCM on disk, stopping at 7,200 s of PCM (counted in bytes, wha
 (100 ms frames; voiced ≥ max(−50 dBFS, p10 + 12 dB); gaps ≤ 1 s merged;
 ±0.25 s padding; regions > 30 s split at the quietest frame in their last 10 s) produces regions; each region is one
 Tinfoil request. No speech → `no_speech`.
+
+**Diarization** (`diarize: true`; [docs/diarization-benchmark.md](./docs/diarization-benchmark.md)). After the mono
+decode, the sherpa-onnx CLI (pyannote segmentation-3.0 + a speaker-embedding model, threshold clustering) labels speech
+with speakers; it runs as a child process like ffmpeg and is killed when the claim is lost. Its segments become speaker
+turns instead of VAD regions: every 100 ms frame of speech gets one speaker (the current speaker keeps overlapped
+speech); runs of one speaker < 1 s apart merge; turns < 0.4 s fold into the nearer neighbour < 1 s away; turns are
+padded ≤ 0.25 s into silence, never into a neighbour; turns > 30 s split at their quietest frame. Each turn is one
+Tinfoil request through the same arbiter. Non-speech is never sent. A diarizer that fails (or is no longer installed
+when the job is claimed) fails the job `processing_failed` before any provider call; the stage is enabled with
+`BATCH_DIARIZATION_ENABLED=true` and offered only when its install under `BATCH_DIARIZATION_DIR` is complete.
 
 **Exactly-once dispatch.** A single-row slot table is the arbiter: in one transaction the worker proves its claim, takes
 the slot and commits a `started` attempt; only then is the request sent, with no await in between. At most one provider
