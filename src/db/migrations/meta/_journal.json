@@ -155,6 +155,13 @@
       "when": 1791240795273,
       "tag": "0021_transcript_evals",
       "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1791245836843,
+      "tag": "0022_batch_diarization",
+      "breakpoints": true
     }
   ]
 }

@@ -74,6 +74,7 @@ describe("single-slot arbiter", () => {
       provider: "tinfoil",
       model: "voxtral-small-24b",
       channels: 2,
+      diarized: false,
       speakers: [{ id: "channel_0", name: "Speaker 1", channel: 0 }, { id: "channel_1", name: "Speaker 2", channel: 1 }],
       stats: { tinfoil_calls: 2 },
     });
@@ -161,6 +162,42 @@ describe("region insert", () => {
       await insertRegions(tx, claim.fence, broken);
     })).rejects.toThrow();
     expect((await regions(claim.fence.id)).length).toBe(0);
+  });
+});
+
+describe("diarization", () => {
+  // stereo_dense mixed down: one voice at 0–1.5, 4–5.5, 8–9.5, 12–13.5 s, the other at 2–3.5, 6–7.5, 10–11.5, 14–15.5 s.
+  const alternating = [0, 2, 4, 6, 8, 10, 12, 14].map((s, i) => ({ startMs: s * 1000, endMs: s * 1000 + 1_500, speaker: i % 2 ? 3 : 7 }));
+  afterEach(() => {
+    h.ctx.diarizer = null;
+  });
+
+  test("diarize: true sends each speaker turn of the mono mix once and labels speakers by first appearance", async () => {
+    h.ctx.diarizer = { diarize: async () => alternating };
+    const id = await h.submit(await audio("stereo_dense"), { body: { diarize: true } });
+    await h.work();
+    const body = await (await result(id)).json();
+    expect(body).toMatchObject({
+      status: "completed",
+      diarized: true,
+      channels: 1,
+      speakers: [{ id: "speaker_0", name: "Speaker 1", channel: 0 }, { id: "speaker_1", name: "Speaker 2", channel: 0 }],
+      stats: { tinfoil_calls: 8 },
+    });
+    // Turns are padded 0.25 s into the 0.5 s gaps, so neighbours meet without overlapping.
+    expect(body.segments.map((s: { speaker_id: string; channel: number; start: number; end: number }) => [s.speaker_id, s.channel, s.start, s.end])).toEqual([
+      ["speaker_0", 0, 0, 1.75], ["speaker_1", 0, 1.75, 3.75], ["speaker_0", 0, 3.75, 5.75], ["speaker_1", 0, 5.75, 7.75],
+      ["speaker_0", 0, 7.75, 9.75], ["speaker_1", 0, 9.75, 11.75], ["speaker_0", 0, 11.75, 13.75], ["speaker_1", 0, 13.75, 15.75],
+    ]);
+    expect(body.text.split("\n").slice(0, 2)).toEqual(["Speaker 1: words 1", "Speaker 2: words 2"]);
+  });
+
+  test("a diarizer failure fails the job before any provider call", async () => {
+    h.ctx.diarizer = { diarize: async () => { throw new Error("diarizer exited 134"); } };
+    const id = await h.submit(await audio("stereo"), { body: { diarize: true } });
+    await h.work();
+    expect(await h.row(id)).toMatchObject({ status: "failed", errorCode: "processing_failed", errorMessage: "Speaker diarization failed", deletionState: "files_deleted" });
+    expect(h.tinfoil.calls.length).toBe(0);
   });
 });
 

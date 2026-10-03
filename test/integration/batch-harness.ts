@@ -83,7 +83,7 @@ export interface BatchHarness {
   create(bytes: Uint8Array, opts?: { tenant?: string; key?: string; contentType?: string; body?: Record<string, unknown> }): Promise<ApiResponse>;
   put(id: string, capability: string, bytes: Uint8Array | ReadableStream<Uint8Array>, opts?: { contentType?: string; contentLength?: number }): Promise<ApiResponse>;
   /** Create + PUT; returns the job id. */
-  submit(bytes: Uint8Array, opts?: { tenant?: string; contentType?: string }): Promise<string>;
+  submit(bytes: Uint8Array, opts?: { tenant?: string; contentType?: string; body?: Record<string, unknown> }): Promise<string>;
   /** One worker iteration: claim the next job and run it to a terminal state (or fence loss). */
   work(ctx?: BatchContext): Promise<boolean>;
   row(id: string): Promise<typeof transcriptions.$inferSelect>;

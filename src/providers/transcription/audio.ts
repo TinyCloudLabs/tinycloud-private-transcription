@@ -52,9 +52,15 @@ export function sliceToWav(pcm: Pcm16, startSec: number, endSec: number): Uint8A
 }
 
 export function pcmToWav(samples: Int16Array, sampleRate: number): Uint8Array {
-  const dataBytes = samples.length * 2;
-  const buffer = new ArrayBuffer(44 + dataBytes);
-  const view = new DataView(buffer);
+  const out = new Uint8Array(44 + samples.length * 2);
+  out.set(wavHeader(samples.length * 2, sampleRate));
+  new Int16Array(out.buffer, 44).set(samples);
+  return out;
+}
+
+/** The 44-byte header of a 16-bit mono PCM WAV file whose sample data is `dataBytes` long. */
+export function wavHeader(dataBytes: number, sampleRate: number): Uint8Array {
+  const view = new DataView(new ArrayBuffer(44));
   const write = (offset: number, value: string) => {
     for (let i = 0; i < value.length; i++) view.setUint8(offset + i, value.charCodeAt(i));
   };
@@ -62,6 +68,5 @@ export function pcmToWav(samples: Int16Array, sampleRate: number): Uint8Array {
   write(12, "fmt "); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
   view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
   write(36, "data"); view.setUint32(40, dataBytes, true);
-  new Int16Array(buffer, 44).set(samples);
-  return new Uint8Array(buffer);
+  return new Uint8Array(view.buffer);
 }

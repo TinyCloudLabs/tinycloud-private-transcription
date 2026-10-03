@@ -114,7 +114,8 @@ function transcriptionRoutes(ctx: BatchContext) {
     if (job.status !== "completed") return c.json({ id: job.id, status: job.status }, 202);
     const result = job.transcriptDeletedAt ? null : await getResult(ctx, job.id);
     if (!result) throw new BatchError("transcript_expired", "The transcript is no longer available");
-    return c.json({ id: job.id, status: job.status, ...(result as Record<string, unknown>) });
+    // Results stored before `diarized` existed were never diarized.
+    return c.json({ id: job.id, status: job.status, diarized: false, ...(result as Record<string, unknown>) });
   });
 
   r.post("/:id/cancel", async (c) => {

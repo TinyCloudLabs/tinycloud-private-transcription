@@ -82,8 +82,8 @@ const canonical = (value: unknown): string =>
 export const hashCreateRequest = ({ diarize, ...input }: CreateTranscriptionInput, tenantRef: string) =>
   createHash("sha256").update(canonical({ ...input, ...(diarize ? { diarize } : {}), tenant_ref: tenantRef })).digest("hex");
 
-/** Whether this deployment can diarize. No diarization stage is installed yet (TC-595 adds it). */
-export const diarizationAvailable = (_ctx: BatchContext): boolean => false;
+/** Whether this deployment can diarize: enabled, and the sherpa-onnx install is present (src/uploads/diarize.ts). */
+export const diarizationAvailable = (ctx: BatchContext): boolean => ctx.diarizer !== null;
 
 export async function readiness(ctx: BatchContext) {
   const providerConfigured = ctx.provider !== null;
@@ -226,6 +226,7 @@ export async function createTranscription(
         language: input.language,
         channelMode: input.channel_mode,
         channelLabels: input.channel_labels,
+        diarize: input.diarize,
         uploadDeadlineAt: new Date(Date.now() + ctx.config.upload.deadlineSeconds * 1000),
       }).returning();
       return { job: job!, created: true, upload: await issueCapability(ctx, tx, job!) };
@@ -338,6 +339,7 @@ export async function serializeJob(ctx: BatchContext, job: TranscriptionRow) {
     language: job.language,
     channel_mode: job.channelMode,
     channel_labels: job.channelLabels,
+    diarize: job.diarize,
     duration_seconds: job.durationSeconds,
     channels: job.channels,
     progress: { stage, queue_position: queuePosition, regions_completed: completed, regions_total: total },

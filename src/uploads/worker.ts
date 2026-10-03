@@ -6,13 +6,14 @@ import { providerDispatchSlots, transcriptionAdmission, transcriptionAttempts, t
 import { pcmToWav } from "../providers/transcription/audio.ts";
 import { decodeChannelToPcm, PCM_RATE, readPcmRange } from "./audio.ts";
 import type { BatchContext } from "./context.ts";
+import { speakerTurns, type SpeakerSegment } from "./diarize.ts";
 import type { JobErrorCode } from "./errors.ts";
 import { isSimulatedCrash } from "./faults.ts";
 import { fenceGuard, holdFence, LostFence, type DbOrTx, type Fence } from "./fence.ts";
 import { cleanupJobFiles, recoverStaleClaims, releaseDeadSlot, runSweep, terminalize, workerLive } from "./ledger.ts";
 import type { ProviderOutcome } from "./provider.ts";
 import { ensureStorageRoot, jobDir, removeJobEntry, workDirName } from "./storage.ts";
-import { detectRegions } from "./vad.ts";
+import { detectRegions, frameEnergies } from "./vad.ts";
 
 export interface Claim {
   job: TranscriptionRow;
@@ -133,12 +134,15 @@ async function runPipeline(ctx: BatchContext, job: TranscriptionRow, fence: Fenc
   await ctx.faults.hit("worker.after_rename", { id: job.id });
   await holdFence(ctx.db, fence);
 
-  // 2. VAD regions, inserted in one fenced transaction (kept across re-claims).
+  // 2. VAD regions (speaker turns for a diarized job), inserted in one fenced transaction (kept across re-claims).
   let regions = await ctx.db.select().from(transcriptionRegions).where(eq(transcriptionRegions.transcriptionId, job.id))
     .orderBy(asc(transcriptionRegions.startMs), asc(transcriptionRegions.channel));
   if (regions.length === 0) {
-    const detected = (await Promise.all(pcm.map(async (path, channel) => (await detectRegions(path)).map((region) => ({ ...region, channel })))))
-      .flat().sort((a, b) => a.startMs - b.startMs || a.channel - b.channel);
+    const detected = job.diarize
+      ? await diarizeTurns(ctx, job, fence, pcm[0]!, signal)
+      : (await Promise.all(pcm.map(async (path, channel) => (await detectRegions(path)).map((region) => ({ ...region, channel, speaker: null })))))
+        .flat().sort((a, b) => a.startMs - b.startMs || a.channel - b.channel);
+    if (detected === null) return;
     if (detected.length === 0) {
       if (await failClaim(ctx, ctx.db, fence, "no_speech", "No speech was detected in the recording")) await cleanupJobFiles(ctx, job.id);
       else throw new LostFence(job.id);
@@ -178,12 +182,31 @@ async function runPipeline(ctx: BatchContext, job: TranscriptionRow, fence: Fenc
 export const REGION_INSERT_CHUNK = 1_000;
 
 /** Inserts every detected region (ordinal = index) in chunks, inside the caller's fenced transaction. */
-export async function insertRegions(tx: DbOrTx, fence: Fence, detected: { channel: number; startMs: number; endMs: number }[]) {
+export async function insertRegions(tx: DbOrTx, fence: Fence, detected: { channel: number; speaker?: number | null; startMs: number; endMs: number }[]) {
   for (let from = 0; from < detected.length; from += REGION_INSERT_CHUNK) {
     await tx.insert(transcriptionRegions).values(detected.slice(from, from + REGION_INSERT_CHUNK).map((region, index) => ({
-      transcriptionId: fence.id, ordinal: from + index, channel: region.channel, startMs: region.startMs, endMs: region.endMs, status: "pending", generation: fence.generation,
+      transcriptionId: fence.id, ordinal: from + index, channel: region.channel, speaker: region.speaker ?? null, startMs: region.startMs, endMs: region.endMs, status: "pending", generation: fence.generation,
     })));
   }
+}
+
+/**
+ * Speaker turns of the mono mix (channel 0). A job whose diarization cannot run (the stage failed, or was switched off
+ * after the job was accepted) fails processing_failed, fenced, and this returns null.
+ */
+async function diarizeTurns(ctx: BatchContext, job: TranscriptionRow, fence: Fence, pcmPath: string, signal: AbortSignal) {
+  let segments: SpeakerSegment[];
+  try {
+    if (!ctx.diarizer) throw new Error("diarization is not available");
+    segments = await ctx.diarizer.diarize(pcmPath, signal);
+  } catch (error) {
+    if (signal.aborted) throw error;
+    ctx.log.error("batch diarization failed", { transcriptionId: job.id, stage: "diarize", installed: ctx.diarizer !== null, alert: true });
+    if (await failClaim(ctx, ctx.db, fence, "processing_failed", "Speaker diarization failed")) await cleanupJobFiles(ctx, job.id);
+    else throw new LostFence(job.id);
+    return null;
+  }
+  return speakerTurns(segments, await frameEnergies(pcmPath)).map((turn) => ({ ...turn, channel: 0 }));
 }
 
 type Admission = { kind: "admitted"; attemptId: string } | { kind: "capacity" } | { kind: "settled" };
@@ -350,17 +373,21 @@ async function assemble(ctx: BatchContext, job: TranscriptionRow, fence: Fence) 
       .orderBy(asc(transcriptionRegions.startMs), asc(transcriptionRegions.channel));
     if (regions.some((region) => region.status !== "completed")) throw new Error("assembly with unsettled regions");
     const channels = job.channelMode === "separate" && job.channels === 2 ? [0, 1] : [0];
-    const speakers = channels.map((channel) => ({ id: `channel_${channel}`, name: job.channelLabels[channel] ?? `Speaker ${channel + 1}`, channel }));
-    const segments = regions
-      .filter((region) => (region.text ?? "").trim() !== "")
-      .map((region, index) => ({
-        id: `seg_${String(index + 1).padStart(4, "0")}`,
-        speaker_id: `channel_${region.channel}`,
-        channel: region.channel,
-        start: region.startMs / 1000,
-        end: region.endMs / 1000,
-        text: region.text!.trim(),
-      }));
+    const spoken = regions.filter((region) => (region.text ?? "").trim() !== "");
+    // A diarized job's speakers are numbered by first appearance among the turns with text: speaker_0, speaker_1, …
+    const order = new Map<number, number>();
+    if (job.diarize) for (const region of spoken) if (!order.has(region.speaker!)) order.set(region.speaker!, order.size);
+    const speakers = job.diarize
+      ? [...order.values()].map((n) => ({ id: `speaker_${n}`, name: `Speaker ${n + 1}`, channel: 0 }))
+      : channels.map((channel) => ({ id: `channel_${channel}`, name: job.channelLabels[channel] ?? `Speaker ${channel + 1}`, channel }));
+    const segments = spoken.map((region, index) => ({
+      id: `seg_${String(index + 1).padStart(4, "0")}`,
+      speaker_id: job.diarize ? `speaker_${order.get(region.speaker!)}` : `channel_${region.channel}`,
+      channel: region.channel,
+      start: region.startMs / 1000,
+      end: region.endMs / 1000,
+      text: region.text!.trim(),
+    }));
     if (segments.length === 0) {
       return terminalize(tx, job.id, fenceGuard(fence), "failed", { code: "no_speech", message: "No speech was recognized in the recording" });
     }
@@ -374,6 +401,7 @@ async function assemble(ctx: BatchContext, job: TranscriptionRow, fence: Fence) 
         provider: "tinfoil",
         model: ctx.provider!.model,
         channels: channels.length,
+        diarized: job.diarize,
         speakers,
         segments,
         text: segments.map((segment) => `${name.get(segment.speaker_id)}: ${segment.text}`).join("\n"),
@@ -451,7 +479,7 @@ if (import.meta.main) {
   const { createBatchContext } = await import("../roles/batch.ts");
   const ctx = createBatchContext();
   await ensureStorageRoot(ctx.config.uploadDir);
-  ctx.log.info("batch worker started", { providerConfigured: ctx.provider !== null });
+  ctx.log.info("batch worker started", { providerConfigured: ctx.provider !== null, diarization: ctx.diarizer !== null });
   const worker = startBatchWorker(ctx);
   const shutdown = async () => {
     await worker.stop();

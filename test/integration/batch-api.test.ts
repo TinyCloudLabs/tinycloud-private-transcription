@@ -287,6 +287,18 @@ describe("create and admission", () => {
     });
   });
 
+  test("with the diarization stage installed, capabilities offer it and diarize: true creates a mixed-mode job", async () => {
+    h.ctx.diarizer = { diarize: async () => [] };
+    try {
+      expect(await (await h.api("/v1/transcriptions/capabilities")).json()).toMatchObject({ diarization: true });
+      const res = await h.create(await audio("stereo"), { body: { diarize: true } });
+      expect(res.status).toBe(201);
+      expect(await res.json()).toMatchObject({ diarize: true, channel_mode: "mixed" });
+    } finally {
+      h.ctx.diarizer = null;
+    }
+  });
+
   test("a replay whose job row is purged between the two reads becomes an ordinary create", async () => {
     const bytes = await audio("stereo");
     const key = { "Idempotency-Key": "tc:purged" };

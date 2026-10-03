@@ -143,6 +143,15 @@ https://tinycloud.chat,https://tinychat-4jq.pages.dev,https://*.tinychat-4jq.pag
 Check after a deploy: `curl -si -X OPTIONS $URL/uploads/trn_01M3PQ71Q9YF7GSEFP6S19ZJPW -H 'Origin: https://tinycloud.chat'
 -H 'Access-Control-Request-Method: PUT'` answers `204` with `access-control-allow-origin: https://tinycloud.chat`.
 
+## Speaker diarization
+
+The image carries the sherpa-onnx diarization stage at `/opt/sherpa-onnx` (TitaNet-S + pyannote segmentation-3.0;
+choice, numbers and sizing in [docs/diarization-benchmark.md](../../docs/diarization-benchmark.md)). It is offered only
+with `BATCH_DIARIZATION_ENABLED=true` on **both** the `api` and `upload-worker` services; that is not yet set in
+[`app-compose.yaml`](./app-compose.yaml), and adding it is a deploy change (TC-596). tdx.large stays sufficient.
+Check after a deploy: `GET /v1/transcriptions/capabilities` reports `"diarization": true`, and the `batch worker
+started` log line has `diarization: true`.
+
 ## Verify (plan V3)
 
 - `GET /health` → `checks.upload_transcription`: `ready: true`, `provider_configured: true`, `worker_live: true`,

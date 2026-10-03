@@ -23,6 +23,11 @@ export interface BatchConfig {
   tinfoil: { baseUrl: string; apiKey: string; model: string; timeoutMs: number };
   /** BATCH_CORS_ORIGINS: browser origins allowed to PUT /uploads/{id} directly. Empty → no CORS headers. */
   corsOrigins: string[];
+  /**
+   * Speaker diarization (create `diarize: true`). Offered only when enabled and the sherpa-onnx install under `dir`
+   * (`diarize` launcher + `models/`) is complete; see src/uploads/diarize.ts.
+   */
+  diarization: { enabled: boolean; dir: string };
   limits: {
     maxBytes: number;
     maxDurationSeconds: number;
@@ -97,6 +102,10 @@ export function batchConfigFromEnv(): BatchConfig {
       timeoutMs: positiveIntegerEnv("BATCH_TINFOIL_TIMEOUT_MS", "180000"),
     },
     corsOrigins: parseCorsOrigins(str("BATCH_CORS_ORIGINS", "")),
+    diarization: {
+      enabled: str("BATCH_DIARIZATION_ENABLED", "false") === "true",
+      dir: str("BATCH_DIARIZATION_DIR", "/opt/sherpa-onnx"),
+    },
     limits: {
       maxBytes: MAX_UPLOAD_BYTES,
       maxDurationSeconds: MAX_DURATION_SECONDS,
