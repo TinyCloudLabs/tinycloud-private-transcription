@@ -125,7 +125,7 @@ async function runPipeline(ctx: BatchContext, job: TranscriptionRow, fence: Fenc
   const plan: (number | null)[] = job.channelMode === "separate" && job.channels === 2 ? [0, 1] : [null];
   const pcm = plan.map((_, index) => join(work, `ch${index}.pcm`));
   for (const [index, channel] of plan.entries()) {
-    await decodeChannelToPcm(join(dir, job.audioFile!), `${pcm[index]}.tmp`, channel, signal, ctx.config.ffmpegPath);
+    await decodeChannelToPcm(join(dir, job.audioFile!), `${pcm[index]}.tmp`, channel, ctx.config.limits.maxDurationSeconds, signal, ctx.config.ffmpegPath);
   }
   await ctx.faults.hit("worker.after_decode", { id: job.id });
   await holdFence(ctx.db, fence);

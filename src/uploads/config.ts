@@ -27,6 +27,8 @@ export interface BatchConfig {
     maxBytes: number;
     maxDurationSeconds: number;
     maxChannels: number;
+    /** Wall-clock budget for measuring a recording whose container carries no duration (inside the PUT). */
+    durationScanSeconds: number;
     /** Service-wide jobs in awaiting_upload + queued + processing. */
     maxActiveJobs: number;
     /** Service-wide sum of declared byte_size over the same active set. Bounds temp + accepted audio on disk. */
@@ -99,6 +101,7 @@ export function batchConfigFromEnv(): BatchConfig {
       maxBytes: MAX_UPLOAD_BYTES,
       maxDurationSeconds: MAX_DURATION_SECONDS,
       maxChannels: MAX_CHANNELS,
+      durationScanSeconds: 45,
       maxActiveJobs: positiveIntegerEnv("BATCH_MAX_ACTIVE_JOBS", "10"),
       maxReservedBytes: positiveIntegerEnv("BATCH_MAX_RESERVED_BYTES", String(10 * MAX_UPLOAD_BYTES)),
       maxConcurrentUploads: positiveIntegerEnv("BATCH_MAX_CONCURRENT_UPLOADS", "3"),
