@@ -146,13 +146,15 @@ time per job (a DB lease: `409 upload_in_progress`) and at most `BATCH_MAX_CONCU
 its average rate is below `BATCH_UPLOAD_MIN_BYTES_PER_SECOND` after 60 s; or it passes its hard expiry,
 min(start + `BATCH_UPLOAD_MAX_PUT_SECONDS`, the upload deadline). Lease heartbeats never move the hard expiry. A body that
 ends early or errors is also `408 upload_interrupted`; a wrong `Content-Length` is `400 upload_length_mismatch`; a wrong
-`Content-Type` is `415 unsupported_media_type`. The bytes are streamed to a temp file while hashed, then verified
-(sha256, then ffprobe: the container is the declared `content_type`'s, exactly one audio stream (video and data
-streams are ignored and never decoded), 1–2 channels, ≤ 7,200 s; when the container carries no duration, as browser
-MediaRecorder WebM does not, it is the end of the last audio packet), renamed, and committed. Validation failures end
-the job before any provider call: `422 upload_rejected {status:"failed", job_error:{code: upload_integrity_failed |
-invalid_audio | unsupported_recording | recording_too_long}}`. `invalid_audio` covers unreadable bytes, a container
-other than the declared type (e.g. WAV bytes declared `audio/mp4`), and zero or several audio streams.
+`Content-Type` is `415 unsupported_media_type`. The bytes are streamed to a temp file while hashed, then verified:
+sha256, then ffprobe (the container is the declared `content_type`'s, exactly one audio stream, 1–2 channels, ≤ 7,200 s;
+video and data streams are ignored: never transcoded or transcribed). When the container carries no duration,
+as browser MediaRecorder WebM does not, the length is the last audio packet's end minus the start time, measured within
+45 s of wall clock (else `invalid_audio`); more packets than 7,200 s of 2.5 ms Opus frames is `recording_too_long`
+whatever the timestamps say. The bytes are then renamed and committed. Validation failures end the job before any
+provider call: `422 upload_rejected {status:"failed", job_error:{code: upload_integrity_failed | invalid_audio |
+unsupported_recording | recording_too_long}}`. `invalid_audio` covers unreadable bytes, a container other than the
+declared type (e.g. WAV bytes declared `audio/mp4`), and zero or several audio streams.
 
 **Browser uploads (CORS).** `BATCH_CORS_ORIGINS` lists the origins allowed to `PUT /uploads/{id}` from a browser:
 comma-separated exact origins (`scheme://host[:port]`, lowercase, no path), each optionally with one leading wildcard
@@ -172,7 +174,8 @@ replay); anything else → the upload was accepted or the job ended.
 
 ### Processing
 One job end-to-end at a time, service-wide. Per channel (`separate` + 2 channels; otherwise a mono downmix), ffmpeg
-decodes to 16 kHz PCM on disk; an energy VAD (100 ms frames; voiced ≥ max(−50 dBFS, p10 + 12 dB); gaps ≤ 1 s merged;
+decodes to 16 kHz PCM on disk, stopping at 7,200 s of PCM (counted in bytes, whatever the timestamps say); an energy VAD
+(100 ms frames; voiced ≥ max(−50 dBFS, p10 + 12 dB); gaps ≤ 1 s merged;
 ±0.25 s padding; regions > 30 s split at the quietest frame in their last 10 s) produces regions; each region is one
 Tinfoil request. No speech → `no_speech`.
 

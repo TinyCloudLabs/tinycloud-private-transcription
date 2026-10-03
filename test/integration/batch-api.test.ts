@@ -11,7 +11,7 @@ import { createBatchApp } from "../../src/roles/batch.ts";
 import { parseCorsOrigins } from "../../src/uploads/cors.ts";
 import { runSweep } from "../../src/uploads/ledger.ts";
 import { audioName, jobDir } from "../../src/uploads/storage.ts";
-import { audio, exists, sha256, startBatchHarness, TENANT_A, TENANT_B, tenant, trickle, type BatchHarness } from "./batch-harness.ts";
+import { audio, exists, laceBombWebm, sha256, startBatchHarness, TENANT_A, TENANT_B, tenant, trickle, type BatchHarness } from "./batch-harness.ts";
 
 let h: BatchHarness;
 beforeAll(async () => {
@@ -23,7 +23,7 @@ afterEach(async () => {
   // Each test starts from an empty job table, open admission and the default limits.
   await h.ctx.db.execute(sql`truncate table transcriptions, transcription_tenant_usage cascade`);
   await h.ctx.db.execute(sql`update transcription_admission set mode = 'open' where id = 1`);
-  Object.assign(h.ctx.config.limits, { maxActiveJobs: 10, maxReservedBytes: 1_209_600_000, maxConcurrentUploads: 3, diskHighWaterPercent: 99, tenantDailyBytes: 362_880_000, maxDurationSeconds: 7_200 });
+  Object.assign(h.ctx.config.limits, { maxActiveJobs: 10, maxReservedBytes: 1_209_600_000, maxConcurrentUploads: 3, diskHighWaterPercent: 99, tenantDailyBytes: 362_880_000, maxDurationSeconds: 7_200, durationScanSeconds: 45 });
   Object.assign(h.ctx.config.upload, { maxPutSeconds: 1_800, minBytesPerSecond: 32_768, progressGraceSeconds: 60, idleTimeoutSeconds: 60, leaseStaleSeconds: 120 });
   h.tinfoil.calls = [];
 });
@@ -615,6 +615,33 @@ describe("upload validation fails the job and deletes its bytes", () => {
       expect((await h.put(job.id, job.upload.capability, bytes, { contentType })).status).toBe(401);
     }, 60_000); // generating the real 7,201 s fixture takes seconds on CI runners
   }
+});
+
+describe("measuring a recording without a container duration is bounded", () => {
+  const upload = async (bytes: Uint8Array) => {
+    const job = await (await h.create(bytes, { contentType: "audio/webm" })).json();
+    const res = await h.put(job.id, job.upload.capability, bytes, { contentType: "audio/webm" });
+    return { job, res, error: await errorOf(res) };
+  };
+
+  test("more packets than the duration cap allows fails recording_too_long, whatever the timestamps claim", async () => {
+    h.ctx.config.limits.maxDurationSeconds = 60; // at most 24,000 packets of 2.5 ms
+    const { job, res, error } = await upload(laceBombWebm(200)); // 51,200 packets whose timestamps span 2 s
+    expect(res.status).toBe(422);
+    expect(error).toMatchObject({ code: "upload_rejected", job_error: { code: "recording_too_long" } });
+    expect(h.tinfoil.calls.length).toBe(0);
+    expect(await exists(jobDir(h.uploadDir, job.id))).toBe(false);
+  });
+
+  test("a scan past its wall-clock budget is stopped: the PUT fails invalid_audio within the budget", async () => {
+    h.ctx.config.limits.durationScanSeconds = 0.3;
+    const bytes = laceBombWebm(4_000); // ~1M packets: seconds of ffprobe if nothing stopped it
+    const started = Date.now();
+    const { res, error } = await upload(bytes);
+    expect(Date.now() - started).toBeLessThan(3_000);
+    expect(res.status).toBe(422);
+    expect(error).toMatchObject({ code: "upload_rejected", job_error: { code: "invalid_audio" } });
+  }, 30_000);
 });
 
 describe("deadlines", () => {

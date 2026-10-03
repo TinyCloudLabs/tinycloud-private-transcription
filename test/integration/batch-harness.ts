@@ -187,7 +187,7 @@ export async function startBatchHarness(opts: { config?: DeepPartial<BatchConfig
 const fixtureCache = new Map<string, Uint8Array>();
 
 type Fixture = "stereo" | "mono_wav" | "silent_wav" | "three_channel_wav" | "over_cap_mp3" | "stereo_dense"
-  | "stereo_m4a" | "stereo_webm" | "stereo_webm_no_duration" | "stereo_flac" | "stereo_mp4_with_video";
+  | "stereo_m4a" | "stereo_webm" | "stereo_webm_no_duration" | "stereo_webm_offset" | "stereo_flac" | "stereo_mp4_with_video";
 
 // ch0 speaks 0.5–2.5 s, ch1 speaks 3.5–5.5 s; 7 s stereo. Re-encoded per container below. Inputs and graph only:
 // `-map` is an output option, so it has to follow any further input.
@@ -208,6 +208,8 @@ export async function audio(kind: Fixture): Promise<Uint8Array> {
     stereo_webm: [...STEREO, "-map", "[out]", "-ar", "48000", "-c:a", "libopus", "-b:a", "32k"],
     // What browser MediaRecorder writes: no Duration element and no Cues, so ffprobe reports duration N/A.
     stereo_webm_no_duration: [...STEREO, "-map", "[out]", "-ar", "48000", "-c:a", "libopus", "-b:a", "32k", "-live", "1"],
+    // No duration either, and timestamps that start at 100 s: the length is 7 s, not 107 s.
+    stereo_webm_offset: [...STEREO, "-map", "[out]", "-ar", "48000", "-c:a", "libopus", "-b:a", "32k", "-output_ts_offset", "100", "-live", "1"],
     stereo_flac: [...STEREO, "-map", "[out]", "-ar", "16000", "-c:a", "flac"],
     // A video track next to the audio (screen recordings, phone videos) is ignored.
     stereo_mp4_with_video: [...STEREO, "-f", "lavfi", "-i", "color=c=black:s=64x64:r=5:d=7", "-map", "[out]", "-map", "2:v", "-c:v", "mpeg4",
@@ -248,4 +250,35 @@ export function trickle(bytes: Uint8Array, chunks: number, delayMs: number, opts
 
 export async function exists(path: string) {
   return (await import("node:fs/promises")).lstat(path).then(() => true, () => false);
+}
+
+/**
+ * A hostile WebM written byte by byte: no Duration and no Cues, and every block is a fixed-size lace of 256 one-byte
+ * Opus packets (2.5 ms CELT TOC, empty frame). Only the first packet of a lace has a timestamp, so the packet scan sees
+ * `blocks × 256` packets that claim almost no time. Small on disk, millions of packets at scale.
+ */
+export function laceBombWebm(blocks: number): Uint8Array {
+  const size = (n: number) => [0x01, ...[48, 40, 32, 24, 16, 8, 0].map((shift) => Number((BigInt(n) >> BigInt(shift)) & 0xffn))];
+  const el = (id: number[], body: number[]) => [...id, ...size(body.length), ...body];
+  const uint = (id: number[], value: number) => el(id, [value >> 24 & 0xff, value >> 16 & 0xff, value >> 8 & 0xff, value & 0xff]);
+  const text = (id: number[], value: string) => el(id, [...new TextEncoder().encode(value)]);
+  const float = (id: number[], value: number) => el(id, [...new Uint8Array(new Float64Array([value]).buffer).reverse()]);
+  const opusHead = [...new TextEncoder().encode("OpusHead"), 1, 1, 0x38, 0x01, 0x80, 0xbb, 0, 0, 0, 0, 0];
+  const header = el([0x1a, 0x45, 0xdf, 0xa3], [
+    ...uint([0x42, 0x86], 1), ...uint([0x42, 0xf7], 1), ...uint([0x42, 0xf2], 4), ...uint([0x42, 0xf3], 8),
+    ...text([0x42, 0x82], "webm"), ...uint([0x42, 0x87], 4), ...uint([0x42, 0x85], 2),
+  ]);
+  const info = el([0x15, 0x49, 0xa9, 0x66], [...uint([0x2a, 0xd7, 0xb1], 1_000_000), ...text([0x4d, 0x80], "t"), ...text([0x57, 0x41], "t")]);
+  const tracks = el([0x16, 0x54, 0xae, 0x6b], el([0xae], [
+    ...uint([0xd7], 1), ...uint([0x73, 0xc5], 1), ...uint([0x83], 2), ...text([0x86], "A_OPUS"), ...el([0x63, 0xa2], opusHead),
+    ...el([0xe1], [...float([0xb5], 48_000), ...uint([0x9f], 1)]),
+  ]));
+  const block = (timecode: number) => el([0xa3], [0x81, timecode >> 8 & 0xff, timecode & 0xff, 0x84, 255, ...new Array<number>(256).fill(0x80)]);
+  const clusters: number[] = [];
+  for (let first = 0; first < blocks; first += 100) {
+    const body = [...uint([0xe7], first)];
+    for (let index = first; index < Math.min(blocks, first + 100); index++) body.push(...block(index - first));
+    clusters.push(...el([0x1f, 0x43, 0xb6, 0x75], body));
+  }
+  return new Uint8Array([...header, ...el([0x18, 0x53, 0x80, 0x67], [...info, ...tracks, ...clusters])]);
 }
