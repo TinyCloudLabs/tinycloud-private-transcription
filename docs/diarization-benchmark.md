@@ -19,7 +19,7 @@ threshold to ship, and whether `tdx.large` (4 vCPU, 8 GB) is enough. Measured 20
 
 | Model (sherpa-onnx file) | Source / licence | Size |
 |---|---|---|
-| **TitaNet-S** `nemo_en_titanet_small.onnx` | NVIDIA NeMo, CC-BY-4.0 (NeMo pretrained checkpoints; attribution required) | 40 MB |
+| **TitaNet-S** `nemo_en_titanet_small.onnx` | NVIDIA NeMo, Apache-2.0 (the [NGC model card](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/nemo/models/titanet_small) puts it under the NeMo Toolkit licence) | 40 MB |
 | ERes2Net `3dspeaker_speech_eres2net_sv_en_voxceleb_16k.onnx` | 3D-Speaker (ModelScope `iic/speech_eres2net_sv_en_voxceleb_16k`), Apache-2.0 | 26 MB |
 | CAM++ `3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx` | 3D-Speaker (ModelScope `iic/speech_campplus_sv_en_voxceleb_16k`), Apache-2.0 | 30 MB |
 | ResNet34-LM `wespeaker_en_voxceleb_resnet34_LM.onnx` | WeSpeaker, CC-BY-4.0 (VoxCeleb-trained models follow the dataset licence) | 27 MB |
@@ -105,8 +105,8 @@ local Postgres, real `voxtral-small-24b` calls:
 
 ## Decision
 
-- **Ship TitaNet-S with `clusterThreshold` 1.0** (`src/uploads/diarize.ts`). Fallback if the CC-BY-4.0 attribution
-  terms are unacceptable: ERes2Net (Apache-2.0) @ 0.8, mean DER 11.7 %, worse on meetings.
+- **Ship TitaNet-S with `clusterThreshold` 1.0** (`src/uploads/diarize.ts`; Apache-2.0, like the runner-up). If a later
+  data set shows it over-splitting, the next best is ERes2Net (Apache-2.0) @ 0.8, mean DER 11.7 %, worse on meetings.
 - **Instance: tdx.large is enough.** Diarization is CPU-bound at roughly 0.1–0.16 × real time on 4 cores and runs once
   per job, before the (sequential) Tinfoil calls; peak memory (1.3 GB for a 2 h upload) stays well under the 8 GB of tdx.large next to Postgres,
   the api and ffmpeg. tdx.xlarge would only shorten the diarization step (the worker uses at most 4 threads) and is
