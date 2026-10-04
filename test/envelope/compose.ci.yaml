@@ -1,0 +1,26 @@
+# CI-only overlay for test/envelope/run.sh; never deployed. On top of infra/dstack-batch/app-compose.yaml, whose memory
+# limits, swap limits and Postgres settings it must not touch (test/unit/deploy-config-batch.test.ts checks this), it:
+#   - runs the api image built from this commit instead of the GHCR pin;
+#   - points the batch Tinfoil client at a local mock (test/envelope/mock-tinfoil.ts);
+#   - pins api, upload-worker and postgres to one CPU, like tdx.small (1 vCPU); the mock runs on another CPU.
+services:
+  api:
+    image: ${ENVELOPE_IMAGE:?ENVELOPE_IMAGE is required}
+    cpuset: "0"
+    environment:
+      BATCH_TINFOIL_BASE_URL: http://mock-tinfoil:8081
+  upload-worker:
+    image: ${ENVELOPE_IMAGE:?ENVELOPE_IMAGE is required}
+    cpuset: "0"
+    environment:
+      BATCH_TINFOIL_BASE_URL: http://mock-tinfoil:8081
+  postgres:
+    cpuset: "0"
+  mock-tinfoil:
+    image: ${ENVELOPE_IMAGE:?ENVELOPE_IMAGE is required}
+    cpuset: "1"
+    command: ["bun", "run", "/envelope/mock-tinfoil.ts"]
+    ports:
+      - "127.0.0.1:18081:8081"
+    volumes:
+      - ${ENVELOPE_DIR:?ENVELOPE_DIR is required}/mock-tinfoil.ts:/envelope/mock-tinfoil.ts:ro

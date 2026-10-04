@@ -10,6 +10,12 @@
 # The api/worker image is an immutable pin that only a PR changes; it cannot be overridden from the sealed env.
 # Until the first batch image exists (P2 merged → publish-image.yml), it is the placeholder below, which
 # .github/workflows/deploy-batch.yml refuses to deploy.
+#
+# Sized for Phala tdx.small (1 vCPU, 2048 MB; the guest sees 1,853 MiB). A live tdx.small with two small containers
+# reports ~1.27 GB used, so ~1 GiB is left to the guest OS, dstack and dockerd. The three services are capped at
+# 832 MiB together (api 320m + upload-worker 320m + postgres 192m), with no swap, so a runaway process is OOM-killed
+# inside its own container instead of taking the guest down. The cgroup limit also counts page cache, which the kernel
+# reclaims first. .github/workflows/batch-envelope.yml proves these limits with a 2-hour stereo recording on one CPU.
 services:
   api:
     image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:90770d38cda27c0e84916acd1363709121a89be3@sha256:d6412c92e8c71b9d0a941563005ae5a9d9c7987d2871d686a8c808702013b2be
@@ -45,6 +51,10 @@ services:
       timeout: 5s
       retries: 30
       start_period: 20s
+    # Bun + Hono + streamed uploads (to disk, hashed in flight) + ffprobe; the healthcheck's bun runs in this cgroup.
+    mem_limit: 320m
+    memswap_limit: 320m
+    mem_reservation: 96m
 
   upload-worker:
     image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:90770d38cda27c0e84916acd1363709121a89be3@sha256:d6412c92e8c71b9d0a941563005ae5a9d9c7987d2871d686a8c808702013b2be
@@ -64,10 +74,22 @@ services:
       LOG_LEVEL: info
     volumes:
       - ptx-batch-uploads:/var/lib/ptx-batch/uploads
+    # One job at a time: ffmpeg (a child, same cgroup) decodes each channel to PCM on disk; the VAD reads it in 60 s
+    # slices and each dispatch reads one region (<= 30 s, ~1 MB). Nothing holds a whole channel in memory.
+    mem_limit: 320m
+    memswap_limit: 320m
+    mem_reservation: 96m
 
   postgres:
     image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     restart: unless-stopped
+    # Tiny-box tuning. max_connections 40 covers the Bun.SQL pools (10 each: api, its boot migrator, worker) plus the
+    # 3 superuser slots; max_wal_size bounds WAL on disk (see the disk budget in the runbook).
+    command: ["postgres", "-c", "max_connections=40", "-c", "shared_buffers=32MB", "-c", "work_mem=2MB",
+      "-c", "maintenance_work_mem=16MB", "-c", "max_wal_size=256MB"]
+    mem_limit: 192m
+    memswap_limit: 192m
+    mem_reservation: 64m
     environment:
       POSTGRES_USER: ptx
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}

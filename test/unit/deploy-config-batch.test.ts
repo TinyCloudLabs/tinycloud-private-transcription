@@ -24,7 +24,10 @@ const envExample = read("infra/dstack-batch/.env.example");
 const API_IMAGE = /^ghcr\.io\/tinycloudlabs\/tinycloud-private-transcription\/api:(?:[0-9a-f]{40}|PIN_AFTER_P2_MERGE)@sha256:[0-9a-f]{64}$/;
 const POSTGRES = "postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685";
 
-type Service = { image: string; build?: unknown; command?: string[]; environment: Record<string, string>; volumes?: { source?: string; target: string }[]; ports?: unknown[] };
+type Service = {
+  image: string; build?: unknown; command?: string[]; environment: Record<string, string>; volumes?: { source?: string; target: string }[]; ports?: unknown[];
+  mem_limit?: string; memswap_limit?: string; mem_reservation?: string; cpuset?: string;
+};
 
 function render(): Record<string, Service> {
   const rendered = Bun.spawnSync(
@@ -77,6 +80,35 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(services["upload-worker"]!.environment.PTX_BOOTSTRAP_KEYS).toBeUndefined();
   });
 
+  test("fits tdx.small: every service has a memory limit, no swap, and a reservation; ~1 GiB stays with the guest", () => {
+    const services = render();
+    const limits = { api: 320, "upload-worker": 320, postgres: 192 } as const;
+    for (const [name, mib] of Object.entries(limits)) {
+      const service = services[name]!;
+      expect({ name, limit: Number(service.mem_limit) }).toEqual({ name, limit: mib * 1024 * 1024 });
+      expect({ name, swap: service.memswap_limit }).toEqual({ name, swap: service.mem_limit });
+      expect(Number(service.mem_reservation)).toBeGreaterThan(0);
+      expect(Number(service.mem_reservation)).toBeLessThan(Number(service.mem_limit));
+    }
+    // The guest of a live tdx.small reports 1,942,806,528 bytes; leave at least 1 GB of it to the OS, dstack and dockerd.
+    const total = Object.values(services).reduce((sum, service) => sum + Number(service.mem_limit), 0);
+    expect(1_942_806_528 - total).toBeGreaterThanOrEqual(1_000_000_000);
+    expect(services.postgres!.command).toEqual(["postgres", "-c", "max_connections=40", "-c", "shared_buffers=32MB", "-c", "work_mem=2MB",
+      "-c", "maintenance_work_mem=16MB", "-c", "max_wal_size=256MB"]);
+  });
+
+  test("the CI envelope overlay never changes the limits it proves", () => {
+    const overlay = Bun.YAML.parse(read("test/envelope/compose.ci.yaml")) as { services: Record<string, Record<string, unknown>> };
+    for (const name of ["api", "upload-worker", "postgres"]) {
+      for (const key of ["mem_limit", "memswap_limit", "mem_reservation", "deploy", "command", "entrypoint"]) {
+        expect({ name, key, set: key in (overlay.services[name] ?? {}) }).toEqual({ name, key, set: false });
+      }
+    }
+    const envelope = read(".github/workflows/batch-envelope.yml");
+    expect(envelope).toContain("test/envelope/run.sh");
+    expect(read("test/envelope/run.sh")).toContain('-f "$REPO/infra/dstack-batch/app-compose.yaml" -f "$ENVELOPE_DIR/compose.ci.yaml"');
+  });
+
   test("its literal limits match the code defaults and the upload cap", () => {
     const env = render().api!.environment;
     const defaults = batchConfigFromEnv();
@@ -120,8 +152,8 @@ describe(".github/workflows/deploy-batch.yml", () => {
     expect(deploy).toContain("--no-dev-os");
     expect(deploy.match(/--no-public-logs/g)?.length).toBe(2);
     expect(deploy).toContain('-t "$INSTANCE_TYPE" --disk-size "$DISK_SIZE"');
-    expect(workflowText).toContain("INSTANCE_TYPE: tdx.large");
-    expect(workflowText).toContain("DISK_SIZE: 40G");
+    expect(workflowText).toContain("INSTANCE_TYPE: tdx.small");
+    expect(workflowText).toContain("DISK_SIZE: 20G");
     const order = ["Install dependencies and deploy tooling from lockfiles", "Guard inputs, secrets and the image pin", "Validate the sealed environment", "Resolve the CVM", "Drain admission and wait for zero active jobs", "Deploy", "Sync allowed_envs", "Wait for running and resolve the gateway URL", "Health gate (live, then upload_transcription.ready)", "Admission gate (the deployed service is not open)", "Open admission"].map(index);
     expect(order.every((i) => i >= 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
@@ -328,7 +360,7 @@ esac`;
   });
 
   test("the runbook documents the production OS and the owner prerequisites", () => {
-    for (const phrase of ["--no-dev-os", "phala login", "BATCH_TINFOIL_API_KEY", "$170/month", "Never purge the volumes"]) expect(runbook).toContain(phrase);
+    for (const phrase of ["--no-dev-os", "phala login", "BATCH_TINFOIL_API_KEY", "$42/month", "Never purge the volumes"]) expect(runbook).toContain(phrase);
   });
 });
 

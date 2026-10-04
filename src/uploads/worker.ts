@@ -146,9 +146,7 @@ async function runPipeline(ctx: BatchContext, job: TranscriptionRow, fence: Fenc
     }
     await ctx.db.transaction(async (tx) => {
       await holdFence(tx, fence);
-      await tx.insert(transcriptionRegions).values(detected.map((region, ordinal) => ({
-        transcriptionId: job.id, ordinal, channel: region.channel, startMs: region.startMs, endMs: region.endMs, status: "pending", generation: fence.generation,
-      })));
+      await insertRegions(tx, fence, detected);
     });
     regions = await ctx.db.select().from(transcriptionRegions).where(eq(transcriptionRegions.transcriptionId, job.id))
       .orderBy(asc(transcriptionRegions.startMs), asc(transcriptionRegions.channel));
@@ -171,6 +169,21 @@ async function runPipeline(ctx: BatchContext, job: TranscriptionRow, fence: Fenc
   await assemble(ctx, job, fence);
   await ctx.faults.hit("worker.after_terminal", { id: job.id });
   await cleanupJobFiles(ctx, job.id);
+}
+
+/**
+ * Rows per INSERT. Postgres binds at most 65,535 parameters per statement; a region row binds about ten, so a 2 h
+ * stereo recording's worst case (~12,000 regions) needs several statements. The caller runs them all in one transaction.
+ */
+export const REGION_INSERT_CHUNK = 1_000;
+
+/** Inserts every detected region (ordinal = index) in chunks, inside the caller's fenced transaction. */
+export async function insertRegions(tx: DbOrTx, fence: Fence, detected: { channel: number; startMs: number; endMs: number }[]) {
+  for (let from = 0; from < detected.length; from += REGION_INSERT_CHUNK) {
+    await tx.insert(transcriptionRegions).values(detected.slice(from, from + REGION_INSERT_CHUNK).map((region, index) => ({
+      transcriptionId: fence.id, ordinal: from + index, channel: region.channel, startMs: region.startMs, endMs: region.endMs, status: "pending", generation: fence.generation,
+    })));
+  }
 }
 
 type Admission = { kind: "admitted"; attemptId: string } | { kind: "capacity" } | { kind: "settled" };
