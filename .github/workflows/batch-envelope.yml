@@ -1,0 +1,47 @@
+name: Batch memory envelope
+# Proves that ptx-batch fits tdx.small. The api image built from this commit runs infra/dstack-batch/app-compose.yaml
+# with its memory limits, no swap and its Postgres settings unchanged, pinned to one CPU, and Tinfoil mocked
+# (test/envelope/compose.ci.yaml). A synthetic 2-hour stereo 128 kbps MP3 goes through create, three concurrent PUTs,
+# and the worker's real decode + VAD + per-region dispatch. Fails on a timeout, an OOM kill or a restart; the job
+# summary reports peak memory per container. Uses no secret. Script: test/envelope/run.sh.
+
+on:
+  pull_request:
+    paths: &paths
+      - Dockerfile
+      - package.json
+      - bun.lock
+      - tsconfig.json
+      - src/**
+      - infra/dstack-batch/**
+      - test/envelope/**
+      - .github/workflows/batch-envelope.yml
+  push:
+    branches: [main]
+    paths: *paths
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: batch-envelope-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  envelope:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Build the api image
+        run: docker build --tag ptx-api:envelope .
+
+      - name: Run a 2-hour stereo recording under the tdx.small limits
+        timeout-minutes: 30
+        env:
+          ENVELOPE_IMAGE: ptx-api:envelope
+        run: test/envelope/run.sh

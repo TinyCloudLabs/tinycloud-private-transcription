@@ -42,8 +42,10 @@ concurrency:
 env:
   CVM_NAME: ptx-batch
   COMPOSE: infra/dstack-batch/app-compose.yaml
-  INSTANCE_TYPE: tdx.large
-  DISK_SIZE: 40G
+  # Used on create only (an update never resizes). tdx.small = 1 vCPU / 2048 MB; memory and disk budget in
+  # infra/dstack-batch/README.md, proven by .github/workflows/batch-envelope.yml.
+  INSTANCE_TYPE: tdx.small
+  DISK_SIZE: 20G
   IMAGE_REPO: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api
   # Installed by `npm ci --ignore-scripts` from .github/scripts/package-lock.json; never a global or npx binary.
   PHALA: ${{ github.workspace }}/.github/scripts/node_modules/.bin/phala
