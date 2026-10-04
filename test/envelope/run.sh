@@ -8,7 +8,9 @@
 #   1. the fresh install reports admission closed; the admin key opens it;
 #   2. three tenants create and PUT a synthetic 2-hour stereo 128 kbps MP3 at once (BATCH_MAX_CONCURRENT_UPLOADS = 3);
 #   3. the two later uploads are cancelled, and the worker runs the oldest: ffmpeg decode per channel, VAD, one mocked
-#      provider call per region; the job must complete with its audio deleted.
+#      provider call per region; the job must complete with its audio deleted;
+#   4. while it processes, a burst of BURST_CLIENTS (30) parallel clients polls GET /v1/transcriptions/{id} for
+#      BURST_SECONDS; every poll must answer 200.
 # Fails on a timeout, an OOM kill or a restart in any container; prints peak memory per container (and to
 # $GITHUB_STEP_SUMMARY when set).
 set -euo pipefail
@@ -22,6 +24,8 @@ DURATION_SECONDS=7199 # the 7,200 s cap minus room for MP3 encoder padding
 URL=http://127.0.0.1:8080
 MOCK=http://127.0.0.1:18081
 SERVICES=(api upload-worker postgres)
+BURST_CLIENTS=30
+BURST_SECONDS=15
 MP3="$WORK/recording.mp3"
 
 compose() {
@@ -96,7 +100,8 @@ for s in "${SERVICES[@]}"; do
 done
 echo "::endgroup::"
 
-# Peak anonymous memory per container (every process in its cgroup: bun, ffmpeg, ffprobe, the healthcheck's bun) and
+# Peak unreclaimable memory per container, anon + shmem from memory.stat (every process in its cgroup: bun, ffmpeg,
+# ffprobe, the healthcheck's bun; shmem holds Postgres shared_buffers), overall and while the poll burst runs, and
 # peak RSS per process name, sampled at 5 Hz from the host so the sampler adds nothing to the containers.
 touch "$WORK/sampling"
 sampler_args=()
@@ -104,7 +109,7 @@ for s in "${SERVICES[@]}"; do sampler_args+=("$s=${CGROUP[$s]}"); done
 python3 - "$WORK" "${sampler_args[@]}" <<'PY' &
 import json, os, sys, time
 work, pairs = sys.argv[1], [arg.split("=", 1) for arg in sys.argv[2:]]
-anon, rss = {}, {}
+anon, burst, rss = {}, {}, {}
 def read(path):
     try:
         with open(path) as f:
@@ -113,9 +118,11 @@ def read(path):
         return ""
 while os.path.exists(os.path.join(work, "sampling")):
     for name, cgroup in pairs:
-        for line in read(f"{cgroup}/memory.stat").splitlines():
-            if line.startswith("anon "):
-                anon[name] = max(anon.get(name, 0), int(line.split()[1]))
+        stat = dict(line.split() for line in read(f"{cgroup}/memory.stat").splitlines() if line.count(" ") == 1)
+        held = int(stat.get("anon", 0)) + int(stat.get("shmem", 0))
+        anon[name] = max(anon.get(name, 0), held)
+        if os.path.exists(os.path.join(work, "burst")):
+            burst[name] = max(burst.get(name, 0), held)
         for pid in read(f"{cgroup}/cgroup.procs").split():
             fields = dict(line.split(":", 1) for line in read(f"/proc/{pid}/status").splitlines() if ":" in line)
             if "VmRSS" in fields and "Name" in fields:
@@ -123,7 +130,7 @@ while os.path.exists(os.path.join(work, "sampling")):
                 rss[key] = max(rss.get(key, 0), int(fields["VmRSS"].split()[0]) * 1024)
     time.sleep(0.2)
 with open(os.path.join(work, "peaks.json"), "w") as f:
-    json.dump({"anon": anon, "rss": rss}, f)
+    json.dump({"anon": anon, "burst": burst, "rss": rss}, f)
 PY
 sampler=$!
 
@@ -168,20 +175,43 @@ done
 echo "::endgroup::"
 
 echo "::group::Process the 2-hour stereo job (deadline ${PROCESS_DEADLINE_SECONDS} s)"
+poll_burst() { # one client: GET the job until the burst window closes; one HTTP code per line
+  local until=$((SECONDS + BURST_SECONDS))
+  while [ "$SECONDS" -lt "$until" ]; do
+    curl -sS -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $CLIENT_KEY" -H "X-Tenant-Ref: ${TENANT[$keep]}" \
+      "$URL/v1/transcriptions/${JOB[$keep]}" || true # a failed request still prints 000
+  done
+}
 deadline=$((SECONDS + PROCESS_DEADLINE_SECONDS))
+burst_stage=""
 while :; do
   job="$(api "$keep" "$URL/v1/transcriptions/${JOB[$keep]}")"
   status="$(jq -r .status <<<"$job")"
   echo "$(date -u +%T) status=$status $(jq -c .progress <<<"$job")"
   case "$status" in completed | failed | cancelled) break ;; esac
   [ "$SECONDS" -lt "$deadline" ] || fail "the job did not finish within ${PROCESS_DEADLINE_SECONDS} s"
-  sleep 10
+  if [ "$status" = processing ] && [ -z "$burst_stage" ]; then
+    burst_stage="$(jq -r .progress.stage <<<"$job")"
+    echo "burst: $BURST_CLIENTS parallel pollers for $BURST_SECONDS s (job stage $burst_stage)"
+    touch "$WORK/burst"
+    burst_pids=()
+    for c in $(seq 1 "$BURST_CLIENTS"); do poll_burst > "$WORK/burst.$c" & burst_pids+=($!); done
+    for p in "${burst_pids[@]}"; do wait "$p"; done
+    rm -f "$WORK/burst"
+    continue
+  fi
+  sleep 2
 done
 echo "::endgroup::"
 rm -f "$WORK/sampling"
 wait "$sampler"
 
 [ "$status" = completed ] || fail "the job ended $status: $(jq -c .error <<<"$job")"
+[ -n "$burst_stage" ] || fail "the job finished before the poll burst could start"
+BURST_POLLS="$(cat "$WORK"/burst.* | wc -l)"
+burst_bad="$(cat "$WORK"/burst.* | grep -cv '^200$' || true)"
+[ "$burst_bad" = 0 ] || fail "$burst_bad of $BURST_POLLS burst polls did not answer 200: $(cat "$WORK"/burst.* | sort | uniq -c | tr '\n' ' ')"
+
 result="$(api "$keep" "$URL/v1/transcriptions/${JOB[$keep]}/result")"
 stats="$(curl -fsS "$MOCK/stats")"
 regions="$(jq -r .progress.regions_total <<<"$job")"
@@ -200,13 +230,14 @@ rows=""
 for s in "${SERVICES[@]}"; do
   hwm="$(awk '$1 == "VmHWM:" { print $2 * 1024 }' "/proc/${PID[$s]}/status")"
   anon="$(jq -r --arg s "$s" '.anon[$s] // 0' "$WORK/peaks.json")"
+  burst="$(jq -r --arg s "$s" '.burst[$s] // 0' "$WORK/peaks.json")"
   procs="$(jq -r --arg s "$s" '.rss | to_entries | map(select(.key | startswith($s + "/"))) | sort_by(-.value)
     | map("\(.key | split("/")[1]) \((.value / 1048576) | round)") | join(", ")' "$WORK/peaks.json")"
   peak="$(cat "${CGROUP[$s]}/memory.peak")"
   oom="$(awk '$1 == "oom_kill" { print $2 }' "${CGROUP[$s]}/memory.events")"
   restarts="$(docker inspect -f '{{.RestartCount}}' "${CID[$s]}")"
   killed="$(docker inspect -f '{{.State.OOMKilled}}' "${CID[$s]}")"
-  rows+="| $s | $(mib "${LIMIT[$s]}") | $(mib "$hwm") | $(mib "$anon") | $procs | $(mib "$peak") | $oom | $restarts |"$'\n'
+  rows+="| $s | $(mib "${LIMIT[$s]}") | $(mib "$hwm") | $(mib "$anon") | $(mib "$burst") | $procs | $(mib "$peak") | $oom | $restarts |"$'\n'
   if [ "$oom" != 0 ] || [ "$restarts" != 0 ] || [ "$killed" != false ]; then breach+="$s (oom_kill=$oom restarts=$restarts OOMKilled=$killed) "; fi
 done
 
@@ -214,9 +245,10 @@ report="### ptx-batch memory envelope (tdx.small limits, 1 CPU)
 
 - Recording: ${DURATION_SECONDS} s stereo 128 kbps MP3, $SIZE bytes; 3 concurrent PUTs in ${UPLOAD_SECONDS} s
 - Job: completed in ${processing} s of processing; $regions regions, $calls mocked provider calls, audio deleted
+- Poll burst: $BURST_CLIENTS parallel clients x ${BURST_SECONDS} s during $burst_stage, $BURST_POLLS GETs, all 200
 
-| service | limit MiB | pid 1 peak RSS (VmHWM) MiB | peak anon, whole container MiB | peak RSS per process MiB | cgroup peak incl. page cache MiB | oom_kill | restarts |
-|---|---|---|---|---|---|---|---|
+| service | limit MiB | pid 1 peak RSS (VmHWM) MiB | peak anon+shmem, whole container MiB | anon+shmem peak during the poll burst MiB | peak RSS per process MiB | cgroup peak incl. page cache MiB | oom_kill | restarts |
+|---|---|---|---|---|---|---|---|---|
 $rows"
 echo "$report"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then echo "$report" >> "$GITHUB_STEP_SUMMARY"; fi

@@ -15,10 +15,10 @@
 # reports ~1.27 GB used, so ~1 GiB is left to the guest OS, dstack and dockerd. The three services are capped at
 # 832 MiB together (api 320m + upload-worker 320m + postgres 192m), with no swap, so a runaway process is OOM-killed
 # inside its own container instead of taking the guest down. The cgroup limit also counts page cache, which the kernel
-# reclaims first. .github/workflows/batch-envelope.yml proves these limits with a 2-hour stereo recording on one CPU.
+# reclaims first. Container logs are json-file, capped at 3 x 10 MB per service. .github/workflows/batch-envelope.yml proves these limits with a 2-hour stereo recording on one CPU.
 services:
   api:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:90770d38cda27c0e84916acd1363709121a89be3@sha256:d6412c92e8c71b9d0a941563005ae5a9d9c7987d2871d686a8c808702013b2be
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:ec780b3f0b2a12618908cb58a357a501134546f3@sha256:e179fbec1047e6837bc923dc1e32ac7aee4fb44588d48b8025fd87d73475b0d6
     restart: unless-stopped
     depends_on:
       postgres:
@@ -55,9 +55,14 @@ services:
     mem_limit: 320m
     memswap_limit: 320m
     mem_reservation: 96m
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
 
   upload-worker:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:90770d38cda27c0e84916acd1363709121a89be3@sha256:d6412c92e8c71b9d0a941563005ae5a9d9c7987d2871d686a8c808702013b2be
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:ec780b3f0b2a12618908cb58a357a501134546f3@sha256:e179fbec1047e6837bc923dc1e32ac7aee4fb44588d48b8025fd87d73475b0d6
     restart: unless-stopped
     command: ["bun", "run", "src/uploads/worker.ts"]
     depends_on:
@@ -79,6 +84,11 @@ services:
     mem_limit: 320m
     memswap_limit: 320m
     mem_reservation: 96m
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
 
   postgres:
     image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
@@ -90,6 +100,11 @@ services:
     mem_limit: 192m
     memswap_limit: 192m
     mem_reservation: 64m
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     environment:
       POSTGRES_USER: ptx
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
