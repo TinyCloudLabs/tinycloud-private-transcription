@@ -108,7 +108,7 @@ describe("region insert", () => {
     await h.submit(await audio("stereo"));
     const claim = (await claimNext(h.ctx))!;
     const rows = many.map((r, ordinal) => ({ transcriptionId: claim.fence.id, ordinal, ...r, status: "pending", generation: claim.fence.generation }));
-    await expect(h.ctx.db.insert(transcriptionRegions).values(rows)).rejects.toThrow();
+    await expect(h.ctx.db.insert(transcriptionRegions).values(rows).execute()).rejects.toThrow();
     expect((await regions(claim.fence.id)).length).toBe(0);
   });
 
