@@ -101,7 +101,14 @@ The decode path never holds a recording in memory: ffmpeg writes 16 kHz s16le PC
 it in 60 s slices (a 2 h channel is 72,000 frame energies, 576 KB), and each dispatch reads one region of at most
 30 s (~0.96 MB WAV). [`batch-envelope.yml`](../../.github/workflows/batch-envelope.yml) proves the envelope on every
 change to the batch runtime: it runs this compose (limits unchanged) on one CPU with Tinfoil mocked, uploads a
-synthetic 2-hour stereo 128 kbps MP3 three times at once, and fails on any OOM kill or restart. ENVELOPE_RESULTS
+synthetic 2-hour stereo 128 kbps MP3 three times at once, and fails on any OOM kill or restart.
+First run (PR #68, GitHub runner, 1 CPU, 3 × 115 MB PUTs at localhost speed, 708 regions):
+
+| container | limit | pid 1 peak RSS (VmHWM) | other peaks | OOM kills / restarts |
+|---|---|---|---|---|
+| api | 320 MiB | 111 MiB (bun) | ffprobe 33 MiB | 0 / 0 |
+| upload-worker | 320 MiB | 88 MiB (bun) | ffmpeg 44 MiB | 0 / 0 |
+| postgres | 192 MiB | 20 MiB | 59 MiB anon, whole container | 0 / 0 |
 
 **Disk (20 GB).** The data disk holds Docker images, Postgres and the upload volume; a live tdx.small shows an
 18.87 GiB filesystem. Worst case for a 2 h recording (16 kHz s16le = 32,000 B/s per channel):
