@@ -6,7 +6,8 @@ import { providerDispatchSlots, transcriptionAttempts, transcriptionRegions, tra
 import { runSweep, retentionLagSeconds } from "../../src/uploads/ledger.ts";
 import type { FaultPoint } from "../../src/uploads/faults.ts";
 import { jobDir, jobsRoot } from "../../src/uploads/storage.ts";
-import { claimNext, processClaim, recordWorkerHeartbeat, startBatchWorker } from "../../src/uploads/worker.ts";
+import { claimNext, insertRegions, processClaim, recordWorkerHeartbeat, REGION_INSERT_CHUNK, startBatchWorker } from "../../src/uploads/worker.ts";
+import { holdFence } from "../../src/uploads/fence.ts";
 import { audio, exists, startBatchHarness, TENANT_A, TENANT_B, tenant, type BatchHarness } from "./batch-harness.ts";
 
 let h: BatchHarness;
@@ -96,6 +97,43 @@ describe("single-slot arbiter", () => {
     await h.work();
     expect(await h.row(id)).toMatchObject({ status: "failed", errorCode: "no_speech", deletionState: "files_deleted" });
     expect(h.tinfoil.calls.length).toBe(0);
+  });
+});
+
+describe("region insert", () => {
+  // Postgres binds at most 65,535 parameters per statement; ~12,000 regions is the 2 h stereo worst case.
+  const many = Array.from({ length: 12_345 }, (_, i) => ({ channel: i % 2, startMs: i * 600, endMs: i * 600 + 400 }));
+
+  test("one statement cannot hold 12,000+ regions (the bind limit this guards against)", async () => {
+    await h.submit(await audio("stereo"));
+    const claim = (await claimNext(h.ctx))!;
+    const rows = many.map((r, ordinal) => ({ transcriptionId: claim.fence.id, ordinal, ...r, status: "pending", generation: claim.fence.generation }));
+    await expect(h.ctx.db.insert(transcriptionRegions).values(rows)).rejects.toThrow();
+    expect((await regions(claim.fence.id)).length).toBe(0);
+  });
+
+  test("insertRegions writes 12,000+ regions in chunks inside one fenced transaction", async () => {
+    await h.submit(await audio("stereo"));
+    const claim = (await claimNext(h.ctx))!;
+    expect(many.length).toBeGreaterThan(10 * REGION_INSERT_CHUNK);
+    await h.ctx.db.transaction(async (tx) => {
+      await holdFence(tx, claim.fence);
+      await insertRegions(tx, claim.fence, many);
+    });
+    const stored = (await regions(claim.fence.id)).sort((a, b) => a.ordinal - b.ordinal);
+    expect(stored.length).toBe(many.length);
+    expect(stored.every((r, i) => r.ordinal === i && r.startMs === many[i]!.startMs && r.channel === many[i]!.channel && r.generation === claim.fence.generation)).toBe(true);
+  });
+
+  test("a failure in a later chunk (int4 overflow) rolls back every earlier chunk", async () => {
+    await h.submit(await audio("stereo"));
+    const claim = (await claimNext(h.ctx))!;
+    const broken = [...many.slice(0, 2 * REGION_INSERT_CHUNK + 5), { channel: 0, startMs: 2 ** 40, endMs: 2 ** 40 + 400 }];
+    await expect(h.ctx.db.transaction(async (tx) => {
+      await holdFence(tx, claim.fence);
+      await insertRegions(tx, claim.fence, broken);
+    })).rejects.toThrow();
+    expect((await regions(claim.fence.id)).length).toBe(0);
   });
 });
 
