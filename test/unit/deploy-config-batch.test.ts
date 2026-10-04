@@ -27,6 +27,7 @@ const POSTGRES = "postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b
 type Service = {
   image: string; build?: unknown; command?: string[]; environment: Record<string, string>; volumes?: { source?: string; target: string }[]; ports?: unknown[];
   mem_limit?: string; memswap_limit?: string; mem_reservation?: string; cpuset?: string;
+  logging?: { driver?: string; options?: Record<string, string> };
 };
 
 function render(): Record<string, Service> {
@@ -93,6 +94,9 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     // The guest of a live tdx.small reports 1,942,806,528 bytes; leave at least 1 GB of it to the OS, dstack and dockerd.
     const total = Object.values(services).reduce((sum, service) => sum + Number(service.mem_limit), 0);
     expect(1_942_806_528 - total).toBeGreaterThanOrEqual(1_000_000_000);
+    for (const [name, service] of Object.entries(services)) {
+      expect({ name, logging: service.logging }).toEqual({ name, logging: { driver: "json-file", options: { "max-size": "10m", "max-file": "3" } } });
+    }
     expect(services.postgres!.command).toEqual(["postgres", "-c", "max_connections=40", "-c", "shared_buffers=32MB", "-c", "work_mem=2MB",
       "-c", "maintenance_work_mem=16MB", "-c", "max_wal_size=256MB"]);
   });
