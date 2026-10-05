@@ -8,7 +8,11 @@ const flag = (name: string) => {
   const i = rest.indexOf(`--${name}`);
   return i >= 0 ? rest[i + 1] : undefined;
 };
-const USAGE = `usage: bun run cli <create-key --project <name> [--scopes <scope>[,<scope>...]] | migrate>
+const USAGE = `usage: bun run cli <create-key --project <name> [--scopes <scope>[,<scope>...]] | migrate | eval ...>
+  eval run --meeting <id> [--models <m>[,<m>...]]     re-transcribe retained audio with each model (TC-745)
+  eval reference --meeting <id> --source <name> < file   store a reference transcript (e.g. Gemini) and re-score
+  eval report --meeting <id>                          metrics for the published transcript and every eval
+  eval show --meeting <id> [--eval <evalId>]          print the published (or an eval's) transcript
   scopes: ${API_KEY_SCOPES.join(", ")} (default ${DEFAULT_KEY_SCOPES.join(",")}; quote them in the shell, e.g. --scopes 'transcriptions:*')`;
 const fail = (message: string): never => {
   console.error(message);
@@ -42,6 +46,30 @@ switch (cmd) {
   case "migrate": {
     await runMigrations();
     console.log("migrations applied");
+    process.exit(0);
+  }
+  case "eval": {
+    const { runTranscriptEval, setReferenceTranscript, transcriptEvalReport, transcriptEvalText } = await import("./services/transcript-eval.ts");
+    const sub = rest[0];
+    const meetingId = flag("meeting") ?? fail("--meeting is required");
+    await runMigrations();
+    const ctx = createContext();
+    if (sub === "run") {
+      const models = (flag("models") ?? ctx.config.eval.models.join(",") ?? "").split(",").map((m) => m.trim()).filter(Boolean);
+      if (!models.length) fail("--models (or EVAL_MODELS) is required");
+      const ids = await runTranscriptEval(ctx, meetingId, models, (line) => console.error(line));
+      console.log(ids.join("\n"));
+    } else if (sub === "reference") {
+      const turns = await setReferenceTranscript(ctx, meetingId, flag("source") ?? "reference", await Bun.stdin.text());
+      console.log(`reference stored: ${turns} turns`);
+    } else if (sub === "report") {
+      const report = await transcriptEvalReport(ctx, meetingId);
+      console.log(`reference: ${report.reference ?? "none"}`);
+      const keys = ["wer", "word_recall", "trigram_recall", "speaker_accuracy", "hyp_words", "ref_words", "speakers", "unknown_word_share", "turns", "median_turn_words", "hallucinated_turns", "dropped_hallucinations", "failed_batches"];
+      console.table(report.rows.map((row) => ({ source: row.source, status: row.status, calls: row.calls, ...Object.fromEntries(keys.map((key) => [key, (row.metrics as Record<string, unknown>)[key]])) })));
+    } else if (sub === "show") {
+      console.log(await transcriptEvalText(ctx, meetingId, flag("eval")));
+    } else fail(`unknown eval command: ${sub}`);
     process.exit(0);
   }
   default:

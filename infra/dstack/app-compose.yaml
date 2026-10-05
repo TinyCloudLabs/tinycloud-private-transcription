@@ -95,6 +95,13 @@ services:
       TINFOIL_BASE_URL: ${TINFOIL_BASE_URL:-https://inference.tinfoil.sh}
       TINFOIL_API_KEY: ${TINFOIL_API_KEY:-}
       TINFOIL_MODEL: ${TINFOIL_MODEL:-voxtral-small-24b}
+      # Attributed Google Meet batches use Whisper: it returns segment timestamps, so published
+      # turns interleave on the meeting clock, and it does not answer short clips like a chatbot (TC-740).
+      TINFOIL_ATTRIBUTED_MODEL: ${TINFOIL_ATTRIBUTED_MODEL:-whisper-large-v3-turbo}
+      # Internal eval (TC-745): after publication, re-transcribe internal team meetings with these
+      # models and keep the results in the ptx DB for comparison (`bun run cli eval report`).
+      EVAL_MODELS: ${EVAL_MODELS:-voxtral-small-24b}
+      EVAL_TINYCHAT_ADDRESSES: ${EVAL_TINYCHAT_ADDRESSES:-0xd671eece61b27a73a9abbe07aa5b3002626fef5a,0x7d0333579c19e8fa149c2dbf8405cb6f66c373f2,0xd559ccd9eb87c530a9a349262669386de93cf412,0xa8763f2b67aa9c807d2277a698cb071e3d86204a}
       # Each seat has a private control network and token. Its unauthenticated CDP remains bound
       # only to that seat's own loopback namespace.
       SIGNAL_CAPTURE_URLS: http://signal-capture:18076,http://signal-capture-2:18077,http://signal-capture-3:18078

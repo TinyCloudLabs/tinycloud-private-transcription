@@ -6,6 +6,7 @@ import { handleJoinDeadline, handleMeetingPoll, handleMeetingStart } from "./mee
 import { finalizeAttributedRun, processAttributedBatch, reconcileAttributedRuns, recordAttributedWorkerReadiness } from "../services/attributed-transcription.ts";
 import { TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
 import { MIN_RECOVERY_ACK_BUDGET_MS, recoveryAckBudgetMs } from "../services/recording-recovery.ts";
+import { handleEvalJob } from "../services/transcript-eval.ts";
 import type { Job } from "./queue.ts";
 
 export type JobOutcome = "processed" | "noop" | "deferred";
@@ -24,6 +25,8 @@ export async function processJob(ctx: AppContext, job: Job): Promise<JobOutcome>
       return (await finalizeAttributedRun(ctx, job.meetingId)) ? "processed" : "noop";
     case "webhook.deliver":
       await deliverWebhook(ctx, job.deliveryId, job.claimToken); return "processed";
+    case "eval.meeting":
+      return handleEvalJob(ctx, job.meetingId, job.models);
   }
 }
 

@@ -5,6 +5,7 @@ import { TinfoilTranscriptionProvider } from "../../src/providers/transcription/
 import { PCM_RATE, pcmToWav } from "../../src/providers/transcription/audio.ts";
 import { attributedTranscriptionRuns, attributedWorkerReadiness } from "../../src/db/schema.ts";
 import { attributedWorkerReady, recordAttributedWorkerReadiness } from "../../src/services/attributed-transcription.ts";
+import { runTranscriptEval, setReferenceTranscript, transcriptEvalReport, transcriptEvalText } from "../../src/services/transcript-eval.ts";
 import { startHarness, type Harness } from "./harness.ts";
 
 let h: Harness;
@@ -42,6 +43,30 @@ test("only closed authenticated attributed ranges become canonical", async () =>
   expect(transcript).toMatchObject({ provider: "tinfoil-attributed", text: "Alice: sealed words" });
   expect(transcript.text).not.toContain("diagnostic only");
   expect(h.vexa.requests.map((request) => request.path).some((path) => path.startsWith("/recordings"))).toBe(false);
+});
+
+test("internal eval re-transcribes retained audio beside the canonical transcript and scores both (TC-745)", async () => {
+  const created = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://meet.google.com/eva-lmee-tin" } });
+  const { id } = await created.json();
+  const native = "eva-lmee-tin";
+  const bot = await h.waitFor(async () => h.vexa.meetings.get(`google_meet/${native}`) ?? null);
+  const path = `/meetings/${bot.id}/attributed-audio/ranges/0`;
+  await h.vexa.control("google_meet", native, {
+    status: "completed", completion_reason: "stopped",
+    attributed_audio_capability: { requested_version: 1, supported_version: 1, status: "supported" },
+    attributed_audio_manifest: { version: 1, meeting_id: String(bot.id), state: "closed", clock_origin: "first_admitted_capture_epoch_ms", clock_origin_ms: 0, ranges: [{ version: 1, meeting_id: String(bot.id), sequence: 0, idempotency_key: "r0", speaker_key: "alice", speaker_name: "Alice", attribution: { source: "glow-bound", confidence: .9 }, clock_origin_ms: 0, start_ms: 0, end_ms: 1000, audio_duration_ms: 1000, channel: 0, turn_generation: 1, codec: "pcm_f32le", sample_rate: 16000, channels: 1, byte_count: pcm.byteLength, sha256, state: "uploaded", path }] },
+    attributed_audio_base64: { [path]: Buffer.from(pcm).toString("base64") },
+  });
+  await h.waitFor(async () => { const body = await (await h.api(`/v1/meetings/${id}`)).json(); return body.status === "completed" ? body : null; });
+  const canonical = await (await h.api(`/v1/meetings/${id}/transcript`)).text();
+  const [evalId] = await runTranscriptEval(h.ctx, id, ["other-model"]);
+  expect(await setReferenceTranscript(h.ctx, id, "gemini", "00:00:00\n\nAlice: sealed words\n")).toBe(1);
+  const report = await transcriptEvalReport(h.ctx, id);
+  expect(report.reference).toBe("gemini (1 turns)");
+  expect(report.rows.map((row) => [row.source.split(" ")[0], row.status, row.metrics.wer])).toEqual([["published:tinfoil-attributed", "completed", 0], ["tinfoil:other-model", "completed", 0]]);
+  expect(await transcriptEvalText(h.ctx, id, evalId)).toBe("[00:00:00] Alice: sealed words");
+  // The canonical transcript is untouched.
+  expect(await (await h.api(`/v1/meetings/${id}/transcript`)).text()).toBe(canonical);
 });
 
 test("attributed readiness is a stale-safe PostgreSQL worker heartbeat", async () => {
@@ -149,8 +174,9 @@ test("unresolved-speaker ranges publish as unknown without vetoing the meeting (
     attributed_audio_capability: { requested_version: 1, supported_version: 1, status: "supported" },
     attributed_audio_manifest: { version: 1, meeting_id: String(bot.id), state: "closed", clock_origin: "first_admitted_capture_epoch_ms", clock_origin_ms: 0, ranges: [
       range(0, "alice", "Alice", 0, { source: "glow-bound", confidence: .9 }),
-      range(1, "alice", "", 2000, { source: "unresolved", confidence: 0 }),
-      range(2, "alice", "", 4000, { source: "unresolved", confidence: 0 }, "failed"),
+      // Far enough from Alice's speech that no neighbouring bound range names it (TC-742).
+      range(1, "alice", "", 10_000, { source: "unresolved", confidence: 0 }),
+      range(2, "alice", "", 12_000, { source: "unresolved", confidence: 0 }, "failed"),
     ] },
     attributed_audio_base64: { [rangePath(0)]: Buffer.from(pcm).toString("base64"), [rangePath(1)]: Buffer.from(pcm).toString("base64") },
   });

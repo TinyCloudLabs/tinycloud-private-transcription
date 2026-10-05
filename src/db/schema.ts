@@ -334,3 +334,30 @@ export type MeetingRow = typeof meetings.$inferSelect;
 export type TranscriptRow = typeof transcripts.$inferSelect;
 export type WebhookDeliveryRow = typeof webhookDeliveries.$inferSelect;
 export type ProjectRow = typeof projects.$inferSelect;
+
+/**
+ * Internal transcript evaluation (TC-745). A reference transcript (e.g. a Google Meet / Gemini
+ * export) per meeting, and shadow transcriptions of the meeting's retained audio by other models.
+ * Both are operator-only, never served by the public API, and cascade with meeting deletion.
+ */
+export const referenceTranscripts = pgTable("reference_transcripts", {
+  meetingId: text("meeting_id").primaryKey().references(() => meetings.id, { onDelete: "cascade" }),
+  source: text("source").notNull(),
+  text: text("text").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const transcriptEvals = pgTable("transcript_evals", {
+  id: text("id").primaryKey(),
+  meetingId: text("meeting_id").notNull().references(() => meetings.id, { onDelete: "cascade" }),
+  provider: text("provider").notNull(),
+  model: text("model").notNull(),
+  status: text("status").notNull().default("running"), // running | completed | failed
+  calls: integer("calls"),
+  batchesJson: jsonb("batches_json"),
+  transcriptJson: jsonb("transcript_json"),
+  metricsJson: jsonb("metrics_json"),
+  error: text("error"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+}, (t) => [index("transcript_evals_meeting_idx").on(t.meetingId)]);

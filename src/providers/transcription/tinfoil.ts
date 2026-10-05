@@ -2,12 +2,15 @@ import { ApiError } from "../../domain/errors.ts";
 import { normalizeSegments, type NormalizedTranscript } from "../../domain/transcript.ts";
 import { decodeToPcm, rmsDbfs, sliceToWav, pcmToWav, type Pcm16 } from "./audio.ts";
 import type { AttributedBatch } from "./attributed.ts";
+import { batchTimeline, paddedBatchPcm, type AttributedResult, type TimedPiece, type TimelineEntry } from "./attributed-assembly.ts";
 import type { TranscriptionInput, TranscriptionProvider } from "./types.ts";
 
 export interface TinfoilOptions {
   baseUrl: string;
   apiKey: string;
   model: string;
+  /** Model for attributed meeting batches; defaults to `model`. Whisper models return segment timestamps. */
+  attributedModel?: string;
   timeoutMs?: number;
   fetch?: typeof fetch;
   ffmpegPath?: string;
@@ -23,6 +26,52 @@ interface TinfoilResponse {
   language?: string;
   duration?: number;
   usage?: { type?: string; seconds?: number };
+  segments?: unknown;
+}
+
+/** Tinfoil serves `verbose_json` (segment timestamps) for Whisper models only; voxtral rejects it. */
+export const timestampedModel = (model: string) => /whisper/i.test(model);
+const MAX_TIMED_PIECES = 4_000;
+/**
+ * HTTP 429 is a definite rejection: the request was not processed or billed, so unlike a transport
+ * error or timeout it may be re-sent inside the same durable claim.
+ */
+export class TinfoilRateLimited extends ApiError {
+  constructor() { super("provider_unavailable", "Transcription provider is unavailable"); }
+}
+const RATE_LIMIT_RETRIES = 4;
+/** A ≤30 s window takes Whisper a few seconds; bound each request and the whole batch's retries. */
+const WINDOW_TIMEOUT_MS = 60_000, BATCH_RETRY_BUDGET_MS = 240_000;
+
+/** Below Tinfoil/vLLM's 30 s re-chunking, so returned offsets are relative to our own window. */
+export const TIMED_WINDOW_SEC = 29.5;
+
+/** Windows of the padded batch audio, cut only where a range (and its leading pause) begins. */
+export function timedWindows(timeline: TimelineEntry[], total: number, maxSec = TIMED_WINDOW_SEC): Array<{ from: number; to: number }> {
+  const windows: Array<{ from: number; to: number }> = [];
+  let from = 0;
+  for (const entry of timeline) {
+    const cut = entry.audioStart - entry.padBefore;
+    if (cut > from && entry.audioEnd - from > maxSec) { windows.push({ from, to: cut }); from = cut; }
+  }
+  windows.push({ from, to: total });
+  return windows;
+}
+const numberOrUndefined = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? value : undefined;
+function timedPieces(segments: unknown): TimedPiece[] | undefined {
+  if (!Array.isArray(segments) || segments.length > MAX_TIMED_PIECES) return undefined;
+  const pieces: TimedPiece[] = [];
+  for (const segment of segments) {
+    if (!segment || typeof segment !== "object") return undefined;
+    const { start, end, text, avg_logprob, no_speech_prob, compression_ratio } = segment as Record<string, unknown>;
+    if (typeof start !== "number" || typeof end !== "number" || !Number.isFinite(start) || !Number.isFinite(end) || typeof text !== "string") return undefined;
+    const piece: TimedPiece = { start, end, text };
+    for (const [key, value] of [["avg_logprob", avg_logprob], ["no_speech_prob", no_speech_prob], ["compression_ratio", compression_ratio]] as const) {
+      const number = numberOrUndefined(value); if (number !== undefined) piece[key] = number;
+    }
+    pieces.push(piece);
+  }
+  return pieces;
 }
 
 // Provider metadata is untrusted and may become canonical API/webhook data. Keep only a compact
@@ -63,24 +112,61 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     this.maxRequestWaveMs = (retries + 1) * timeout + backoff;
   }
 
-  /** Text-only operation for a Vexa-owned, already-attributed PCM batch. */
-  async transcribeAttributedPcm(bytes: Uint8Array, batch: AttributedBatch, language: string | null) {
+  get attributedModel() { return this.opts.attributedModel || this.opts.model; }
+
+  /** Same configuration with its own call counter (operator evals run beside production). */
+  fork(): TinfoilTranscriptionProvider { return new TinfoilTranscriptionProvider(this.opts); }
+
+  /**
+   * Transcribes a Vexa-owned, already-attributed PCM batch. Ranges are spliced with short pauses.
+   * A Whisper model returns segment offsets into that spliced audio (TC-741); because Tinfoil's
+   * server re-chunks long audio at ~30 s and labels chunks at fixed 30 s offsets, timed requests are
+   * cut at range boundaries into windows of at most TIMED_WINDOW_SEC so every offset stays exact.
+   */
+  async transcribeAttributedPcm(bytes: Uint8Array, batch: AttributedBatch, language: string | null, model = this.attributedModel): Promise<AttributedResult> {
     const first = batch.ranges[0];
     if (!first || first.codec !== "pcm_f32le" || first.channels !== 1) throw new ApiError("transcription_failed", "Unsupported attributed audio codec");
     const input = new Float32Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 4));
     let energy = 0;
-    const pcm16 = new Int16Array(input.length);
     for (let i = 0; i < input.length; i++) {
       const sample = input[i]!;
       if (!Number.isFinite(sample)) throw new ApiError("transcription_failed", "Attributed audio contains non-finite PCM samples");
-      const value = Math.max(-1, Math.min(1, sample)); energy += value * value; pcm16[i] = value * 32767;
+      const value = Math.max(-1, Math.min(1, sample)); energy += value * value;
     }
     if (!input.length || 20 * Math.log10(Math.sqrt(energy / input.length) || 0) < (this.opts.silenceDbfs ?? -60)) throw new ApiError("transcription_failed", "Attributed audio is silent");
+    const padded = paddedBatchPcm(batch, input);
+    const rate = first.sample_rate;
+    const wav = (from: number, to: number) => {
+      const slice = padded.subarray(Math.round(from * rate), Math.round(to * rate));
+      const pcm16 = new Int16Array(slice.length);
+      for (let i = 0; i < slice.length; i++) pcm16[i] = Math.max(-1, Math.min(1, slice[i]!)) * 32767;
+      return pcmToWav(pcm16, rate);
+    };
     // An attributed request is durably claimed before this method is entered.  Retrying after a
     // transport error can create a second billed request whose result cannot be attributed to the
-    // persisted claim, so this deliberately bypasses postWithRetry.
-    const body = await this.post(pcmToWav(pcm16, first.sample_rate), `${batch.idempotency_key}.wav`, language);
-    return { text: body.text, language: body.language };
+    // persisted claim, so this deliberately bypasses postWithRetry. Timed windows are sent once
+    // each, in order, inside the same claim.
+    const timed = timestampedModel(model);
+    const total = padded.length / rate;
+    if (!timed) {
+      const body = await this.post(wav(0, total), `${batch.idempotency_key}.wav`, language, model, false);
+      return { text: body.text, language: body.language, model };
+    }
+    const texts: string[] = [], segments: TimedPiece[] = [];
+    let language_: string | undefined, untimed = false;
+    const deadline = Date.now() + BATCH_RETRY_BUDGET_MS;
+    for (const [index, window] of timedWindows(batchTimeline(batch), total).entries()) {
+      const body = await this.postUnlessRateLimited(wav(window.from, window.to), `${batch.idempotency_key}-${index}.wav`, language, model, deadline);
+      if (body.text.trim()) texts.push(body.text.trim());
+      language_ ??= body.language;
+      const pieces = timedPieces(body.segments);
+      if (!pieces) { untimed = true; continue; }
+      const length = window.to - window.from;
+      // Whisper may place a trailing caption past the end of the audio; it has no audio to map to.
+      for (const piece of pieces) if (piece.start < length) segments.push({ ...piece, start: piece.start + window.from, end: Math.min(Math.max(piece.end, piece.start), length) + window.from });
+    }
+    // Text without usable offsets must not be published at invented times.
+    return { text: texts.join(" "), language: language_, model, ...(untimed ? {} : { segments }) };
   }
 
   async transcribe(input: TranscriptionInput): Promise<NormalizedTranscript> {
@@ -137,6 +223,16 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     return { ...transcript, duration_seconds: round(pcm.durationSec) };
   }
 
+  private async postUnlessRateLimited(bytes: Uint8Array, filename: string, language: string | null, model: string, deadline: number): Promise<TinfoilResponse> {
+    for (let attempt = 0; ; attempt++) {
+      try { return await this.post(bytes, filename, language, model, true, Math.min(this.opts.timeoutMs ?? WINDOW_TIMEOUT_MS, WINDOW_TIMEOUT_MS)); } catch (error) {
+        const delay = (this.opts.retryDelayMs ?? 250) * 8 * 2 ** attempt;
+        if (!(error instanceof TinfoilRateLimited) || attempt >= RATE_LIMIT_RETRIES || Date.now() + delay > deadline) throw error;
+        await Bun.sleep(delay);
+      }
+    }
+  }
+
   private async postWithRetry(bytes: Uint8Array, filename: string, language: string | null): Promise<TinfoilResponse> {
     const maxRetries = Math.max(0, this.opts.maxRetries ?? 2);
     for (let attempt = 0; ; attempt++) {
@@ -150,10 +246,11 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     }
   }
 
-  private async post(bytes: Uint8Array, filename: string, language: string | null): Promise<TinfoilResponse> {
+  private async post(bytes: Uint8Array, filename: string, language: string | null, model = this.opts.model, timed = false, timeoutMs = this.opts.timeoutMs ?? 120_000): Promise<TinfoilResponse> {
     const form = new FormData();
-    form.set("model", this.opts.model);
-    form.set("response_format", "json");
+    form.set("model", model);
+    form.set("response_format", timed ? "verbose_json" : "json");
+    if (timed) form.append("timestamp_granularities[]", "segment");
     if (language) form.set("language", language);
     form.set("file", new Blob([bytes as Uint8Array<ArrayBuffer>], { type: "audio/wav" }), filename);
 
@@ -164,13 +261,14 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
         method: "POST",
         headers: { Authorization: `Bearer ${this.opts.apiKey}` },
         body: form,
-        signal: AbortSignal.timeout(this.opts.timeoutMs ?? 120_000),
+        signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {
       const timeout = error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");
       throw new ApiError(timeout ? "provider_timeout" : "provider_unavailable", timeout ? "Transcription provider timed out" : "Transcription provider is unavailable");
     }
-    if (response.status === 429 || response.status >= 500) {
+    if (response.status === 429) throw new TinfoilRateLimited();
+    if (response.status >= 500) {
       throw new ApiError("provider_unavailable", "Transcription provider is unavailable");
     }
     if (!response.ok) {
@@ -187,7 +285,7 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
       throw new ApiError("transcription_failed", "Transcription provider returned no transcription text");
     }
     const parsed = body as TinfoilResponse;
-    return { text: parsed.text, ...(safeTinfoilLanguage(parsed.language) ? { language: safeTinfoilLanguage(parsed.language) } : {}) };
+    return { text: parsed.text, ...(safeTinfoilLanguage(parsed.language) ? { language: safeTinfoilLanguage(parsed.language) } : {}), ...(parsed.segments !== undefined ? { segments: parsed.segments } : {}) };
   }
 }
 

@@ -63,10 +63,11 @@ test("open, failed, absolute, and oversized evidence are rejected before fetch",
 
 test("unresolved-speaker ranges batch and transcribe as an unknown speaker (TC-559)", async () => {
   // The unresolved range shares the named participant's speaker_key: publication must still give
-  // it a distinct speaker_id, never Alice's (M2).
+  // it a distinct speaker_id, never Alice's (M2). It is far enough from Alice's speech that no
+  // neighbouring bound range names it (TC-742).
   const unresolved = (sequence: number, start_ms: number) => range(sequence, "a", "", start_ms, start_ms + 1_000, "unresolved");
   const named = range(0, "a", "Alice", 0, 1_000);
-  const input = manifest([named, unresolved(1, 2_000), unresolved(2, 4_000)]);
+  const input = manifest([named, unresolved(1, 10_000), unresolved(2, 12_000)]);
   const batches = attributedBatches(input, 1);
   expect(batches).toHaveLength(2);
   const transcript = await transcribeAttributedManifest(input, async (item) => bytesFor(item.start_ms, item.end_ms), async (_pcm, batch) => ({ text: batch.speaker_name || "mystery" }), "en", 1);

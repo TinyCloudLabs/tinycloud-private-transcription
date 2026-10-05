@@ -1,10 +1,11 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
 import type { AppContext } from "../context.ts";
 import { attributedAttempts, attributedBatches as batchesTable, attributedRanges, attributedTranscriptionRuns, attributedWorkerReadiness, meetings, tinfoilDispatchSlots, transcripts, webhookDeliveries } from "../db/schema.ts";
-import { normalizeSegments } from "../domain/transcript.ts";
-import { attributedBatches, batchSpeaker, bySequence, readAttributedBatch, type AttributedBatch, type AttributedCapability, type AttributedManifest } from "../providers/transcription/attributed.ts";
+import { attributedBatches, bySequence, readAttributedBatch, type AttributedBatch, type AttributedCapability, type AttributedManifest } from "../providers/transcription/attributed.ts";
+import { assembleAttributedTranscript, type AttributedResult } from "../providers/transcription/attributed-assembly.ts";
 import { safeTinfoilLanguage, TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
 import { getMeetingById } from "./meetings.ts";
+import { scheduleTranscriptEval } from "./transcript-eval.ts";
 import { enqueueMeetingWebhook, webhookDeliveryValues, wakeWebhookDelivery } from "../webhooks/dispatcher.ts";
 
 const ATTEMPT_LIMIT = 1, CLAIM_MS = 5 * 60_000, SLOT_CLAIM_MS = 10 * 60_000, MAX_FETCH_ATTEMPTS = 3;
@@ -375,7 +376,7 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
       || batches.length !== expected.length || batches.some((batch) => canonical(batch.batchJson) !== canonical(expectedByOrdinal.get(batch.ordinal)))
       || batches.some((batch) => batch.ordinal < 0 || !expectedByOrdinal.has(batch.ordinal));
     if (invalidLedger) return reject();
-    const raw: Array<{ start: number; end: number; text: string; speaker: string; speakerKey: string; attribution: "identified" | "provisional" | "unknown"; language: string | null }> = [];
+    const completedBatches: Array<{ spec: AttributedBatch; result: AttributedResult }> = [];
     // Batches without usable audio lose only their own ranges; publication continues as partial.
     const settledRangeStatus: Record<string, string> = { completed: "completed", silence: "silence", failed: "failed", ambiguous: "unresolved" };
     let partial = false;
@@ -391,10 +392,7 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
         if (batch.attempts !== 1 || rowsForBatch.length !== 1 || rowsForBatch[0]!.attributed_attempts.ordinal !== 1
             || rowsForBatch[0]!.attributed_attempts.status !== "succeeded" || !rowsForBatch[0]!.attributed_attempts.completedAt
             || typeof result.text !== "string" || !result.text.trim() || (result.language !== null && result.language !== undefined && !safeTinfoilLanguage(result.language))) return reject();
-        const speaker = batchSpeaker(spec);
-        // Unresolved speech publishes under an unknown speaker — degraded, not failed (SPEC).
-        if (speaker.attribution === "unknown") partial = true;
-        raw.push({ start: spec.start_ms / 1000, end: spec.end_ms / 1000, text: result.text, ...speaker, language: typeof result.language === "string" ? result.language : null });
+        completedBatches.push({ spec, result: result as AttributedResult });
       } else if (batch.status === "silence") {
         if (batch.attempts !== 0 || rowsForBatch.length !== 0 || result.text !== "") return reject();
       } else {
@@ -410,7 +408,11 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
     const skipped = ranges.filter((row) => !batchedSequences.has(row.sequence));
     if (skipped.some((row) => !["failed", "unresolved"].includes(row.status))) return reject();
     if (skipped.length) partial = true;
-    const transcript = normalizeSegments(raw.sort((a, b) => a.start - b.start || a.end - b.end), meeting.language);
+    // Timed results publish as turns on the meeting clock; unresolved speech the channel cannot
+    // name publishes under an unknown speaker — degraded, not failed (SPEC, TC-741/742/743).
+    const assembled = assembleAttributedTranscript(manifest, completedBatches, meeting.language);
+    const transcript = assembled.transcript;
+    if (assembled.unknown) partial = true;
     if (partial && !transcript.text.trim()) return reject();
     const payload = { speakers: transcript.speakers, segments: transcript.segments, text: transcript.text, ...(partial ? { partial: true } : {}) };
     const existing = await tx.select().from(transcripts).where(eq(transcripts.meetingId, meetingId)).for("update");
@@ -445,7 +447,10 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
     // A no-op finalizer has no publication outcome and must not heal a prior failure. Only this
     // worker's real commit (or rejection) changes its own durable readiness.
     ctx.attributedWorkerHealthy = published.meeting.status === "completed";
-    if (published.meeting.status === "completed") await recordAttributedWorkerReadiness(ctx, true, "published");
+    if (published.meeting.status === "completed") {
+      await recordAttributedWorkerReadiness(ctx, true, "published");
+      await scheduleTranscriptEval(ctx, published.meeting);
+    }
     else await recordAttributedWorkerReadiness(ctx, false, "publication_failed");
     if (published.deliveryId) await wakeWebhookDelivery(ctx, published.deliveryId, new Date()).catch(() => {
       ctx.log.warn("completion webhook wakeup deferred", { meetingId, stage: "webhook_wakeup" });
