@@ -40,6 +40,8 @@ services:
       BATCH_TENANT_DAILY_BYTES: "362880000"
       BATCH_UPLOAD_MAX_PUT_SECONDS: "1800"
       BATCH_UPLOAD_MIN_BYTES_PER_SECOND: "32768"
+      # Browser and app origins allowed to PUT /uploads/{id} directly (Exo web, Pages previews, desktop, mobile).
+      BATCH_CORS_ORIGINS: "https://tinycloud.chat,https://tinychat-4jq.pages.dev,https://*.tinychat-4jq.pages.dev,tauri://localhost,http://tauri.localhost,capacitor://localhost,https://localhost"
       LOG_LEVEL: info
     ports:
       - "8080:8080"

@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { hashApiKey } from "../../src/api/auth.ts";
 import { checkBatchDeployKeys, mintBootstrapKeys } from "../../src/api/bootstrap-keys.ts";
 import { batchConfigFromEnv } from "../../src/uploads/config.ts";
+import { corsOriginMatcher, parseCorsOrigins } from "../../src/uploads/cors.ts";
 
 const repo = fileURLToPath(new URL("../..", import.meta.url));
 const read = (path: string) => readFileSync(new URL(`../../${path}`, import.meta.url), "utf8");
@@ -122,6 +123,17 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(Number(env.BATCH_DISK_HIGH_WATER_PERCENT)).toBe(defaults.limits.diskHighWaterPercent);
     expect(Number(env.BATCH_TENANT_DAILY_BYTES)).toBe(defaults.limits.tenantDailyBytes);
     expect(env.BATCH_TINFOIL_MODEL).toBe("voxtral-small-24b");
+  });
+
+  test("lets Exo's web, desktop and mobile origins upload, and no other site", () => {
+    const allowed = corsOriginMatcher(parseCorsOrigins(render().api!.environment.BATCH_CORS_ORIGINS ?? ""));
+    for (const origin of ["https://tinycloud.chat", "https://feat-x.tinychat-4jq.pages.dev", "tauri://localhost", "http://tauri.localhost", "capacitor://localhost", "https://localhost"]) {
+      expect({ origin, allowed: allowed(origin) }).toEqual({ origin, allowed: true });
+    }
+    for (const origin of ["https://evil.example", "https://tinycloud.chat.evil.example", "http://tinycloud.chat"]) {
+      expect({ origin, allowed: allowed(origin) }).toEqual({ origin, allowed: false });
+    }
+    expect(render()["upload-worker"]!.environment.BATCH_CORS_ORIGINS).toBeUndefined();
   });
 });
 

@@ -131,13 +131,13 @@ one job's PCM, ≤ 0.92 GB; WAL, ~0.25 GB; ≈ 1.5 GB) fits in the remaining 4 G
 
 ## Browser uploads (CORS)
 
-Exo uploads the recording straight from the browser/app to `PUT /uploads/{id}`, so the service must allow those
-origins with `BATCH_CORS_ORIGINS` (contract: [SPEC.md](../../SPEC.md#upload)). It is not a secret and is not yet set in
-[`app-compose.yaml`](./app-compose.yaml); adding it to the `api` service's `environment:` is a deploy change (TC-596).
-Recommended value:
+Exo uploads the recording straight from the browser/app to `PUT /uploads/{id}`, so the service allows those origins with
+`BATCH_CORS_ORIGINS` (contract: [SPEC.md](../../SPEC.md#upload)). It is not a secret and is set on the `api` service in
+[`app-compose.yaml`](./app-compose.yaml): the web app, its Pages previews, the desktop app (macOS and Windows) and the
+mobile app (Android and iOS):
 
 ```
-https://tinycloud.chat,https://*.tinychat-4jq.pages.dev,tauri://localhost,http://tauri.localhost,capacitor://localhost,https://localhost
+https://tinycloud.chat,https://tinychat-4jq.pages.dev,https://*.tinychat-4jq.pages.dev,tauri://localhost,http://tauri.localhost,capacitor://localhost,https://localhost
 ```
 
 Check after a deploy: `curl -si -X OPTIONS $URL/uploads/trn_01M3PQ71Q9YF7GSEFP6S19ZJPW -H 'Origin: https://tinycloud.chat'
