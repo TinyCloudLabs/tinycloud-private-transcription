@@ -18,7 +18,7 @@ const ASSISTANT = [
 const STOCK = /^(?:thank you(?: so much| very much)?|thanks for (?:watching|listening)|you|subtitles? by [^.]*|please subscribe[^.]*|\.+)[.!]?$/i;
 
 /** Audio this short cannot carry a multi-sentence reply; stock captions on longer audio may be real. */
-const SHORT_AUDIO_SEC = 3, STOCK_AUDIO_SEC = 6;
+const SHORT_AUDIO_SEC = 3, OPENING_AUDIO_SEC = 15, STOCK_AUDIO_SEC = 6;
 
 export interface HallucinationEvidence {
   /** Whisper segment confidence; present only for timed output. */
@@ -41,7 +41,9 @@ export function hallucinated(text: string, evidence: HallucinationEvidence = {})
   if (!trimmed) return true;
   const { audioSec } = evidence;
   if (evidence.untimed !== false && evidence.avg_logprob === undefined && ASSISTANT.some((pattern) => pattern.test(trimmed))
-      && ((audioSec !== undefined && audioSec < SHORT_AUDIO_SEC) || opensAsAssistant(trimmed))) return true;
+      // A reply that opens the text is invented only when the audio could not hold much speech:
+      // a long batch that starts with such a phrase still carries real talk after it.
+      && ((audioSec !== undefined && audioSec < SHORT_AUDIO_SEC) || (opensAsAssistant(trimmed) && (audioSec === undefined || audioSec < OPENING_AUDIO_SEC)))) return true;
   // Whisper's own decoding guards: repetition loops and confident "no speech" with weak text.
   if ((evidence.compression_ratio ?? 0) > 2.4) return true;
   if ((evidence.no_speech_prob ?? 0) > 0.6 && (evidence.avg_logprob ?? 0) < -0.5) return true;

@@ -6,7 +6,6 @@ import { assembleAttributedTranscript, type AttributedResult } from "../provider
 import { attributedBatches, type AttributedManifest } from "../providers/transcription/attributed.ts";
 import { TinfoilRateLimited, TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
 import { VexaHttpError } from "../providers/vexa/client.ts";
-import { ApiError } from "../domain/errors.ts";
 import { replayAttributedBatches } from "../eval/replay.ts";
 import { parseReferenceTranscript } from "../eval/reference.ts";
 import { transcriptMetrics, type TranscriptMetrics, type TurnLike } from "../eval/metrics.ts";
@@ -35,7 +34,7 @@ const backoff = async <T>(fn: () => Promise<T>, retryable: (error: unknown) => b
 };
 // Only definite rejections are re-sent. A timeout may have been processed and billed.
 const vexaRetryable = (error: unknown) => error instanceof VexaHttpError && (error.status === 429 || error.status >= 500);
-const tinfoilRetryable = (error: unknown) => error instanceof TinfoilRateLimited || (error instanceof ApiError && error.code === "provider_unavailable");
+const tinfoilRetryable = (error: unknown) => error instanceof TinfoilRateLimited;
 const PRODUCTION_WAIT_MS = 15_000, PRODUCTION_WAIT_LIMIT_MS = 2 * 60 * 60_000, STALE_RUNNING_MS = 6 * 60 * 60_000;
 
 /**

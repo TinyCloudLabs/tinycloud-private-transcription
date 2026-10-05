@@ -142,7 +142,8 @@ describe("review fixes (PR #71)", () => {
     // A long untimed batch that merely contains a chat-like phrase mid-turn is real speech.
     expect(hallucinated("So we told the customer, okay. And then the support bot said how can I assist you today, which was funny. Anyway the pilot is going well.", { untimed: true, audioSec: 40 })).toBe(false);
     // Opening with the reply, or on short audio, it is not.
-    expect(hallucinated("Hello! How can I assist you today? Here are a few topics we could discuss.", { untimed: true, audioSec: 40 })).toBe(true);
+    expect(hallucinated("Hello! How can I assist you today? Here are a few topics we could discuss.", { untimed: true, audioSec: 8 })).toBe(true);
+    expect(hallucinated("Hi! How can I assist you today? Great, so the first item on the agenda is the pilot.", { untimed: true, audioSec: 90 })).toBe(false);
     expect(hallucinated("Thank you.", { untimed: true, audioSec: 20 })).toBe(false);
   });
 
