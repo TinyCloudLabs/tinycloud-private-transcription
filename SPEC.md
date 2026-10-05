@@ -89,8 +89,8 @@ other-tenant or deleted job is the same `404 transcription_not_found`.
 
 ```http
 POST /v1/transcriptions   Idempotency-Key: <1..200 printable ASCII>   X-Tenant-Ref   X-Correlation-Id?
-{"content_type":"audio/mpeg|audio/wav|audio/ogg","byte_size":1..120960000,"sha256":"<64 hex>",
- "language":"en"?, "channel_mode":"separate|mixed"?, "channel_labels":["Speaker 1","Speaker 2"]?}
+{"content_type":"audio/mpeg|audio/wav|audio/ogg|audio/mp4|audio/webm|audio/flac","byte_size":1..120960000,"sha256":"<64 hex>",
+ "language":"en"?, "channel_mode":"separate|mixed"?, "channel_labels":["Speaker 1","Speaker 2"]?, "diarize":false?}
 → 201 new | 200 replay (same key + same body + same tenant): <job> + "upload":{"path":"/uploads/trn_…","capability":"tcu_…","expires_at","max_live":5}
   ("upload" is present only while the job is awaiting_upload; each replay issues one more capability and revokes none)
 GET  /v1/transcriptions?limit=1..100            {"object":"list","data":[<job>…]} newest first
@@ -99,7 +99,7 @@ GET  /v1/transcriptions/{id}                    <job>
 GET  /v1/transcriptions/{id}/result             202 {id,status} | 200 completed transcript | 200 {id,status:"failed"|"cancelled",error} | 410 transcript_expired
 POST /v1/transcriptions/{id}/cancel             {id,status} (idempotent)
 DELETE /v1/transcriptions/{id}                  204; the job is gone from every read at once
-GET  /v1/transcriptions/capabilities            {max_bytes,max_duration_seconds:7200,max_channels:2,content_types,transcript_ttl_seconds:86400,admission,ready}
+GET  /v1/transcriptions/capabilities            {max_bytes,max_duration_seconds:7200,max_channels:2,content_types,diarization,transcript_ttl_seconds:86400,admission,ready}
 PUT  /uploads/{id}   Authorization: Bearer <capability>   Content-Length = byte_size   Content-Type = content_type
 GET|PUT /v1/admin/admission  (admin:*)          {"mode":"open|drain|closed"} → {mode, active:{awaiting_upload,queued,processing}, retention_lag_seconds}
 ```
@@ -110,6 +110,13 @@ error:{type,code,message}|null, created_at, upload_deadline_at, uploaded_at, pro
 Completed result: `{id, status, language, duration_seconds, provider:"tinfoil", model, channels, speakers:[{id:
 "channel_N", name, channel}], segments:[{id, speaker_id, channel, start, end, text}], text, stats:{tinfoil_calls,
 tinfoil_audio_seconds}}`. Timestamps are region-level (VAD regions, below).
+
+`content_type` → container: `audio/mpeg` mp3, `audio/wav` WAV, `audio/ogg` Ogg (Vorbis/Opus/FLAC), `audio/mp4`
+MP4/M4A (any `mov,mp4,m4a` demux), `audio/webm` WebM/Matroska, `audio/flac` FLAC. `channel_mode` defaults to `separate`,
+or to `mixed` when `diarize` is true; `diarize: true` with `channel_mode: "separate"` is `400 invalid_request`.
+`capabilities.diarization` is true only when the diarization stage is installed and enabled; while it is false,
+`diarize: true` is `400 diarization_unavailable` (nothing is created). `diarize: false` is not part of the idempotency
+hash, so requests from before the field existed replay unchanged.
 
 States: `awaiting_upload → queued → processing → completed`; terminal `failed` and `cancelled`.
 
@@ -139,10 +146,24 @@ time per job (a DB lease: `409 upload_in_progress`) and at most `BATCH_MAX_CONCU
 its average rate is below `BATCH_UPLOAD_MIN_BYTES_PER_SECOND` after 60 s; or it passes its hard expiry,
 min(start + `BATCH_UPLOAD_MAX_PUT_SECONDS`, the upload deadline). Lease heartbeats never move the hard expiry. A body that
 ends early or errors is also `408 upload_interrupted`; a wrong `Content-Length` is `400 upload_length_mismatch`; a wrong
-`Content-Type` is `415 unsupported_media_type`. The bytes are streamed to a temp file while hashed, then verified
-(sha256, then ffprobe: one audio stream of the declared container, 1–2 channels, ≤ 7,200 s), renamed, and committed.
-Validation failures end the job: `422 upload_rejected {status:"failed", job_error:{code: upload_integrity_failed |
-invalid_audio | unsupported_recording | recording_too_long}}`.
+`Content-Type` is `415 unsupported_media_type`. The bytes are streamed to a temp file while hashed, then verified:
+sha256, then ffprobe (the container is the declared `content_type`'s, exactly one audio stream, 1–2 channels, ≤ 7,200 s;
+video and data streams are ignored: never transcoded or transcribed). When the container carries no duration,
+as browser MediaRecorder WebM does not, the length is the last audio packet's end minus the start time, measured within
+45 s of wall clock (else `invalid_audio`); more packets than 7,200 s of 2.5 ms Opus frames is `recording_too_long`
+whatever the timestamps say. The bytes are then renamed and committed. Validation failures end the job before any
+provider call: `422 upload_rejected {status:"failed", job_error:{code: upload_integrity_failed | invalid_audio |
+unsupported_recording | recording_too_long}}`. `invalid_audio` covers unreadable bytes, a container other than the
+declared type (e.g. WAV bytes declared `audio/mp4`), and zero or several audio streams.
+
+**Browser uploads (CORS).** `BATCH_CORS_ORIGINS` lists the origins allowed to `PUT /uploads/{id}` from a browser:
+comma-separated exact origins (`scheme://host[:port]`, lowercase, no path), each optionally with one leading wildcard
+label (`https://*.tinychat-4jq.pages.dev` matches `https://x.tinychat-4jq.pages.dev` only). A malformed entry fails
+startup. Unset or empty: no CORS headers anywhere (the default). It applies to `/uploads/*` only: `OPTIONS` preflight
+answers `204` with `Access-Control-Allow-Origin: <origin>`, `Access-Control-Allow-Methods: PUT, OPTIONS`,
+`Access-Control-Allow-Headers: Authorization, Content-Type` and `Access-Control-Max-Age: 600`; the `PUT` and every error
+it returns carry `Access-Control-Allow-Origin`. Every `/uploads/*` answer has `Vary: Origin`; credentials are never
+allowed (the capability travels in `Authorization`). A disallowed origin gets no `Access-Control-Allow-Origin`.
 
 **Post-acceptance contract (the only one).** `201 {"status":"queued"}` is returned only after the transaction that moves
 the job to `queued` has committed; that same transaction deletes every capability of the job. Any later PUT, including a
@@ -153,7 +174,8 @@ replay); anything else → the upload was accepted or the job ended.
 
 ### Processing
 One job end-to-end at a time, service-wide. Per channel (`separate` + 2 channels; otherwise a mono downmix), ffmpeg
-decodes to 16 kHz PCM on disk; an energy VAD (100 ms frames; voiced ≥ max(−50 dBFS, p10 + 12 dB); gaps ≤ 1 s merged;
+decodes to 16 kHz PCM on disk, stopping at 7,200 s of PCM (counted in bytes, whatever the timestamps say); an energy VAD
+(100 ms frames; voiced ≥ max(−50 dBFS, p10 + 12 dB); gaps ≤ 1 s merged;
 ±0.25 s padding; regions > 30 s split at the quietest frame in their last 10 s) produces regions; each region is one
 Tinfoil request. No speech → `no_speech`.
 
@@ -194,8 +216,8 @@ oldest pending deletion) and is `degraded` past 300 s. Deleted data may remain o
 
 ### Errors and correlation
 Every response has `X-Correlation-Id` (the caller's, if 1–128 of `[A-Za-z0-9._:-]`, else a new UUID). Every error body is
-`{"error":{"type","code","message","correlation_id", …}}`. Request codes: `invalid_request`, `unauthorized`,
-`insufficient_scope`, `idempotency_conflict`, `transcription_not_found`, `active_transcription_exists`,
+`{"error":{"type","code","message","correlation_id", …}}`. Request codes: `invalid_request`, `diarization_unavailable`
+(400), `unauthorized`, `insufficient_scope`, `idempotency_conflict`, `transcription_not_found`, `active_transcription_exists`,
 `recording_too_large` (413), `quota_exceeded`, `service_busy`, `upload_capability_limit` (429), `service_paused`,
 `service_unavailable` (503), `upload_capability_invalid` (401), `upload_capability_expired` (410),
 `upload_length_mismatch` (400), `unsupported_media_type` (415), `upload_in_progress` (409), `upload_interrupted`

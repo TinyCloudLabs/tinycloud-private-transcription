@@ -130,6 +130,7 @@ bun run cli create-key --project tinychat --scopes 'transcriptions:*'
 | `BATCH_TENANT_DAILY_BYTES` | `362880000` | per tenant per UTC day (3 × cap) |
 | `BATCH_UPLOAD_MAX_PUT_SECONDS` | `1800` | absolute cap on one PUT (also clamped to the job's 2 h upload deadline) |
 | `BATCH_UPLOAD_MIN_BYTES_PER_SECOND` | `32768` | minimum average PUT rate after 60 s |
+| `BATCH_CORS_ORIGINS` | unset | comma-separated browser origins allowed to `PUT /uploads/{id}` directly (exact, or one leading `*.` label, e.g. `https://*.tinychat-4jq.pages.dev`); unset = no CORS headers; a malformed entry fails boot |
 | `PTX_FAULT_INJECT` | unset | staging-only fault injection (`<point>:<crash|error|delay=<ms>>,…`); must never be set in a deploy |
 
 ### Env vars

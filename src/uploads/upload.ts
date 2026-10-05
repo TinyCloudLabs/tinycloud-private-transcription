@@ -67,7 +67,9 @@ export async function handleUpload(ctx: BatchContext, id: string, request: Reque
     }
     await ctx.faults.hit("upload.after_hash_verify", { id });
 
-    const probed = await probeAudio(tempPath, job.contentType as UploadContentType, ctx.config.limits, ctx.config.ffprobePath);
+    const probed = await probeAudio(tempPath, job.contentType as UploadContentType, ctx.config.limits, ctx.config.ffprobePath, request.signal);
+    // A client that went away mid-probe leaves the job awaiting_upload; it is not the recording's fault.
+    if (!probed.ok && request.signal.aborted) throw interrupted("The upload connection was closed");
     if (!probed.ok) await failUpload(ctx, job, lease.token, probed.code, probed.message);
     await ctx.faults.hit("upload.after_probe", { id });
 

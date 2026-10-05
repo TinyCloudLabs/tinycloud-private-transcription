@@ -5,6 +5,7 @@ import type { AuthEnv } from "../api/auth.ts";
 import { ApiError } from "../domain/errors.ts";
 import { CONTENT_TYPES } from "./config.ts";
 import type { BatchContext } from "./context.ts";
+import { uploadCors } from "./cors.ts";
 import { BatchError } from "./errors.ts";
 import { isSimulatedCrash } from "./faults.ts";
 import { retentionLagSeconds } from "./ledger.ts";
@@ -16,6 +17,7 @@ import {
   cancelJob,
   createTranscription,
   deleteJob,
+  diarizationAvailable,
   getJob,
   getJobByIdempotencyKey,
   getResult,
@@ -62,6 +64,7 @@ function transcriptionRoutes(ctx: BatchContext) {
       max_duration_seconds: ctx.config.limits.maxDurationSeconds,
       max_channels: ctx.config.limits.maxChannels,
       content_types: CONTENT_TYPES,
+      diarization: diarizationAvailable(ctx),
       transcript_ttl_seconds: ctx.config.retention.transcriptTtlSeconds,
       admission: await admissionMode(ctx.db),
       ready: ready.ready,
@@ -221,6 +224,7 @@ export function createBatchRoutes(ctx: BatchContext) {
   app.notFound((c) => c.json(new BatchError("not_found", `No route for ${c.req.method} ${c.req.path}`).toBody(correlationOf(c)), 404));
 
   app.route("/", healthRoutes(ctx));
+  app.use("/uploads/*", uploadCors(ctx.config.corsOrigins));
   app.put("/uploads/:id", async (c) => {
     const result = await handleUpload(ctx, c.req.param("id"), c.req.raw);
     return c.json(result, 201);

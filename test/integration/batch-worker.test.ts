@@ -84,6 +84,33 @@ describe("single-slot arbiter", () => {
     expect(await exists(jobDir(h.uploadDir, id))).toBe(false);
   });
 
+  test("m4a, webm (with and without a duration, or starting at 100 s), flac and mp4 with a video track transcribe like the mp3", async () => {
+    const cases = [
+      ["stereo_m4a", "audio/mp4"], ["stereo_webm", "audio/webm"], ["stereo_webm_no_duration", "audio/webm"], ["stereo_webm_offset", "audio/webm"],
+      ["stereo_flac", "audio/flac"], ["stereo_mp4_with_video", "audio/mp4"],
+    ] as const;
+    for (const [fixture, contentType] of cases) {
+      const id = await h.submit(await audio(fixture), { contentType });
+      expect(await h.row(id)).toMatchObject({ channels: 2, durationSeconds: expect.closeTo(7, 0) });
+      await h.work();
+      const body = await (await result(id)).json();
+      expect({ fixture, status: body.status, speakers: body.segments.map((s: { speaker_id: string }) => s.speaker_id) })
+        .toEqual({ fixture, status: "completed", speakers: ["channel_0", "channel_1"] });
+    }
+  });
+
+  test("decoding stops at the duration cap even when the accepted recording is longer than its probe said", async () => {
+    const id = await h.submit(await audio("stereo")); // ch0 speaks 0.5–2.5 s, ch1 3.5–5.5 s
+    h.ctx.config.limits.maxDurationSeconds = 3;
+    try {
+      await h.work();
+    } finally {
+      h.ctx.config.limits.maxDurationSeconds = 7_200;
+    }
+    const body = await (await result(id)).json();
+    expect(body.segments.map((s: { speaker_id: string; end: number }) => [s.speaker_id, s.end <= 3])).toEqual([["channel_0", true]]);
+  });
+
   test("mixed channel mode and mono recordings produce one speaker", async () => {
     const id = await h.submit(await audio("mono_wav"), { contentType: "audio/wav" });
     await h.work();

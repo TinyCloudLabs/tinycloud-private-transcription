@@ -1,10 +1,11 @@
 import { positiveIntegerEnv } from "../config.ts";
+import { parseCorsOrigins } from "./cors.ts";
 
 /** 2 h at 128 kbps stereo + 5% (the same formula Exo uses for its 8 h local cap). */
 export const MAX_UPLOAD_BYTES = 120_960_000;
 export const MAX_DURATION_SECONDS = 7_200;
 export const MAX_CHANNELS = 2;
-export const CONTENT_TYPES = ["audio/mpeg", "audio/wav", "audio/ogg"] as const;
+export const CONTENT_TYPES = ["audio/mpeg", "audio/wav", "audio/ogg", "audio/mp4", "audio/webm", "audio/flac"] as const;
 export type UploadContentType = (typeof CONTENT_TYPES)[number];
 
 /**
@@ -20,10 +21,14 @@ export interface BatchConfig {
   ffmpegPath: string;
   ffprobePath: string;
   tinfoil: { baseUrl: string; apiKey: string; model: string; timeoutMs: number };
+  /** BATCH_CORS_ORIGINS: browser origins allowed to PUT /uploads/{id} directly. Empty → no CORS headers. */
+  corsOrigins: string[];
   limits: {
     maxBytes: number;
     maxDurationSeconds: number;
     maxChannels: number;
+    /** Wall-clock budget for measuring a recording whose container carries no duration (inside the PUT). */
+    durationScanSeconds: number;
     /** Service-wide jobs in awaiting_upload + queued + processing. */
     maxActiveJobs: number;
     /** Service-wide sum of declared byte_size over the same active set. Bounds temp + accepted audio on disk. */
@@ -91,10 +96,12 @@ export function batchConfigFromEnv(): BatchConfig {
       model: str("BATCH_TINFOIL_MODEL", "voxtral-small-24b"),
       timeoutMs: positiveIntegerEnv("BATCH_TINFOIL_TIMEOUT_MS", "180000"),
     },
+    corsOrigins: parseCorsOrigins(str("BATCH_CORS_ORIGINS", "")),
     limits: {
       maxBytes: MAX_UPLOAD_BYTES,
       maxDurationSeconds: MAX_DURATION_SECONDS,
       maxChannels: MAX_CHANNELS,
+      durationScanSeconds: 45,
       maxActiveJobs: positiveIntegerEnv("BATCH_MAX_ACTIVE_JOBS", "10"),
       maxReservedBytes: positiveIntegerEnv("BATCH_MAX_RESERVED_BYTES", String(10 * MAX_UPLOAD_BYTES)),
       maxConcurrentUploads: positiveIntegerEnv("BATCH_MAX_CONCURRENT_UPLOADS", "3"),

@@ -8,9 +8,10 @@ import { createDb } from "../../src/db/client.ts";
 import { transcriptionCapabilities, transcriptions, transcriptionWorkers } from "../../src/db/schema.ts";
 import { silentLogger } from "../../src/log.ts";
 import { createBatchApp } from "../../src/roles/batch.ts";
+import { parseCorsOrigins } from "../../src/uploads/cors.ts";
 import { runSweep } from "../../src/uploads/ledger.ts";
 import { audioName, jobDir } from "../../src/uploads/storage.ts";
-import { audio, exists, sha256, startBatchHarness, TENANT_A, TENANT_B, tenant, trickle, type BatchHarness } from "./batch-harness.ts";
+import { audio, exists, laceBombWebm, sha256, startBatchHarness, TENANT_A, TENANT_B, tenant, trickle, type BatchHarness } from "./batch-harness.ts";
 
 let h: BatchHarness;
 beforeAll(async () => {
@@ -22,7 +23,7 @@ afterEach(async () => {
   // Each test starts from an empty job table, open admission and the default limits.
   await h.ctx.db.execute(sql`truncate table transcriptions, transcription_tenant_usage cascade`);
   await h.ctx.db.execute(sql`update transcription_admission set mode = 'open' where id = 1`);
-  Object.assign(h.ctx.config.limits, { maxActiveJobs: 10, maxReservedBytes: 1_209_600_000, maxConcurrentUploads: 3, diskHighWaterPercent: 99, tenantDailyBytes: 362_880_000, maxDurationSeconds: 7_200 });
+  Object.assign(h.ctx.config.limits, { maxActiveJobs: 10, maxReservedBytes: 1_209_600_000, maxConcurrentUploads: 3, diskHighWaterPercent: 99, tenantDailyBytes: 362_880_000, maxDurationSeconds: 7_200, durationScanSeconds: 45 });
   Object.assign(h.ctx.config.upload, { maxPutSeconds: 1_800, minBytesPerSecond: 32_768, progressGraceSeconds: 60, idleTimeoutSeconds: 60, leaseStaleSeconds: 120 });
   h.tinfoil.calls = [];
 });
@@ -82,13 +83,16 @@ describe("create and admission", () => {
   test("validates the body and caps byte_size at 120,960,000 before any state is written", async () => {
     const bytes = await audio("stereo");
     const bad = [
-      [{ content_type: "audio/flac" }, 400, "invalid_request"],
+      [{ content_type: "audio/aac" }, 400, "invalid_request"],
       [{ byte_size: 0 }, 400, "invalid_request"],
       [{ byte_size: 120_960_001 }, 413, "recording_too_large"],
       [{ sha256: "XYZ" }, 400, "invalid_request"],
       [{ language: "en; drop" }, 400, "invalid_request"],
       [{ channel_labels: ["a", "b", "c"] }, 400, "invalid_request"],
       [{ extra: true }, 400, "invalid_request"],
+      [{ diarize: "yes" }, 400, "invalid_request"],
+      [{ diarize: true, channel_mode: "separate" }, 400, "invalid_request"],
+      [{ diarize: true }, 400, "diarization_unavailable"],
     ] as const;
     for (const [body, status, code] of bad) {
       const res = await h.create(bytes, { body });
@@ -276,6 +280,13 @@ describe("create and admission", () => {
     }
   });
 
+  test("capabilities list every accepted container and report diarization unavailable", async () => {
+    expect(await (await h.api("/v1/transcriptions/capabilities")).json()).toMatchObject({
+      content_types: ["audio/mpeg", "audio/wav", "audio/ogg", "audio/mp4", "audio/webm", "audio/flac"],
+      diarization: false,
+    });
+  });
+
   test("a replay whose job row is purged between the two reads becomes an ordinary create", async () => {
     const bytes = await audio("stereo");
     const key = { "Idempotency-Key": "tc:purged" };
@@ -413,6 +424,54 @@ describe("upload capability", () => {
   });
 });
 
+describe("upload CORS", () => {
+  const ALLOWED = "http://localhost:5173";
+  const corsApp = () => createBatchApp(h.withContext({ config: { ...h.ctx.config, corsOrigins: parseCorsOrigins(`${ALLOWED},https://*.tinychat-4jq.pages.dev`) } }));
+  const preflight = (origin: string, { app = corsApp(), path = "/uploads/trn_01M3PQ71Q9YF7GSEFP6S19ZJPW" } = {}) => app.request(path, {
+    method: "OPTIONS",
+    headers: { Origin: origin, "Access-Control-Request-Method": "PUT", "Access-Control-Request-Headers": "authorization,content-type" },
+  });
+
+  test("an allowed origin gets the preflight headers, without credentials", async () => {
+    for (const origin of [ALLOWED, "https://feat-x.tinychat-4jq.pages.dev"]) {
+      const res = await preflight(origin);
+      expect(res.status).toBe(204);
+      expect(Object.fromEntries(res.headers)).toMatchObject({
+        "access-control-allow-origin": origin,
+        "access-control-allow-methods": "PUT, OPTIONS",
+        "access-control-allow-headers": "Authorization, Content-Type",
+        "access-control-max-age": "600",
+        vary: "Origin",
+      });
+      expect(res.headers.has("access-control-allow-credentials")).toBe(false);
+    }
+  });
+
+  test("a disallowed origin, an unconfigured service and non-upload routes get no CORS headers", async () => {
+    const denied = await preflight("https://evil.example");
+    expect(denied.headers.get("access-control-allow-origin")).toBeNull();
+    expect(denied.headers.get("vary")).toBe("Origin");
+    expect((await preflight(ALLOWED, { app: createBatchApp(h.ctx) })).headers.get("access-control-allow-origin")).toBeNull();
+    expect((await preflight(ALLOWED, { path: "/v1/transcriptions" })).headers.get("access-control-allow-origin")).toBeNull();
+  });
+
+  test("the PUT and its error answers carry the allow-origin header for an allowed origin", async () => {
+    const app = corsApp();
+    const bytes = await audio("stereo");
+    const job = await (await h.create(bytes)).json();
+    const put = (contentType: string) => app.request(`/uploads/${job.id}`, {
+      method: "PUT",
+      headers: { Origin: ALLOWED, Authorization: `Bearer ${job.upload.capability}`, "Content-Type": contentType, "Content-Length": String(bytes.byteLength) },
+      body: bytes,
+    });
+    const wrongType = await put("audio/wav");
+    expect({ status: wrongType.status, origin: wrongType.headers.get("access-control-allow-origin") }).toEqual({ status: 415, origin: ALLOWED });
+    const accepted = await put("audio/mpeg");
+    expect({ status: accepted.status, origin: accepted.headers.get("access-control-allow-origin"), vary: accepted.headers.get("vary") })
+      .toEqual({ status: 201, origin: ALLOWED, vary: "Origin" });
+  });
+});
+
 describe("upload contract", () => {
   test("a PUT after acceptance gets 401 upload_capability_invalid and changes nothing; status is the recovery path", async () => {
     const bytes = await audio("stereo");
@@ -539,6 +598,8 @@ describe("upload validation fails the job and deletes its bytes", () => {
   const cases = [
     ["sha256 mismatch", "stereo", "audio/mpeg", { sha256: "0".repeat(64) }, "upload_integrity_failed"],
     ["declared wav, bytes are mp3", "stereo", "audio/wav", {}, "invalid_audio"],
+    ["declared mp4, bytes are wav", "mono_wav", "audio/mp4", {}, "invalid_audio"],
+    ["declared webm, bytes are m4a", "stereo_m4a", "audio/webm", {}, "invalid_audio"],
     ["three channels", "three_channel_wav", "audio/wav", {}, "unsupported_recording"],
     ["over the 7,200 s cap", "over_cap_mp3", "audio/mpeg", {}, "recording_too_long"],
   ] as const;
@@ -554,6 +615,33 @@ describe("upload validation fails the job and deletes its bytes", () => {
       expect((await h.put(job.id, job.upload.capability, bytes, { contentType })).status).toBe(401);
     }, 60_000); // generating the real 7,201 s fixture takes seconds on CI runners
   }
+});
+
+describe("measuring a recording without a container duration is bounded", () => {
+  const upload = async (bytes: Uint8Array) => {
+    const job = await (await h.create(bytes, { contentType: "audio/webm" })).json();
+    const res = await h.put(job.id, job.upload.capability, bytes, { contentType: "audio/webm" });
+    return { job, res, error: await errorOf(res) };
+  };
+
+  test("more packets than the duration cap allows fails recording_too_long, whatever the timestamps claim", async () => {
+    h.ctx.config.limits.maxDurationSeconds = 60; // at most 24,000 packets of 2.5 ms
+    const { job, res, error } = await upload(laceBombWebm(200)); // 51,200 packets whose timestamps span 2 s
+    expect(res.status).toBe(422);
+    expect(error).toMatchObject({ code: "upload_rejected", job_error: { code: "recording_too_long" } });
+    expect(h.tinfoil.calls.length).toBe(0);
+    expect(await exists(jobDir(h.uploadDir, job.id))).toBe(false);
+  });
+
+  test("a scan past its wall-clock budget is stopped: the PUT fails invalid_audio within the budget", async () => {
+    h.ctx.config.limits.durationScanSeconds = 0.3;
+    const bytes = laceBombWebm(4_000); // ~1M packets: seconds of ffprobe if nothing stopped it
+    const started = Date.now();
+    const { res, error } = await upload(bytes);
+    expect(Date.now() - started).toBeLessThan(3_000);
+    expect(res.status).toBe(422);
+    expect(error).toMatchObject({ code: "upload_rejected", job_error: { code: "invalid_audio" } });
+  }, 30_000);
 });
 
 describe("deadlines", () => {
