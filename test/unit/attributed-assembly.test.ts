@@ -132,3 +132,40 @@ describe("Tinfoil rate limits", () => {
     expect(calls).toBe(1);
   });
 });
+
+describe("review fixes (PR #71)", () => {
+  test("real speech that resembles assistant phrasing is kept", () => {
+    for (const text of ["Could you share more details on pricing?", "If you have any questions, feel free to reach out.", "Hi, how can I help you today?"]) {
+      expect(hallucinated(text, { untimed: true, audioSec: 8 })).toBe(false);
+      expect(hallucinated(text, { untimed: false, avg_logprob: -0.4, audioSec: 2 })).toBe(false);
+    }
+    // A long untimed batch that merely contains a chat-like phrase mid-turn is real speech.
+    expect(hallucinated("So we told the customer, okay. And then the support bot said how can I assist you today, which was funny. Anyway the pilot is going well.", { untimed: true, audioSec: 40 })).toBe(false);
+    // Opening with the reply, or on short audio, it is not.
+    expect(hallucinated("Hello! How can I assist you today? Here are a few topics we could discuss.", { untimed: true, audioSec: 40 })).toBe(true);
+    expect(hallucinated("Thank you.", { untimed: true, audioSec: 20 })).toBe(false);
+  });
+
+  test("a trailing Whisper segment past the window end keeps the batch timed", async () => {
+    const [batch] = attributedBatches(manifest([range(0, "Alice", 0, 2_000)]), 1);
+    const fetchImpl = (async () => new Response(JSON.stringify({ text: "hello there thank you", segments: [{ start: 0, end: 1.5, text: "Hello there." }, { start: 2.4, end: 3.2, text: "Thank you." }] }))) as unknown as typeof fetch;
+    const provider = new TinfoilTranscriptionProvider({ baseUrl: "https://t", apiKey: "k", model: "whisper-large-v3-turbo", fetch: fetchImpl });
+    const result = await provider.transcribeAttributedPcm(new Uint8Array(new Float32Array(32_000).fill(0.1).buffer), batch!, "en");
+    expect(result.segments).toEqual([{ start: 0, end: 1.5, text: "Hello there." }]);
+    // Stored results with a malformed piece drop only that piece.
+    const input = manifest([range(0, "Alice", 0, 2_000)]);
+    const { transcript } = assembleAttributedTranscript(input, [{ spec: batch!, result: { text: "x", segments: [{ start: 0, end: 1, text: "Kept." }, { start: 3, end: 2, text: "Bad." }] } }], "en");
+    expect(transcript.segments.map((s) => [s.text, s.start])).toEqual([["Kept.", 0]]);
+  });
+
+  test("untimed unresolved text is named only when every range infers the same speaker (M2)", () => {
+    const input = manifest([
+      range(0, "Kenny", 0, 1_000, { channel: 2 }), range(1, "", 2_000, 3_000, { channel: 2 }),
+      range(2, "Sam", 30_000, 31_000, { channel: 2 }), range(3, "", 32_000, 33_000, { channel: 2 }),
+    ]);
+    const unresolved = attributedBatches(input, 1).find((spec) => spec.attribution.source === "unresolved")!;
+    expect(unresolved.ranges.map((r) => r.sequence)).toEqual([1, 3]);
+    const { transcript } = assembleAttributedTranscript(input, [{ spec: unresolved, result: { text: "a long stretch of mixed speech from two people on one channel" } }], "en");
+    expect(transcript.segments.map((s) => [s.speaker_name, s.attribution])).toEqual([["Unknown", "unknown"]]);
+  });
+});

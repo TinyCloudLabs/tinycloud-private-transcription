@@ -40,6 +40,8 @@ export class TinfoilRateLimited extends ApiError {
   constructor() { super("provider_unavailable", "Transcription provider is unavailable"); }
 }
 const RATE_LIMIT_RETRIES = 4;
+/** A ≤30 s window takes Whisper a few seconds; bound each request and the whole batch's retries. */
+const WINDOW_TIMEOUT_MS = 60_000, BATCH_RETRY_BUDGET_MS = 240_000;
 
 /** Below Tinfoil/vLLM's 30 s re-chunking, so returned offsets are relative to our own window. */
 export const TIMED_WINDOW_SEC = 29.5;
@@ -112,6 +114,9 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
 
   get attributedModel() { return this.opts.attributedModel || this.opts.model; }
 
+  /** Same configuration with its own call counter (operator evals run beside production). */
+  fork(): TinfoilTranscriptionProvider { return new TinfoilTranscriptionProvider(this.opts); }
+
   /**
    * Transcribes a Vexa-owned, already-attributed PCM batch. Ranges are spliced with short pauses.
    * A Whisper model returns segment offsets into that spliced audio (TC-741); because Tinfoil's
@@ -149,13 +154,16 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     }
     const texts: string[] = [], segments: TimedPiece[] = [];
     let language_: string | undefined, untimed = false;
+    const deadline = Date.now() + BATCH_RETRY_BUDGET_MS;
     for (const [index, window] of timedWindows(batchTimeline(batch), total).entries()) {
-      const body = await this.postUnlessRateLimited(wav(window.from, window.to), `${batch.idempotency_key}-${index}.wav`, language, model);
+      const body = await this.postUnlessRateLimited(wav(window.from, window.to), `${batch.idempotency_key}-${index}.wav`, language, model, deadline);
       if (body.text.trim()) texts.push(body.text.trim());
       language_ ??= body.language;
       const pieces = timedPieces(body.segments);
       if (!pieces) { untimed = true; continue; }
-      for (const piece of pieces) segments.push({ ...piece, start: piece.start + window.from, end: Math.min(piece.end, window.to - window.from) + window.from });
+      const length = window.to - window.from;
+      // Whisper may place a trailing caption past the end of the audio; it has no audio to map to.
+      for (const piece of pieces) if (piece.start < length) segments.push({ ...piece, start: piece.start + window.from, end: Math.min(Math.max(piece.end, piece.start), length) + window.from });
     }
     // Text without usable offsets must not be published at invented times.
     return { text: texts.join(" "), language: language_, model, ...(untimed ? {} : { segments }) };
@@ -215,11 +223,12 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     return { ...transcript, duration_seconds: round(pcm.durationSec) };
   }
 
-  private async postUnlessRateLimited(bytes: Uint8Array, filename: string, language: string | null, model: string): Promise<TinfoilResponse> {
+  private async postUnlessRateLimited(bytes: Uint8Array, filename: string, language: string | null, model: string, deadline: number): Promise<TinfoilResponse> {
     for (let attempt = 0; ; attempt++) {
-      try { return await this.post(bytes, filename, language, model, true); } catch (error) {
-        if (!(error instanceof TinfoilRateLimited) || attempt >= RATE_LIMIT_RETRIES) throw error;
-        await Bun.sleep((this.opts.retryDelayMs ?? 250) * 8 * 2 ** attempt);
+      try { return await this.post(bytes, filename, language, model, true, Math.min(this.opts.timeoutMs ?? WINDOW_TIMEOUT_MS, WINDOW_TIMEOUT_MS)); } catch (error) {
+        const delay = (this.opts.retryDelayMs ?? 250) * 8 * 2 ** attempt;
+        if (!(error instanceof TinfoilRateLimited) || attempt >= RATE_LIMIT_RETRIES || Date.now() + delay > deadline) throw error;
+        await Bun.sleep(delay);
       }
     }
   }
@@ -237,7 +246,7 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     }
   }
 
-  private async post(bytes: Uint8Array, filename: string, language: string | null, model = this.opts.model, timed = false): Promise<TinfoilResponse> {
+  private async post(bytes: Uint8Array, filename: string, language: string | null, model = this.opts.model, timed = false, timeoutMs = this.opts.timeoutMs ?? 120_000): Promise<TinfoilResponse> {
     const form = new FormData();
     form.set("model", model);
     form.set("response_format", timed ? "verbose_json" : "json");
@@ -252,7 +261,7 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
         method: "POST",
         headers: { Authorization: `Bearer ${this.opts.apiKey}` },
         body: form,
-        signal: AbortSignal.timeout(this.opts.timeoutMs ?? 120_000),
+        signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {
       const timeout = error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");

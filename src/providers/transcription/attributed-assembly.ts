@@ -68,16 +68,20 @@ export interface TimedPiece { start: number; end: number; text: string; avg_logp
 export interface AttributedResult { text: string; language?: string | null; segments?: TimedPiece[]; model?: string }
 
 const finite = (value: unknown) => typeof value === "number" && Number.isFinite(value);
-/** Provider output is untrusted: only a bounded, well-formed segment list is used for timing. */
+const optionalFinite = (value: unknown) => value === undefined || value === null || finite(value);
+/**
+ * Provider output is untrusted: only a bounded list of well-formed pieces is used for timing.
+ * Malformed pieces (e.g. a trailing segment Whisper places past the audio end) are dropped one by
+ * one rather than discarding the batch's timing; deterministic, so publication re-derives the same.
+ */
 export function validPieces(result: { segments?: unknown }): TimedPiece[] | null {
   const pieces = result.segments;
   if (!Array.isArray(pieces) || !pieces.length || pieces.length > MAX_PIECES) return null;
-  for (const piece of pieces) {
-    if (!piece || typeof piece !== "object" || !finite(piece.start) || !finite(piece.end) || piece.start < 0 || piece.end < piece.start
-        || typeof piece.text !== "string" || piece.text.length > MAX_PIECE_TEXT) return null;
-    for (const key of ["avg_logprob", "no_speech_prob", "compression_ratio"] as const) if (piece[key] !== undefined && piece[key] !== null && !finite(piece[key])) return null;
-  }
-  return pieces as TimedPiece[];
+  const valid = pieces.filter((piece): piece is TimedPiece => !!piece && typeof piece === "object"
+    && finite(piece.start) && finite(piece.end) && piece.start >= 0 && piece.end >= piece.start
+    && typeof piece.text === "string" && piece.text.length <= MAX_PIECE_TEXT
+    && optionalFinite(piece.avg_logprob) && optionalFinite(piece.no_speech_prob) && optionalFinite(piece.compression_ratio));
+  return valid.length ? valid : null;
 }
 
 type Named = { name: string; source: "glow-bound" | "provisional" };
@@ -118,9 +122,14 @@ type RawPiece = { start: number; end: number; text: string; speaker: string; spe
 /** One published identity per display name: the capture channel is not a person. */
 const nameKey = (name: string) => `name:${name.normalize("NFC").trim().toLowerCase()}`;
 
-function speakerFor(batch: AttributedBatch, range: AttributedRange | undefined, inferred: Map<number, Named>): Pick<RawPiece, "speaker" | "speakerKey" | "attribution"> {
+/**
+ * `ranges` are the ranges the text came from: one for a timed piece, the whole batch for untimed
+ * text. Unresolved text takes an inferred name only when every one of those ranges agrees (M2).
+ */
+function speakerFor(batch: AttributedBatch, ranges: AttributedRange[], inferred: Map<number, Named>): Pick<RawPiece, "speaker" | "speakerKey" | "attribution"> {
   if (batch.attribution.source === "unresolved") {
-    const guess = range ? inferred.get(range.sequence) : undefined;
+    const names = new Set(ranges.map((range) => inferred.get(range.sequence)?.name));
+    const guess = names.size === 1 ? inferred.get(ranges[0]!.sequence) : undefined;
     // The provider's speaker_key can collide with a named participant's key, so unresolved
     // ranges keep their own namespace unless a neighbouring bound range names them.
     return guess ? { speaker: guess.name, speakerKey: nameKey(guess.name), attribution: "provisional" }
@@ -141,18 +150,19 @@ export function attributedPieces(manifest: AttributedManifest, completed: Array<
     const pieces = validPieces(result);
     if (!pieces) {
       stats.untimed_batches++;
-      if (hallucinated(result.text)) { stats.dropped_hallucinations++; continue; }
-      raw.push({ start: spec.start_ms / 1000, end: spec.end_ms / 1000, text: result.text, ...speakerFor(spec, spec.ranges[0], inferred), language });
+      const audioSec = spec.ranges.reduce((sum, range) => sum + range.audio_duration_ms, 0) / 1000;
+      if (hallucinated(result.text, { untimed: true, audioSec })) { stats.dropped_hallucinations++; continue; }
+      raw.push({ start: spec.start_ms / 1000, end: spec.end_ms / 1000, text: result.text, ...speakerFor(spec, spec.ranges, inferred), language });
       continue;
     }
     stats.timed_batches++;
     const timeline = batchTimeline(spec);
     for (const piece of pieces) {
       if (!piece.text.trim()) continue;
-      if (hallucinated(piece.text, piece)) { stats.dropped_hallucinations++; continue; }
+      if (hallucinated(piece.text, { avg_logprob: piece.avg_logprob ?? undefined, no_speech_prob: piece.no_speech_prob ?? undefined, compression_ratio: piece.compression_ratio ?? undefined, untimed: false, audioSec: piece.end - piece.start })) { stats.dropped_hallucinations++; continue; }
       const start = meetingSeconds(timeline, piece.start), end = meetingSeconds(timeline, Math.max(piece.start, piece.end - 1e-3));
       const mid = meetingSeconds(timeline, (piece.start + piece.end) / 2);
-      raw.push({ start: start.at, end: Math.max(start.at, end.at), text: piece.text.trim(), ...speakerFor(spec, mid.entry.range, inferred), language });
+      raw.push({ start: start.at, end: Math.max(start.at, end.at), text: piece.text.trim(), ...speakerFor(spec, [mid.entry.range], inferred), language });
     }
   }
   stats.pieces = raw.length;

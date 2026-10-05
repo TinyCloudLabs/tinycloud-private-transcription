@@ -13,6 +13,8 @@ export async function replayAttributedBatches(opts: {
   manifest: AttributedManifest; vexaMeetingId: number;
   fetchRange: (range: AttributedRange) => Promise<Uint8Array>;
   transcribe: BatchTranscriber; concurrency?: number;
+  /** Awaited before each batch; throwing aborts the replay (e.g. the meeting is being deleted). */
+  beforeBatch?: () => Promise<void>;
   onBatch?: (batch: ReplayedBatch, done: number, total: number) => void;
 }): Promise<ReplayedBatch[]> {
   const specs = attributedBatches(opts.manifest, opts.vexaMeetingId);
@@ -20,6 +22,8 @@ export async function replayAttributedBatches(opts: {
   let next = 0, done = 0;
   const worker = async () => {
     while (next < specs.length) {
+      await opts.beforeBatch?.();
+      if (next >= specs.length) return;
       const ordinal = next++, spec = specs[ordinal]!, started = Date.now();
       let replayed: ReplayedBatch;
       try {

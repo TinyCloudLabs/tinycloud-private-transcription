@@ -23,7 +23,8 @@ export interface TranscriptMetrics {
 }
 
 const FILLER = new Set(["um", "uh", "mhm", "uhhuh", "hmm", "ah", "er", "erm"]);
-const ALIGN_CELL_LIMIT = 120_000_000;
+// Full alignment stores 2 bits per cell (40 MB at the limit); above it only the distance is computed.
+const ALIGN_CELL_LIMIT = 160_000_000;
 
 export function words(text: string): string[] {
   return text.toLowerCase().normalize("NFKD").replace(/[̀-ͯ]/g, "")
@@ -49,22 +50,24 @@ function align(hyp: Array<{ word: string; speaker: string }>, ref: Array<{ word:
     return { errors: prev[m]!, matches: null, speakerAgree: null, deletions: null, substitutions: null };
   }
   // Direction matrix: 0 = match/sub (diag), 1 = deletion (up), 2 = insertion (left).
-  const dir = new Uint8Array((n + 1) * (m + 1));
+  const dir = new Uint8Array(Math.ceil((n + 1) * (m + 1) / 4));
+  const setDir = (cell: number, value: number) => { dir[cell >> 2]! |= value << ((cell & 3) * 2); };
+  const getDir = (cell: number) => (dir[cell >> 2]! >> ((cell & 3) * 2)) & 3;
   let prev = new Uint32Array(m + 1), cur = new Uint32Array(m + 1);
-  for (let j = 0; j <= m; j++) { prev[j] = j; dir[j] = 2; }
+  for (let j = 0; j <= m; j++) { prev[j] = j; setDir(j, 2); }
   for (let i = 1; i <= n; i++) {
-    cur[0] = i; dir[i * (m + 1)] = 1;
+    cur[0] = i; setDir(i * (m + 1), 1);
     for (let j = 1; j <= m; j++) {
       const diag = prev[j - 1]! + (ref[i - 1]!.word === hyp[j - 1]!.word ? 0 : 1), up = prev[j]! + 1, left = cur[j - 1]! + 1;
-      if (diag <= up && diag <= left) { cur[j] = diag; dir[i * (m + 1) + j] = 0; }
-      else if (up <= left) { cur[j] = up; dir[i * (m + 1) + j] = 1; }
-      else { cur[j] = left; dir[i * (m + 1) + j] = 2; }
+      if (diag <= up && diag <= left) cur[j] = diag;
+      else if (up <= left) { cur[j] = up; setDir(i * (m + 1) + j, 1); }
+      else { cur[j] = left; setDir(i * (m + 1) + j, 2); }
     }
     [prev, cur] = [cur, prev];
   }
   let i = n, j = m, matches = 0, speakerAgree = 0, deletions = 0, substitutions = 0;
   while (i > 0 || j > 0) {
-    const d = i > 0 && j > 0 ? dir[i * (m + 1) + j]! : i > 0 ? 1 : 2;
+    const d = i > 0 && j > 0 ? getDir(i * (m + 1) + j) : i > 0 ? 1 : 2;
     if (d === 0) {
       if (ref[i - 1]!.word === hyp[j - 1]!.word) { matches++; if (ref[i - 1]!.speaker === hyp[j - 1]!.speaker) speakerAgree++; } else substitutions++;
       i--; j--;

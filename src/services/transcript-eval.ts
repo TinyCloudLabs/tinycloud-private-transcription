@@ -1,10 +1,12 @@
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, inArray, lt } from "drizzle-orm";
 import { ulid } from "ulid";
 import type { AppContext } from "../context.ts";
-import { attributedTranscriptionRuns, meetings, referenceTranscripts, transcriptEvals, transcripts } from "../db/schema.ts";
+import { attributedBatches as batchesTable, attributedTranscriptionRuns, meetings, referenceTranscripts, transcriptEvals, transcripts } from "../db/schema.ts";
 import { assembleAttributedTranscript, type AttributedResult } from "../providers/transcription/attributed-assembly.ts";
 import { attributedBatches, type AttributedManifest } from "../providers/transcription/attributed.ts";
-import { TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
+import { TinfoilRateLimited, TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
+import { VexaHttpError } from "../providers/vexa/client.ts";
+import { ApiError } from "../domain/errors.ts";
 import { replayAttributedBatches } from "../eval/replay.ts";
 import { parseReferenceTranscript } from "../eval/reference.ts";
 import { transcriptMetrics, type TranscriptMetrics, type TurnLike } from "../eval/metrics.ts";
@@ -31,7 +33,27 @@ const backoff = async <T>(fn: () => Promise<T>, retryable: (error: unknown) => b
     }
   }
 };
-const rateLimited = (error: unknown) => /429|5\d\d|unavailable|timed out|timeout/i.test(error instanceof Error ? `${error.name} ${error.message} ${(error as { status?: number }).status ?? ""}` : String(error));
+// Only definite rejections are re-sent. A timeout may have been processed and billed.
+const vexaRetryable = (error: unknown) => error instanceof VexaHttpError && (error.status === 429 || error.status >= 500);
+const tinfoilRetryable = (error: unknown) => error instanceof TinfoilRateLimited || (error instanceof ApiError && error.code === "provider_unavailable");
+const PRODUCTION_WAIT_MS = 15_000, PRODUCTION_WAIT_LIMIT_MS = 2 * 60 * 60_000, STALE_RUNNING_MS = 6 * 60 * 60_000;
+
+/**
+ * Before every batch: stop if the meeting is gone or being deleted (no audio is read or sent after
+ * a deletion starts), and wait while production attributed work is queued so evals never compete
+ * with a live meeting for Tinfoil capacity.
+ */
+async function evalGuard(ctx: AppContext, meetingId: string): Promise<void> {
+  const started = Date.now();
+  for (;;) {
+    const [meeting] = await ctx.db.select({ dispatchBlocked: meetings.dispatchBlocked, deletionToken: meetings.deletionToken }).from(meetings).where(eq(meetings.id, meetingId));
+    if (!meeting || meeting.dispatchBlocked || meeting.deletionToken) throw new Error("Meeting was deleted or is being deleted");
+    const [busy] = await ctx.db.select({ id: batchesTable.id }).from(batchesTable).where(inArray(batchesTable.status, ["pending", "claimed"])).limit(1);
+    if (!busy) return;
+    if (Date.now() - started > PRODUCTION_WAIT_LIMIT_MS) throw new Error("Production transcription stayed busy");
+    await Bun.sleep(PRODUCTION_WAIT_MS);
+  }
+}
 
 /** Meetings an automatic eval may touch: listed TinyChat owners only, unless EVAL_ALL_MEETINGS. */
 export function evalEligible(ctx: AppContext, meeting: typeof meetings.$inferSelect): boolean {
@@ -51,6 +73,9 @@ export async function scheduleTranscriptEval(ctx: AppContext, meeting: typeof me
 /** Worker job: starts the eval in the background, or defers while another eval is running. */
 export async function handleEvalJob(ctx: AppContext, meetingId: string, models?: string[]): Promise<"processed" | "deferred"> {
   if (running) { await ctx.queue.push({ type: "eval.meeting", meetingId, ...(models ? { models } : {}) }, 60_000, `eval:${meetingId}`); return "deferred"; }
+  // A worker that stopped mid-eval leaves its row running; nothing resumes it.
+  await ctx.db.update(transcriptEvals).set({ status: "failed", error: "interrupted", completedAt: new Date() })
+    .where(and(eq(transcriptEvals.status, "running"), lt(transcriptEvals.createdAt, new Date(Date.now() - STALE_RUNNING_MS))));
   running = runTranscriptEval(ctx, meetingId, models ?? ctx.config.eval.models)
     .then(() => {}, (error) => { ctx.log.warn("transcript eval failed", { meetingId, stage: "transcript_eval", code: error instanceof Error ? error.name : "error" }); })
     .finally(() => { running = null; });
@@ -66,8 +91,8 @@ const turnsOf = (segments: Array<{ speaker_name: string; text: string }>): TurnL
 
 /** Re-transcribes one meeting with each model. Runs inline (CLI) or in the worker's background. */
 export async function runTranscriptEval(ctx: AppContext, meetingId: string, models: string[], log: (line: string) => void = () => {}): Promise<string[]> {
-  const provider = ctx.transcriptRecovery;
-  if (!(provider instanceof TinfoilTranscriptionProvider)) throw new Error("Tinfoil is not configured");
+  if (!(ctx.transcriptRecovery instanceof TinfoilTranscriptionProvider)) throw new Error("Tinfoil is not configured");
+  const provider = ctx.transcriptRecovery.fork();
   const [meeting] = await ctx.db.select().from(meetings).where(eq(meetings.id, meetingId));
   const [run] = await ctx.db.select().from(attributedTranscriptionRuns).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
   if (!meeting?.vexaMeetingId || !run || run.status === "fallback") throw new Error("Meeting has no staged attributed manifest");
@@ -83,8 +108,9 @@ export async function runTranscriptEval(ctx: AppContext, meetingId: string, mode
     try {
       const batches = await replayAttributedBatches({
         manifest, vexaMeetingId: meeting.vexaMeetingId, concurrency: ctx.config.eval.concurrency,
-        fetchRange: (range) => backoff(async () => (await ctx.vexa.fetchBytes(range.path!)).bytes, rateLimited),
-        transcribe: (pcm, batch) => backoff(() => provider.transcribeAttributedPcm(pcm, batch, meeting.language, model), rateLimited),
+        beforeBatch: () => evalGuard(ctx, meetingId),
+        fetchRange: (range) => backoff(async () => (await ctx.vexa.fetchBytes(range.path!)).bytes, vexaRetryable),
+        transcribe: (pcm, batch) => backoff(() => provider.transcribeAttributedPcm(pcm, batch, meeting.language, model), tinfoilRetryable),
         onBatch: (_batch, done, total) => { if (done % 25 === 0 || done === total) log(`${model}: ${done}/${total}`); },
       });
       const completed = batches.filter((b) => b.status === "completed").map((b) => ({ spec: specs[b.ordinal]!, result: b.result as AttributedResult }));
