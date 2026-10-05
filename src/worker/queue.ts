@@ -6,6 +6,7 @@ export type Job =
   | { type: "meeting.join_deadline"; meetingId: string }
   | { type: "attributed.batch"; meetingId: string; batchId: string }
   | { type: "attributed.finalize"; meetingId: string }
+  | { type: "eval.meeting"; meetingId: string; models?: string[] }
   | { type: "webhook.deliver"; deliveryId: string; claimToken: string };
 
 // A wakeup marker's TTL is only a lost-job safety net. The marker value is the wakeupId carried

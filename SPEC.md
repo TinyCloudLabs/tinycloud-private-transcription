@@ -60,6 +60,13 @@ capture-provider record back to `processing` and retries Vexa-segment finalizati
  "segments":[{"id":"seg_001","speaker_id":"speaker_0","speaker_name":"Alice","start":0.0,"end":3.2,"text":"…"}],
  "text":"Alice: …","created_at":"…"}
 ```
+Attributed Google Meet transcripts (`provider:"tinfoil-attributed"`) are turn-level: each speaker
+stream is transcribed with a timestamped model (`TINFOIL_ATTRIBUTED_MODEL`, Whisper) and every segment
+is placed on the meeting clock, so speakers interleave in spoken order. A participant has one
+`speaker_id` per display name. Audio whose speaker the capture could not bind takes the name of the
+bound speaker on the same audio channel within 3 s, with `attribution:"provisional"`; otherwise it
+publishes under `Unknown`. Model output that is not speech (chat-assistant replies, stock captions on
+silence) is dropped.
 `partial: true` is added when the transcript degraded: unresolved-speaker ranges published under an
 unknown speaker, producer-failed ranges skipped, or the mixed recording recovered because the
 attributed manifest could not be staged. `GET /v1/meetings/{id}` and `meeting.completed` webhooks
@@ -70,6 +77,14 @@ then also carry `transcript_partial: true`.
 Errors: `{"error":{"type":"meeting_join_failed","code":"waiting_room_timeout","message":"…"}}`. Codes: invalid_meeting_url, unsupported_platform, meeting_not_found, meeting_join_failed, waiting_room_timeout, bot_removed, meeting_ended, capture_failed, transcription_failed, provider_timeout, provider_unavailable, internal_error (+ request-level `unauthorized` 401, `insufficient_scope` 403, `invalid_request`, `idempotency_conflict`). Never leak Vexa errors raw.
 
 Platform detection: meet.google.com→google_meet, zoom.us→zoom, teams.microsoft.com→microsoft_teams, meet.jit.si / self-hosted Jitsi→jitsi. Only platforms in `ENABLED_PLATFORMS` (default `jitsi`) are accepted; a detected-but-disabled platform answers 400 `unsupported_platform` naming the platform.
+
+Internal evaluation (operator only, never served by the API): with `EVAL_MODELS` set, the worker
+re-transcribes eligible completed attributed meetings (owners in `EVAL_TINYCHAT_ADDRESSES`, or all with
+`EVAL_ALL_MEETINGS=true`) with each model from the retained audio and stores the results in
+`transcript_evals`. `bun run cli eval reference|run|report|show` stores a reference transcript (e.g. a
+Google Meet/Gemini export), runs evals on demand, and prints metrics (WER in published order, word and
+trigram recall, speaker accuracy, unknown share, hallucinated turns) for the published transcript and
+every eval. Eval and reference rows are deleted with the meeting.
 
 Webhook event: `{"id":"evt_…","type":"meeting.completed","created_at":"…","data":{"meeting_id":"…","metadata":{},"transcript_provider":"vexa"}}` (`data.error` on `meeting.failed`).
 

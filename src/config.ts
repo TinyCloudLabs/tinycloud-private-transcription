@@ -85,6 +85,19 @@ export const config = {
     baseUrl: env("TINFOIL_BASE_URL", "https://inference.tinfoil.sh"),
     apiKey: env("TINFOIL_API_KEY", ""),
     model: env("TINFOIL_MODEL", "voxtral-small-24b"),
+    /** Attributed Google Meet batches (TC-741): a Whisper model returns segment timestamps for turn order. */
+    attributedModel: env("TINFOIL_ATTRIBUTED_MODEL", ""),
+  },
+  /** Internal transcript evaluation (TC-745): shadow transcriptions stored beside the canonical one. */
+  eval: {
+    /** Comma-separated Tinfoil models re-run on each eligible meeting after publication; empty disables. */
+    models: env("EVAL_MODELS", "").split(",").map((s) => s.trim()).filter(Boolean),
+    /** Lowercase TinyChat owner addresses whose meetings are evaluated automatically. */
+    tinychatAddresses: env("EVAL_TINYCHAT_ADDRESSES", "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean),
+    allMeetings: env("EVAL_ALL_MEETINGS", "false") === "true",
+    delayMs: positiveIntegerEnv("EVAL_DELAY_MS", "120000"),
+    /** Production attributed transcription owns two Tinfoil dispatch slots; evals take one more at most. */
+    concurrency: positiveIntegerEnv("EVAL_CONCURRENCY", "1"),
   },
   /** Durable paid-call fence for whole-recording recovery (TC-574). */
   recordingRecovery: {

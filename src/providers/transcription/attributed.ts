@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { ApiError } from "../../domain/errors.ts";
-import { normalizeSegments, type NormalizedTranscript } from "../../domain/transcript.ts";
+import type { NormalizedTranscript } from "../../domain/transcript.ts";
+import { assembleAttributedTranscript, type AttributedResult } from "./attributed-assembly.ts";
 
 /** Exact attributed-audio.v1 producer shape (Vexa PR #10). */
 export interface AttributedRange {
@@ -149,20 +150,13 @@ export async function readAttributedBatch(batch: AttributedBatch, read: (range: 
   return { pcm, silent: silentPcm(pcm) };
 }
 
-export async function transcribeAttributedManifest(manifest: AttributedManifest, read: (range: AttributedRange) => Promise<Uint8Array>, textOnly: (pcm: Uint8Array, batch: AttributedBatch) => Promise<{ text: string; language?: string }>, language: string | null, vexaMeetingId: number): Promise<NormalizedTranscript> {
-  const raw = [];
-  for (const batch of attributedBatches(manifest, vexaMeetingId)) {
-    const prepared = await readAttributedBatch(batch, read), response = prepared.silent ? { text: "" } : await textOnly(prepared.pcm, batch);
-    if (response.text.trim()) raw.push({ start: batch.start_ms / 1000, end: batch.end_ms / 1000, text: response.text, ...batchSpeaker(batch), language: response.language ?? null });
+export async function transcribeAttributedManifest(manifest: AttributedManifest, read: (range: AttributedRange) => Promise<Uint8Array>, transcribe: (pcm: Uint8Array, batch: AttributedBatch) => Promise<AttributedResult>, language: string | null, vexaMeetingId: number): Promise<NormalizedTranscript> {
+  const completed: Array<{ spec: AttributedBatch; result: AttributedResult }> = [];
+  for (const spec of attributedBatches(manifest, vexaMeetingId)) {
+    const prepared = await readAttributedBatch(spec, read);
+    if (prepared.silent) continue;
+    const result = await transcribe(prepared.pcm, spec);
+    if (result.text.trim()) completed.push({ spec, result });
   }
-  return normalizeSegments(raw, language);
-}
-
-/** Unresolved attribution keeps its text but publishes under an unknown speaker. */
-export function batchSpeaker(batch: AttributedBatch): { speaker: string; speakerKey: string; attribution: "identified" | "provisional" | "unknown" } {
-  return batch.attribution.source === "unresolved"
-    // The provider's speaker_key can collide with a named participant's key, so unresolved
-    // ranges get their own namespace: they must never inherit someone else's speaker_id.
-    ? { speaker: "Unknown", speakerKey: `unresolved:${batch.speaker_key}`, attribution: "unknown" }
-    : { speaker: batch.speaker_name, speakerKey: batch.speaker_key, attribution: batch.attribution.source === "glow-bound" && batch.attribution.confidence > 0 ? "identified" : "provisional" };
+  return assembleAttributedTranscript(manifest, completed, language).transcript;
 }

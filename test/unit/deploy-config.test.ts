@@ -199,6 +199,14 @@ describe("infra/dstack/app-compose.yaml", () => {
     }
   });
 
+  test("worker transcribes attributed batches with a timestamped model and evaluates internal meetings (TC-740)", () => {
+    const env = serviceEnv("worker");
+    expect(env).toContain("TINFOIL_ATTRIBUTED_MODEL: ${TINFOIL_ATTRIBUTED_MODEL:-whisper-large-v3-turbo}");
+    expect(env).toContain("EVAL_MODELS: ${EVAL_MODELS:-voxtral-small-24b}");
+    expect(env).toMatch(/EVAL_TINYCHAT_ADDRESSES: \$\{EVAL_TINYCHAT_ADDRESSES:-(0x[0-9a-f]{40},?)+\}/);
+    expect(env).not.toContain("EVAL_ALL_MEETINGS");
+  });
+
   test("captures attributed Google Meet audio without live Vexa transcription", () => {
     const env = serviceEnv("meeting-api");
     expect(env).toContain('TRANSCRIBE_ENABLED: "false"');
