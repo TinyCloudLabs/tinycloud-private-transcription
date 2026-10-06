@@ -8,7 +8,8 @@
 //   speaker <local speaker> <embedded seconds> <embedding values...>
 // The embedding of a local speaker is the duration-weighted mean of the L2-normalized embeddings of its clearest
 // speech: the parts of its segments where no other speaker is talking, in pieces of 1-10 s, longest first, at most
-// 60 s (or its longest segment when it has no such piece). The caller links local speakers across windows with it.
+// 60 s (or at most 10 s of its longest segment when it has no such piece). The caller links local speakers across
+// windows with it.
 // Only this window's samples are held in memory, and the diarizer is freed before embeddings are computed.
 //
 // Memory (docs/diarization-benchmark.md): onnxruntime's arena and memory patterns are off (the config file), every
@@ -129,7 +130,10 @@ int main(int argc, char **argv) {
         if (!last && segments[j].end > cur) cur = segments[j].end;
       }
     }
-    if (np == 0 && longest.end > longest.start) pieces[np++] = longest;
+    if (np == 0 && longest.end > longest.start) { // no clear piece: the middle PIECE_MAX of its longest segment
+      const float mid = (longest.start + longest.end) / 2;
+      pieces[np++] = longest.end - longest.start > PIECE_MAX ? (Span){mid - PIECE_MAX / 2, mid + PIECE_MAX / 2} : longest;
+    }
     qsort(pieces, np, sizeof(Span), by_length_desc);
 
     memset(sum, 0, (dim > 0 ? dim : 1) * sizeof(double));

@@ -247,7 +247,7 @@ processing="$(jq -r '((.finished_at | sub("\\.[0-9]+"; "") | fromdateiso8601) - 
 echo "::group::Diarize the 2-hour two-voice recording (deadline ${DIARIZE_DEADLINE_SECONDS} s)"
 curl -fsS -H "Authorization: Bearer $CLIENT_KEY" -H "X-Tenant-Ref: ${TENANT[$keep]}" "$URL/v1/transcriptions/capabilities" \
   | jq -e '.diarization == true' >/dev/null || fail "capabilities do not offer diarization"
-d="$(for i in 1 2 3; do [ "$i" != "$keep" ] && echo "$i"; done | head -1)" # a tenant whose job was cancelled
+d=$((keep == 1 ? 2 : 1)) # a tenant whose job was cancelled
 calls_before="$calls"
 created="$(api "$d" -X POST "$URL/v1/transcriptions" -H "Idempotency-Key: envelope-diarize" -H 'Content-Type: application/json' \
   -d "$(jq -nc --argjson size "$DSIZE" --arg sha "$DSHA" '{content_type: "audio/mpeg", byte_size: $size, sha256: $sha, language: "en", channel_mode: "mixed", diarize: true}')")"
@@ -276,7 +276,8 @@ dstats="$(curl -fsS "$MOCK/stats")"
 dregions="$(jq -r .progress.regions_total <<<"$djob")"
 dcalls=$(($(jq -r .calls <<<"$dstats") - calls_before))
 dspeakers="$(jq -r '.speakers | length' <<<"$dresult")"
-jq -e '.diarized == true and .channels == 1 and (.speakers | length) >= 1 and all(.speakers[]; (.id | test("^speaker_[0-9]+$")) and .channel == 0)' \
+# Two synthetic voices (TitaNet may hear them as one): more than 3 speakers means the windows were not linked.
+jq -e '.diarized == true and .channels == 1 and (.speakers | length) >= 1 and (.speakers | length) <= 3 and all(.speakers[]; (.id | test("^speaker_[0-9]+$")) and .channel == 0)' \
   <<<"$dresult" >/dev/null || fail "the result is not diarized: $(jq -c '{diarized, channels, speakers}' <<<"$dresult")"
 [ "$dregions" -ge 200 ] || fail "diarization found only $dregions turns"
 [ "$dcalls" = "$dregions" ] || fail "$dcalls provider calls for $dregions turns"

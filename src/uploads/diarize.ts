@@ -85,6 +85,7 @@ export type WindowRunner = (pcmPath: string, window: Window, signal: AbortSignal
  * last one is never a short tail). Each window owns its span up to the middle of each overlap.
  */
 export function planWindows(totalMs: number, windowMs = DIARIZATION.windowMs, overlapMs = DIARIZATION.overlapMs): Window[] {
+  if (totalMs <= 0) return [];
   if (totalMs <= windowMs) return [{ startMs: 0, endMs: totalMs, ownStartMs: 0, ownEndMs: totalMs }];
   const count = Math.ceil((totalMs - overlapMs) / (windowMs - overlapMs));
   const step = (totalMs - overlapMs) / count;

@@ -228,6 +228,7 @@ describe("windowed diarization", () => {
   test("a recording up to one window long is one window", () => {
     expect(planWindows(minutes(10))).toEqual([{ startMs: 0, endMs: minutes(10), ownStartMs: 0, ownEndMs: minutes(10) }]);
     expect(planWindows(1_234)).toEqual([{ startMs: 0, endMs: 1_234, ownStartMs: 0, ownEndMs: 1_234 }]);
+    expect(planWindows(0)).toEqual([]); // nothing decoded: no diarizer process, and the job ends no_speech
   });
 
   test("windows are equal, at most windowMs, share overlapMs, and own the recording exactly once", () => {
@@ -380,6 +381,26 @@ describe("windowed diarization", () => {
       }).diarize(pcm, abort.signal);
       await expect(aborted).rejects.toThrow("aborted");
       expect(ran).toBe(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an abort kills the window's diarizer process at once", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ptx-diarizer-"));
+    try {
+      const command = join(dir, "diarize");
+      await writeFile(command, ["#!/bin/sh", `echo $$ > ${dir}/pid`, "exec sleep 30"].join("\n"), { mode: 0o755 });
+      const abort = new AbortController();
+      const started = Date.now();
+      const running = sherpaWindowRunner({ command, segmentation: "s.onnx", embedding: "e.onnx", onnxruntime: "o.config" })(
+        join(dir, "ch0.pcm"), { startMs: 0, endMs: 600_000, ownStartMs: 0, ownEndMs: 600_000 }, abort.signal);
+      while (!existsSync(join(dir, "pid"))) await Bun.sleep(10);
+      abort.abort();
+      await expect(running).rejects.toThrow("aborted");
+      expect(Date.now() - started).toBeLessThan(5_000);
+      const pid = Number((await readFile(join(dir, "pid"), "utf8")).trim());
+      expect(() => process.kill(pid, 0)).toThrow(); // the process is gone
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

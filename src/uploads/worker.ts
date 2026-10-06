@@ -201,6 +201,8 @@ async function diarizeTurns(ctx: BatchContext, job: TranscriptionRow, fence: Fen
     segments = await ctx.diarizer.diarize(pcmPath, signal);
   } catch (error) {
     if (signal.aborted) throw error;
+    // A cancel or delete removes the PCM before the renewal timer notices: that is a lost fence, not an operator fault.
+    await holdFence(ctx.db, fence);
     ctx.log.error("batch diarization failed", { transcriptionId: job.id, stage: "diarize", installed: ctx.diarizer !== null, alert: true });
     if (await failClaim(ctx, ctx.db, fence, "processing_failed", "Speaker diarization failed")) await cleanupJobFiles(ctx, job.id);
     else throw new LostFence(job.id);
