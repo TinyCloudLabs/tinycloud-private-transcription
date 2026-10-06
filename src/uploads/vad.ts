@@ -67,20 +67,23 @@ export function regionsFromEnergies(energies: Float64Array): Region[] {
     if (last && region.startMs <= last.endMs) last.endMs = Math.max(last.endMs, region.endMs);
     else coalesced.push({ ...region });
   }
+  return coalesced.flatMap((region) => splitLong(region, energies));
+}
+
+/** Cuts a region longer than VAD.maxMs at the quietest frame in the last VAD.splitSearchMs of every VAD.maxMs window. */
+export function splitLong(region: Region, energies: Float64Array): Region[] {
   const out: Region[] = [];
-  for (const region of coalesced) {
-    let from = region.startMs;
-    while (region.endMs - from > VAD.maxMs) {
-      const searchFrom = Math.floor((from + VAD.maxMs - VAD.splitSearchMs) / VAD.frameMs);
-      const searchTo = Math.floor((from + VAD.maxMs) / VAD.frameMs);
-      let best = searchTo - 1;
-      for (let f = searchFrom; f < searchTo; f++) if (energies[f]! <= energies[best]!) best = f;
-      const cut = best * VAD.frameMs + VAD.frameMs / 2;
-      out.push({ startMs: from, endMs: cut });
-      from = cut;
-    }
-    out.push({ startMs: from, endMs: region.endMs });
+  let from = region.startMs;
+  while (region.endMs - from > VAD.maxMs) {
+    const searchFrom = Math.floor((from + VAD.maxMs - VAD.splitSearchMs) / VAD.frameMs);
+    const searchTo = Math.floor((from + VAD.maxMs) / VAD.frameMs);
+    let best = searchTo - 1;
+    for (let f = searchFrom; f < searchTo; f++) if (energies[f]! <= energies[best]!) best = f;
+    const cut = best * VAD.frameMs + VAD.frameMs / 2;
+    out.push({ startMs: from, endMs: cut });
+    from = cut;
   }
+  out.push({ startMs: from, endMs: region.endMs });
   return out;
 }
 

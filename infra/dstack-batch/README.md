@@ -143,6 +143,18 @@ https://tinycloud.chat,https://tinychat-4jq.pages.dev,https://*.tinychat-4jq.pag
 Check after a deploy: `curl -si -X OPTIONS $URL/uploads/trn_01M3PQ71Q9YF7GSEFP6S19ZJPW -H 'Origin: https://tinycloud.chat'
 -H 'Access-Control-Request-Method: PUT'` answers `204` with `access-control-allow-origin: https://tinycloud.chat`.
 
+## Speaker diarization
+
+The image carries the sherpa-onnx diarization stage at `/opt/sherpa-onnx` (TitaNet-S + pyannote segmentation-3.0;
+choice, numbers and sizing in [docs/diarization-benchmark.md](../../docs/diarization-benchmark.md)). It is offered only
+with `BATCH_DIARIZATION_ENABLED=true` on **both** the `api` and `upload-worker` services, which
+[`app-compose.yaml`](./app-compose.yaml) sets. It fits tdx.small: the worker diarizes 10-minute windows one at a time,
+each in its own process inside the `upload-worker` cgroup, and links speakers across windows; the envelope CI runs a
+diarized 2-hour job under the compose limits. To turn it off, set it to `"false"` on both services (a re-pin-style PR
+and a deploy); capabilities then report `diarization: false` and the apps disable "Identify speakers".
+Check after a deploy: `GET /v1/transcriptions/capabilities` reports `"diarization": true`, and the `batch worker
+started` log line has `diarization: true`.
+
 ## Verify (plan V3)
 
 - `GET /health` → `checks.upload_transcription`: `ready: true`, `provider_configured: true`, `worker_live: true`,

@@ -42,6 +42,8 @@ services:
       BATCH_UPLOAD_MIN_BYTES_PER_SECOND: "32768"
       # Browser and app origins allowed to PUT /uploads/{id} directly (Exo web, Pages previews, desktop, mobile).
       BATCH_CORS_ORIGINS: "https://tinycloud.chat,https://tinychat-4jq.pages.dev,https://*.tinychat-4jq.pages.dev,tauri://localhost,http://tauri.localhost,capacitor://localhost,https://localhost"
+      # Speaker diarization (create diarize: true); set on both api (capabilities) and upload-worker (runs it).
+      BATCH_DIARIZATION_ENABLED: "true"
       LOG_LEVEL: info
     ports:
       - "8080:8080"
@@ -78,11 +80,13 @@ services:
       BATCH_TINFOIL_BASE_URL: https://inference.tinfoil.sh
       BATCH_TINFOIL_API_KEY: ${BATCH_TINFOIL_API_KEY:-}
       BATCH_TINFOIL_MODEL: voxtral-small-24b
+      BATCH_DIARIZATION_ENABLED: "true"
       LOG_LEVEL: info
     volumes:
       - ptx-batch-uploads:/var/lib/ptx-batch/uploads
     # One job at a time: ffmpeg (a child, same cgroup) decodes each channel to PCM on disk; the VAD reads it in 60 s
-    # slices and each dispatch reads one region (<= 30 s, ~1 MB). Nothing holds a whole channel in memory.
+    # slices and each dispatch reads one region (<= 30 s, ~1 MB). Nothing holds a whole channel in memory. A diarized
+    # job runs one sherpa-onnx process per 10-minute window, one at a time (docs/diarization-benchmark.md).
     mem_limit: 320m
     memswap_limit: 320m
     mem_reservation: 96m

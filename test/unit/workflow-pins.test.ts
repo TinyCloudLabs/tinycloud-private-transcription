@@ -37,11 +37,17 @@ test("every bun-version is an exact release", () => {
 test("the api image's Bun base is digest-pinned to the exact Bun release CI tests with", () => {
   const dockerfile = readFileSync(new URL("../../Dockerfile", import.meta.url), "utf8");
   const froms = [...dockerfile.matchAll(/^FROM\s+(\S+)/gm)].map((m) => m[1]!);
-  expect(froms.length).toBeGreaterThan(0);
+  const stages = new Set([...dockerfile.matchAll(/^FROM\s+\S+\s+AS\s+(\S+)/gm)].map((m) => m[1]!));
+  expect(froms.at(-1)?.startsWith("oven/bun:")).toBe(true); // the image itself is the Bun base
   const testWorkflow = workflows.find(({ file }) => file === "test.yml")!.text;
   const ciBun = /bun-version:\s*(\d+\.\d+\.\d+)\s*$/m.exec(testWorkflow)?.[1];
   expect(ciBun).toBeDefined();
-  for (const from of froms) {
+  for (const from of froms.filter((f) => !stages.has(f))) {
+    if (!from.startsWith("oven/bun:")) {
+      // A build stage's base (e.g. the diarization compiler): digest-pinned as well.
+      expect({ from, pinned: /^[a-z0-9./-]+:[\w.-]+@sha256:[0-9a-f]{64}$/.test(from) }).toEqual({ from, pinned: true });
+      continue;
+    }
     expect({ from, pinned: /^oven\/bun:\d+\.\d+\.\d+-alpine@sha256:[0-9a-f]{64}$/.test(from) }).toEqual({ from, pinned: true });
     expect({ from, bun: from.split(":")[1]!.split("-")[0] }).toEqual({ from, bun: ciBun! });
   }

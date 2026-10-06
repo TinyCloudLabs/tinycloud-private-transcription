@@ -3,6 +3,7 @@ import { createDb } from "../db/client.ts";
 import { logger } from "../log.ts";
 import { batchConfigFromEnv, type BatchConfig } from "../uploads/config.ts";
 import type { BatchContext } from "../uploads/context.ts";
+import { diarizerFromConfig } from "../uploads/diarize.ts";
 import { faultsFromEnv } from "../uploads/faults.ts";
 import { BatchTinfoilClient } from "../uploads/provider.ts";
 import { createBatchRoutes } from "../uploads/routes.ts";
@@ -20,6 +21,7 @@ export function createBatchContext(overrides: Partial<BatchContext> & { config?:
     db: overrides.db ?? createDb(config.databaseUrl),
     log: overrides.log ?? logger,
     provider: overrides.provider !== undefined ? overrides.provider : config.tinfoil.apiKey ? new BatchTinfoilClient(config.tinfoil) : null,
+    diarizer: overrides.diarizer !== undefined ? overrides.diarizer : diarizerFromConfig(config.diarization),
     faults: overrides.faults ?? faultsFromEnv(),
     workerId: overrides.workerId ?? `batch-worker:${process.pid}:${randomUUID()}`,
   };

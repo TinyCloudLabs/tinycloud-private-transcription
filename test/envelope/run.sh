@@ -10,7 +10,10 @@
 #   3. the two later uploads are cancelled, and the worker runs the oldest: ffmpeg decode per channel, VAD, one mocked
 #      provider call per region; the job must complete with its audio deleted;
 #   4. while it processes, a burst of BURST_CLIENTS (30) parallel clients polls GET /v1/transcriptions/{id} for
-#      BURST_SECONDS; every poll must answer 200.
+#      BURST_SECONDS; every poll must answer 200;
+#   5. capabilities offer diarization, and a 2-hour two-voice MP3 (the repo's fixtures/alice.wav and bob.wav, looped)
+#      goes through create with diarize: true, PUT, and the worker's windowed diarization (one sherpa-onnx process per
+#      window, in the upload-worker cgroup) + per-turn dispatch; the job must complete diarized with its audio deleted.
 # Fails on a timeout, an OOM kill or a restart in any container; prints peak memory per container (and to
 # $GITHUB_STEP_SUMMARY when set).
 set -euo pipefail
@@ -20,6 +23,7 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 export ENVELOPE_IMAGE ENVELOPE_DIR="$REPO/test/envelope"
 WORK="$(mktemp -d "${RUNNER_TEMP:-/tmp}/ptx-envelope.XXXXXX")"
 PROCESS_DEADLINE_SECONDS="${PROCESS_DEADLINE_SECONDS:-1200}"
+DIARIZE_DEADLINE_SECONDS="${DIARIZE_DEADLINE_SECONDS:-2700}"
 DURATION_SECONDS=7199 # the 7,200 s cap minus room for MP3 encoder padding
 URL=http://127.0.0.1:8080
 MOCK=http://127.0.0.1:18081
@@ -27,6 +31,7 @@ SERVICES=(api upload-worker postgres)
 BURST_CLIENTS=30
 BURST_SECONDS=15
 MP3="$WORK/recording.mp3"
+DIARIZE_MP3="$WORK/diarize.mp3"
 
 compose() {
   docker compose -p ptx-envelope -f "$REPO/infra/dstack-batch/app-compose.yaml" -f "$ENVELOPE_DIR/compose.ci.yaml" \
@@ -61,6 +66,20 @@ SIZE="$(stat -c %s "$MP3")"
 SHA="$(sha256sum "$MP3" | cut -d' ' -f1)"
 echo "recording.mp3: $SIZE bytes in $((SECONDS - started)) s"
 [ "$SIZE" -le 120960000 ] || fail "the fixture is over the 120,960,000-byte upload cap"
+echo "::endgroup::"
+
+echo "::group::Generate a ${DURATION_SECONDS} s two-voice mono MP3 for diarization"
+# Real (synthetic) speech, so the segmentation model finds turns: alice, 1 s, bob, 1 s, repeated.
+docker run --rm --user "$(id -u):$(id -g)" --volume "$WORK:/out" --volume "$REPO/fixtures:/fixtures:ro" "$ENVELOPE_IMAGE" \
+  ffmpeg -hide_banner -loglevel error -nostdin -y -i /fixtures/alice.wav -i /fixtures/bob.wav \
+  -filter_complex "[0]aresample=16000,aformat=channel_layouts=mono,apad=pad_dur=1[a];[1]aresample=16000,aformat=channel_layouts=mono,apad=pad_dur=1[b];[a][b]concat=n=2:v=0:a=1[out]" \
+  -map "[out]" /out/cycle.wav
+docker run --rm --user "$(id -u):$(id -g)" --volume "$WORK:/out" "$ENVELOPE_IMAGE" \
+  ffmpeg -hide_banner -loglevel error -nostdin -y -stream_loop -1 -i /out/cycle.wav -t "$DURATION_SECONDS" \
+  -c:a libmp3lame -b:a 64k /out/diarize.mp3
+DSIZE="$(stat -c %s "$DIARIZE_MP3")"
+DSHA="$(sha256sum "$DIARIZE_MP3" | cut -d' ' -f1)"
+echo "diarize.mp3: $DSIZE bytes"
 echo "::endgroup::"
 
 echo "::group::Start infra/dstack-batch/app-compose.yaml with the CI overlay"
@@ -109,7 +128,7 @@ for s in "${SERVICES[@]}"; do sampler_args+=("$s=${CGROUP[$s]}"); done
 python3 - "$WORK" "${sampler_args[@]}" <<'PY' &
 import json, os, sys, time
 work, pairs = sys.argv[1], [arg.split("=", 1) for arg in sys.argv[2:]]
-anon, burst, rss = {}, {}, {}
+anon, burst, diarize, rss = {}, {}, {}, {}
 def read(path):
     try:
         with open(path) as f:
@@ -123,6 +142,8 @@ while os.path.exists(os.path.join(work, "sampling")):
         anon[name] = max(anon.get(name, 0), held)
         if os.path.exists(os.path.join(work, "burst")):
             burst[name] = max(burst.get(name, 0), held)
+        if os.path.exists(os.path.join(work, "diarize")):
+            diarize[name] = max(diarize.get(name, 0), held)
         for pid in read(f"{cgroup}/cgroup.procs").split():
             fields = dict(line.split(":", 1) for line in read(f"/proc/{pid}/status").splitlines() if ":" in line)
             if "VmRSS" in fields and "Name" in fields:
@@ -130,7 +151,7 @@ while os.path.exists(os.path.join(work, "sampling")):
                 rss[key] = max(rss.get(key, 0), int(fields["VmRSS"].split()[0]) * 1024)
     time.sleep(0.2)
 with open(os.path.join(work, "peaks.json"), "w") as f:
-    json.dump({"anon": anon, "burst": burst, "rss": rss}, f)
+    json.dump({"anon": anon, "burst": burst, "diarize": diarize, "rss": rss}, f)
 PY
 sampler=$!
 
@@ -203,8 +224,6 @@ while :; do
   sleep 2
 done
 echo "::endgroup::"
-rm -f "$WORK/sampling"
-wait "$sampler"
 
 [ "$status" = completed ] || fail "the job ended $status: $(jq -c .error <<<"$job")"
 [ -n "$burst_stage" ] || fail "the job finished before the poll burst could start"
@@ -225,19 +244,62 @@ jq -e '.bad_wav == 0 and .max_wav_bytes <= 960100' <<<"$stats" >/dev/null || fai
 jq -e '.retention.audio == "deleted"' <<<"$job" >/dev/null || fail "the audio was not deleted: $(jq -c .retention <<<"$job")"
 processing="$(jq -r '((.finished_at | sub("\\.[0-9]+"; "") | fromdateiso8601) - (.processing_started_at | sub("\\.[0-9]+"; "") | fromdateiso8601))' <<<"$job")"
 
+echo "::group::Diarize the 2-hour two-voice recording (deadline ${DIARIZE_DEADLINE_SECONDS} s)"
+curl -fsS -H "Authorization: Bearer $CLIENT_KEY" -H "X-Tenant-Ref: ${TENANT[$keep]}" "$URL/v1/transcriptions/capabilities" \
+  | jq -e '.diarization == true' >/dev/null || fail "capabilities do not offer diarization"
+d=$((keep == 1 ? 2 : 1)) # a tenant whose job was cancelled
+calls_before="$calls"
+created="$(api "$d" -X POST "$URL/v1/transcriptions" -H "Idempotency-Key: envelope-diarize" -H 'Content-Type: application/json' \
+  -d "$(jq -nc --argjson size "$DSIZE" --arg sha "$DSHA" '{content_type: "audio/mpeg", byte_size: $size, sha256: $sha, language: "en", channel_mode: "mixed", diarize: true}')")"
+DJOB="$(jq -r .id <<<"$created")"
+code="$(curl -sS -o "$WORK/put.d.json" -w '%{http_code}' -T "$DIARIZE_MP3" -H 'Expect:' -H 'Content-Type: audio/mpeg' \
+  -H "Authorization: Bearer $(jq -r .upload.capability <<<"$created")" "$URL$(jq -r .upload.path <<<"$created")")"
+[ "$code" = 201 ] || fail "the diarize upload answered $code: $(cat "$WORK/put.d.json")"
+touch "$WORK/diarize"
+deadline=$((SECONDS + DIARIZE_DEADLINE_SECONDS))
+while :; do
+  djob="$(api "$d" "$URL/v1/transcriptions/$DJOB")"
+  dstatus="$(jq -r .status <<<"$djob")"
+  echo "$(date -u +%T) status=$dstatus $(jq -c .progress <<<"$djob")"
+  case "$dstatus" in completed | failed | cancelled) break ;; esac
+  [ "$SECONDS" -lt "$deadline" ] || fail "the diarized job did not finish within ${DIARIZE_DEADLINE_SECONDS} s"
+  sleep 10
+done
+rm -f "$WORK/diarize"
+echo "::endgroup::"
+rm -f "$WORK/sampling"
+wait "$sampler"
+
+[ "$dstatus" = completed ] || fail "the diarized job ended $dstatus: $(jq -c .error <<<"$djob")"
+dresult="$(api "$d" "$URL/v1/transcriptions/$DJOB/result")"
+dstats="$(curl -fsS "$MOCK/stats")"
+dregions="$(jq -r .progress.regions_total <<<"$djob")"
+dcalls=$(($(jq -r .calls <<<"$dstats") - calls_before))
+dspeakers="$(jq -r '.speakers | length' <<<"$dresult")"
+# Two synthetic voices (TitaNet may hear them as one): more than 3 speakers means the windows were not linked.
+jq -e '.diarized == true and .channels == 1 and (.speakers | length) >= 1 and (.speakers | length) <= 3 and all(.speakers[]; (.id | test("^speaker_[0-9]+$")) and .channel == 0)' \
+  <<<"$dresult" >/dev/null || fail "the result is not diarized: $(jq -c '{diarized, channels, speakers}' <<<"$dresult")"
+[ "$dregions" -ge 200 ] || fail "diarization found only $dregions turns"
+[ "$dcalls" = "$dregions" ] || fail "$dcalls provider calls for $dregions turns"
+[ "$(jq -r '.segments | length' <<<"$dresult")" = "$dregions" ] || fail "the diarized result does not have one segment per turn"
+jq -e '.bad_wav == 0 and .max_wav_bytes <= 960100' <<<"$dstats" >/dev/null || fail "a turn was not a <= 30 s WAV: $dstats"
+jq -e '.retention.audio == "deleted"' <<<"$djob" >/dev/null || fail "the diarized job's audio was not deleted: $(jq -c .retention <<<"$djob")"
+dprocessing="$(jq -r '((.finished_at | sub("\\.[0-9]+"; "") | fromdateiso8601) - (.processing_started_at | sub("\\.[0-9]+"; "") | fromdateiso8601))' <<<"$djob")"
+
 breach=""
 rows=""
 for s in "${SERVICES[@]}"; do
   hwm="$(awk '$1 == "VmHWM:" { print $2 * 1024 }' "/proc/${PID[$s]}/status")"
   anon="$(jq -r --arg s "$s" '.anon[$s] // 0' "$WORK/peaks.json")"
   burst="$(jq -r --arg s "$s" '.burst[$s] // 0' "$WORK/peaks.json")"
+  diar="$(jq -r --arg s "$s" '.diarize[$s] // 0' "$WORK/peaks.json")"
   procs="$(jq -r --arg s "$s" '.rss | to_entries | map(select(.key | startswith($s + "/"))) | sort_by(-.value)
     | map("\(.key | split("/")[1]) \((.value / 1048576) | round)") | join(", ")' "$WORK/peaks.json")"
   peak="$(cat "${CGROUP[$s]}/memory.peak")"
   oom="$(awk '$1 == "oom_kill" { print $2 }' "${CGROUP[$s]}/memory.events")"
   restarts="$(docker inspect -f '{{.RestartCount}}' "${CID[$s]}")"
   killed="$(docker inspect -f '{{.State.OOMKilled}}' "${CID[$s]}")"
-  rows+="| $s | $(mib "${LIMIT[$s]}") | $(mib "$hwm") | $(mib "$anon") | $(mib "$burst") | $procs | $(mib "$peak") | $oom | $restarts |"$'\n'
+  rows+="| $s | $(mib "${LIMIT[$s]}") | $(mib "$hwm") | $(mib "$anon") | $(mib "$burst") | $(mib "$diar") | $procs | $(mib "$peak") | $oom | $restarts |"$'\n'
   if [ "$oom" != 0 ] || [ "$restarts" != 0 ] || [ "$killed" != false ]; then breach+="$s (oom_kill=$oom restarts=$restarts OOMKilled=$killed) "; fi
 done
 
@@ -246,9 +308,10 @@ report="### ptx-batch memory envelope (tdx.small limits, 1 CPU)
 - Recording: ${DURATION_SECONDS} s stereo 128 kbps MP3, $SIZE bytes; 3 concurrent PUTs in ${UPLOAD_SECONDS} s
 - Job: completed in ${processing} s of processing; $regions regions, $calls mocked provider calls, audio deleted
 - Poll burst: $BURST_CLIENTS parallel clients x ${BURST_SECONDS} s during $burst_stage, $BURST_POLLS GETs, all 200
+- Diarized job: ${DURATION_SECONDS} s two-voice mono 64 kbps MP3, $DSIZE bytes; completed in ${dprocessing} s of processing; $dspeakers speakers, $dregions turns, $dcalls mocked provider calls, audio deleted
 
-| service | limit MiB | pid 1 peak RSS (VmHWM) MiB | peak anon+shmem, whole container MiB | anon+shmem peak during the poll burst MiB | peak RSS per process MiB | cgroup peak incl. page cache MiB | oom_kill | restarts |
-|---|---|---|---|---|---|---|---|---|
+| service | limit MiB | pid 1 peak RSS (VmHWM) MiB | peak anon+shmem, whole container MiB | anon+shmem peak during the poll burst MiB | anon+shmem peak during diarization MiB | peak RSS per process MiB | cgroup peak incl. page cache MiB | oom_kill | restarts |
+|---|---|---|---|---|---|---|---|---|---|
 $rows"
 echo "$report"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then echo "$report" >> "$GITHUB_STEP_SUMMARY"; fi
