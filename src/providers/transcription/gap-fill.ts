@@ -27,9 +27,9 @@ import { safeTinfoilLanguage } from "./tinfoil.ts";
  * starts when the bot's capture pipeline starts, right after admission, i.e. at roughly Vexa's
  * `start_time`. Vexa exposes no exact recording start epoch (a media file's `first_chunk_at` is an
  * upload time, one 15 s timeslice late). `clock_origin_ms − start_time` therefore only centres the
- * search: the offset is accepted only when the manifest's ranges (which exist only where someone
- * spoke) land on voiced recording frames with score ≥ ALIGN_MIN_SCORE and clearly better than any
- * offset more than a second away. Otherwise nothing is sent and every span stays a listed gap:
+ * search: the offset is accepted only when the Pearson correlation between the manifest's speech
+ * indicator (ranges exist only where someone spoke) and the recording's voiced frames has one
+ * prominent peak — see analyzeAlignment. Otherwise nothing is sent and every span stays a listed gap:
  * publishing another moment's words would be worse than reporting the gap.
  */
 
@@ -42,11 +42,19 @@ export const GAP_WINDOW_MS = 29_000;
 /** Voiced windows per paid gap-fill row: bounds what one failed attempt can throw away. */
 export const GAP_CHUNK_WINDOWS = 4;
 const FRAME_MS = 100;
-/** Share of the manifest's speech frames that must land on recording speech. */
-export const ALIGN_MIN_SCORE = 0.6;
-/** The best offset must beat every offset more than ALIGN_DISTINCT_MS away by this much. */
-export const ALIGN_MIN_MARGIN = 0.05;
-const ALIGN_DISTINCT_MS = 1_000, ALIGN_MIN_FRAMES = 30, ALIGN_PRIOR_SEARCH_MS = 30_000, ALIGN_BLIND_SEARCH_MS = 600_000, ALIGN_LEAD_MS = 5_000;
+/**
+ * Alignment acceptance (TC-758, tuned on meeting 88: 2,739 s, voiced share 0.77, peak r 0.778,
+ * z 8.3 even with its own lobe counted, best r more than 3 s away 0.56). Synthetic recordings of
+ * other meetings reached at most z 4.8 and a 0.02 margin, so either bound alone rejects them. The peak must be a real correlation (r ≥ ALIGN_MIN_R),
+ * stand out from the offsets searched outside its own ±ALIGN_DISTINCT_MS lobe (z ≥ ALIGN_MIN_Z
+ * over their mean and spread), and beat the best of them by ALIGN_MIN_MARGIN.
+ */
+export const ALIGN_MIN_R = 0.3, ALIGN_MIN_Z = 6, ALIGN_MIN_MARGIN = 0.1;
+/** Offsets whose overlap keeps less than this share of the manifest's speech are not scored. */
+const ALIGN_MIN_COVERAGE = 0.8;
+/** Background offsets (outside the peak lobe) needed before a prominence means anything. */
+const ALIGN_MIN_BACKGROUND = 50;
+const ALIGN_DISTINCT_MS = 1_500, ALIGN_MIN_FRAMES = 30, ALIGN_PRIOR_SEARCH_MS = 30_000, ALIGN_BLIND_SEARCH_MS = 600_000, ALIGN_LEAD_MS = 5_000;
 /** A prior outside this band is not a recording offset (e.g. a test or legacy zero clock origin). */
 const PRIOR_MIN_MS = -60_000, PRIOR_MAX_MS = 6 * 60 * 60_000;
 const SILENT_DB = -60, MAX_WINDOWS = 20_000;
@@ -58,7 +66,8 @@ export interface GapSpec { kind: "gap_fill"; spans: GapSpan[] }
 export interface GapWindow { span: number; start_ms: number; end_ms: number }
 export type AlignWindowStatus = "voiced" | "silent" | "missing";
 /** Voiced windows carry the planned 100 ms levels (dB, rounded) of their cut, checked again at cut time. */
-export interface GapAlignResult { offset_ms: number; score: number; duration_ms: number; windows: Array<{ status: AlignWindowStatus; energy_db?: number; levels?: number[] }> }
+/** `score` is the alignment's peak Pearson r and `z` its prominence over the offsets searched. */
+export interface GapAlignResult { offset_ms: number; score: number; z: number; duration_ms: number; windows: Array<{ status: AlignWindowStatus; energy_db?: number; levels?: number[] }> }
 export interface GapChunkWindow extends GapWindow { index: number; from: number; to: number; cut_start_ms: number; levels: number[] }
 export interface GapChunkSpec { kind: "gap_chunk"; windows: GapChunkWindow[] }
 /** `mismatch`: the cut's audio did not match the aligned plan, so it was never sent (listed as a gap). */
@@ -125,33 +134,67 @@ export function priorOffsetMs(clockOriginMs: number, providerStartedAt: string |
   return Number.isFinite(prior) && prior >= PRIOR_MIN_MS && prior <= PRIOR_MAX_MS ? prior : null;
 }
 
+export interface AlignmentAnalysis {
+  accepted: boolean; offsets: number; mean_r: number | null; sd_r: number | null; prior_ms: number | null;
+  best: { offset_ms: number; r: number; z: number | null } | null; runner_up: { offset_ms: number; r: number } | null;
+}
+const round3 = (value: number) => Math.round(value * 1000) / 1000;
+
 /**
- * Verified recording offset (ms), recording time = meeting time + offset, or null. The score is
- * the share of manifest speech frames that land on voiced recording frames; the prior only
- * centres the search. Too little speech, a weak best score, or a runner-up offset more than a
- * second away within ALIGN_MIN_MARGIN (periodic or continuous audio) is unverified.
+ * Scores every candidate offset k (recording frame = meeting frame + k) by the Pearson correlation
+ * of the manifest's 0/1 speech indicator with the recording's 0/1 voiced frames over their overlap.
+ * Unlike the share of speech frames that land on voiced frames, this does not saturate when someone
+ * is almost always talking: a shift still breaks the pauses' agreement. Overlap sums come from
+ * prefix sums and the cross term iterates speech frames only, so even a blind −5…600 s search over
+ * an hour of speech stays around a hundred million additions. The prior only centres the search.
  */
-export function alignRecording(manifest: AttributedManifest, voiced: Uint8Array, priorMs: number | null): { offset_ms: number; score: number } | null {
-  const frames = new Set<number>();
-  for (const range of manifest.ranges) for (let f = Math.floor(range.start_ms / FRAME_MS); f < Math.ceil(range.end_ms / FRAME_MS); f++) frames.add(f);
-  const speech = [...frames];
-  if (speech.length < ALIGN_MIN_FRAMES || !voiced.length) return null;
+export function analyzeAlignment(manifest: AttributedManifest, voiced: Uint8Array, priorMs: number | null): AlignmentAnalysis {
+  const empty: AlignmentAnalysis = { accepted: false, offsets: 0, mean_r: null, sd_r: null, prior_ms: priorMs, best: null, runner_up: null };
+  const marks = new Set<number>();
+  for (const range of manifest.ranges) for (let f = Math.max(0, Math.floor(range.start_ms / FRAME_MS)); f < Math.ceil(range.end_ms / FRAME_MS); f++) marks.add(f);
+  if (marks.size < ALIGN_MIN_FRAMES || !voiced.length) return empty;
+  const speech = Int32Array.from(marks).sort(), frames = speech[speech.length - 1]! + 1, recording = voiced.length;
+  const speechPrefix = new Int32Array(frames + 1), voicedPrefix = new Int32Array(recording + 1);
+  for (const f of speech) speechPrefix[f + 1] = 1;
+  for (let f = 0; f < frames; f++) speechPrefix[f + 1]! += speechPrefix[f]!;
+  for (let g = 0; g < recording; g++) voicedPrefix[g + 1] = voicedPrefix[g]! + voiced[g]!;
   const centre = priorMs === null ? 0 : Math.round(priorMs / FRAME_MS);
   const [lo, hi] = priorMs === null ? [-ALIGN_LEAD_MS / FRAME_MS, ALIGN_BLIND_SEARCH_MS / FRAME_MS] : [centre - ALIGN_PRIOR_SEARCH_MS / FRAME_MS, centre + ALIGN_PRIOR_SEARCH_MS / FRAME_MS];
-  const scores = new Float64Array(hi - lo + 1);
-  let best = -1;
+  const scored: Array<{ k: number; r: number }> = [];
   for (let k = lo; k <= hi; k++) {
-    let hits = 0;
-    for (const f of speech) if (voiced[f + k] === 1) hits++;
-    const score = hits / speech.length, i = k - lo;
-    scores[i] = score;
-    if (best < 0 || score > scores[best]! || (score === scores[best]! && Math.abs(k - centre) < Math.abs(best + lo - centre))) best = i;
+    const from = Math.max(0, -k), to = Math.min(frames, recording - k), n = to - from;
+    if (n <= 0) continue;
+    const s = speechPrefix[to]! - speechPrefix[from]!;
+    if (s < speech.length * ALIGN_MIN_COVERAGE) continue;
+    const v = voicedPrefix[to + k]! - voicedPrefix[from + k]!;
+    let both = 0;
+    for (const f of speech) if (f >= from && f < to && voiced[f + k] === 1) both++;
+    const ms = s / n, mv = v / n, varS = ms - ms * ms, varV = mv - mv * mv;
+    if (varS <= 0 || varV <= 0) continue;
+    scored.push({ k, r: (both / n - ms * mv) / Math.sqrt(varS * varV) });
   }
-  const top = scores[best]!;
-  if (top < ALIGN_MIN_SCORE) return null;
-  const distinct = ALIGN_DISTINCT_MS / FRAME_MS;
-  for (let i = 0; i < scores.length; i++) if (Math.abs(i - best) > distinct && scores[i]! > top - ALIGN_MIN_MARGIN) return null;
-  return { offset_ms: (best + lo) * FRAME_MS, score: Math.round(top * 1000) / 1000 };
+  if (scored.length < 2) return { ...empty, offsets: scored.length };
+  let best = scored[0]!;
+  for (const candidate of scored) if (candidate.r > best.r || (candidate.r === best.r && Math.abs(candidate.k - centre) < Math.abs(best.k - centre))) best = candidate;
+  // Prominence is measured against the background: offsets outside the peak's own lobe, which
+  // would otherwise inflate the spread it is compared with.
+  const distinct = ALIGN_DISTINCT_MS / FRAME_MS, background = scored.filter((candidate) => Math.abs(candidate.k - best.k) > distinct);
+  if (background.length < ALIGN_MIN_BACKGROUND) return { ...empty, offsets: scored.length };
+  const mean = background.reduce((sum, c) => sum + c.r, 0) / background.length;
+  const sd = Math.sqrt(background.reduce((sum, c) => sum + (c.r - mean) ** 2, 0) / background.length);
+  let runner = background[0]!;
+  for (const candidate of background) if (candidate.r > runner.r) runner = candidate;
+  const z = sd > 0 ? (best.r - mean) / sd : null;
+  const accepted = best.r >= ALIGN_MIN_R && z !== null && z >= ALIGN_MIN_Z && best.r - runner.r >= ALIGN_MIN_MARGIN;
+  return { accepted, offsets: scored.length, mean_r: round3(mean), sd_r: round3(sd), prior_ms: priorMs,
+    best: { offset_ms: best.k * FRAME_MS, r: round3(best.r), z: z === null ? null : Math.round(z * 10) / 10 },
+    runner_up: { offset_ms: runner.k * FRAME_MS, r: round3(runner.r) } };
+}
+
+/** Verified recording offset (ms), recording time = meeting time + offset, or null. `score` is the peak Pearson r. */
+export function alignRecording(manifest: AttributedManifest, voiced: Uint8Array, priorMs: number | null): { offset_ms: number; score: number; z: number } | null {
+  const analysis = analyzeAlignment(manifest, voiced, priorMs);
+  return analysis.accepted && analysis.best ? { offset_ms: analysis.best.offset_ms, score: analysis.best.r, z: analysis.best.z! } : null;
 }
 
 /**
@@ -173,7 +216,7 @@ function cutLevel(levels: Float64Array, from: number, to: number): number {
 }
 
 /** The align step's result: every window classified against the recording at a verified offset. */
-export function planAlignment(spec: GapSpec, levels: Float64Array, durationSec: number, alignment: { offset_ms: number; score: number }): GapAlignResult {
+export function planAlignment(spec: GapSpec, levels: Float64Array, durationSec: number, alignment: { offset_ms: number; score: number; z: number }): GapAlignResult {
   const windows = gapWindows(spec).map((window) => {
     const cut = recordingCut(window, alignment.offset_ms, durationSec);
     if (!cut) return { status: "missing" as const };
@@ -209,7 +252,7 @@ const finite = (value: unknown): value is number => typeof value === "number" &&
 /** Untrusted stored align result; only a verified alignment over exactly the spec's windows is usable. */
 export function validAlignResult(spec: GapSpec, value: unknown): GapAlignResult | null {
   const result = value as GapAlignResult, expected = gapWindows(spec).length;
-  if (!result || typeof result !== "object" || !finite(result.offset_ms) || !finite(result.score) || result.score < ALIGN_MIN_SCORE || !finite(result.duration_ms) || result.duration_ms <= 0
+  if (!result || typeof result !== "object" || !finite(result.offset_ms) || !finite(result.score) || result.score < ALIGN_MIN_R || !finite(result.z) || result.z < ALIGN_MIN_Z || !finite(result.duration_ms) || result.duration_ms <= 0
       || !Array.isArray(result.windows) || result.windows.length !== expected || expected > MAX_WINDOWS
       || result.windows.some((window) => !window || !["voiced", "silent", "missing"].includes(window.status)
         || (window.status === "voiced" && (!Array.isArray(window.levels) || window.levels.length > 400 || !window.levels.every(finite))))) return null;

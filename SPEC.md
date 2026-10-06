@@ -90,19 +90,25 @@ batches that yielded no kept text (a voiced window answered empty, text dropped 
 audio) — is re-read from Vexa's retained mixed recording. One unpaid step streams the recording into
 100 ms levels and aligns it to the meeting clock: the recording starts when the bot's capture starts
 (about Vexa's `start_time`) while the clock origin is its first audible frame, so
-`clock_origin_ms − start_time` only centres the search, and an offset is used only when the
-manifest's speech ranges land on recording speech (score ≥ 0.6, and ≥ 0.05 better than any offset
-more than 1 s away). Without a verified alignment nothing is sent and every span is a listed gap.
+`clock_origin_ms − start_time` only centres the search (±30 s; −5…600 s without it). Each offset
+is scored by the Pearson correlation between the manifest's speech indicator and the recording's
+voiced 100 ms frames, which still discriminates when someone is talking almost all the time. An
+offset is used only for a prominent peak: r ≥ 0.3, z ≥ 6 against the offsets outside its own ±1.5 s
+lobe, and ≥ 0.1 above the best of them. Without a verified alignment nothing is sent and every span
+is a listed gap.
 Voiced windows (≤ 29 s each) are then transcribed in paid groups of ≤ 4 windows, each group its own
 retried attempt ledger, so a failure loses only that group's work. Levels and cuts come from one
 decode path (`aresample=async=1`, which fills container-timestamp gaps; cuts by decoded sample
 offset, never `-ss`), so they share one clock; a cut whose measured 100 ms envelope does not match
 the one alignment planned is not sent and its window is listed as a gap. The recording is downloaded
-once per meeting to a worker-local cache removed when the meeting finalizes, fails or is deleted;
+once per meeting (a download shorter than its `content-length` is retried, never cached) to a
+worker-local cache removed when the meeting publishes or fails; a deleted meeting's cache is removed
+by the worker's sweep within about a minute;
 unpaid preparation renews its claim so a slow download is not mistaken for a crash, and one
 meeting's gap fill holds at most one of the two background slots. `bun run cli gapfill-check
 --meeting <id|vexa id> [--windows N] [--all]` runs the alignment and a few cuts against a real
-recording and prints planned vs measured energy, sending nothing to Tinfoil.
+recording and prints the correlation peak (best offset, r, z, runner-up, prior) and planned vs
+measured energy, sending nothing to Tinfoil.
 Recovered text publishes with `source:"recording"` under the speaker of that speech with
 `attribution:"provisional"`; unresolved speech takes the same-channel inference (provisional) or
 `Unknown` with `attribution:"unknown"`. Anything still untranscribed — and any gap-fill result that

@@ -333,6 +333,23 @@ const meetRange = (botId: number, sequence: number, speaker: string, channel: nu
   ...(state === "uploaded" ? { path: `/meetings/${botId}/attributed-audio/ranges/${sequence}` } : {}),
 });
 
+/**
+ * Another participant talking irregularly through a 2-3 minute meeting. Real recordings are long
+ * and full of speech structure; alignment only accepts a correlation peak that stands out from a
+ * long background, so a test recording of a few seconds would rightly not align (TC-758).
+ */
+const DANA_STARTS = [20_000, 23_400, 29_100, 31_000, 36_700, 44_200, 47_900, 52_300, 58_800, 61_100, 67_400, 73_900, 76_200, 82_800, 88_100,
+  91_700, 97_300, 104_600, 107_100, 113_900, 118_200, 124_700, 129_300, 133_100, 139_800, 146_400];
+const danaPcm = speech(0.05);
+const dana = (shiftMs = 0) => DANA_STARTS.map((start) => ({ speaker: "Dana", channel: 5, start_ms: start + shiftMs, bytes: danaPcm }));
+const DANA_MS = DANA_STARTS.length * 1_000;
+/** A mixed recording: speech level wherever a range spoke, shifted by `offsetMs`, background elsewhere. */
+function mixedRecording(ranges: Array<{ start_ms: number; ms?: number }>, offsetMs: number, seconds: number): Uint8Array {
+  const mixed = new Int16Array(seconds * PCM_RATE).fill(10);
+  for (const r of ranges) mixed.fill(4_000, (r.start_ms + offsetMs) * 16, (r.start_ms + (r.ms ?? 1_000) + offsetMs) * 16);
+  return pcmToWav(mixed, PCM_RATE);
+}
+
 /** Runs one Google Meet capture to a terminal meeting and returns its API views. */
 async function attributedMeeting(native: string, ranges: Array<{ speaker: string; channel: number; start_ms: number; bytes: Uint8Array; state?: "uploaded" | "failed"; ms?: number }>, recording?: Uint8Array) {
   const { id } = await (await h.api("/v1/meetings", { method: "POST", json: { meeting_url: `https://meet.google.com/${native}` } })).json();
@@ -393,17 +410,17 @@ test("a batch exhausted after retries is filled from the retained recording on t
   const ranges = [
     ...[0, 3_000, 6_000, 9_000].map((start_ms) => ({ speaker: "Alice", channel: 0, start_ms, bytes: alicePcm })),
     ...[12_000, 15_000].map((start_ms) => ({ speaker: "Bob", channel: 1, start_ms, bytes: bobPcm })),
+    ...dana(),
   ];
-  const offsetMs = 1_500, mixed = new Int16Array(20 * PCM_RATE).fill(10);
-  for (const r of ranges) mixed.fill(4_000, (r.start_ms + offsetMs) * 16, (r.start_ms + 1_000 + offsetMs) * 16);
   const downloads = () => h.vexa.requests.filter((request) => /^\/recordings\/\d+\/raw$/.test(request.path)).length;
   const downloadsBefore = downloads();
-  const { id, meeting, transcript, run, batches, attempts } = await attributedMeeting("gap-fill-rec", ranges, pcmToWav(mixed, PCM_RATE));
+  const { id, meeting, transcript, run, batches, attempts } = await attributedMeeting("gap-fill-rec", ranges, mixedRecording(ranges, 1_500, 160));
   // Downloaded once for the meeting (align and chunk share the cache), removed once published.
   expect(downloads() - downloadsBefore).toBe(1);
   expect(existsSync(recordingCachePath(id))).toBe(false);
   expect(meeting).toMatchObject({ status: "completed", transcript_partial: true });
   const bob = batches.find((b) => b.kind === "batch" && b.status !== "completed")!;
+  expect(batches.filter((b) => b.kind === "batch" && b.status !== "completed")).toHaveLength(1);
   expect([bob.status, bob.attempts]).toEqual(["ambiguous", 6]);
   expect(attempts.filter((a) => a.batchId === bob.id).every((a) => a.status === "ambiguous")).toBe(true);
   // One unpaid align row, then one paid chunk row for Bob's two voiced windows.
@@ -413,13 +430,13 @@ test("a batch exhausted after retries is filled from the retained recording on t
   expect([chunk.ordinal, chunk.status, chunk.attempts]).toEqual([-2, "completed", 1]);
   expect(gapRequests).toEqual(["gap-0.wav", "gap-1.wav"]);
   // Bob's lost speech is back under Bob, provisional, marked as recording-sourced, in spoken order.
-  expect(transcript.segments.map((s: any) => [s.speaker_name, s.text, s.start, s.end, s.attribution, s.source])).toEqual([
+  expect(transcript.segments.filter((s: any) => s.speaker_name !== "Dana").map((s: any) => [s.speaker_name, s.text, s.start, s.end, s.attribution, s.source])).toEqual([
     ["Alice", "sealed words", 0, 10, "identified", undefined],
     ["Bob", "recovered words", 12, 13, "provisional", "recording"],
     ["Bob", "recovered words", 15, 16, "provisional", "recording"],
   ]);
   expect(transcript.gaps).toBeUndefined();
-  expect(run.coverageJson).toMatchObject({ captured_ms: 6_000, transcribed_ms: 6_000, attributed_ms: 4_000, recording_ms: 2_000, gap_ms: 0, gap_align: "completed", gap_chunks: 1, gap_chunks_filled: 1, gap_rows_unverified: 0 });
+  expect(run.coverageJson).toMatchObject({ captured_ms: 6_000 + DANA_MS, transcribed_ms: 6_000 + DANA_MS, attributed_ms: 4_000 + DANA_MS, recording_ms: 2_000, gap_ms: 0, gap_align: "completed", gap_chunks: 1, gap_chunks_filled: 1, gap_rows_unverified: 0 });
 }, 60_000);
 
 test("speech no path could transcribe is listed as gaps and alerted, never dropped silently (TC-758)", async () => {
@@ -488,20 +505,21 @@ test("ten seconds of voiced audio answered empty inside a completed batch are re
   const recovery = h.ctx.transcriptRecovery;
   h.ctx.transcriptRecovery = new TinfoilTranscriptionProvider({ baseUrl: "http://tinfoil.invalid", apiKey: "test", model: "test", attributedModel: "whisper-test", fetch: fetchMock });
   const timed = (text: string, end: number) => new Response(JSON.stringify({ text, language: "en", segments: text ? [{ start: 0.3, end, text, avg_logprob: -0.2 }] : [] }));
+  // Alice's batch key (her ranges are sequences 0-2): only her second window comes back empty.
+  const aliceBatch = `batch-${createHash("sha256").update(["r0", "r1", "r2"].join("\u0000")).digest("hex")}`;
   respond = (request) => request.filename.startsWith("gap-") ? timed("recovered words", 9.5)
-    : request.filename.endsWith("-1.wav") ? timed("", 0) : timed("first words", 20);
+    : request.filename === `${aliceBatch}-1.wav` ? timed("", 0) : request.filename.startsWith(aliceBatch) ? timed("first words", 20) : timed("dana words", 0.9);
   const block = (ms: number) => new Uint8Array(new Float32Array(ms * 16).fill(0.1).buffer);
   const ranges = [{ start_ms: 0, ms: 12_000 }, { start_ms: 14_000, ms: 11_000 }, { start_ms: 35_000, ms: 10_000 }];
-  const offsetMs = 2_000, mixed = new Int16Array(50 * PCM_RATE).fill(10);
-  for (const r of ranges) mixed.fill(4_000, (r.start_ms + offsetMs) * 16, (r.start_ms + r.ms + offsetMs) * 16);
+  const meetingRanges = [...ranges.map((r) => ({ speaker: "Alice", channel: 0, start_ms: r.start_ms, bytes: block(r.ms), ms: r.ms })), ...dana(30_000)];
   try {
-    const { id, meeting, transcript, run, batches } = await attributedMeeting("ten-seco-nds", ranges.map((r) => ({ speaker: "Alice", channel: 0, start_ms: r.start_ms, bytes: block(r.ms), ms: r.ms })), pcmToWav(mixed, PCM_RATE));
+    const { id, meeting, transcript, run, batches } = await attributedMeeting("ten-seco-nds", meetingRanges, mixedRecording(meetingRanges, 2_000, 190));
     expect(meeting).toMatchObject({ status: "completed", transcript_partial: true });
     // The batch completed on its first attempt; the empty window's 10 s became a gap-fill part.
-    expect(batches.filter((b) => b.kind === "batch").map((b) => [b.status, b.attempts])).toEqual([["completed", 1]]);
-    expect(transcript.segments.map((s: any) => [s.text, s.start, s.source])).toEqual([["first words", 0.3, undefined], ["recovered words", 35, "recording"]]);
+    expect(batches.filter((b) => b.kind === "batch").every((b) => b.status === "completed" && b.attempts === 1)).toBe(true);
+    expect(transcript.segments.filter((s: any) => s.speaker_name === "Alice").map((s: any) => [s.text, s.start, s.source])).toEqual([["first words", 0.3, undefined], ["recovered words", 35, "recording"]]);
     expect(transcript.gaps).toBeUndefined();
-    expect(run.coverageJson).toMatchObject({ captured_ms: 33_000, attributed_ms: 23_000, recording_ms: 10_000, transcribed_ms: 33_000, gap_ms: 0 });
+    expect(run.coverageJson).toMatchObject({ captured_ms: 33_000 + DANA_MS, attributed_ms: 23_000 + DANA_MS, recording_ms: 10_000, transcribed_ms: 33_000 + DANA_MS, gap_ms: 0 });
     expect((await transcriptEvalReport(h.ctx, id)).coverage).toMatchObject({ gap_ms: 0 });
   } finally { h.ctx.transcriptRecovery = recovery; }
 }, 60_000);
@@ -707,14 +725,14 @@ test("a cut that no longer matches its alignment is never sent and is listed as 
 
 test("gapfill-check aligns and cuts a real recording without sending anything", async () => {
   respond = (request) => { throw new Error(`unexpected Tinfoil call ${request.filename}`); };
-  const ranges = [0, 3_000, 6_500, 9_000, 14_000, 17_500].map((start_ms) => ({ speaker: "Alice", channel: 0, start_ms, bytes: alicePcm }));
-  const offsetMs = 2_200, mixed = new Int16Array(25 * PCM_RATE).fill(10);
-  for (const r of ranges) mixed.fill(4_000, (r.start_ms + offsetMs) * 16, (r.start_ms + 1_000 + offsetMs) * 16);
-  // Tinfoil throws for every call, so the meeting's own batch exhausts; the check is independent of that.
-  const { id } = await attributedMeeting("gap-chec-kxx", ranges, pcmToWav(mixed, PCM_RATE));
+  const ranges = [...[0, 3_000, 6_500, 9_000, 14_000, 17_500].map((start_ms) => ({ speaker: "Alice", channel: 0, start_ms, bytes: alicePcm })), ...dana()];
+  // Tinfoil throws for every call, so the meeting's own batches exhaust; the check is independent of that.
+  const { id } = await attributedMeeting("gap-chec-kxx", ranges, mixedRecording(ranges, 2_200, 160));
   const attemptsBefore = (await h.ctx.db.select().from(attributedAttempts)).length;
   const report = await gapFillCheck(h.ctx, id, { windows: 3, all: true });
-  expect(report).toMatchObject({ spans_from: "all_ranges", alignment: { offset_ms: 2_200 } });
+  expect(report).toMatchObject({ spans_from: "all_ranges", alignment: { offset_ms: 2_200 }, analysis: { accepted: true, prior_ms: null, best: { offset_ms: 2_200, r: 1 } } });
+  expect(report.analysis.best!.z!).toBeGreaterThanOrEqual(6);
+  expect(report.analysis.runner_up!.r).toBeLessThan(0.9);
   expect(report.checked).toHaveLength(3);
   expect(report.checked.every((window) => window.match && window.diff_db < 1)).toBe(true);
   expect((await h.ctx.db.select().from(attributedAttempts)).length).toBe(attemptsBefore);

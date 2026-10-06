@@ -86,8 +86,10 @@ switch (cmd) {
     if (windows !== undefined && (!Number.isSafeInteger(windows) || windows <= 0)) fail("--windows must be a positive integer");
     const ctx = createContext();
     const report = await gapFillCheck(ctx, meetingId, { windows, all: rest.includes("--all") });
-    const { checked, ...summary } = report;
+    const { checked, analysis, ...summary } = report;
     console.log(JSON.stringify(summary, null, 2));
+    const a = analysis;
+    console.log(`alignment: ${a.accepted ? "ACCEPTED" : "REJECTED"} — best ${a.best ? `${a.best.offset_ms} ms r=${a.best.r} z=${a.best.z}` : "none"}; runner-up (>1.5 s away) ${a.runner_up ? `${a.runner_up.offset_ms} ms r=${a.runner_up.r}` : "none"}; prior ${a.prior_ms ?? "none"} ms; ${a.offsets} offsets, r mean ${a.mean_r} sd ${a.sd_r}; speech frames ${a.speech_frames}, recording frames ${a.recording_frames}, voiced share ${a.voiced_share}`);
     if (checked.length) console.table(checked);
     else console.log(report.alignment ? "no voiced windows to cut" : "recording did not align: gap fill would send nothing and list every span as a gap");
     process.exit(0);

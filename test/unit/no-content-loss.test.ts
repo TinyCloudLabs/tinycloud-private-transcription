@@ -8,7 +8,7 @@ import { laneAdmits } from "../../src/worker/index.ts";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { acceptWindowText, alignRecording, envelopeMatch, frameLevels, GAP_PAD_MS, gapChunks, gapOutcome, gapSpec, gapWindows, MAX_WINDOW_TEXT, priorOffsetMs, recordingCut, validChunkResult, voicedFrames, type GapAlignResult, type GapChunkSpec, type GapWindowText } from "../../src/providers/transcription/gap-fill.ts";
+import { acceptWindowText, alignRecording, analyzeAlignment, envelopeMatch, frameLevels, GAP_PAD_MS, gapChunks, gapOutcome, gapSpec, gapWindows, MAX_WINDOW_TEXT, priorOffsetMs, recordingCut, validChunkResult, voicedFrames, type GapAlignResult, type GapChunkSpec, type GapWindowText } from "../../src/providers/transcription/gap-fill.ts";
 import { sliceDbfs, TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
 import { attemptLimit, attemptModel, attemptsVerified, retryDelayMs } from "../../src/services/attributed-ledger.ts";
 
@@ -195,7 +195,7 @@ describe("recording gap fill (TC-758)", () => {
     const windows = gapWindows(spec);
     expect(windows).toHaveLength(11);
     expect(windows.every((w) => w.end_ms - w.start_ms + 2 * GAP_PAD_MS <= 29_500)).toBe(true);
-    const align: GapAlignResult = { offset_ms: 1_000, score: 0.9, duration_ms: 400_000, windows: windows.map((_, i) => ({ status: i === 3 ? "silent" : "voiced" })) };
+    const align: GapAlignResult = { offset_ms: 1_000, score: 0.9, z: 9, duration_ms: 400_000, windows: windows.map((_, i) => ({ status: i === 3 ? "silent" : "voiced" })) };
     const chunks = gapChunks(spec, align);
     expect(chunks.map((chunk) => chunk.windows.map((w) => w.index))).toEqual([[0, 1, 2, 4], [5, 6, 7, 8], [9, 10]]);
     // Cuts are widened to whole 100 ms level frames: 0.75 s → 0.7 s.
@@ -209,8 +209,8 @@ describe("recording gap fill (TC-758)", () => {
     const seconds = 45, samples = new Int16Array(seconds * PCM_RATE).fill(10);
     for (const r of ranges) samples.fill(8_000, Math.round((r.start_ms + 7_300) * 16), Math.round((r.end_ms + 7_300) * 16));
     const voiced = voicedFrames(frameLevels(samples, PCM_RATE));
-    expect(alignRecording(input, voiced, null)).toEqual({ offset_ms: 7_300, score: 1 });
-    expect(alignRecording(input, voiced, 6_000)).toEqual({ offset_ms: 7_300, score: 1 });
+    expect(alignRecording(input, voiced, null)).toMatchObject({ offset_ms: 7_300, score: 1 });
+    expect(alignRecording(input, voiced, 6_000)).toMatchObject({ offset_ms: 7_300, score: 1 });
     // No speech structure: the start_time estimate alone is never trusted.
     expect(alignRecording(input, new Uint8Array(voiced.length), 6_000)).toBeNull();
     // Continuous speech fits every offset equally: ambiguous, so unverified.
@@ -245,7 +245,7 @@ describe("recording gap fill (TC-758)", () => {
   test("filled text publishes under the span's speaker as recording-sourced; empty, dropped and unfilled speech is listed", () => {
     const input = manifest([range(0, "Alice", 10_000, 12_000), range(1, "Bob", 20_000, 22_000, { channel: 1 }), range(2, "Bob", 50_000, 51_000, { channel: 1 })]);
     const spec = gapSpec(input, input.ranges.map(full));
-    const align: GapAlignResult = { offset_ms: 2_000, score: 1, duration_ms: 60_000, windows: [{ status: "voiced" }, { status: "voiced" }, { status: "voiced" }] };
+    const align: GapAlignResult = { offset_ms: 2_000, score: 1, z: 9, duration_ms: 60_000, windows: [{ status: "voiced" }, { status: "voiced" }, { status: "voiced" }] };
     const chunks = gapChunks(spec, align);
     const texts = new Map<number, GapWindowText>([
       [0, { index: 0, status: "text", text: "Alice words.", energy_dbfs: -20, segments: [{ start: 0.3, end: 1.2, text: "Alice words.", avg_logprob: -0.2, energy_dbfs: -20 }, { start: 1.3, end: 2.2, text: "Thank you.", avg_logprob: -1.5, energy_dbfs: -20 }] }],
@@ -271,7 +271,7 @@ describe("recording gap fill (TC-758)", () => {
     const input = manifest([range(0, "Alice", 0, 1_000), range(1, "Alice", 1_500, 2_500)]);
     const [spec] = attributedBatches(manifest([input.ranges[0]!]), 1);
     const gap = gapSpec(input, [full(input.ranges[1]!)]);
-    const chunks = gapChunks(gap, { offset_ms: 0, score: 1, duration_ms: 10_000, windows: [{ status: "voiced" }] });
+    const chunks = gapChunks(gap, { offset_ms: 0, score: 1, z: 9, duration_ms: 10_000, windows: [{ status: "voiced" }] });
     const recovered = gapOutcome(gap, chunks, new Map([[0, { index: 0, status: "text" as const, text: "Later words.", energy_dbfs: -20 }]])).pieces;
     const { transcript } = assembleAttributedTranscript(input, [{ spec: spec!, result: { text: "First words." } }], "en", recovered);
     expect(transcript.segments.map((s) => [s.text, s.source])).toEqual([["First words.", undefined], ["Later words.", "recording"]]);
@@ -325,5 +325,62 @@ describe("recording clock and cut verification (TC-758 re-review)", () => {
     expect(laneAdmits([gap("m1", 0)], gap("m2", 0))).toBe(true);
     expect(laneAdmits([gap("m1", 0)], batch("m1", 3))).toBe(true);
     expect(laneAdmits([gap("m1", 0), batch("m2", 0)], batch("m3", 0))).toBe(false);
+  });
+});
+
+describe("alignment by correlation peak (TC-758, meeting 88)", () => {
+  /** Deterministic PRNG so the synthetic meetings are reproducible. */
+  const rng = (seed: number) => () => { seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648; return seed / 2_147_483_648; };
+  /** A 20-minute meeting where someone is almost always talking: 2–9 s turns, 0.2–1.2 s pauses. */
+  function busyMeeting(seed: number) {
+    const random = rng(seed), ranges: Array<{ start_ms: number; end_ms: number }> = [];
+    for (let t = 0; t < 1_200_000;) { const turn = 2_000 + Math.floor(random() * 7_000); ranges.push({ start_ms: t, end_ms: t + turn }); t += turn + 200 + Math.floor(random() * 1_000); }
+    return { ranges, manifest: { ranges } as unknown as AttributedManifest };
+  }
+  /** Recording voiced frames: the manifest's speech at `offsetMs`, plus crosstalk/noise in pauses and dropouts. */
+  function recordingOf(ranges: Array<{ start_ms: number; end_ms: number }>, offsetMs: number, seed: number, frames = 12_400) {
+    const random = rng(seed), voiced = new Uint8Array(frames);
+    for (const range of ranges) for (let f = Math.floor((range.start_ms + offsetMs) / 100); f < Math.ceil((range.end_ms + offsetMs) / 100) && f < frames; f++) if (f >= 0) voiced[f] = 1;
+    // ~10% dropouts in speech, ~45% crosstalk/noise in pauses: voiced share ≈ 0.84, like meeting 88.
+    for (let f = 0; f < frames; f++) { const roll = random(); if (voiced[f] ? roll < 0.1 : roll < 0.45) voiced[f] = voiced[f] ? 0 : 1; }
+    return voiced;
+  }
+  /** The previous criterion: share of speech frames on voiced frames, margin 0.05 beyond 1 s. */
+  function shareCriterion(manifest: AttributedManifest, voiced: Uint8Array, lo: number, hi: number) {
+    const speech = [...new Set(manifest.ranges.flatMap((r) => Array.from({ length: Math.ceil(r.end_ms / 100) - Math.floor(r.start_ms / 100) }, (_, i) => Math.floor(r.start_ms / 100) + i)))];
+    const scores = new Map<number, number>();
+    for (let k = lo; k <= hi; k++) scores.set(k, speech.filter((f) => voiced[f + k] === 1).length / speech.length);
+    const best = [...scores].reduce((a, b) => (b[1] > a[1] ? b : a));
+    return [...scores].every(([k, score]) => Math.abs(k - best[0]) <= 10 || score <= best[1] - 0.05);
+  }
+
+  test("a meeting where someone is always talking aligns by correlation, though the share score plateaus", () => {
+    const { ranges, manifest } = busyMeeting(88);
+    const voiced = recordingOf(ranges, 6_200, 7);
+    const share = voiced.reduce((sum, v) => sum + v, 0) / voiced.length;
+    expect(share).toBeGreaterThan(0.8);
+    // The old share-of-hits criterion cannot separate the true offset from its neighbourhood.
+    expect(shareCriterion(manifest, voiced, 62 - 200, 62 + 200)).toBe(false);
+    const analysis = analyzeAlignment(manifest, voiced, 6_183);
+    expect(analysis).toMatchObject({ accepted: true, best: { offset_ms: 6_200 } });
+    expect(analysis.best!.z!).toBeGreaterThan(15);
+    expect(analysis.best!.r - analysis.runner_up!.r).toBeGreaterThan(0.25);
+    // A blind search (no start_time) finds the same offset.
+    expect(alignRecording(manifest, voiced, null)).toMatchObject({ offset_ms: 6_200 });
+  });
+
+  test("a shuffled or different recording is never aligned", () => {
+    const { ranges, manifest } = busyMeeting(88);
+    const voiced = recordingOf(ranges, 6_200, 7);
+    // Same audio statistics, 30 s blocks shuffled: the speech pattern no longer lines up anywhere.
+    const random = rng(3), blocks = Array.from({ length: Math.ceil(voiced.length / 300) }, (_, i) => voiced.slice(i * 300, (i + 1) * 300));
+    for (let i = blocks.length - 1; i > 0; i--) { const j = Math.floor(random() * (i + 1)); [blocks[i], blocks[j]] = [blocks[j]!, blocks[i]!]; }
+    const shuffled = new Uint8Array(voiced.length); let at = 0; for (const block of blocks) { shuffled.set(block, at); at += block.length; }
+    expect(analyzeAlignment(manifest, shuffled, 6_183).accepted).toBe(false);
+    expect(alignRecording(manifest, shuffled, null)).toBeNull();
+    // Another meeting's recording.
+    const other = busyMeeting(1234);
+    expect(alignRecording(manifest, recordingOf(other.ranges, 6_200, 9), 6_183)).toBeNull();
+    expect(alignRecording(manifest, recordingOf(other.ranges, 6_200, 9), null)).toBeNull();
   });
 });

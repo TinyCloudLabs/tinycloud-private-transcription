@@ -139,6 +139,11 @@ export class VexaClient {
     try {
       if (res.body) for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) { await file.write(chunk); size += chunk.byteLength; }
     } finally { await file.close(); }
+    // A connection cut mid-body can end the stream quietly; a short file must never be cached as
+    // the recording. Not-ready is retried on the caller's fetch budget (TC-758).
+    // (A content-encoded body's length is the encoded size, so it cannot be compared.)
+    const declared = res.headers.get("content-length"), encoding = res.headers.get("content-encoding");
+    if (declared !== null && (!encoding || encoding === "identity") && Number(declared) !== size) throw new ApiError("provider_unavailable", "Retained file download was truncated");
     return size;
   }
 

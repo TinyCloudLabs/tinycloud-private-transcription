@@ -7,7 +7,7 @@ import { attributedAttempts, attributedBatches as batchesTable, attributedRanges
 import { attributedBatches, bySequence, readAttributedBatch, type AttributedBatch, type AttributedCapability, type AttributedManifest } from "../providers/transcription/attributed.ts";
 import { assembleRawPieces, attributedPieces, partsMs, type AttributedResult, type GapPart, type RawPiece } from "../providers/transcription/attributed-assembly.ts";
 import { recordingCuts, recordingLevels, type Pcm16 } from "../providers/transcription/audio.ts";
-import { acceptWindowText, alignRecording, envelopeMatch, frameLevels, gapChunks, gapOutcome, gapSpec, planAlignment, priorOffsetMs, validAlignResult, validChunkResult, voicedFrames, type GapChunkResult, type GapChunkSpec, type GapSpec, type GapWindowText } from "../providers/transcription/gap-fill.ts";
+import { acceptWindowText, analyzeAlignment, envelopeMatch, frameLevels, gapChunks, gapOutcome, gapSpec, planAlignment, priorOffsetMs, validAlignResult, validChunkResult, voicedFrames, type AlignmentAnalysis, type GapChunkResult, type GapChunkSpec, type GapSpec, type GapWindowText } from "../providers/transcription/gap-fill.ts";
 import { ATTEMPT_DEADLINE_MS, safeTinfoilLanguage, TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
 import type { TranscriptGap } from "../domain/transcript.ts";
 import { attemptLimit, attemptModel, attemptsVerified, retryDelayMs } from "./attributed-ledger.ts";
@@ -481,8 +481,13 @@ async function processGapAlign(ctx: AppContext, meetingId: string, batchId: stri
     if (await releaseFailedFetch(ctx, meetingId, batchId, token, fetchAttempts)) return "deferred";
     return unfilled("recording_unavailable");
   }
-  const alignment = alignRecording(gap.manifest, voicedFrames(levels.levels), priorOffsetMs(gap.manifest.clock_origin_ms, gap.meeting.captureDiagnostics?.started_at));
-  if (!alignment) return unfilled("recording_unaligned");
+  const analysis = analyzeAlignment(gap.manifest, voicedFrames(levels.levels), priorOffsetMs(gap.manifest.clock_origin_ms, gap.meeting.captureDiagnostics?.started_at));
+  if (!analysis.accepted || !analysis.best) {
+    ctx.log.warn("recording alignment not verified", { meetingId, stage: "attributed_gap_fill", code: "recording_unaligned", bestOffsetMs: analysis.best?.offset_ms, bestR: analysis.best?.r,
+      z: analysis.best?.z, runnerUpR: analysis.runner_up?.r, runnerUpOffsetMs: analysis.runner_up?.offset_ms, priorMs: analysis.prior_ms, offsets: analysis.offsets });
+    return unfilled("recording_unaligned");
+  }
+  const alignment = { offset_ms: analysis.best.offset_ms, score: analysis.best.r, z: analysis.best.z! };
   const result = planAlignment(spec, levels.levels, levels.durationSec, alignment);
   if (await settle(ctx, batchId, token, "completed", meetingId, [], result)) ctx.log.info("recording aligned for gap fill", { meetingId, stage: "attributed_gap_fill",
     offsetMs: result.offset_ms, score: result.score, windows: result.windows.length, voiced: result.windows.filter((window) => window.status === "voiced").length });
@@ -887,7 +892,10 @@ export async function reconcileAttributedRuns(ctx: AppContext): Promise<void> {
 export interface GapFillCheckWindow { index: number; speaker_name: string; start: number; end: number; from: number; to: number; planned_db: number; measured_db: number; diff_db: number; r: number | null; match: boolean }
 export interface GapFillCheckReport {
   meetingId: string; vexaMeetingId: number; spans_from: "untranscribed" | "all_ranges"; spans: number; windows: number; voiced_windows: number;
-  recording_sec: number; prior_offset_ms: number | null; alignment: { offset_ms: number; score: number } | null; checked: GapFillCheckWindow[];
+  recording_sec: number; prior_offset_ms: number | null; alignment: { offset_ms: number; score: number; z: number } | null;
+  /** Correlation peak diagnostics, reported whether or not the alignment was accepted. */
+  analysis: AlignmentAnalysis & { speech_frames: number; recording_frames: number; voiced_share: number };
+  checked: GapFillCheckWindow[];
 }
 
 /**
@@ -918,8 +926,11 @@ export async function gapFillCheck(ctx: AppContext, meetingRef: string, opts: { 
     await fetchRetainedRecordingToFile(ctx, meeting.vexaMeetingId, file);
     const { levels, durationSec } = await recordingLevels(file);
     const prior = priorOffsetMs(manifest.clock_origin_ms, meeting.captureDiagnostics?.started_at);
-    const alignment = alignRecording(manifest, voicedFrames(levels), prior);
-    const base = { meetingId: meeting.id, vexaMeetingId: meeting.vexaMeetingId, spans_from: spansFrom, spans: spec.spans.length, recording_sec: Math.round(durationSec * 10) / 10, prior_offset_ms: prior, alignment };
+    const voicedMask = voicedFrames(levels), analyzed = analyzeAlignment(manifest, voicedMask, prior);
+    const alignment = analyzed.accepted && analyzed.best ? { offset_ms: analyzed.best.offset_ms, score: analyzed.best.r, z: analyzed.best.z! } : null;
+    const speechFrames = new Set(manifest.ranges.flatMap((range) => Array.from({ length: Math.max(0, Math.ceil(range.end_ms / 100) - Math.floor(range.start_ms / 100)) }, (_, i) => Math.floor(range.start_ms / 100) + i))).size;
+    const analysis = { ...analyzed, speech_frames: speechFrames, recording_frames: voicedMask.length, voiced_share: Math.round(voicedMask.reduce((sum, v) => sum + v, 0) / Math.max(1, voicedMask.length) * 1000) / 1000 };
+    const base = { meetingId: meeting.id, vexaMeetingId: meeting.vexaMeetingId, spans_from: spansFrom, spans: spec.spans.length, recording_sec: Math.round(durationSec * 10) / 10, prior_offset_ms: prior, alignment, analysis };
     if (!alignment) return { ...base, windows: 0, voiced_windows: 0, checked: [] };
     const plan = planAlignment(spec, levels, durationSec, alignment);
     const voiced = gapChunks(spec, plan).flatMap((chunk) => chunk.windows);
