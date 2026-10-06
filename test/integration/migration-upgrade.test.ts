@@ -156,7 +156,7 @@ test("0004-0015 retain production retry, fallback, terminal delivery, and deleti
     expect(signalColumns).toEqual({ count: 2 });
 
     const [migrationCount] = await db.execute(sql`SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`);
-    expect(migrationCount).toEqual({ count: 22 });
+    expect(migrationCount).toEqual({ count: 23 });
 
     const [deletionAdmission] = await db.execute(sql`
       SELECT count(*)::int AS count
@@ -396,15 +396,15 @@ test("0018: a fresh install starts with admission closed; an existing deployment
   }
 }, 30_000);
 
-test("0021: batch jobs queued before diarization existed stay non-diarized", async () => {
+test("0022: batch jobs queued before diarization existed stay non-diarized", async () => {
   const databaseName = `ptx_diarize_${crypto.randomUUID().replaceAll("-", "")}`;
   const databaseUrl = new URL(config.databaseUrl);
   databaseUrl.pathname = `/${databaseName}`;
   const adminUrl = new URL(config.databaseUrl);
   adminUrl.pathname = "/postgres";
   const admin = new SQL(adminUrl.toString());
-  // Every migration through 0020: a batch deployment with a job in flight when the diarization image rolls out.
-  const fixture = await productionMigrationsFixture(21);
+  // Every migration through 0021: a batch deployment with a job in flight when the diarization image rolls out.
+  const fixture = await productionMigrationsFixture(22);
   let db: Db | undefined;
   try {
     await admin.unsafe(`CREATE DATABASE "${databaseName}"`);
