@@ -1,8 +1,9 @@
-# Speaker diarization for the batch worker (TC-595, docs/diarization-benchmark.md): the prebuilt sherpa-onnx CLI, the
-# pyannote segmentation-3.0 model and the NVIDIA NeMo TitaNet-S embedding model, each sha256-verified. The CLI
-# is linked against glibc and this image is Alpine (musl), so the glibc runtime it needs is copied from a pinned Debian
-# image into /opt/sherpa-onnx/glibc, and /opt/sherpa-onnx/diarize runs the CLI through that loader. Nothing else uses it.
-FROM oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f AS diarization
+# Speaker diarization for the batch worker (TC-595, docs/diarization-benchmark.md): src/uploads/diarize-window.c built
+# against the prebuilt sherpa-onnx C API, the pyannote segmentation-3.0 model and the NVIDIA NeMo TitaNet-S embedding
+# model, each sha256-verified. The binary is linked against glibc and this image is Alpine (musl), so the glibc runtime
+# it needs is copied from a pinned Debian image into /opt/sherpa-onnx/glibc, and /opt/sherpa-onnx/diarize runs it through
+# that loader. Nothing else uses it.
+FROM oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f AS sherpa-onnx
 WORKDIR /build
 RUN set -eu; \
     release=https://github.com/k2-fsa/sherpa-onnx/releases/download; \
@@ -24,14 +25,28 @@ RUN set -eu; \
       | sha256sum -c -; \
     tar -xjf sherpa-onnx.tar.bz2; \
     tar -xjf segmentation.tar.bz2; \
-    mkdir -p /opt/sherpa-onnx/bin /opt/sherpa-onnx/lib /opt/sherpa-onnx/models /opt/sherpa-onnx/licenses; \
-    cp sherpa-onnx-v1.13.8-linux-x64-shared-no-tts/bin/sherpa-onnx-offline-speaker-diarization /opt/sherpa-onnx/bin/; \
-    cp sherpa-onnx-v1.13.8-linux-x64-shared-no-tts/lib/libonnxruntime.so /opt/sherpa-onnx/lib/; \
+    mv sherpa-onnx-v1.13.8-linux-x64-shared-no-tts sherpa-onnx
+
+# diarize-window, compiled against the sherpa-onnx C API headers and library from the stage above.
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS diarize-window
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY --from=sherpa-onnx /build/sherpa-onnx/include ./include
+COPY --from=sherpa-onnx /build/sherpa-onnx/lib ./lib
+COPY src/uploads/diarize-window.c ./
+RUN gcc -O2 -Wall -Wextra -Werror -o diarize-window diarize-window.c -I include -L lib -lsherpa-onnx-c-api -lm
+
+FROM sherpa-onnx AS diarization
+COPY --from=diarize-window /build/diarize-window /opt/sherpa-onnx/bin/diarize-window
+RUN set -eu; \
+    mkdir -p /opt/sherpa-onnx/lib /opt/sherpa-onnx/models /opt/sherpa-onnx/licenses; \
+    cp sherpa-onnx/lib/libsherpa-onnx-c-api.so sherpa-onnx/lib/libonnxruntime.so /opt/sherpa-onnx/lib/; \
     cp sherpa-onnx-pyannote-segmentation-3-0/model.onnx /opt/sherpa-onnx/models/segmentation.onnx; \
     cp embedding.onnx /opt/sherpa-onnx/models/embedding.onnx; \
     cp sherpa-onnx-pyannote-segmentation-3-0/LICENSE /opt/sherpa-onnx/licenses/pyannote-segmentation-3.0.LICENSE; \
     cp ./*.LICENSE onnxruntime.ThirdPartyNotices.txt /opt/sherpa-onnx/licenses/; \
-    printf '#!/bin/sh\nexec /opt/sherpa-onnx/glibc/ld-linux-x86-64.so.2 --library-path /opt/sherpa-onnx/glibc:/opt/sherpa-onnx/lib /opt/sherpa-onnx/bin/sherpa-onnx-offline-speaker-diarization "$@"\n' \
+    printf 'EnableCpuMemArena=0\nEnableMemPattern=0\n' > /opt/sherpa-onnx/models/onnxruntime.config; \
+    printf '#!/bin/sh\nexec /opt/sherpa-onnx/glibc/ld-linux-x86-64.so.2 --library-path /opt/sherpa-onnx/glibc:/opt/sherpa-onnx/lib /opt/sherpa-onnx/bin/diarize-window "$@"\n' \
       > /opt/sherpa-onnx/diarize; \
     chmod 755 /opt/sherpa-onnx/diarize
 COPY --from=debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 \

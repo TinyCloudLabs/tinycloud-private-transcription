@@ -107,7 +107,7 @@ production window. Green 2/2 on 2026-08-17 (~2 min each; evidence in `tmp/e2e-<r
 ### Batch transcription role
 
 `PTX_ROLE=batch` runs the batch-transcription service from the same image (contract: [SPEC.md](./SPEC.md#batch-transcription-ptx_rolebatch)).
-It needs only Postgres, ffmpeg and (for `diarize: true`) the bundled sherpa-onnx diarization CLI; it never talks to Vexa,
+It needs only Postgres, ffmpeg and (for `diarize: true`) the bundled sherpa-onnx diarization program; it never talks to Vexa,
 Redis or Signal, and it mounts no meeting route. The meeting role (default) mounts none of its routes.
 
 ```bash
@@ -132,7 +132,7 @@ bun run cli create-key --project tinychat --scopes 'transcriptions:*'
 | `BATCH_UPLOAD_MIN_BYTES_PER_SECOND` | `32768` | minimum average PUT rate after 60 s |
 | `BATCH_CORS_ORIGINS` | unset | comma-separated browser origins allowed to `PUT /uploads/{id}` directly (exact, or one leading `*.` label, e.g. `https://*.tinychat-4jq.pages.dev`); unset = no CORS headers; a malformed entry fails boot |
 | `BATCH_DIARIZATION_ENABLED` | `false` | `true` offers speaker diarization (`capabilities.diarization`, create `diarize: true`) when the install below is complete; set it on both processes. Benchmark and sizing: [docs/diarization-benchmark.md](./docs/diarization-benchmark.md) |
-| `BATCH_DIARIZATION_DIR` | `/opt/sherpa-onnx` | the image's sherpa-onnx install: `diarize` launcher, `models/segmentation.onnx`, `models/embedding.onnx` |
+| `BATCH_DIARIZATION_DIR` | `/opt/sherpa-onnx` | the image's sherpa-onnx install: `diarize` (launcher of `src/uploads/diarize-window.c`), `models/segmentation.onnx`, `models/embedding.onnx`, `models/onnxruntime.config` |
 | `PTX_FAULT_INJECT` | unset | staging-only fault injection (`<point>:<crash|error|delay=<ms>>,…`); must never be set in a deploy |
 
 ### Env vars
