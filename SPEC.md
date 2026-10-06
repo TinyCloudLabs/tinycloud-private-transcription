@@ -199,16 +199,18 @@ decodes to 16 kHz PCM on disk, stopping at 7,200 s of PCM (counted in bytes, wha
 Tinfoil request. No speech → `no_speech`.
 
 **Diarization** (`diarize: true`; [docs/diarization-benchmark.md](./docs/diarization-benchmark.md)). After the mono
-decode, speech is labelled with speakers in windows of at most 10 min that overlap by OVERLAP s, one window at a time,
+decode, speech is labelled with speakers in equal windows of at most 10 min that overlap by 60 s, one window at a time,
 each by its own child process (`src/uploads/diarize-window.c`: sherpa-onnx pyannote segmentation-3.0 + TitaNet-S
-embeddings + threshold clustering; killed when the claim is lost), so memory does not grow with the recording. Each
-window reports its local speakers' segments and a voice embedding per local speaker. Local speakers are linked to the
-recording's speakers in window order: a local speaker joins a known speaker it talks together with for ≥ 2 s of the
-overlap (at least half of its speech there) when their embeddings' cosine similarity is ≥ ANCHOR, or by voice alone at
-≥ LINK; otherwise it is a new speaker; each speaker's centroid is the duration-weighted mean of its embeddings. After the
-last window, speakers never heard in the same window merge while their centroids' similarity is ≥ MERGE, and past 32
-speakers the most similar merge. Each window keeps only its segments up to the middle of each overlap, so overlapped
-speech is attributed once. The segments become speaker turns instead of VAD regions: every 100 ms frame of speech gets one speaker (the current speaker keeps overlapped
+embeddings + clustering at threshold 1.0; killed when the claim is lost), so memory does not grow with the recording.
+Each window reports its local speakers' segments and one voice embedding per local speaker. Local speakers are linked
+to the recording's speakers in window order (constants in `DIARIZATION`, `src/uploads/diarize.ts`): a local speaker
+joins the speaker with the best score ≥ 0.6, the score being the cosine similarity of its embedding to that speaker's
+centroid plus 0.1 × the share of its overlap speech it shares with that speaker in the previous window (when ≥ 2 s);
+each speaker takes one local speaker per window unless the score is ≥ 0.8; otherwise it is a new speaker. Centroids are
+duration-weighted means of the linked embeddings. After the last window, speakers never heard in the same window merge
+while their centroids' similarity is ≥ 0.7, and past 32 speakers the one with the least speech joins its most similar
+speaker. Each window keeps only its segments up to the middle of each overlap, so overlapped speech is attributed once.
+The segments become speaker turns instead of VAD regions: every 100 ms frame of speech gets one speaker (the current speaker keeps overlapped
 speech); runs of one speaker < 1 s apart merge; turns < 0.4 s fold into the nearer neighbour < 1 s away; turns are
 padded ≤ 0.25 s into silence, never into a neighbour; turns > 30 s split at their quietest frame. Each turn is one
 Tinfoil request through the same arbiter. Non-speech is never sent. A diarizer that fails (or is no longer installed
