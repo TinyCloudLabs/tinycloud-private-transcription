@@ -81,6 +81,8 @@ export const attributedTranscriptionRuns = pgTable("attributed_transcription_run
   meetingId: text("meeting_id").primaryKey().references(() => meetings.id, { onDelete: "cascade" }),
   status: text("status").notNull().default("pending"), // pending | processing | partial | failed | completed
   manifestJson: jsonb("manifest_json").notNull(),
+  /** Captured vs transcribed speech, written with the canonical transcript (TC-758). Operator-only. */
+  coverageJson: jsonb("coverage_json"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
@@ -97,9 +99,13 @@ export const attributedBatches = pgTable("attributed_batches", {
   id: text("id").primaryKey(),
   meetingId: text("meeting_id").notNull().references(() => meetings.id, { onDelete: "cascade" }),
   ordinal: integer("ordinal").notNull(),
+  /** `batch` (one speaker stream) or `gap_fill` (ordinal -1: exhausted spans re-read from the retained recording, TC-758). */
+  kind: text("kind").notNull().default("batch"),
   batchJson: jsonb("batch_json").notNull(),
   status: text("status").notNull().default("pending"), // pending | claimed | completed | silence | unresolved | failed | ambiguous
   attempts: integer("attempts").notNull().default(0),
+  /** Durable retry backoff (TC-758): a pending row is not claimed before this instant. */
+  nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }),
   /** Failed range fetches only; durable so finalize/reconcile requeues cannot reset the bound (TC-576). */
   fetchAttempts: integer("fetch_attempts").notNull().default(0),
   claimToken: text("claim_token"),
@@ -121,6 +127,8 @@ export const attributedAttempts = pgTable("attributed_attempts", {
   ordinal: integer("ordinal").notNull(),
   status: text("status").notNull(), // started | succeeded | failed | ambiguous
   outcome: text("outcome"),
+  /** Model the paid request used; a retry after repeated empty results switches to the fallback (TC-758). */
+  model: text("model"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   completedAt: timestamp("completed_at", { withTimezone: true }),
 }, (t) => [uniqueIndex("attributed_attempts_batch_ordinal_idx").on(t.batchId, t.ordinal)]);

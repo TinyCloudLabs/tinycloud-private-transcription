@@ -19,6 +19,14 @@ const STOCK = /^(?:thank you(?: so much| very much)?|thanks for (?:watching|list
 
 /** Audio this short cannot carry a multi-sentence reply; stock captions on longer audio may be real. */
 const SHORT_AUDIO_SEC = 3, OPENING_AUDIO_SEC = 15, STOCK_AUDIO_SEC = 6;
+/**
+ * RMS of the audio a piece came from (TC-758). Below SILENT nothing was said: 1 s of digital
+ * silence sent to Whisper came back " Thank you." at avg_logprob -0.342, just inside the confidence
+ * rule. At or above SPEECH the audio carries a voice, so only much weaker confidence drops text:
+ * losing a real "thank you" is worse than keeping a doubtful one.
+ */
+export const SILENT_DBFS = -65, SPEECH_DBFS = -45;
+const SPEECH_STOCK_LOGPROB = -1, SPEECH_NO_SPEECH_PROB = 0.8, SPEECH_NO_SPEECH_LOGPROB = -1;
 
 export interface HallucinationEvidence {
   /** Whisper segment confidence; present only for timed output. */
@@ -27,6 +35,8 @@ export interface HallucinationEvidence {
   audioSec?: number;
   /** Output of an audio LLM (no timestamps): the only source of chat-assistant replies. */
   untimed?: boolean;
+  /** RMS dBFS of the audio under the text, when measured. Absent on results stored before TC-758. */
+  energy_dbfs?: number;
 }
 
 /** A chat reply opens with the assistant phrase, possibly after a bare greeting ("Hello!"). */
@@ -39,17 +49,21 @@ const opensAsAssistant = (text: string) => {
 export function hallucinated(text: string, evidence: HallucinationEvidence = {}): boolean {
   const trimmed = text.trim();
   if (!trimmed) return true;
-  const { audioSec } = evidence;
+  const { audioSec, energy_dbfs: energy } = evidence;
+  if (energy !== undefined && energy < SILENT_DBFS) return true;
+  // Unmeasured energy keeps the pre-TC-758 rules exactly, so stored results republish identically.
+  const speech = energy !== undefined && energy >= SPEECH_DBFS;
   if (evidence.untimed !== false && evidence.avg_logprob === undefined && ASSISTANT.some((pattern) => pattern.test(trimmed))
       // A reply that opens the text is invented only when the audio could not hold much speech:
       // a long batch that starts with such a phrase still carries real talk after it.
       && ((audioSec !== undefined && audioSec < SHORT_AUDIO_SEC) || (opensAsAssistant(trimmed) && (audioSec === undefined || audioSec < OPENING_AUDIO_SEC)))) return true;
   // Whisper's own decoding guards: repetition loops and confident "no speech" with weak text.
   if ((evidence.compression_ratio ?? 0) > 2.4) return true;
-  if ((evidence.no_speech_prob ?? 0) > 0.6 && (evidence.avg_logprob ?? 0) < -0.5) return true;
+  if (speech ? (evidence.no_speech_prob ?? 0) > SPEECH_NO_SPEECH_PROB && (evidence.avg_logprob ?? 0) < SPEECH_NO_SPEECH_LOGPROB
+    : (evidence.no_speech_prob ?? 0) > 0.6 && (evidence.avg_logprob ?? 0) < -0.5) return true;
   if (STOCK.test(trimmed)) {
-    if (evidence.avg_logprob !== undefined) return evidence.avg_logprob < -0.35;
-    return audioSec === undefined || audioSec < STOCK_AUDIO_SEC;
+    if (evidence.avg_logprob !== undefined) return evidence.avg_logprob < (speech ? SPEECH_STOCK_LOGPROB : -0.35);
+    return !speech && (audioSec === undefined || audioSec < STOCK_AUDIO_SEC);
   }
   return false;
 }

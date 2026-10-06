@@ -152,7 +152,8 @@ describe("review fixes (PR #71)", () => {
     const fetchImpl = (async () => new Response(JSON.stringify({ text: "hello there thank you", segments: [{ start: 0, end: 1.5, text: "Hello there." }, { start: 2.4, end: 3.2, text: "Thank you." }] }))) as unknown as typeof fetch;
     const provider = new TinfoilTranscriptionProvider({ baseUrl: "https://t", apiKey: "k", model: "whisper-large-v3-turbo", fetch: fetchImpl });
     const result = await provider.transcribeAttributedPcm(new Uint8Array(new Float32Array(32_000).fill(0.1).buffer), batch!, "en");
-    expect(result.segments).toEqual([{ start: 0, end: 1.5, text: "Hello there." }]);
+    // Each kept piece records the energy of its audio (0.1 amplitude = -20 dBFS, TC-758).
+    expect(result.segments).toEqual([{ start: 0, end: 1.5, text: "Hello there.", energy_dbfs: -20 }]);
     // Stored results with a malformed piece drop only that piece.
     const input = manifest([range(0, "Alice", 0, 2_000)]);
     const { transcript } = assembleAttributedTranscript(input, [{ spec: batch!, result: { text: "x", segments: [{ start: 0, end: 1, text: "Kept." }, { start: 3, end: 2, text: "Bad." }] } }], "en");

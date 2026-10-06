@@ -10,6 +10,13 @@ export const positiveIntegerEnv = (name: string, fallback: string): number => {
   return value;
 };
 
+/** Comma-separated positive millisecond delays; empty entries are rejected so a typo cannot disable retries. */
+export const backoffEnv = (name: string, fallback: string): number[] => {
+  const values = env(name, fallback).split(",").map((value) => Number(value.trim()));
+  if (!values.length || values.length > 15 || values.some((value) => !Number.isSafeInteger(value) || value <= 0)) throw new Error(`${name} must be 1-15 comma-separated positive integers`);
+  return values;
+};
+
 export type TranscriptionProviderName = "vexa" | "tinfoil";
 
 /**
@@ -87,6 +94,16 @@ export const config = {
     model: env("TINFOIL_MODEL", "voxtral-small-24b"),
     /** Attributed Google Meet batches (TC-741): a Whisper model returns segment timestamps for turn order. */
     attributedModel: env("TINFOIL_ATTRIBUTED_MODEL", ""),
+    /** Used for an attributed batch after two empty Whisper results, so voiced audio is not lost (TC-758). Untimed. */
+    attributedFallbackModel: env("TINFOIL_ATTRIBUTED_FALLBACK_MODEL", "voxtral-small-24b"),
+  },
+  /**
+   * Attributed batches and recording gap fills whose paid call was uncertain, empty or failed are
+   * re-sent after these delays (TC-758). A batch gets length + 1 paid attempts and as many fetch
+   * tries; a possible duplicate Tinfoil charge is accepted in exchange for never losing speech.
+   */
+  attributedRetry: {
+    backoffMs: backoffEnv("ATTRIBUTED_RETRY_BACKOFF_MS", "30000,60000,120000,240000,480000"),
   },
   /** Internal transcript evaluation (TC-745): shadow transcriptions stored beside the canonical one. */
   eval: {

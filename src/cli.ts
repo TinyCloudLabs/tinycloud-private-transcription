@@ -11,7 +11,7 @@ const flag = (name: string) => {
 const USAGE = `usage: bun run cli <create-key --project <name> [--scopes <scope>[,<scope>...]] | migrate | eval ...>
   eval run --meeting <id> [--models <m>[,<m>...]]     re-transcribe retained audio with each model (TC-745)
   eval reference --meeting <id> --source <name> < file   store a reference transcript (e.g. Gemini) and re-score
-  eval report --meeting <id>                          metrics for the published transcript and every eval
+  eval report --meeting <id>                          coverage (captured vs transcribed speech) and metrics for the published transcript and every eval
   eval show --meeting <id> [--eval <evalId>]          print the published (or an eval's) transcript
   scopes: ${API_KEY_SCOPES.join(", ")} (default ${DEFAULT_KEY_SCOPES.join(",")}; quote them in the shell, e.g. --scopes 'transcriptions:*')`;
 const fail = (message: string): never => {
@@ -65,6 +65,10 @@ switch (cmd) {
     } else if (sub === "report") {
       const report = await transcriptEvalReport(ctx, meetingId);
       console.log(`reference: ${report.reference ?? "none"}`);
+      const c = report.coverage as Record<string, number | string> | null;
+      const sec = (ms: unknown) => typeof ms === "number" ? `${(ms / 1000).toFixed(1)}s` : "?";
+      console.log(c ? `coverage: captured ${sec(c.captured_ms)}, transcribed ${sec(c.transcribed_ms)} (attributed ${sec(c.attributed_ms)} + recording ${sec(c.recording_ms)}), silent ${sec(c.silent_ms)}, gaps ${sec(c.gap_ms)}; ${c.retried_batches}/${c.batches} batches retried, gap fill ${c.gap_fill}`
+        : "coverage: none (not an attributed meeting, or published before TC-758)");
       const keys = ["wer", "word_recall", "trigram_recall", "speaker_accuracy", "hyp_words", "ref_words", "speakers", "unknown_word_share", "turns", "median_turn_words", "hallucinated_turns", "dropped_hallucinations", "failed_batches"];
       console.table(report.rows.map((row) => ({ source: row.source, status: row.status, calls: row.calls, ...Object.fromEntries(keys.map((key) => [key, (row.metrics as Record<string, unknown>)[key]])) })));
     } else if (sub === "show") {

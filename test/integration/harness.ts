@@ -50,6 +50,8 @@ export async function startHarness(
     attributedTranscriptionEnabled?: boolean;
     workerHeartbeatIntervalMs?: number;
     workerPopTimeoutSec?: number;
+    /** Attributed retry schedule (TC-758); tests default to the poll interval (the pre-TC-758 fetch requeue cadence) so retries settle quickly. */
+    attributedRetryBackoffMs?: number[];
   } = {},
 ): Promise<Harness> {
   const vexa = startMockVexa(0);
@@ -64,6 +66,7 @@ export async function startHarness(
       : {}),
     ...(opts.transcriptionProvider ? { transcriptionProvider: opts.transcriptionProvider } : {}),
     ...(opts.attributedTranscriptionEnabled !== undefined ? { attributedTranscriptionEnabled: opts.attributedTranscriptionEnabled } : {}),
+    attributedRetry: { backoffMs: opts.attributedRetryBackoffMs ?? [50, 50, 50, 50, 50] },
   };
   const db = await runMigrations(config.databaseUrl);
   // attributed_worker_readiness and tinfoil_dispatch_slots are included: a prior harness's stopped

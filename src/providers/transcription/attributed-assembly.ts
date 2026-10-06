@@ -64,8 +64,9 @@ export function meetingSeconds(timeline: TimelineEntry[], offset: number): { at:
   return { at: entry.range.start_ms / 1000 + within, entry };
 }
 
-export interface TimedPiece { start: number; end: number; text: string; avg_logprob?: number; no_speech_prob?: number; compression_ratio?: number }
-export interface AttributedResult { text: string; language?: string | null; segments?: TimedPiece[]; model?: string }
+/** `energy_dbfs` is the RMS of the audio under the piece, measured before sending (TC-758). */
+export interface TimedPiece { start: number; end: number; text: string; avg_logprob?: number; no_speech_prob?: number; compression_ratio?: number; energy_dbfs?: number }
+export interface AttributedResult { text: string; language?: string | null; segments?: TimedPiece[]; model?: string; energy_dbfs?: number }
 
 const finite = (value: unknown) => typeof value === "number" && Number.isFinite(value);
 const optionalFinite = (value: unknown) => value === undefined || value === null || finite(value);
@@ -80,9 +81,13 @@ export function validPieces(result: { segments?: unknown }): TimedPiece[] | null
   const valid = pieces.filter((piece): piece is TimedPiece => !!piece && typeof piece === "object"
     && finite(piece.start) && finite(piece.end) && piece.start >= 0 && piece.end >= piece.start
     && typeof piece.text === "string" && piece.text.length <= MAX_PIECE_TEXT
-    && optionalFinite(piece.avg_logprob) && optionalFinite(piece.no_speech_prob) && optionalFinite(piece.compression_ratio));
+    && optionalFinite(piece.avg_logprob) && optionalFinite(piece.no_speech_prob) && optionalFinite(piece.compression_ratio) && optionalFinite(piece.energy_dbfs));
   return valid.length ? valid : null;
 }
+
+/** Whisper's per-piece evidence for the hallucination filter; energy only where it was measured. */
+export const pieceEvidence = (piece: TimedPiece) => ({ avg_logprob: piece.avg_logprob ?? undefined, no_speech_prob: piece.no_speech_prob ?? undefined,
+  compression_ratio: piece.compression_ratio ?? undefined, ...(piece.energy_dbfs != null ? { energy_dbfs: piece.energy_dbfs } : {}), untimed: false, audioSec: piece.end - piece.start });
 
 type Named = { name: string; source: "glow-bound" | "provisional" };
 const isNamed = (range: AttributedRange) => range.attribution.source !== "unresolved" && !!range.speaker_name.trim();
@@ -117,10 +122,11 @@ export function inferUnresolvedSpeakers(manifest: AttributedManifest, windowMs =
   return inferred;
 }
 
-type RawPiece = { start: number; end: number; text: string; speaker: string; speakerKey: string; attribution: SpeakerAttribution; language: string | null };
+/** `origin: "recording"` marks text re-read from the retained mixed recording for an untranscribed span (TC-758). */
+export type RawPiece = { start: number; end: number; text: string; speaker: string; speakerKey: string; attribution: SpeakerAttribution; language: string | null; origin?: "recording" };
 
 /** One published identity per display name: the capture channel is not a person. */
-const nameKey = (name: string) => `name:${name.normalize("NFC").trim().toLowerCase()}`;
+export const nameKey = (name: string) => `name:${name.normalize("NFC").trim().toLowerCase()}`;
 
 /**
  * `ranges` are the ranges the text came from: one for a timed piece, the whole batch for untimed
@@ -151,7 +157,8 @@ export function attributedPieces(manifest: AttributedManifest, completed: Array<
     if (!pieces) {
       stats.untimed_batches++;
       const audioSec = spec.ranges.reduce((sum, range) => sum + range.audio_duration_ms, 0) / 1000;
-      if (hallucinated(result.text, { untimed: true, audioSec })) { stats.dropped_hallucinations++; continue; }
+      const energy = typeof result.energy_dbfs === "number" && Number.isFinite(result.energy_dbfs) ? { energy_dbfs: result.energy_dbfs } : {};
+      if (hallucinated(result.text, { untimed: true, audioSec, ...energy })) { stats.dropped_hallucinations++; continue; }
       raw.push({ start: spec.start_ms / 1000, end: spec.end_ms / 1000, text: result.text, ...speakerFor(spec, spec.ranges, inferred), language });
       continue;
     }
@@ -159,7 +166,7 @@ export function attributedPieces(manifest: AttributedManifest, completed: Array<
     const timeline = batchTimeline(spec);
     for (const piece of pieces) {
       if (!piece.text.trim()) continue;
-      if (hallucinated(piece.text, { avg_logprob: piece.avg_logprob ?? undefined, no_speech_prob: piece.no_speech_prob ?? undefined, compression_ratio: piece.compression_ratio ?? undefined, untimed: false, audioSec: piece.end - piece.start })) { stats.dropped_hallucinations++; continue; }
+      if (hallucinated(piece.text, pieceEvidence(piece))) { stats.dropped_hallucinations++; continue; }
       const start = meetingSeconds(timeline, piece.start), end = meetingSeconds(timeline, Math.max(piece.start, piece.end - 1e-3));
       const mid = meetingSeconds(timeline, (piece.start + piece.end) / 2);
       raw.push({ start: start.at, end: Math.max(start.at, end.at), text: piece.text.trim(), ...speakerFor(spec, [mid.entry.range], inferred), language });
@@ -175,7 +182,7 @@ export function mergeTurns(raw: RawPiece[]): RawPiece[] {
   const turns: RawPiece[] = [];
   for (const piece of sorted) {
     const last = turns.at(-1);
-    if (last && last.speakerKey === piece.speakerKey && last.attribution === piece.attribution
+    if (last && last.speakerKey === piece.speakerKey && last.attribution === piece.attribution && last.origin === piece.origin
         && piece.start - last.end <= TURN_GAP_SEC && piece.end - last.start <= MAX_TURN_SEC) {
       last.end = Math.max(last.end, piece.end); last.text = `${last.text} ${piece.text}`;
     } else turns.push({ ...piece });
@@ -183,8 +190,9 @@ export function mergeTurns(raw: RawPiece[]): RawPiece[] {
   return turns;
 }
 
-export function assembleAttributedTranscript(manifest: AttributedManifest, completed: Array<{ spec: AttributedBatch; result: AttributedResult }>, language: string | null): { transcript: NormalizedTranscript; stats: AssemblyStats; unknown: boolean } {
+/** `recovered` are pieces re-read from the retained recording for spans the attributed path could not transcribe (TC-758). */
+export function assembleAttributedTranscript(manifest: AttributedManifest, completed: Array<{ spec: AttributedBatch; result: AttributedResult }>, language: string | null, recovered: RawPiece[] = []): { transcript: NormalizedTranscript; stats: AssemblyStats; unknown: boolean } {
   const { raw, stats } = attributedPieces(manifest, completed);
-  const transcript = normalizeSegments(mergeTurns(raw), language);
+  const transcript = normalizeSegments(mergeTurns([...raw, ...recovered]), language);
   return { transcript, stats, unknown: transcript.segments.some((segment) => segment.attribution === "unknown") };
 }

@@ -11,6 +11,8 @@ export interface TinfoilOptions {
   model: string;
   /** Model for attributed meeting batches; defaults to `model`. Whisper models return segment timestamps. */
   attributedModel?: string;
+  /** Untimed model for an attributed batch after repeated empty Whisper results (TC-758). */
+  attributedFallbackModel?: string;
   timeoutMs?: number;
   fetch?: typeof fetch;
   ffmpegPath?: string;
@@ -45,6 +47,25 @@ const WINDOW_TIMEOUT_MS = 60_000, BATCH_RETRY_BUDGET_MS = 240_000;
 
 /** Below Tinfoil/vLLM's 30 s re-chunking, so returned offsets are relative to our own window. */
 export const TIMED_WINDOW_SEC = 29.5;
+/**
+ * Hard bound on one durable attempt (TC-758): no request of an attempt is sent or left running past
+ * admission + this. A retry after a dead owner waits past it, so two attempts never overlap.
+ */
+export const ATTEMPT_DEADLINE_MS = 8 * 60_000;
+const SILENT_WINDOW_DBFS = -60, ENERGY_FLOOR_DBFS = -120;
+
+/** RMS in dBFS of samples [from, to), floored so digital silence stays JSON-representable. */
+export function sliceDbfs(samples: Float32Array | Int16Array, from: number, to: number): number {
+  const scale = samples instanceof Int16Array ? 32768 : 1;
+  const start = Math.max(0, Math.floor(from)), end = Math.min(samples.length, Math.ceil(to));
+  if (end <= start) return ENERGY_FLOOR_DBFS;
+  let sum = 0;
+  for (let i = start; i < end; i++) { const value = Math.max(-1, Math.min(1, samples[i]! / scale)); sum += value * value; }
+  const rms = Math.sqrt(sum / (end - start));
+  return rms > 0 ? Math.max(ENERGY_FLOOR_DBFS, Math.round(20 * Math.log10(rms) * 10) / 10) : ENERGY_FLOOR_DBFS;
+}
+/** Energy under a piece, at least 100 ms wide so a zero-length timestamp still measures audio. */
+const pieceDbfs = (samples: Float32Array | Int16Array, rate: number, from: number, to: number) => sliceDbfs(samples, from * rate, Math.max(to, from + 0.1) * rate);
 
 /** Windows of the padded batch audio, cut only where a range (and its leading pause) begins. */
 export function timedWindows(timeline: TimelineEntry[], total: number, maxSec = TIMED_WINDOW_SEC): Array<{ from: number; to: number }> {
@@ -113,6 +134,7 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
   }
 
   get attributedModel() { return this.opts.attributedModel || this.opts.model; }
+  get attributedFallbackModel() { return this.opts.attributedFallbackModel || this.opts.model; }
 
   /** Same configuration with its own call counter (operator evals run beside production). */
   fork(): TinfoilTranscriptionProvider { return new TinfoilTranscriptionProvider(this.opts); }
@@ -123,7 +145,7 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
    * server re-chunks long audio at ~30 s and labels chunks at fixed 30 s offsets, timed requests are
    * cut at range boundaries into windows of at most TIMED_WINDOW_SEC so every offset stays exact.
    */
-  async transcribeAttributedPcm(bytes: Uint8Array, batch: AttributedBatch, language: string | null, model = this.attributedModel): Promise<AttributedResult> {
+  async transcribeAttributedPcm(bytes: Uint8Array, batch: AttributedBatch, language: string | null, model = this.attributedModel, deadline = Date.now() + ATTEMPT_DEADLINE_MS): Promise<AttributedResult> {
     const first = batch.ranges[0];
     if (!first || first.codec !== "pcm_f32le" || first.channels !== 1) throw new ApiError("transcription_failed", "Unsupported attributed audio codec");
     const input = new Float32Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 4));
@@ -142,31 +164,68 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
       for (let i = 0; i < slice.length; i++) pcm16[i] = Math.max(-1, Math.min(1, slice[i]!)) * 32767;
       return pcmToWav(pcm16, rate);
     };
-    // An attributed request is durably claimed before this method is entered.  Retrying after a
-    // transport error can create a second billed request whose result cannot be attributed to the
-    // persisted claim, so this deliberately bypasses postWithRetry. Timed windows are sent once
-    // each, in order, inside the same claim.
+    // An attributed request is durably claimed before this method is entered, and only that
+    // durable attempt may send. A transport error is not retried here: the ledger schedules a new
+    // attempt (TC-758), so every billed request stays attributable to one attempt row. Timed
+    // windows are sent once each, in order, inside the same attempt and before its deadline.
     const timed = timestampedModel(model);
     const total = padded.length / rate;
     if (!timed) {
-      const body = await this.post(wav(0, total), `${batch.idempotency_key}.wav`, language, model, false);
-      return { text: body.text, language: body.language, model };
+      const body = await this.post(wav(0, total), `${batch.idempotency_key}.wav`, language, model, false, this.untilDeadline(this.opts.timeoutMs ?? 120_000, deadline));
+      return { text: body.text, language: body.language, model, energy_dbfs: sliceDbfs(padded, 0, padded.length) };
     }
     const texts: string[] = [], segments: TimedPiece[] = [];
     let language_: string | undefined, untimed = false;
-    const deadline = Date.now() + BATCH_RETRY_BUDGET_MS;
+    const retryBudget = Math.min(deadline, Date.now() + BATCH_RETRY_BUDGET_MS);
     for (const [index, window] of timedWindows(batchTimeline(batch), total).entries()) {
-      const body = await this.postUnlessRateLimited(wav(window.from, window.to), `${batch.idempotency_key}-${index}.wav`, language, model, deadline);
+      // A window of digital or near silence is never sent: Whisper captions silence (TC-758).
+      if (sliceDbfs(padded, window.from * rate, window.to * rate) < SILENT_WINDOW_DBFS) continue;
+      const body = await this.postUnlessRateLimited(wav(window.from, window.to), `${batch.idempotency_key}-${index}.wav`, language, model, retryBudget, deadline);
       if (body.text.trim()) texts.push(body.text.trim());
       language_ ??= body.language;
       const pieces = timedPieces(body.segments);
       if (!pieces) { untimed = true; continue; }
       const length = window.to - window.from;
       // Whisper may place a trailing caption past the end of the audio; it has no audio to map to.
-      for (const piece of pieces) if (piece.start < length) segments.push({ ...piece, start: piece.start + window.from, end: Math.min(Math.max(piece.end, piece.start), length) + window.from });
+      for (const piece of pieces) if (piece.start < length) {
+        const start = piece.start + window.from, end = Math.min(Math.max(piece.end, piece.start), length) + window.from;
+        segments.push({ ...piece, start, end, energy_dbfs: pieceDbfs(padded, rate, start, end) });
+      }
     }
     // Text without usable offsets must not be published at invented times.
     return { text: texts.join(" "), language: language_, model, ...(untimed ? {} : { segments }) };
+  }
+
+  /**
+   * Re-reads spans of the retained mixed recording that the attributed path could not transcribe
+   * (TC-758). `windows` are recording seconds, each under TIMED_WINDOW_SEC so Whisper offsets stay
+   * window-relative. Like attributed batches, the caller owns one durable attempt for the whole
+   * call: nothing is retried here except a definite 429, and nothing is sent past `deadline`.
+   */
+  async transcribeRecordingWindows(pcm: Pcm16, windows: Array<{ from: number; to: number }>, language: string | null, model: string, deadline: number): Promise<Array<{ text: string; language?: string; segments?: TimedPiece[]; energy_dbfs: number }>> {
+    const timed = timestampedModel(model), rate = pcm.sampleRate, out: Array<{ text: string; language?: string; segments?: TimedPiece[]; energy_dbfs: number }> = [];
+    const retryBudget = Math.min(deadline, Date.now() + BATCH_RETRY_BUDGET_MS);
+    for (const [index, window] of windows.entries()) {
+      const from = Math.max(0, Math.floor(window.from * rate)), to = Math.min(pcm.samples.length, Math.ceil(window.to * rate));
+      const slice = pcm.samples.subarray(from, Math.max(from, to));
+      const energy_dbfs = sliceDbfs(slice, 0, slice.length);
+      const body = await this.postUnlessRateLimited(pcmToWav(slice, rate), `gap-${index}.wav`, language, model, retryBudget, deadline, timed);
+      const length = slice.length / rate;
+      const pieces = timed ? timedPieces(body.segments) : undefined;
+      out.push({ text: body.text, ...(body.language ? { language: body.language } : {}), energy_dbfs,
+        ...(pieces ? { segments: pieces.filter((piece) => piece.start < length).map((piece) => {
+          const end = Math.min(Math.max(piece.end, piece.start), length);
+          return { ...piece, end, energy_dbfs: pieceDbfs(slice, rate, piece.start, end) };
+        }) } : {}) });
+    }
+    return out;
+  }
+
+  /** Per-request timeout that never outlives the attempt deadline; past it nothing is sent. */
+  private untilDeadline(timeoutMs: number, deadline: number): number {
+    const left = deadline - Date.now();
+    if (left <= 0) throw new ApiError("provider_timeout", "Transcription attempt deadline passed");
+    return Math.min(timeoutMs, left);
   }
 
   async transcribe(input: TranscriptionInput): Promise<NormalizedTranscript> {
@@ -223,9 +282,9 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     return { ...transcript, duration_seconds: round(pcm.durationSec) };
   }
 
-  private async postUnlessRateLimited(bytes: Uint8Array, filename: string, language: string | null, model: string, deadline: number): Promise<TinfoilResponse> {
+  private async postUnlessRateLimited(bytes: Uint8Array, filename: string, language: string | null, model: string, deadline: number, hardDeadline = Infinity, timed = true): Promise<TinfoilResponse> {
     for (let attempt = 0; ; attempt++) {
-      try { return await this.post(bytes, filename, language, model, true, Math.min(this.opts.timeoutMs ?? WINDOW_TIMEOUT_MS, WINDOW_TIMEOUT_MS)); } catch (error) {
+      try { return await this.post(bytes, filename, language, model, timed, this.untilDeadline(Math.min(this.opts.timeoutMs ?? WINDOW_TIMEOUT_MS, WINDOW_TIMEOUT_MS), hardDeadline)); } catch (error) {
         const delay = (this.opts.retryDelayMs ?? 250) * 8 * 2 ** attempt;
         if (!(error instanceof TinfoilRateLimited) || attempt >= RATE_LIMIT_RETRIES || Date.now() + delay > deadline) throw error;
         await Bun.sleep(delay);

@@ -19,7 +19,7 @@ export function createTranscriptionProvider(cfg: Pick<Config, "transcriptionProv
 }
 
 /** Tinfoil is an optional recovery path, never the globally selected primary provider. */
-export function createTranscriptRecoveryProvider(cfg: { tinfoil: Pick<Config["tinfoil"], "baseUrl" | "apiKey" | "model"> & Partial<Pick<Config["tinfoil"], "attributedModel">> }): TranscriptionProvider | null {
+export function createTranscriptRecoveryProvider(cfg: { tinfoil: Pick<Config["tinfoil"], "baseUrl" | "apiKey" | "model"> & Partial<Pick<Config["tinfoil"], "attributedModel" | "attributedFallbackModel">> }): TranscriptionProvider | null {
   if (!cfg.tinfoil.apiKey) return null;
   return new TinfoilTranscriptionProvider(cfg.tinfoil);
 }

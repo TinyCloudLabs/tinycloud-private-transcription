@@ -543,7 +543,7 @@ export function serializeTranscript(m: MeetingRow, t: TranscriptRow) {
   // jsonb drivers return objects for new rows. Earlier writers double-encoded this value, so
   // accept a legacy JSON string on reads until those rows are naturally replaced.
   const value = typeof t.segmentsJson === "string" ? JSON.parse(t.segmentsJson) : t.segmentsJson;
-  const body = value as { speakers: unknown[]; segments: unknown[]; text: string; partial?: boolean };
+  const body = value as { speakers: unknown[]; segments: unknown[]; text: string; partial?: boolean; gaps?: unknown[] };
   return {
     meeting_id: m.id,
     status: "completed",
@@ -555,6 +555,8 @@ export function serializeTranscript(m: MeetingRow, t: TranscriptRow) {
     segments: body.segments,
     text: body.text,
     ...(body.partial === true ? { partial: true } : {}),
+    // Captured speech no path could transcribe (TC-758); present only when there is some.
+    ...(Array.isArray(body.gaps) && body.gaps.length ? { gaps: body.gaps } : {}),
     created_at: t.createdAt.toISOString(),
   };
 }

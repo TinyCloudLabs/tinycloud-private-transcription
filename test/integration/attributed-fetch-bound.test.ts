@@ -29,10 +29,10 @@ const rangeSpec = (vexaMeetingId: number, path: string) => ({
   channels: 1, byte_count: pcm.byteLength, sha256, state: "uploaded", path,
 });
 
-// MAX_FETCH_ATTEMPTS is 3: a permanently missing range may be fetched 4 times total. The bound
-// lives on the batch row, so finalize/reconcile requeues (which carry no fetch counter) must not
-// extend it (TC-576).
-test("a permanently missing range is fetched at most MAX_FETCH_ATTEMPTS + 1 times", async () => {
+// A range fetch is retried once per backoff step (5 in the harness schedule, TC-758): a permanently
+// missing range is fetched 6 times total. The bound lives on the batch row, so finalize/reconcile
+// requeues (which carry no fetch counter) must not extend it (TC-576).
+test("a permanently missing range is fetched at most once per backoff step plus one", async () => {
   const baselineTinfoilCalls = tinfoilCalls;
   const created = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://meet.google.com/fetch-bound-1" } });
   const { id } = await created.json();
@@ -70,11 +70,11 @@ test("a permanently missing range is fetched at most MAX_FETCH_ATTEMPTS + 1 time
   expect(attempts.n).toBe(0);
   expect(tinfoilCalls).toBe(baselineTinfoilCalls);
   // Settled means settled: further finalize/reconcile wakeups must not trigger another fetch.
-  expect(h.vexa.requests.filter((request) => request.path === path).length).toBe(4);
+  expect(h.vexa.requests.filter((request) => request.path === path).length).toBe(6);
   await finalizeAttributedRun(h.ctx, id);
   await reconcileAttributedRuns(h.ctx);
   await h.waitFor(async () => (await h.ctx.queue.pending()).delayed.length === 0 || null, { timeoutMs: 10_000 }).catch(() => {});
-  expect(h.vexa.requests.filter((request) => request.path === path).length).toBe(4);
+  expect(h.vexa.requests.filter((request) => request.path === path).length).toBe(6);
 }, 60_000);
 
 // Only failed range fetches spend the durable retry budget: a batch deferred on dispatch capacity
