@@ -66,11 +66,30 @@ is placed on the meeting clock, so speakers interleave in spoken order. A partic
 `speaker_id` per display name. Audio whose speaker the capture could not bind takes the name of the
 bound speaker on the same audio channel within 3 s, with `attribution:"provisional"`; otherwise it
 publishes under `Unknown`. Model output that is not speech (chat-assistant replies, stock captions on
-silence) is dropped.
+silence) is dropped; audio below −65 dBFS never yields text (silent windows are not even sent), and
+speech-level audio (≥ −45 dBFS) keeps short phrases unless the model's confidence is very low.
+
+No captured speech is silently lost (TC-758). A batch whose Tinfoil call was uncertain (transport
+error, timeout), returned no words, or failed, and a range fetch that failed, is retried after
+`ATTRIBUTED_RETRY_BACKOFF_MS` (default 30 s, 1 m, 2 m, 4 m, 8 m: six tries); a possible duplicate
+provider charge is accepted. Every paid try is its own durable attempt under the same fence as
+before (claim token, dispatch slot, owner heartbeat), and an attempt never runs past 8 min, so a
+retry after a dead worker waits out that bound and two calls for one batch never overlap. After two
+empty results the batch uses `TINFOIL_ATTRIBUTED_FALLBACK_MODEL` (default `voxtral-small-24b`,
+untimed: one segment per batch). Publication waits for scheduled retries and accepts a batch whose
+latest attempt succeeded after only failed/uncertain ones, or whose attempts are all failed/uncertain.
+Speech still untranscribed — exhausted batches and producer-failed ranges — is then re-read once
+(same retries) from Vexa's retained mixed recording and published under that range's speaker (or the
+same-channel inference, else `Unknown`) with `attribution:"provisional"` and `source:"recording"`.
+The recording is placed on the meeting clock by correlating the manifest's speech ranges with the
+recording's voiced frames, starting from `clock_origin_ms − start_time` (the recording starts when the
+bot's capture starts; the clock origin is its first audible frame); without a confident alignment
+nothing is sent. Anything still untranscribed is listed as `gaps: [{start, end, speaker_name}]`
+(meeting seconds) with `partial: true`, and the worker logs `untranscribed_gap` with the gap total.
 `partial: true` is added when the transcript degraded: unresolved-speaker ranges published under an
-unknown speaker, producer-failed ranges skipped, or the mixed recording recovered because the
-attributed manifest could not be staged. `GET /v1/meetings/{id}` and `meeting.completed` webhooks
-then also carry `transcript_partial: true`.
+unknown speaker, ranges filled from the recording or listed as gaps, or the mixed recording recovered
+because the attributed manifest could not be staged. `GET /v1/meetings/{id}` and `meeting.completed`
+webhooks then also carry `transcript_partial: true`.
 `speaker_id` is stable within a meeting only. `provider` is `"vexa"`: Vexa owns the transcript and speaker attribution, while TinyCloud normalizes the completed segments. `DELETE /v1/meetings/{id}` removes our record + transcript and the Vexa meeting.
 `GET /health` → `{status:"ok","checks":{postgres,redis,vexa,bot_capacity:{running,max},transcription_provider}}` (`bot_capacity.max` from `VEXA_MAX_CONCURRENT_BOTS`).
 
@@ -84,7 +103,9 @@ re-transcribes eligible completed attributed meetings (owners in `EVAL_TINYCHAT_
 `transcript_evals`. `bun run cli eval reference|run|report|show` stores a reference transcript (e.g. a
 Google Meet/Gemini export), runs evals on demand, and prints metrics (WER in published order, word and
 trigram recall, speaker accuracy, unknown share, hallucinated turns) for the published transcript and
-every eval. Eval and reference rows are deleted with the meeting.
+every eval. `eval report` also prints the meeting's coverage (captured vs transcribed speech ms,
+split into attributed, recording-filled, silent and gap ms), stored with the canonical transcript in
+`attributed_transcription_runs.coverage_json`. Eval and reference rows are deleted with the meeting.
 
 Webhook event: `{"id":"evt_…","type":"meeting.completed","created_at":"…","data":{"meeting_id":"…","metadata":{},"transcript_provider":"vexa"}}` (`data.error` on `meeting.failed`).
 
