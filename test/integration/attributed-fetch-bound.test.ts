@@ -59,10 +59,13 @@ test("a permanently missing range is fetched at most once per backoff step plus 
     return row.status === "failed" ? row : null;
   }, { timeoutMs: 30_000, label: "batch settled failed" });
   expect(batch.status).toBe("failed");
+  // There is no retained recording either: the captured second is listed as a gap rather than the
+  // meeting failing and hiding it (TC-758).
   const meeting = await h.waitFor(async () => {
-    const body = await (await h.api(`/v1/meetings/${id}`)).json(); return body.status === "failed" ? body : null;
+    const body = await (await h.api(`/v1/meetings/${id}`)).json(); return body.status === "completed" ? body : null;
   }, { timeoutMs: 30_000 });
-  expect(meeting.error?.code).toBe("transcription_failed");
+  expect(meeting.transcript_partial).toBe(true);
+  expect(await (await h.api(`/v1/meetings/${id}/transcript`)).json()).toMatchObject({ text: "", gaps: [{ start: 0, end: 1, speaker_name: "Alice" }] });
   // No paid call was ever admitted: the attempt ledger stays empty and Tinfoil was never invoked.
   const [attempts] = await h.ctx.db.execute<{ n: number }>(
     sql`select count(*)::int as n from attributed_attempts a join attributed_batches b on a.batch_id = b.id where b.meeting_id = ${id}`,

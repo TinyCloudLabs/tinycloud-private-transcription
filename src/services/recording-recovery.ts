@@ -205,3 +205,18 @@ export async function fetchRetainedRecording(ctx: AppContext, vexaMeetingId: num
     throw error;
   }
 }
+
+/** Streams the retained recording to `destination` (unpaid). Not ready is `RecoveryRecordingNotReadyError`. */
+export async function fetchRetainedRecordingToFile(ctx: AppContext, vexaMeetingId: number, destination: string): Promise<void> {
+  try {
+    const recordings = await ctx.vexa.listRecordings();
+    const recording = recordings.recordings.find((candidate) => candidate.meeting_id === vexaMeetingId && candidate.media_files.some((file) => file.type === "audio"));
+    if (!recording) throw new RecoveryRecordingNotReadyError();
+    const master = await ctx.vexa.recordingMaster(recording.id);
+    if (!master.raw_url) throw new RecoveryRecordingNotReadyError();
+    if (!(await ctx.vexa.fetchToFile(master.raw_url, destination))) throw new RecoveryRecordingNotReadyError();
+  } catch (error) {
+    if (error instanceof RecoveryRecordingNotReadyError || isRetryableRecordingFetchError(error)) throw new RecoveryRecordingNotReadyError();
+    throw error;
+  }
+}

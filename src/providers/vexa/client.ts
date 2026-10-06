@@ -126,6 +126,12 @@ export class VexaClient {
     return { bytes: new Uint8Array(await res.arrayBuffer()), contentType: res.headers.get("content-type") ?? "application/octet-stream" };
   }
 
+  /** Streams a retained file to disk instead of memory (recordings can be large, TC-758). Returns its size. */
+  async fetchToFile(path: string, destination: string): Promise<number> {
+    const res = await this.raw("GET", path, undefined, 300_000);
+    return Bun.write(destination, res);
+  }
+
   async health(): Promise<boolean> {
     try {
       await this.botStatus();

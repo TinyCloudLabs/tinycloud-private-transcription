@@ -98,6 +98,10 @@ services:
       # Attributed Google Meet batches use Whisper: it returns segment timestamps, so published
       # turns interleave on the meeting clock, and it does not answer short clips like a chatbot (TC-740).
       TINFOIL_ATTRIBUTED_MODEL: ${TINFOIL_ATTRIBUTED_MODEL:-whisper-large-v3-turbo}
+      # TC-758: untimed fallback after two empty Whisper results, and the attributed retry schedule
+      # (6 tries). Shortening the schedule settles over-limit rows exhausted; it never strands them.
+      TINFOIL_ATTRIBUTED_FALLBACK_MODEL: ${TINFOIL_ATTRIBUTED_FALLBACK_MODEL:-voxtral-small-24b}
+      ATTRIBUTED_RETRY_BACKOFF_MS: ${ATTRIBUTED_RETRY_BACKOFF_MS:-30000,60000,120000,240000,480000}
       # Internal eval (TC-745): after publication, re-transcribe internal team meetings with these
       # models and keep the results in the ptx DB for comparison (`bun run cli eval report`).
       EVAL_MODELS: ${EVAL_MODELS:-voxtral-small-24b}

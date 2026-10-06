@@ -66,28 +66,45 @@ is placed on the meeting clock, so speakers interleave in spoken order. A partic
 `speaker_id` per display name. Audio whose speaker the capture could not bind takes the name of the
 bound speaker on the same audio channel within 3 s, with `attribution:"provisional"`; otherwise it
 publishes under `Unknown`. Model output that is not speech (chat-assistant replies, stock captions on
-silence) is dropped; audio below −65 dBFS never yields text (silent windows are not even sent), and
-speech-level audio (≥ −45 dBFS) keeps short phrases unless the model's confidence is very low.
+silence, repetition loops) is dropped. Audio below −65 dBFS never yields text (silent windows are not
+even sent); energy is measured over the captured audio within ±1 s of the text, never over pauses
+inserted between ranges. Speech-level audio (≥ −45 dBFS) keeps short phrases unless the model's
+confidence is very low: possible noise is preferred over lost speech.
 
 No captured speech is silently lost (TC-758). A batch whose Tinfoil call was uncertain (transport
-error, timeout), returned no words, or failed, and a range fetch that failed, is retried after
-`ATTRIBUTED_RETRY_BACKOFF_MS` (default 30 s, 1 m, 2 m, 4 m, 8 m: six tries); a possible duplicate
-provider charge is accepted. Every paid try is its own durable attempt under the same fence as
-before (claim token, dispatch slot, owner heartbeat), and an attempt never runs past 8 min, so a
-retry after a dead worker waits out that bound and two calls for one batch never overlap. After two
-empty results the batch uses `TINFOIL_ATTRIBUTED_FALLBACK_MODEL` (default `voxtral-small-24b`,
-untimed: one segment per batch). Publication waits for scheduled retries and accepts a batch whose
-latest attempt succeeded after only failed/uncertain ones, or whose attempts are all failed/uncertain.
-Speech still untranscribed — exhausted batches and producer-failed ranges — is then re-read once
-(same retries) from Vexa's retained mixed recording and published under that range's speaker (or the
-same-channel inference, else `Unknown`) with `attribution:"provisional"` and `source:"recording"`.
-The recording is placed on the meeting clock by correlating the manifest's speech ranges with the
-recording's voiced frames, starting from `clock_origin_ms − start_time` (the recording starts when the
-bot's capture starts; the clock origin is its first audible frame); without a confident alignment
-nothing is sent. Anything still untranscribed is listed as `gaps: [{start, end, speaker_name}]`
-(meeting seconds) with `partial: true`, and the worker logs `untranscribed_gap` with the gap total.
+error, timeout), returned no words (or only text the filter drops), or failed, and a range fetch that
+failed, is retried after `ATTRIBUTED_RETRY_BACKOFF_MS` (default 30 s, 1 m, 2 m, 4 m, 8 m: six tries);
+a possible duplicate provider charge is accepted. Every paid try is its own durable attempt under the
+same fence as before (claim token, dispatch slot, owner heartbeat). An attempt never runs past 8 min,
+so a retry after a dead worker waits out that bound and two calls for one batch never overlap; a
+worker that dies while preparing (e.g. killed during a download) spends the same six-try budget.
+After two empty results the batch uses `TINFOIL_ATTRIBUTED_FALLBACK_MODEL` (default
+`voxtral-small-24b`, untimed: one segment per batch, published with `source:"fallback"`). A row whose
+attempts already reach the limit (e.g. after the schedule was shortened) settles exhausted. Batch
+and gap-fill calls run in two background worker slots, so other meetings' jobs are never held up.
+Publication waits for scheduled retries and accepts a batch whose latest attempt succeeded after only
+failed/uncertain ones, or whose attempts are all failed/uncertain.
+
+Speech still untranscribed — exhausted batches, producer-failed ranges, and the parts of completed
+batches that yielded no kept text (a voiced window answered empty, text dropped over non-silent
+audio) — is re-read from Vexa's retained mixed recording. One unpaid step streams the recording into
+100 ms levels and aligns it to the meeting clock: the recording starts when the bot's capture starts
+(about Vexa's `start_time`) while the clock origin is its first audible frame, so
+`clock_origin_ms − start_time` only centres the search, and an offset is used only when the
+manifest's speech ranges land on recording speech (score ≥ 0.6, and ≥ 0.05 better than any offset
+more than 1 s away). Without a verified alignment nothing is sent and every span is a listed gap.
+Voiced windows (≤ 29 s each, cut on their own from the file) are then transcribed in paid groups of
+≤ 4 windows, each group its own retried attempt ledger, so a failure loses only that group's work.
+Recovered text publishes with `source:"recording"` under the speaker of that speech with
+`attribution:"provisional"`; unresolved speech takes the same-channel inference (provisional) or
+`Unknown` with `attribution:"unknown"`. Anything still untranscribed — and any gap-fill result that
+fails verification, which never fails the meeting — is listed as `gaps: [{start, end, speaker_name}]`
+(meeting seconds) with `partial: true`; a meeting with gaps but no text still completes with them
+listed. The worker logs `untranscribed_gap` with the gap total. Publication is typically minutes
+after the meeting; when every attempt times out at its deadline, batch retries and the recording
+fill together can delay it by about 1.5–2 h.
 `partial: true` is added when the transcript degraded: unresolved-speaker ranges published under an
-unknown speaker, ranges filled from the recording or listed as gaps, or the mixed recording recovered
+unknown speaker, speech filled from the recording or listed as gaps, or the mixed recording recovered
 because the attributed manifest could not be staged. `GET /v1/meetings/{id}` and `meeting.completed`
 webhooks then also carry `transcript_partial: true`.
 `speaker_id` is stable within a meeting only. `provider` is `"vexa"`: Vexa owns the transcript and speaker attribution, while TinyCloud normalizes the completed segments. `DELETE /v1/meetings/{id}` removes our record + transcript and the Vexa meeting.
@@ -329,7 +346,10 @@ Batch role only (migration 0017): `transcriptions`, `transcription_capabilities`
 `transcription_admission` (one row), `transcription_workers`.
 
 ## Deployment
-Meeting service: single dstack CVM: api, worker, Vexa services, redis, postgres. Batch transcription runs as its own
+Meeting service: single dstack CVM: api, worker, Vexa services, redis, postgres. TC-758 is a one-way upgrade
+(migration 0023 is additive): once retried batches (more than one attempt) or `gap_align`/`gap_fill`
+ledger rows exist, earlier code rejects them at publication and fails those meetings, so do not roll
+back past it. Batch transcription runs as its own
 service (`PTX_ROLE=batch`: api, `src/uploads/worker.ts`, postgres) with its own Tinfoil credential.
 
 ## Non-goals (V1)

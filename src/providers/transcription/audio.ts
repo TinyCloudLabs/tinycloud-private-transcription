@@ -70,3 +70,48 @@ export function wavHeader(dataBytes: number, sampleRate: number): Uint8Array {
   write(36, "data"); view.setUint32(40, dataBytes, true);
   return new Uint8Array(view.buffer);
 }
+
+/** Runs ffmpeg to stdout with a hard wall-clock bound; the process is killed past it. */
+function spawnFfmpeg(args: string[], ffmpegPath: string | undefined, timeoutMs: number) {
+  const proc = Bun.spawn([ffmpegPath ?? "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", ...args], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const timer = setTimeout(() => proc.kill(), timeoutMs);
+  const finished = async () => {
+    const [error, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    clearTimeout(timer);
+    if (code !== 0) throw new Error(`ffmpeg failed (exit ${code}): ${error.trim().slice(0, 300)}`);
+  };
+  return { proc, finished };
+}
+
+const LEVEL_RATE = 8_000, LEVEL_FRAME = 800, LEVEL_FLOOR_DB = -120;
+/**
+ * 100 ms RMS levels (dB) of a recording file (TC-758). The audio is streamed through ffmpeg at
+ * 8 kHz and folded into frame levels as it arrives, so memory is O(frames), not O(samples):
+ * a whole meeting is never held decoded.
+ */
+export async function recordingLevels(path: string, opts: { ffmpegPath?: string; timeoutMs?: number } = {}): Promise<{ levels: Float64Array; durationSec: number }> {
+  const { proc, finished } = spawnFfmpeg(["-i", path, "-vn", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", String(LEVEL_RATE), "pipe:1"], opts.ffmpegPath, opts.timeoutMs ?? 300_000);
+  const levels: number[] = [];
+  let sum = 0, count = 0, samples = 0, carry = -1;
+  const take = (sample: number) => {
+    const value = sample / 32768; sum += value * value; count++; samples++;
+    if (count === LEVEL_FRAME) { levels.push(sum > 0 ? Math.max(LEVEL_FLOOR_DB, 10 * Math.log10(sum / count)) : LEVEL_FLOOR_DB); sum = 0; count = 0; }
+  };
+  for await (const chunk of proc.stdout as unknown as AsyncIterable<Uint8Array>) {
+    let i = 0;
+    if (carry >= 0 && chunk.length) { take(((carry | (chunk[0]! << 8)) << 16) >> 16); carry = -1; i = 1; }
+    for (; i + 1 < chunk.length; i += 2) take(((chunk[i]! | (chunk[i + 1]! << 8)) << 16) >> 16);
+    if (i < chunk.length) carry = chunk[i]!;
+  }
+  await finished();
+  return { levels: Float64Array.from(levels), durationSec: samples / LEVEL_RATE };
+}
+
+/** Decodes only [fromSec, toSec) of a recording file to 16 kHz mono PCM (input seeking). */
+export async function decodeCut(path: string, fromSec: number, toSec: number, opts: { ffmpegPath?: string; timeoutMs?: number } = {}): Promise<Pcm16> {
+  const { proc, finished } = spawnFfmpeg(["-ss", fromSec.toFixed(3), "-t", Math.max(0, toSec - fromSec).toFixed(3), "-i", path, "-vn", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", String(PCM_RATE), "pipe:1"],
+    opts.ffmpegPath, opts.timeoutMs ?? 60_000);
+  const [out] = await Promise.all([new Response(proc.stdout).arrayBuffer(), finished()]);
+  const samples = new Int16Array(out.slice(0, out.byteLength - (out.byteLength % 2)));
+  return { samples, sampleRate: PCM_RATE, durationSec: samples.length / PCM_RATE };
+}

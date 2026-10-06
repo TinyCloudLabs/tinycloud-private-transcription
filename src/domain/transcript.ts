@@ -15,7 +15,7 @@ export interface RawSegment {
    * Text re-read from the retained mixed recording for a span the per-speaker path lost (TC-758);
    * published as `source: "recording"`. Not named `source`: Vexa rows carry their own `source`.
    */
-  origin?: "recording";
+  origin?: "recording" | "fallback";
 }
 
 export interface Speaker {
@@ -30,7 +30,8 @@ export interface Segment {
   end: number;
   text: string;
   attribution?: SpeakerAttribution;
-  source?: "recording";
+  /** `recording`: re-read from the mixed recording; `fallback`: from the fallback model (TC-758). */
+  source?: "recording" | "fallback";
 }
 export interface NormalizedTranscript {
   language: string;
@@ -71,7 +72,7 @@ export function normalizeSegments(raw: RawSegment[], languageHint?: string | nul
       end: s.end,
       text: s.text.trim(),
       ...(s.attribution ? { attribution: s.attribution } : {}),
-      ...(s.origin === "recording" ? { source: "recording" as const } : {}),
+      ...(s.origin === "recording" || s.origin === "fallback" ? { source: s.origin } : {}),
     };
   });
   const language = languageHint || sorted.find((s) => s.language)?.language || "en";

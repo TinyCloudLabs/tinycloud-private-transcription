@@ -1,10 +1,10 @@
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { asc, eq, sql } from "drizzle-orm";
+import { and, asc, eq, sql } from "drizzle-orm";
 import { ATTEMPT_DEADLINE_MS, TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
 import { PCM_RATE, pcmToWav } from "../../src/providers/transcription/audio.ts";
-import { attributedAttempts, attributedBatches, attributedTranscriptionRuns, attributedWorkerReadiness } from "../../src/db/schema.ts";
-import { attributedWorkerReady, processAttributedBatch, reconcileAttributedRuns, recordAttributedWorkerReadiness } from "../../src/services/attributed-transcription.ts";
+import { attributedAttempts, attributedBatches, attributedTranscriptionRuns, attributedWorkerReadiness, meetings } from "../../src/db/schema.ts";
+import { attributedWorkerReady, finalizeAttributedRun, processAttributedBatch, reconcileAttributedRuns, recordAttributedWorkerReadiness } from "../../src/services/attributed-transcription.ts";
 import { runTranscriptEval, setReferenceTranscript, transcriptEvalReport, transcriptEvalText } from "../../src/services/transcript-eval.ts";
 import { silentLogger } from "../../src/log.ts";
 import { startHarness, type Harness } from "./harness.ts";
@@ -23,13 +23,14 @@ let respond: ((request: TinfoilRequest) => Response | Promise<Response>) | null 
 const warnings: Array<{ msg: string; data?: Record<string, unknown> }> = [];
 const words = (text: string) => new Response(JSON.stringify({ text, language: "en" }));
 
+const fetchMock = (async (_url: string, init: RequestInit) => {
+  const form = init.body as FormData, file = form.get("file") as File;
+  const bytes = await file.arrayBuffer();
+  const request = { filename: file.name, model: String(form.get("model")), firstSample: bytes.byteLength > 45 ? new Int16Array(bytes, 44, 1)[0]! : 0 };
+  return respond ? respond(request) : words("sealed words");
+}) as unknown as typeof fetch;
+
 beforeAll(async () => {
-  const fetchMock = (async (_url: string, init: RequestInit) => {
-    const form = init.body as FormData, file = form.get("file") as File;
-    const bytes = await file.arrayBuffer();
-    const request = { filename: file.name, model: String(form.get("model")), firstSample: bytes.byteLength > 45 ? new Int16Array(bytes, 44, 1)[0]! : 0 };
-    return respond ? respond(request) : words("sealed words");
-  }) as unknown as typeof fetch;
   const tinfoil = new TinfoilTranscriptionProvider({ baseUrl: "http://tinfoil.invalid", apiKey: "test", model: "test", attributedFallbackModel: "fallback-model", fetch: fetchMock });
   const log = { ...silentLogger, warn: (msg: string, data?: Record<string, unknown>) => { warnings.push({ msg, data }); } };
   h = await startHarness({ attributedTranscriptionEnabled: true, enabledPlatforms: ["google_meet"], transcriptRecovery: tinfoil, log });
@@ -215,7 +216,9 @@ test("unresolved-speaker ranges publish as unknown without vetoing the meeting (
            count(*) filter (where status = 'completed')::int as completed
     from attributed_ranges where meeting_id = ${id}`);
   expect(rangeRow).toEqual({ failed: 1, completed: 2 });
-});
+  // The producer-failed range has no retained recording here, so it is listed rather than dropped (TC-758).
+  expect(transcript.gaps).toEqual([{ start: 12, end: 13, speaker_name: "Unknown" }]);
+}, 30_000);
 
 test("an open manifest degrades to the mixed recording instead of failing (TC-559)", async () => {
   const created = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://meet.google.com/zab-cdef-ghi" } });
@@ -313,18 +316,18 @@ const speech = (amplitude: number) => new Uint8Array(new Float32Array(16_000).fi
 const alicePcm = speech(0.1), bobPcm = speech(0.2);
 const BOB_FIRST_SAMPLE = Math.trunc(0.2 * 32767);
 const hash = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
-const meetRange = (botId: number, sequence: number, speaker: string, channel: number, start_ms: number, bytes: Uint8Array, state: "uploaded" | "failed" = "uploaded") => ({
+const meetRange = (botId: number, sequence: number, speaker: string, channel: number, start_ms: number, bytes: Uint8Array, state: "uploaded" | "failed" = "uploaded", ms = 1000) => ({
   version: 1, meeting_id: String(botId), sequence, idempotency_key: `r${sequence}`, speaker_key: `gmeet:${channel}:${speaker}`, speaker_name: speaker,
-  attribution: { source: "glow-bound", confidence: 1 }, clock_origin_ms: 0, start_ms, end_ms: start_ms + 1000, audio_duration_ms: 1000,
+  attribution: { source: "glow-bound", confidence: 1 }, clock_origin_ms: 0, start_ms, end_ms: start_ms + ms, audio_duration_ms: ms,
   channel, turn_generation: 1, codec: "pcm_f32le", sample_rate: 16000, channels: 1, byte_count: bytes.byteLength, sha256: hash(bytes), state,
   ...(state === "uploaded" ? { path: `/meetings/${botId}/attributed-audio/ranges/${sequence}` } : {}),
 });
 
 /** Runs one Google Meet capture to a terminal meeting and returns its API views. */
-async function attributedMeeting(native: string, ranges: Array<{ speaker: string; channel: number; start_ms: number; bytes: Uint8Array; state?: "uploaded" | "failed" }>, recording?: Uint8Array) {
+async function attributedMeeting(native: string, ranges: Array<{ speaker: string; channel: number; start_ms: number; bytes: Uint8Array; state?: "uploaded" | "failed"; ms?: number }>, recording?: Uint8Array) {
   const { id } = await (await h.api("/v1/meetings", { method: "POST", json: { meeting_url: `https://meet.google.com/${native}` } })).json();
   const bot = await h.waitFor(async () => h.vexa.meetings.get(`google_meet/${native}`) ?? null, { timeoutMs: 30_000 });
-  const manifestRanges = ranges.map((r, sequence) => meetRange(bot.id, sequence, r.speaker, r.channel, r.start_ms, r.bytes, r.state));
+  const manifestRanges = ranges.map((r, sequence) => meetRange(bot.id, sequence, r.speaker, r.channel, r.start_ms, r.bytes, r.state, r.ms));
   await h.vexa.control("google_meet", native, {
     status: "completed", completion_reason: "stopped",
     attributed_audio_capability: { requested_version: 1, supported_version: 1, status: "supported" },
@@ -355,7 +358,7 @@ test("an uncertain first Tinfoil call is retried and the meeting publishes compl
   // Two durable attempts: the uncertain one settled terminal, then the retry succeeded.
   expect(batches.map((b) => [b.kind, b.status, b.attempts])).toEqual([["batch", "completed", 2]]);
   expect(attempts.map((a) => [a.ordinal, a.status, a.outcome, a.model])).toEqual([[1, "ambiguous", "external_call_uncertain", "test"], [2, "succeeded", null, "test"]]);
-  expect(run.coverageJson).toMatchObject({ captured_ms: 1000, transcribed_ms: 1000, attributed_ms: 1000, gap_ms: 0, retried_batches: 1, gap_fill: "none" });
+  expect(run.coverageJson).toMatchObject({ captured_ms: 1000, transcribed_ms: 1000, attributed_ms: 1000, gap_ms: 0, retried_batches: 1, gap_align: "none" });
   expect(warnings.some((w) => w.msg.includes("retry scheduled") && w.data?.meetingId === id && w.data?.code === "external_call_uncertain")).toBe(true);
   expect((await transcriptEvalReport(h.ctx, id)).coverage).toMatchObject({ captured_ms: 1000, transcribed_ms: 1000 });
 }, 60_000);
@@ -388,9 +391,11 @@ test("a batch exhausted after retries is filled from the retained recording on t
   const bob = batches.find((b) => b.kind === "batch" && b.status !== "completed")!;
   expect([bob.status, bob.attempts]).toEqual(["ambiguous", 6]);
   expect(attempts.filter((a) => a.batchId === bob.id).every((a) => a.status === "ambiguous")).toBe(true);
-  const gap = batches.find((b) => b.kind === "gap_fill")!;
-  expect([gap.ordinal, gap.status, gap.attempts]).toEqual([-1, "completed", 1]);
-  expect(gap.resultJson).toMatchObject({ offset_ms: 1_500, alignment: "correlated" });
+  // One unpaid align row, then one paid chunk row for Bob's two voiced windows.
+  const align = batches.find((b) => b.kind === "gap_align")!, chunk = batches.find((b) => b.kind === "gap_fill")!;
+  expect([align.ordinal, align.status, align.attempts]).toEqual([-1, "completed", 0]);
+  expect(align.resultJson).toMatchObject({ offset_ms: 1_500 });
+  expect([chunk.ordinal, chunk.status, chunk.attempts]).toEqual([-2, "completed", 1]);
   expect(gapRequests).toEqual(["gap-0.wav", "gap-1.wav"]);
   // Bob's lost speech is back under Bob, provisional, marked as recording-sourced, in spoken order.
   expect(transcript.segments.map((s: any) => [s.speaker_name, s.text, s.start, s.end, s.attribution, s.source])).toEqual([
@@ -399,7 +404,7 @@ test("a batch exhausted after retries is filled from the retained recording on t
     ["Bob", "recovered words", 15, 16, "provisional", "recording"],
   ]);
   expect(transcript.gaps).toBeUndefined();
-  expect(run.coverageJson).toMatchObject({ captured_ms: 6_000, transcribed_ms: 6_000, attributed_ms: 4_000, recording_ms: 2_000, gap_ms: 0, gap_fill: "completed" });
+  expect(run.coverageJson).toMatchObject({ captured_ms: 6_000, transcribed_ms: 6_000, attributed_ms: 4_000, recording_ms: 2_000, gap_ms: 0, gap_align: "completed", gap_chunks: 1, gap_chunks_filled: 1, gap_rows_unverified: 0 });
 }, 60_000);
 
 test("speech no path could transcribe is listed as gaps and alerted, never dropped silently (TC-758)", async () => {
@@ -410,8 +415,9 @@ test("speech no path could transcribe is listed as gaps and alerted, never dropp
   ]);
   expect(meeting).toMatchObject({ status: "completed", transcript_partial: true });
   expect(transcript).toMatchObject({ partial: true, text: "Alice: sealed words", gaps: [{ start: 20, end: 21, speaker_name: "Carol" }] });
-  expect(batches.find((b) => b.kind === "gap_fill")).toMatchObject({ status: "failed", attempts: 0, fetchAttempts: 5 });
-  expect(run.coverageJson).toMatchObject({ captured_ms: 2_000, transcribed_ms: 1_000, gap_ms: 1_000, gap_fill: "failed" });
+  expect(batches.find((b) => b.kind === "gap_align")).toMatchObject({ status: "failed", attempts: 0, fetchAttempts: 5 });
+  expect(batches.some((b) => b.kind === "gap_fill")).toBe(false);
+  expect(run.coverageJson).toMatchObject({ captured_ms: 2_000, transcribed_ms: 1_000, gap_ms: 1_000, gap_align: "failed", gap_chunks: 0 });
   expect(warnings.find((w) => w.data?.code === "untranscribed_gap" && w.data?.meetingId === id)?.data).toMatchObject({ gaps: 1, gapMs: 1_000 });
 }, 60_000);
 
@@ -457,6 +463,125 @@ test("a dead owner's attempt is re-sent only after its deadline, so two paid cal
     expect(meeting.transcript_partial).toBeUndefined();
     const attempts = await h.ctx.db.select().from(attributedAttempts).where(eq(attributedAttempts.batchId, batch.id)).orderBy(asc(attributedAttempts.ordinal));
     expect(attempts.map((a) => [a.ordinal, a.status])).toEqual([[1, "ambiguous"], [2, "succeeded"]]);
+  } finally {
+    h.ctx.transcriptRecovery = recovery;
+  }
+}, 60_000);
+
+test("ten seconds of voiced audio answered empty inside a completed batch are re-read from the recording (TC-758)", async () => {
+  // Whisper: Alice's batch splits into two windows; the second (her last 10 s) comes back empty.
+  const recovery = h.ctx.transcriptRecovery;
+  h.ctx.transcriptRecovery = new TinfoilTranscriptionProvider({ baseUrl: "http://tinfoil.invalid", apiKey: "test", model: "test", attributedModel: "whisper-test", fetch: fetchMock });
+  const timed = (text: string, end: number) => new Response(JSON.stringify({ text, language: "en", segments: text ? [{ start: 0.3, end, text, avg_logprob: -0.2 }] : [] }));
+  respond = (request) => request.filename.startsWith("gap-") ? timed("recovered words", 9.5)
+    : request.filename.endsWith("-1.wav") ? timed("", 0) : timed("first words", 20);
+  const block = (ms: number) => new Uint8Array(new Float32Array(ms * 16).fill(0.1).buffer);
+  const ranges = [{ start_ms: 0, ms: 12_000 }, { start_ms: 14_000, ms: 11_000 }, { start_ms: 35_000, ms: 10_000 }];
+  const offsetMs = 2_000, mixed = new Int16Array(50 * PCM_RATE).fill(10);
+  for (const r of ranges) mixed.fill(4_000, (r.start_ms + offsetMs) * 16, (r.start_ms + r.ms + offsetMs) * 16);
+  try {
+    const { id, meeting, transcript, run, batches } = await attributedMeeting("ten-seco-nds", ranges.map((r) => ({ speaker: "Alice", channel: 0, start_ms: r.start_ms, bytes: block(r.ms), ms: r.ms })), pcmToWav(mixed, PCM_RATE));
+    expect(meeting).toMatchObject({ status: "completed", transcript_partial: true });
+    // The batch completed on its first attempt; the empty window's 10 s became a gap-fill part.
+    expect(batches.filter((b) => b.kind === "batch").map((b) => [b.status, b.attempts])).toEqual([["completed", 1]]);
+    expect(transcript.segments.map((s: any) => [s.text, s.start, s.source])).toEqual([["first words", 0.3, undefined], ["recovered words", 35.05, "recording"]]);
+    expect(transcript.gaps).toBeUndefined();
+    expect(run.coverageJson).toMatchObject({ captured_ms: 33_000, attributed_ms: 23_000, recording_ms: 10_000, transcribed_ms: 33_000, gap_ms: 0 });
+    expect((await transcriptEvalReport(h.ctx, id)).coverage).toMatchObject({ gap_ms: 0 });
+  } finally { h.ctx.transcriptRecovery = recovery; }
+}, 60_000);
+
+test("a meeting.start is handled while a slow attributed batch call is in flight (TC-758)", async () => {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let inFlight = false;
+  respond = async (request) => {
+    if (request.firstSample === Math.trunc(0.3 * 32767)) { inFlight = true; await held; }
+    return words("sealed words");
+  };
+  const slow = attributedMeeting("slo-wbat-chx", [{ speaker: "Alice", channel: 0, start_ms: 0, bytes: speech(0.3) }]);
+  try {
+    await h.waitFor(async () => inFlight || null, { timeoutMs: 30_000, label: "slow batch in flight" });
+    // While that paid call is held open, another meeting's bot is still dispatched promptly.
+    await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://meet.google.com/oth-erme-etx" } });
+    await h.waitFor(async () => h.vexa.meetings.get("google_meet/oth-erme-etx") ?? null, { timeoutMs: 5_000, label: "meeting.start handled during the slow batch" });
+    expect(inFlight).toBe(true);
+  } finally { release(); }
+  expect((await slow).meeting.status).toBe("completed");
+}, 60_000);
+
+/** Stages a meeting with Tinfoil withheld, so its single batch stays pending for direct manipulation. */
+async function heldMeeting(native: string) {
+  const { id } = await (await h.api("/v1/meetings", { method: "POST", json: { meeting_url: `https://meet.google.com/${native}` } })).json();
+  const bot = await h.waitFor(async () => h.vexa.meetings.get(`google_meet/${native}`) ?? null, { timeoutMs: 30_000 });
+  const range = meetRange(bot.id, 0, "Alice", 0, 0, alicePcm);
+  await h.vexa.control("google_meet", native, {
+    status: "completed", completion_reason: "stopped",
+    attributed_audio_capability: { requested_version: 1, supported_version: 1, status: "supported" },
+    attributed_audio_manifest: { version: 1, meeting_id: String(bot.id), state: "closed", clock_origin: "first_admitted_capture_epoch_ms", clock_origin_ms: 0, ranges: [range] },
+    attributed_audio_base64: { [range.path!]: Buffer.from(alicePcm).toString("base64") },
+  });
+  const batch = await h.waitFor(async () => {
+    const [row] = await h.ctx.db.select().from(attributedBatches).where(eq(attributedBatches.meetingId, id)); return row?.status === "pending" ? row : null;
+  }, { timeoutMs: 30_000, label: "batch staged" });
+  return { id, botId: bot.id as number, batch };
+}
+const terminalMeeting = (id: string) => h.waitFor(async () => { const body = await (await h.api(`/v1/meetings/${id}`)).json(); return ["completed", "failed"].includes(body.status) ? body : null; }, { timeoutMs: 30_000 });
+
+test("a pending row already at the attempt limit settles exhausted instead of stalling the meeting (TC-758)", async () => {
+  const recovery = h.ctx.transcriptRecovery;
+  h.ctx.transcriptRecovery = null;
+  try {
+    // E.g. six attempts were made under a longer schedule, then ATTRIBUTED_RETRY_BACKOFF_MS shrank.
+    const { id, batch } = await heldMeeting("ove-rlim-itx");
+    await h.ctx.db.update(attributedBatches).set({ attempts: 6 }).where(eq(attributedBatches.id, batch.id));
+    for (let n = 1; n <= 6; n++) await h.ctx.db.insert(attributedAttempts).values({ id: `${batch.id}:attempt:${n}`, batchId: batch.id, ordinal: n, status: "ambiguous", outcome: "external_call_uncertain", completedAt: new Date() });
+    h.ctx.transcriptRecovery = recovery;
+    await h.ctx.queue.push({ type: "attributed.batch", meetingId: id, batchId: batch.id });
+    const meeting = await terminalMeeting(id);
+    // No recording either: the speech is listed, and the meeting completes rather than hanging or failing.
+    expect(meeting).toMatchObject({ status: "completed", transcript_partial: true });
+    const transcript = await (await h.api(`/v1/meetings/${id}/transcript`)).json();
+    expect(transcript).toMatchObject({ text: "", gaps: [{ start: 0, end: 1, speaker_name: "Alice" }] });
+    const [settled] = await h.ctx.db.select().from(attributedBatches).where(eq(attributedBatches.id, batch.id));
+    expect([settled.status, settled.attempts]).toEqual(["ambiguous", 6]);
+  } finally { h.ctx.transcriptRecovery = recovery; }
+}, 60_000);
+
+test("a step that keeps crashing its worker before paying ends exhausted, not in a crash loop (TC-758)", async () => {
+  const recovery = h.ctx.transcriptRecovery;
+  h.ctx.transcriptRecovery = null;
+  try {
+    const { id, batch } = await heldMeeting("cra-shlo-opx");
+    // Five earlier claims already died mid-preparation (e.g. OOM during a decode); this is the sixth.
+    await h.ctx.db.update(attributedBatches).set({ status: "claimed", claimToken: "crashed", claimedAt: new Date(Date.now() - 10 * 60_000), fetchAttempts: 5 }).where(eq(attributedBatches.id, batch.id));
+    await reconcileAttributedRuns(h.ctx);
+    const [after] = await h.ctx.db.select().from(attributedBatches).where(eq(attributedBatches.id, batch.id));
+    expect([after.status, after.attempts]).toEqual(["failed", 0]);
+    h.ctx.transcriptRecovery = recovery;
+    await h.ctx.queue.push({ type: "attributed.finalize", meetingId: id });
+    const meeting = await terminalMeeting(id);
+    expect(meeting).toMatchObject({ status: "completed", transcript_partial: true });
+  } finally { h.ctx.transcriptRecovery = recovery; }
+}, 60_000);
+
+test("gap fill never fetches the recording of a meeting that is being deleted (TC-758)", async () => {
+  const recovery = h.ctx.transcriptRecovery;
+  h.ctx.transcriptRecovery = null;
+  try {
+    const { id, batch } = await heldMeeting("del-etin-gxx");
+    await h.ctx.db.update(attributedBatches).set({ status: "failed" }).where(eq(attributedBatches.id, batch.id));
+    await h.ctx.db.execute(sql`update attributed_ranges set status = 'failed' where meeting_id = ${id}`);
+    await h.ctx.db.update(meetings).set({ deletionToken: "deleting" }).where(eq(meetings.id, id));
+    const recordingRequests = () => h.vexa.requests.filter((request) => request.path.startsWith("/recordings")).length;
+    const before = recordingRequests();
+    h.ctx.transcriptRecovery = recovery;
+    await finalizeAttributedRun(h.ctx, id);
+    const [align] = await h.ctx.db.select().from(attributedBatches).where(and(eq(attributedBatches.meetingId, id), eq(attributedBatches.kind, "gap_align")));
+    expect(await processAttributedBatch(h.ctx, id, align.id)).toBe("processed");
+    const [settled] = await h.ctx.db.select().from(attributedBatches).where(eq(attributedBatches.id, align.id));
+    expect([settled.status, settled.resultJson]).toEqual(["failed", { outcome: "ineligible_dispatch" }]);
+    expect(recordingRequests()).toBe(before);
   } finally {
     h.ctx.transcriptRecovery = recovery;
   }

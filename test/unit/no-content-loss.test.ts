@@ -2,9 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { hallucinated } from "../../src/domain/hallucination.ts";
 import { attributedBatches, type AttributedManifest, type AttributedRange } from "../../src/providers/transcription/attributed.ts";
-import { assembleAttributedTranscript } from "../../src/providers/transcription/attributed-assembly.ts";
+import { assembleAttributedTranscript, attributedPieces, batchTimeline, type AttributedResult } from "../../src/providers/transcription/attributed-assembly.ts";
 import { PCM_RATE } from "../../src/providers/transcription/audio.ts";
-import { alignRecording, GAP_PAD_MS, gapOutcome, gapSpec, gapWindows, priorOffsetMs, recordingCut, validGapResult, voicedFrames, type GapFillResult } from "../../src/providers/transcription/gap-fill.ts";
+import { acceptWindowText, alignRecording, frameLevels, GAP_PAD_MS, gapChunks, gapOutcome, gapSpec, gapWindows, MAX_WINDOW_TEXT, priorOffsetMs, recordingCut, validChunkResult, voicedFrames, type GapAlignResult, type GapChunkSpec, type GapWindowText } from "../../src/providers/transcription/gap-fill.ts";
 import { sliceDbfs, TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
 import { attemptLimit, attemptModel, attemptsVerified, retryDelayMs } from "../../src/services/attributed-ledger.ts";
 
@@ -119,44 +119,99 @@ describe("Tinfoil attempt behaviour (TC-758)", () => {
   });
 });
 
+const full = (r: AttributedRange) => ({ sequence: r.sequence, start_ms: r.start_ms, end_ms: r.end_ms });
+
+describe("untranscribed parts of completed batches (TC-758)", () => {
+  test("a voiced window answered empty and a dropped piece are untranscribed; silent windows are not", () => {
+    // 3 Alice ranges: [0,29 s] one window, [30,31 s] window two, [32,33 s] window three... spliced with pauses.
+    const input = manifest([range(0, "Alice", 0, 20_000), range(1, "Alice", 30_000, 50_000), range(2, "Alice", 60_000, 70_000)]);
+    const [batch] = attributedBatches(input, 1);
+    const timeline = batchTimeline(batch!);
+    const [w0, w1, w2] = [[timeline[0]!.audioStart, timeline[0]!.audioEnd], [timeline[1]!.audioStart - timeline[1]!.padBefore, timeline[1]!.audioEnd], [timeline[2]!.audioStart - timeline[2]!.padBefore, timeline[2]!.audioEnd]] as Array<[number, number]>;
+    const result: AttributedResult = { text: "a b", windows: [{ from: w0[0], to: w0[1], status: "text" }, { from: w1[0], to: w1[1], status: "empty" }, { from: w2[0], to: w2[1], status: "silent" }],
+      segments: [{ start: 1, end: 5, text: "Real words.", avg_logprob: -0.2, energy_dbfs: -20 }, { start: 10, end: 11, text: "Thank you.", avg_logprob: -1.5, energy_dbfs: -20 }] };
+    const { raw, untranscribed, silent_ms } = attributedPieces(input, [{ spec: batch!, result }]);
+    expect(raw.map((piece) => piece.text)).toEqual(["Real words."]);
+    // The dropped caption's audio [10,11] s and the whole empty window (range 1) are lost speech.
+    expect(untranscribed).toEqual([{ sequence: 0, start_ms: 10_000, end_ms: 11_000 }, { sequence: 1, start_ms: 30_000, end_ms: 50_000 }]);
+    expect(silent_ms).toBe(10_000);
+    // Results stored before TC-758 (no window record) assemble exactly as before: nothing untranscribed.
+    expect(attributedPieces(input, [{ spec: batch!, result: { ...result, windows: undefined } }]).untranscribed).toEqual([]);
+  });
+
+  test("fallback-model text publishes marked for audit and still passes the chat-reply and loop filters", () => {
+    const input = manifest([range(0, "Alice", 0, 20_000)]);
+    const [batch] = attributedBatches(input, 1);
+    const marked = (text: string) => attributedPieces(input, [{ spec: batch!, result: { text, fallback: true, energy_dbfs: -20, windows: [{ from: 0, to: 20, status: "text" }] } }]);
+    expect(assembleAttributedTranscript(input, [{ spec: batch!, result: { text: "We ship Friday.", fallback: true, energy_dbfs: -20 } }], "en").transcript.segments[0]).toMatchObject({ source: "fallback", attribution: "identified" });
+    const loop = marked("Thank you. ".repeat(40));
+    expect([loop.raw.length, loop.untranscribed]).toEqual([0, [{ sequence: 0, start_ms: 0, end_ms: 20_000 }]]);
+    const [short] = attributedBatches(manifest([range(0, "Alice", 0, 8_000)]), 1);
+    expect(attributedPieces(input, [{ spec: short!, result: { text: "Hello! How can I assist you today? Let's have a friendly and engaging conversation.", fallback: true, energy_dbfs: -20, windows: [{ from: 0, to: 8, status: "text" }] } }]).raw).toHaveLength(0);
+  });
+
+  test("energy is measured over captured audio only, so a real word next to an inserted pause is kept", async () => {
+    // Two ranges 1 s apart: the second window opens with a 0.8 s inserted pause before "Yes.".
+    const input = manifest([range(0, "Alice", 0, 29_000), range(1, "Alice", 30_000, 30_600)]);
+    const [batch] = attributedBatches(input, 1);
+    const pcm = new Float32Array((29_000 + 600) * 16).fill(0.1);
+    const fetchImpl = (async (_url: string, init: RequestInit) => {
+      const name = ((init.body as FormData).get("file") as File).name;
+      return new Response(JSON.stringify(name.endsWith("-1.wav") ? { text: "Yes.", segments: [{ start: 0, end: 0.6, text: "Yes.", avg_logprob: -0.3 }] } : { text: "a", segments: [{ start: 0, end: 5, text: "a", avg_logprob: -0.1 }] }));
+    }) as unknown as typeof fetch;
+    const provider = new TinfoilTranscriptionProvider({ baseUrl: "https://t", apiKey: "k", model: "whisper-large-v3-turbo", fetch: fetchImpl });
+    const result = await provider.transcribeAttributedPcm(new Uint8Array(pcm.buffer), batch!, "en");
+    const yes = result.segments!.find((piece) => piece.text === "Yes.")!;
+    // Padded-audio energy over [29.8, 30.4] would be mostly inserted zeros; captured audio is -20 dBFS.
+    expect(yes.energy_dbfs).toBe(-20);
+    expect(attributedPieces(input, [{ spec: batch!, result }]).raw.map((piece) => piece.text)).toEqual(["a", "Yes."]);
+  });
+});
+
 describe("recording gap fill (TC-758)", () => {
-  test("merges one speaker's adjacent untranscribed ranges and names unresolved ones by channel", () => {
+  test("merges one speaker's adjacent untranscribed parts and names unresolved ones by channel", () => {
     const input = manifest([
       range(0, "Alice", 0, 1_000), range(1, "Alice", 2_000, 3_000), range(2, "Alice", 9_000, 10_000),
       range(3, "Bob", 2_500, 4_000, { channel: 1 }), range(4, "", 4_500, 5_000, { channel: 1 }), range(5, "", 40_000, 41_000, { channel: 3, state: "failed" }),
     ]);
-    const spec = gapSpec(input, [0, 1, 2, 3, 4, 5]);
-    expect(spec.spans.map((span) => [span.speaker_name, span.attribution, span.start_ms, span.end_ms, span.sequences])).toEqual([
+    const spec = gapSpec(input, input.ranges.map(full));
+    expect(spec.spans.map((span) => [span.speaker_name, span.attribution, span.start_ms, span.end_ms, span.parts.map((p) => p.sequence)])).toEqual([
       ["Alice", "provisional", 0, 3_000, [0, 1]],
       ["Bob", "provisional", 2_500, 5_000, [3, 4]],
       ["Alice", "provisional", 9_000, 10_000, [2]],
       ["Unknown", "unknown", 40_000, 41_000, [5]],
     ]);
+    // A sub-range of a completed batch is its own span.
+    expect(gapSpec(input, [{ sequence: 2, start_ms: 9_200, end_ms: 9_700 }]).spans.map((span) => [span.start_ms, span.end_ms])).toEqual([[9_200, 9_700]]);
   });
 
-  test("long spans split into windows that stay under the 30 s re-chunking with padding", () => {
-    const input = manifest(Array.from({ length: 70 }, (_, i) => range(i, "Alice", i * 1_000, i * 1_000 + 1_000)));
-    const windows = gapWindows(gapSpec(input, input.ranges.map((r) => r.sequence)));
-    expect(windows).toHaveLength(3);
-    expect(windows[0]!.start_ms).toBe(0);
-    expect(windows.at(-1)!.end_ms).toBe(70_000);
+  test("long spans split into windows under the 30 s re-chunking, and voiced windows into bounded paid chunks", () => {
+    const input = manifest(Array.from({ length: 300 }, (_, i) => range(i, "Alice", i * 1_000, i * 1_000 + 1_000)));
+    const spec = gapSpec(input, input.ranges.map(full));
+    const windows = gapWindows(spec);
+    expect(windows).toHaveLength(11);
     expect(windows.every((w) => w.end_ms - w.start_ms + 2 * GAP_PAD_MS <= 29_500)).toBe(true);
+    const align: GapAlignResult = { offset_ms: 1_000, score: 0.9, duration_ms: 400_000, windows: windows.map((_, i) => ({ status: i === 3 ? "silent" : "voiced" })) };
+    const chunks = gapChunks(spec, align);
+    expect(chunks.map((chunk) => chunk.windows.map((w) => w.index))).toEqual([[0, 1, 2, 4], [5, 6, 7, 8], [9, 10]]);
+    expect(chunks[0]!.windows[0]).toMatchObject({ from: 0.75, cut_start_ms: -250 });
   });
 
-  test("correlation recovers the recording offset from where the manifest says people spoke", () => {
-    // Speech bursts on the meeting clock; the recording started 7.3 s before the clock origin.
+  test("an offset is used only when the recording verifies it", () => {
+    // Irregular speech bursts on the meeting clock; the recording started 7.3 s before the clock origin.
     const ranges = [0, 4_000, 9_000, 15_000, 22_000, 30_000].map((start, i) => range(i, "Alice", start, start + 1_500));
     const input = manifest(ranges);
-    const offsetMs = 7_300, seconds = 45;
-    const samples = new Int16Array(seconds * PCM_RATE).fill(10);
-    for (const r of ranges) samples.fill(8_000, Math.round((r.start_ms + offsetMs) * 16), Math.round((r.end_ms + offsetMs) * 16));
-    const voiced = voicedFrames({ samples, sampleRate: PCM_RATE, durationSec: seconds });
-    expect(alignRecording(input, voiced, null)).toEqual({ offset_ms: 7_300, alignment: "correlated", score: 1 });
-    expect(alignRecording(input, voiced, 6_000)?.offset_ms).toBe(7_300);
-    // Silence everywhere: no correlation; a prior is used if known, otherwise nothing is filled.
-    const quiet = new Uint8Array(voiced.length);
-    expect(alignRecording(input, quiet, 6_000)).toMatchObject({ offset_ms: 6_000, alignment: "prior" });
-    expect(alignRecording(input, quiet, null)).toBeNull();
+    const seconds = 45, samples = new Int16Array(seconds * PCM_RATE).fill(10);
+    for (const r of ranges) samples.fill(8_000, Math.round((r.start_ms + 7_300) * 16), Math.round((r.end_ms + 7_300) * 16));
+    const voiced = voicedFrames(frameLevels(samples, PCM_RATE));
+    expect(alignRecording(input, voiced, null)).toEqual({ offset_ms: 7_300, score: 1 });
+    expect(alignRecording(input, voiced, 6_000)).toEqual({ offset_ms: 7_300, score: 1 });
+    // No speech structure: the start_time estimate alone is never trusted.
+    expect(alignRecording(input, new Uint8Array(voiced.length), 6_000)).toBeNull();
+    // Continuous speech fits every offset equally: ambiguous, so unverified.
+    expect(alignRecording(input, new Uint8Array(voiced.length).fill(1), 6_000)).toBeNull();
+    // Too little captured speech to verify anything.
+    expect(alignRecording(manifest([range(0, "Alice", 0, 1_000)]), voiced, null)).toBeNull();
   });
 
   test("the prior offset is the clock origin relative to Vexa's start time, when plausible", () => {
@@ -172,34 +227,46 @@ describe("recording gap fill (TC-758)", () => {
     expect(recordingCut({ span: 0, start_ms: 100_000, end_ms: 101_000 }, 0, 60)).toBeNull();
   });
 
-  test("filled text publishes under the span's speaker as recording-sourced; the rest is listed as gaps", () => {
+  test("over-long, malformed or filtered recording answers are empty windows at processing time", () => {
+    const window = { index: 0, span: 0, start_ms: 0, end_ms: 2_000, from: 0, to: 2.5, cut_start_ms: -250 };
+    expect(acceptWindowText(window, { text: "x".repeat(MAX_WINDOW_TEXT + 1), energy_dbfs: -20 }).status).toBe("empty");
+    expect(acceptWindowText(window, { text: "Hello! How can I assist you today?", energy_dbfs: -20 }).status).toBe("empty");
+    expect(acceptWindowText(window, { text: "Ship it.", language: "en", energy_dbfs: -20 })).toEqual({ index: 0, status: "text", text: "Ship it.", language: "en", energy_dbfs: -20 });
+    const chunk: GapChunkSpec = { kind: "gap_chunk", windows: [window] };
+    expect(validChunkResult(chunk, { windows: [{ index: 0, status: "text", text: "x".repeat(MAX_WINDOW_TEXT + 1) }] })).toBeNull();
+    expect(validChunkResult(chunk, { windows: [{ index: 0, status: "empty" }] })).not.toBeNull();
+  });
+
+  test("filled text publishes under the span's speaker as recording-sourced; empty, dropped and unfilled speech is listed", () => {
     const input = manifest([range(0, "Alice", 10_000, 12_000), range(1, "Bob", 20_000, 22_000, { channel: 1 }), range(2, "Bob", 50_000, 51_000, { channel: 1 })]);
-    const spec = gapSpec(input, [0, 1, 2]);
-    const windows = gapWindows(spec);
-    const result: GapFillResult = { text: "a b", offset_ms: 2_000, alignment: "correlated", score: 1, windows: [
-      { ...windows[0]!, status: "text", cut_start_ms: 9_750, text: "Alice words.", energy_dbfs: -20, segments: [{ start: 0.3, end: 2.2, text: "Alice words.", avg_logprob: -0.2, energy_dbfs: -20 }] },
-      { ...windows[1]!, status: "text", cut_start_ms: 19_750, text: "Bob words.", energy_dbfs: -20 },
-      { ...windows[2]!, status: "empty", cut_start_ms: 49_750, energy_dbfs: -20 },
-    ] };
-    expect(validGapResult(spec, result)).toBe(result);
-    expect(validGapResult(spec, { ...result, windows: result.windows.slice(1) })).toBeNull();
-    const outcome = gapOutcome(input, spec, result);
-    expect(outcome.gaps).toEqual([{ start: 50, end: 51, speaker_name: "Bob" }]);
-    expect([outcome.recording_ms, outcome.gap_ms]).toEqual([4_000, 1_000]);
+    const spec = gapSpec(input, input.ranges.map(full));
+    const align: GapAlignResult = { offset_ms: 2_000, score: 1, duration_ms: 60_000, windows: [{ status: "voiced" }, { status: "voiced" }, { status: "voiced" }] };
+    const chunks = gapChunks(spec, align);
+    const texts = new Map<number, GapWindowText>([
+      [0, { index: 0, status: "text", text: "Alice words.", energy_dbfs: -20, segments: [{ start: 0.3, end: 1.2, text: "Alice words.", avg_logprob: -0.2, energy_dbfs: -20 }, { start: 1.3, end: 2.2, text: "Thank you.", avg_logprob: -1.5, energy_dbfs: -20 }] }],
+      [1, { index: 1, status: "text", text: "Bob words.", energy_dbfs: -20 }],
+      [2, { index: 2, status: "empty", energy_dbfs: -20 }],
+    ]);
+    const outcome = gapOutcome(spec, chunks, texts);
+    // Alice's dropped caption [11.05, 11.95] s and Bob's empty window are gaps.
+    expect(outcome.gaps).toEqual([{ start: 11.05, end: 11.95, speaker_name: "Alice" }, { start: 50, end: 51, speaker_name: "Bob" }]);
+    expect([outcome.recording_ms, outcome.gap_ms]).toEqual([3_100, 1_900]);
     const { transcript } = assembleAttributedTranscript(input, [], "en", outcome.pieces);
     expect(transcript.segments.map((s) => [s.speaker_name, s.text, s.start, s.end, s.attribution, s.source])).toEqual([
-      ["Alice", "Alice words.", 10.05, 11.95, "provisional", "recording"],
+      ["Alice", "Alice words.", 10.05, 10.95, "provisional", "recording"],
       ["Bob", "Bob words.", 20, 22, "provisional", "recording"],
     ]);
-    // Exhausted or unaligned: every captured span is a gap.
-    expect(gapOutcome(input, spec, null)).toMatchObject({ pieces: [], recording_ms: 0, gap_ms: 5_000 });
+    // Unaligned (no chunks) or exhausted (no texts): every captured part is a gap.
+    expect(gapOutcome(spec, [], new Map())).toMatchObject({ pieces: [], recording_ms: 0, gap_ms: 5_000 });
+    expect(gapOutcome(spec, chunks, new Map())).toMatchObject({ pieces: [], recording_ms: 0, gap_ms: 5_000 });
   });
 
   test("recovered text never merges into the speaker's attributed turn", () => {
     const input = manifest([range(0, "Alice", 0, 1_000), range(1, "Alice", 1_500, 2_500)]);
     const [spec] = attributedBatches(manifest([input.ranges[0]!]), 1);
-    const recovered = gapOutcome(input, gapSpec(input, [1]), { text: "x", offset_ms: 0, alignment: "prior", score: null,
-      windows: [{ span: 0, start_ms: 1_500, end_ms: 2_500, status: "text", cut_start_ms: 1_250, text: "Later words." }] }).pieces;
+    const gap = gapSpec(input, [full(input.ranges[1]!)]);
+    const chunks = gapChunks(gap, { offset_ms: 0, score: 1, duration_ms: 10_000, windows: [{ status: "voiced" }] });
+    const recovered = gapOutcome(gap, chunks, new Map([[0, { index: 0, status: "text" as const, text: "Later words.", energy_dbfs: -20 }]])).pieces;
     const { transcript } = assembleAttributedTranscript(input, [{ spec: spec!, result: { text: "First words." } }], "en", recovered);
     expect(transcript.segments.map((s) => [s.text, s.source])).toEqual([["First words.", undefined], ["Later words.", "recording"]]);
     expect(new Set(transcript.segments.map((s) => s.speaker_id)).size).toBe(1);

@@ -1,15 +1,18 @@
-import { and, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
+import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { and, desc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import type { AppContext } from "../context.ts";
 import { attributedAttempts, attributedBatches as batchesTable, attributedRanges, attributedTranscriptionRuns, attributedWorkerReadiness, meetings, tinfoilDispatchSlots, transcripts, webhookDeliveries } from "../db/schema.ts";
 import { attributedBatches, bySequence, readAttributedBatch, type AttributedBatch, type AttributedCapability, type AttributedManifest } from "../providers/transcription/attributed.ts";
-import { assembleAttributedTranscript, type AttributedResult, type RawPiece } from "../providers/transcription/attributed-assembly.ts";
-import { decodeToPcm, type Pcm16 } from "../providers/transcription/audio.ts";
-import { alignRecording, gapOutcome, gapSpec, gapWindows, priorOffsetMs, recordingCut, silentWindow, validGapResult, voicedFrames, type GapFillResult, type GapSpec, type GapWindowResult } from "../providers/transcription/gap-fill.ts";
-import { ATTEMPT_DEADLINE_MS, safeTinfoilLanguage, sliceDbfs, TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
+import { assembleRawPieces, attributedPieces, partsMs, type AttributedResult, type GapPart, type RawPiece } from "../providers/transcription/attributed-assembly.ts";
+import { decodeCut, recordingLevels, type Pcm16 } from "../providers/transcription/audio.ts";
+import { acceptWindowText, alignRecording, gapChunks, gapOutcome, gapSpec, planAlignment, priorOffsetMs, validAlignResult, validChunkResult, voicedFrames, type GapChunkResult, type GapChunkSpec, type GapSpec, type GapWindowText } from "../providers/transcription/gap-fill.ts";
+import { ATTEMPT_DEADLINE_MS, safeTinfoilLanguage, TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
 import type { TranscriptGap } from "../domain/transcript.ts";
 import { attemptLimit, attemptModel, attemptsVerified, retryDelayMs } from "./attributed-ledger.ts";
 import { getMeetingById } from "./meetings.ts";
-import { fetchRetainedRecording } from "./recording-recovery.ts";
+import { fetchRetainedRecordingToFile } from "./recording-recovery.ts";
 import { scheduleTranscriptEval } from "./transcript-eval.ts";
 import { enqueueMeetingWebhook, webhookDeliveryValues, wakeWebhookDelivery } from "../webhooks/dispatcher.ts";
 
@@ -20,9 +23,6 @@ const CLAIM_MS = 5 * 60_000, SLOT_CLAIM_MS = 10 * 60_000;
  * the next attempt of the same batch (TC-758).
  */
 const ZOMBIE_MARGIN_MS = 2 * 60_000;
-/** The recording gap fill of a meeting (TC-758) is a ledger row of its own beside the batches. */
-const GAP_FILL_ORDINAL = -1;
-const gapFillId = (meetingId: string) => `${meetingId}:gapfill`;
 const backoffOf = (ctx: AppContext) => ctx.config.attributedRetry.backoffMs;
 const READINESS_STALE_MS = 15_000;
 type AttributedReadinessStage = "startup" | "reconciled" | "reconciliation_failed" | "heartbeat" | "publication_failed" | "published" | "stopped";
@@ -268,9 +268,35 @@ async function releaseFailedFetch(ctx: AppContext, meetingId: string, batchId: s
 
 export type AttributedJobOutcome = "processed" | "noop" | "deferred";
 
+/** Results are untrusted provider data, but only the batch's own assessment is needed here. */
+const NO_MANIFEST = { ranges: [] } as unknown as AttributedManifest;
+
+/**
+ * A pending row whose attempts already reach the current limit (e.g. after the schedule was
+ * shortened) can never be claimed again. It settles exhausted, so its speech is gap-filled or
+ * listed instead of holding the meeting in processing forever (TC-758).
+ */
+async function exhaustOverLimit(ctx: AppContext, row: typeof batchesTable.$inferSelect): Promise<boolean> {
+  return ctx.db.transaction(async (tx) => {
+    const [latest] = await tx.select({ status: attributedAttempts.status }).from(attributedAttempts).where(eq(attributedAttempts.batchId, row.id)).orderBy(desc(attributedAttempts.ordinal)).limit(1);
+    const status = latest?.status === "ambiguous" ? "ambiguous" : "failed";
+    const [won] = await tx.update(batchesTable).set({ status, updatedAt: new Date() })
+      .where(and(eq(batchesTable.id, row.id), eq(batchesTable.status, "pending"), sql`${batchesTable.attempts} >= ${attemptLimit(backoffOf(ctx))}`)).returning();
+    if (!won) return false;
+    if (row.kind === "batch") await tx.update(attributedRanges).set({ status: status === "failed" ? "failed" : "unresolved" })
+      .where(and(eq(attributedRanges.meetingId, row.meetingId), inArray(attributedRanges.sequence, sequences(object<AttributedBatch>(row.batchJson)))));
+    return true;
+  });
+}
+
 export async function processAttributedBatch(ctx: AppContext, meetingId: string, batchId: string): Promise<AttributedJobOutcome> {
   const [stored] = await ctx.db.select().from(batchesTable).where(and(eq(batchesTable.id, batchId), eq(batchesTable.meetingId, meetingId)));
   if (!stored || stored.status !== "pending") return "noop";
+  if (stored.attempts >= attemptLimit(backoffOf(ctx))) {
+    if (await exhaustOverLimit(ctx, stored)) ctx.log.warn("attributed attempts exhausted", { meetingId, stage: "attributed_batch", code: "attempt_limit", attempt: stored.attempts });
+    await ctx.queue.push({ type: "attributed.finalize", meetingId });
+    return "processed";
+  }
   // The durable backoff, not the wakeup, decides when a retry may run (TC-758): an early
   // finalize/reconcile wakeup re-arms the batch's own delayed entry instead of re-sending early.
   const wait = stored.nextAttemptAt ? stored.nextAttemptAt.getTime() - Date.now() : 0;
@@ -279,7 +305,8 @@ export async function processAttributedBatch(ctx: AppContext, meetingId: string,
   const provider = ctx.transcriptRecovery;
   if (!(provider instanceof TinfoilTranscriptionProvider)) { await ctx.queue.push({ type: "attributed.batch", meetingId, batchId }, ctx.config.vexa.pollIntervalMs, `batch:${batchId}`); return "deferred"; }
   const claimed = await claimBatch(ctx, batchId); if (!claimed) return "noop";
-  if (claimed.batch.kind === "gap_fill") return processGapFill(ctx, meetingId, batchId, claimed.token, claimed.batch.fetchAttempts, provider, object<GapSpec>(claimed.batch.batchJson));
+  if (claimed.batch.kind === "gap_align") return processGapAlign(ctx, meetingId, batchId, claimed.token, claimed.batch.fetchAttempts, object<GapSpec>(claimed.batch.batchJson));
+  if (claimed.batch.kind === "gap_fill") return processGapChunk(ctx, meetingId, batchId, claimed.token, claimed.batch.fetchAttempts, provider, object<GapChunkSpec>(claimed.batch.batchJson));
   const spec = object<AttributedBatch>(claimed.batch.batchJson);
   const rangeSequences = sequences(spec);
     const done = async (outcome: AttributedJobOutcome) => {
@@ -320,52 +347,108 @@ export async function processAttributedBatch(ctx: AppContext, meetingId: string,
     try {
       // No await is permitted between the durable admission above and invoking the paid provider.
       const response = await provider.transcribeAttributedPcm(prepared.pcm, spec, eligibility.language, eligibility.model, deadline);
-      // A voiced request that returned no words is evidence failure, not a silent meeting: retried.
-      if (response.text.trim()) await settle(ctx, batchId, claimed.token, "completed", meetingId, rangeSequences, response, eligibility.attemptId);
+      const result: AttributedResult = eligibility.model !== provider.attributedModel ? { ...response, fallback: true } : response;
+      // Voiced audio that yielded no words — or only text the not-speech filter drops — is
+      // evidence failure, not a silent meeting: retried, then gap-filled (TC-758). Parts of a
+      // completed batch without kept text are found again at finalization and gap-filled too.
+      const kept = response.text.trim() ? attributedPieces(NO_MANIFEST, [{ spec, result }], new Map()).raw.length : 0;
+      if (kept) await settle(ctx, batchId, claimed.token, "completed", meetingId, rangeSequences, result, eligibility.attemptId);
       else await settleFailedAttempt(ctx, meetingId, batchId, claimed.token, rangeSequences, eligibility, "failed", "empty_transcript", "attributed_batch");
     } catch { await settleFailedAttempt(ctx, meetingId, batchId, claimed.token, rangeSequences, eligibility, "ambiguous", "external_call_uncertain", "attributed_batch"); }
   await ctx.queue.push({ type: "attributed.finalize", meetingId });
   return "processed";
 }
 
+/** The recording gap fill (TC-758): one unpaid align row, then bounded paid chunk rows. */
+const GAP_ALIGN_ORDINAL = -1;
+const gapAlignId = (meetingId: string) => `${meetingId}:gapalign`;
+const gapChunkId = (meetingId: string, index: number) => `${meetingId}:gapfill:${index}`;
+const gapChunkOrdinal = (index: number) => -2 - index;
+const GAP_TMP_PREFIX = "ptx-gap-", STALE_TMP_MS = 60 * 60_000;
+
 /**
- * Recording gap fill (TC-758): re-reads the spans the attributed path could not transcribe from
- * Vexa's retained mixed recording. It runs under exactly the batch fence — claim token, one
- * durable attempt row per paid call, a dispatch slot, the attempt deadline, owner heartbeats in
- * reconcileClaim — so it is resumable and never runs twice concurrently. Everything before
- * admission (download, decode, alignment, silence) is unpaid.
+ * Audio is only ever fetched for a meeting still processing its own run: never one that is
+ * failing, cancelled, or being deleted (TC-758).
  */
-async function processGapFill(ctx: AppContext, meetingId: string, batchId: string, token: string, fetchAttempts: number, provider: TinfoilTranscriptionProvider, spec: GapSpec): Promise<AttributedJobOutcome> {
-  const done = async () => { await ctx.queue.push({ type: "attributed.finalize", meetingId }); return "processed" as const; };
-  const unfilled = async (outcome: string, result: Record<string, unknown> = {}) => {
-    // No paid call was made: the spans stay listed as gaps in the published transcript.
-    if (await settle(ctx, batchId, token, "failed", meetingId, [], { ...result, outcome })) ctx.log.warn("recording gap fill unavailable", { meetingId, stage: "attributed_gap_fill", code: outcome });
-    return done();
-  };
+async function gapContext(ctx: AppContext, meetingId: string) {
   const [meeting] = await ctx.db.select().from(meetings).where(eq(meetings.id, meetingId));
   const [run] = await ctx.db.select().from(attributedTranscriptionRuns).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
-  if (!meeting?.vexaMeetingId || !run || run.status !== "processing") return unfilled("ineligible_dispatch");
-  const manifest = object<AttributedManifest>(run.manifestJson);
-  let pcm: Pcm16;
-  try { pcm = await decodeToPcm((await fetchRetainedRecording(ctx, meeting.vexaMeetingId)).bytes); }
+  if (!meeting || meeting.status !== "processing" || meeting.dispatchBlocked || meeting.deletionToken || !meeting.vexaMeetingId || !run || run.status !== "processing") return null;
+  return { meeting, vexaMeetingId: meeting.vexaMeetingId, manifest: object<AttributedManifest>(run.manifestJson) };
+}
+
+/**
+ * The recording is streamed to a private temp directory removed when the step ends. A process
+ * killed mid-step (e.g. OOM) leaves its directory behind; later steps sweep stale ones.
+ */
+async function withRecording<T>(ctx: AppContext, vexaMeetingId: number, use: (file: string) => Promise<T>): Promise<T> {
+  await readdir(tmpdir()).then(async (names) => {
+    for (const name of names) if (name.startsWith(GAP_TMP_PREFIX)) {
+      const path = join(tmpdir(), name);
+      if (Date.now() - (await stat(path)).mtimeMs > STALE_TMP_MS) await rm(path, { recursive: true, force: true });
+    }
+  }).catch(() => {});
+  const dir = await mkdtemp(join(tmpdir(), GAP_TMP_PREFIX));
+  try {
+    const file = join(dir, "recording");
+    await fetchRetainedRecordingToFile(ctx, vexaMeetingId, file);
+    return await use(file);
+  } finally { await rm(dir, { recursive: true, force: true }).catch(() => {}); }
+}
+
+/**
+ * Gap-fill align step (unpaid): streams the retained recording into 100 ms levels, verifies its
+ * offset to the meeting clock, and classifies every window. Without a verified alignment nothing
+ * is ever sent and every span is listed as a gap.
+ */
+async function processGapAlign(ctx: AppContext, meetingId: string, batchId: string, token: string, fetchAttempts: number, spec: GapSpec): Promise<AttributedJobOutcome> {
+  const done = async () => { await ctx.queue.push({ type: "attributed.finalize", meetingId }); return "processed" as const; };
+  const unfilled = async (outcome: string) => {
+    if (await settle(ctx, batchId, token, "failed", meetingId, [], { outcome })) ctx.log.warn("recording gap fill unavailable", { meetingId, stage: "attributed_gap_fill", code: outcome });
+    return done();
+  };
+  const gap = await gapContext(ctx, meetingId);
+  if (!gap) return unfilled("ineligible_dispatch");
+  let levels: { levels: Float64Array; durationSec: number };
+  try { levels = await withRecording(ctx, gap.vexaMeetingId, (file) => recordingLevels(file)); }
   catch {
     // Vexa finalizes the recording after the meeting; not ready yet is retried on the fetch budget.
     if (await releaseFailedFetch(ctx, meetingId, batchId, token, fetchAttempts)) return "deferred";
     return unfilled("recording_unavailable");
   }
-  const alignment = alignRecording(manifest, voicedFrames(pcm), priorOffsetMs(manifest.clock_origin_ms, meeting.captureDiagnostics?.started_at));
+  const alignment = alignRecording(gap.manifest, voicedFrames(levels.levels), priorOffsetMs(gap.manifest.clock_origin_ms, gap.meeting.captureDiagnostics?.started_at));
   if (!alignment) return unfilled("recording_unaligned");
-  const windows: GapWindowResult[] = [], send: Array<{ from: number; to: number; index: number }> = [];
-  for (const window of gapWindows(spec)) {
-    const cut = recordingCut(window, alignment.offset_ms, pcm.durationSec);
-    if (!cut) { windows.push({ ...window, status: "missing" }); continue; }
-    const energy = sliceDbfs(pcm.samples, cut.from * pcm.sampleRate, cut.to * pcm.sampleRate);
-    if (silentWindow(energy)) { windows.push({ ...window, status: "silent", energy_dbfs: energy }); continue; }
-    send.push({ from: cut.from, to: cut.to, index: windows.length });
-    windows.push({ ...window, status: "empty", cut_start_ms: cut.cutStartMs, energy_dbfs: energy });
+  const result = planAlignment(spec, levels.levels, levels.durationSec, alignment);
+  if (await settle(ctx, batchId, token, "completed", meetingId, [], result)) ctx.log.info("recording aligned for gap fill", { meetingId, stage: "attributed_gap_fill",
+    offsetMs: result.offset_ms, score: result.score, windows: result.windows.length, voiced: result.windows.filter((window) => window.status === "voiced").length });
+  return done();
+}
+
+/**
+ * Gap-fill chunk (paid): at most GAP_CHUNK_WINDOWS windows, each cut from the recording file on its
+ * own. It runs under exactly the batch fence — claim token, one durable attempt row per paid call,
+ * a dispatch slot, the attempt deadline, owner heartbeats in reconcileClaim — so it is resumable,
+ * retried like a batch, and never runs twice concurrently; a failure loses only this chunk's work.
+ */
+async function processGapChunk(ctx: AppContext, meetingId: string, batchId: string, token: string, fetchAttempts: number, provider: TinfoilTranscriptionProvider, chunk: GapChunkSpec): Promise<AttributedJobOutcome> {
+  const done = async () => { await ctx.queue.push({ type: "attributed.finalize", meetingId }); return "processed" as const; };
+  const unfilled = async (outcome: string) => {
+    if (await settle(ctx, batchId, token, "failed", meetingId, [], { outcome })) ctx.log.warn("recording gap fill unavailable", { meetingId, stage: "attributed_gap_fill", code: outcome });
+    return done();
+  };
+  const gap = await gapContext(ctx, meetingId);
+  if (!gap) return unfilled("ineligible_dispatch");
+  let cuts: Pcm16[];
+  try {
+    cuts = await withRecording(ctx, gap.vexaMeetingId, async (file) => {
+      const out: Pcm16[] = [];
+      for (const window of chunk.windows) out.push(await decodeCut(file, window.from, window.to));
+      return out;
+    });
+  } catch {
+    if (await releaseFailedFetch(ctx, meetingId, batchId, token, fetchAttempts)) return "deferred";
+    return unfilled("recording_unavailable");
   }
-  const base = { offset_ms: alignment.offset_ms, alignment: alignment.alignment, score: alignment.score };
-  if (!send.length) return unfilled("recording_silent", { ...base, windows });
   await recordAttributedWorkerReadiness(ctx, ctx.attributedWorkerHealthy, "heartbeat");
   const eligibility = await admitTinfoilDispatch(ctx, meetingId, batchId, token, provider);
   if (eligibility.kind === "capacity") {
@@ -379,17 +462,13 @@ async function processGapFill(ctx: AppContext, meetingId: string, batchId: strin
   const deadline = Date.now() + ATTEMPT_DEADLINE_MS;
   try {
     // No await is permitted between the durable admission above and invoking the paid provider.
-    const responses = await provider.transcribeRecordingWindows(pcm, send, eligibility.language, eligibility.model, deadline);
-    for (const [index, response] of responses.entries()) {
-      const window = windows[send[index]!.index]!;
-      if (!response.text.trim()) continue;
-      Object.assign(window, { status: "text", text: response.text.trim(), energy_dbfs: response.energy_dbfs,
-        ...(response.language ? { language: response.language } : {}), ...(response.segments ? { segments: response.segments } : {}) });
-    }
-    const texts = windows.filter((window) => window.status === "text");
-    if (!texts.length) await settleFailedAttempt(ctx, meetingId, batchId, token, [], eligibility, "failed", "empty_transcript", "attributed_gap_fill");
+    const responses = await provider.transcribeRecordingWindows(cuts, eligibility.language, eligibility.model, deadline);
+    // Bounds and the not-speech filter apply here, before anything settles: an over-long or
+    // filtered answer is an empty window that is retried, never a result publication rejects.
+    const windows = chunk.windows.map((window, index) => acceptWindowText(window, responses[index] ?? { text: "" }));
+    if (!windows.some((window) => window.status === "text")) await settleFailedAttempt(ctx, meetingId, batchId, token, [], eligibility, "failed", "empty_transcript", "attributed_gap_fill");
     else {
-      const result: GapFillResult = { text: texts.map((window) => window.text).join(" "), language: texts.find((window) => window.language)?.language ?? null, model: eligibility.model, ...base, windows };
+      const result: GapChunkResult = { model: eligibility.model, ...(eligibility.model !== provider.attributedModel ? { fallback: true } : {}), windows };
       await settle(ctx, batchId, token, "completed", meetingId, [], result, eligibility.attemptId);
     }
   } catch { await settleFailedAttempt(ctx, meetingId, batchId, token, [], eligibility, "ambiguous", "external_call_uncertain", "attributed_gap_fill"); }
@@ -410,20 +489,27 @@ async function reconcileClaim(ctx: AppContext, batchId: string): Promise<boolean
         : [];
       if (owner) return false;
     } else if (!expired) return false;
-    // This process died before durable paid admission. It is explicitly safe to requeue: no
-    // attempt row/dispatch token exists, so the next claim makes the next numbered attempt.
+    // A claim that expired before paid admission means its process died or stalled while preparing
+    // (e.g. OOM-killed during a download or decode). No attempt row/dispatch token exists, so a
+    // requeue is safe, but it spends the preparation budget like a failed fetch: a step that
+    // crashes its worker every time ends exhausted (its speech gap-filled or listed) instead of
+    // crash-looping forever (TC-758).
     const unpaid = !batch.dispatchToken;
-    const backoff = backoffOf(ctx), retry = !unpaid && batch.attempts < attemptLimit(backoff);
-    const retryAt = retry ? new Date(Math.max(Date.now() + retryDelayMs(backoff, batch.attempts), (batch.dispatchedAt?.getTime() ?? Date.now()) + ATTEMPT_DEADLINE_MS + ZOMBIE_MARGIN_MS)) : undefined;
-    const [won] = await tx.update(batchesTable).set({ status: unpaid || retry ? "pending" : "ambiguous", claimToken: null, dispatchToken: null, dispatchOwnerId: null, dispatchedAt: null, claimedAt: null,
-      ...(retryAt ? { nextAttemptAt: retryAt } : {}), updatedAt: new Date() }).where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "claimed"), eq(batchesTable.claimToken, batch.claimToken ?? ""))).returning();
+    const backoff = backoffOf(ctx), limit = attemptLimit(backoff);
+    const crashedOut = unpaid && batch.fetchAttempts >= limit - 1;
+    const retry = !unpaid && batch.attempts < limit;
+    const retryAt = retry ? new Date(Math.max(Date.now() + retryDelayMs(backoff, batch.attempts), (batch.dispatchedAt?.getTime() ?? Date.now()) + ATTEMPT_DEADLINE_MS + ZOMBIE_MARGIN_MS))
+      : unpaid && !crashedOut ? new Date(Date.now() + retryDelayMs(backoff, batch.fetchAttempts + 1)) : undefined;
+    const status = unpaid ? (crashedOut ? "failed" : "pending") : retry ? "pending" : "ambiguous";
+    const [won] = await tx.update(batchesTable).set({ status, claimToken: null, dispatchToken: null, dispatchOwnerId: null, dispatchedAt: null, claimedAt: null,
+      ...(unpaid && !crashedOut ? { fetchAttempts: batch.fetchAttempts + 1 } : {}), ...(retryAt ? { nextAttemptAt: retryAt } : {}), updatedAt: new Date() })
+      .where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "claimed"), eq(batchesTable.claimToken, batch.claimToken ?? ""))).returning();
     if (!won) return false;
     if (batch.dispatchToken) await tx.update(tinfoilDispatchSlots).set({ claimToken: null, claimedAt: null, ownerId: null })
       .where(eq(tinfoilDispatchSlots.claimToken, batch.dispatchToken));
-    if (!unpaid) {
-      if (!retry && batch.kind === "batch") await tx.update(attributedRanges).set({ status: "unresolved" }).where(and(eq(attributedRanges.meetingId, batch.meetingId), inArray(attributedRanges.sequence, sequences(object<AttributedBatch>(batch.batchJson)))));
-      await tx.update(attributedAttempts).set({ status: "ambiguous", outcome: "external_call_uncertain", completedAt: new Date() }).where(and(eq(attributedAttempts.batchId, batchId), eq(attributedAttempts.status, "started")));
-    }
+    if ((status === "failed" || status === "ambiguous") && batch.kind === "batch") await tx.update(attributedRanges).set({ status: status === "failed" ? "failed" : "unresolved" })
+      .where(and(eq(attributedRanges.meetingId, batch.meetingId), inArray(attributedRanges.sequence, sequences(object<AttributedBatch>(batch.batchJson)))));
+    if (!unpaid) await tx.update(attributedAttempts).set({ status: "ambiguous", outcome: "external_call_uncertain", completedAt: new Date() }).where(and(eq(attributedAttempts.batchId, batchId), eq(attributedAttempts.status, "started")));
     return true;
   });
 }
@@ -454,47 +540,66 @@ export async function finalizeAttributedRun(ctx: AppContext, meetingId: string):
   const meeting = await getMeetingById(ctx, meetingId);
   if (!meeting || meeting.status === "completed" || meeting.status === "failed") return false;
   if (!(await stageGapFill(ctx, meetingId, rows))) return false;
-  // Unresolved-speaker audio is transcribed as an unknown speaker; ranges without usable audio
-  // are filled from the recording or listed as gaps. Neither vetoes the resolved text (TC-559).
+  // Unresolved-speaker audio is transcribed as an unknown speaker; speech without usable text is
+  // filled from the recording or listed as gaps. Neither vetoes the resolved text (TC-559).
   return publish(ctx, meetingId);
 }
 
-/** Ranges whose audio no batch transcribed: exhausted batches and producer-failed (never batched) ranges. */
-function untranscribedSequences(manifest: AttributedManifest, specs: Array<{ spec: AttributedBatch; status: string }>): number[] {
-  const batched = new Set<number>(), out: number[] = [];
-  for (const { spec, status } of specs) for (const range of spec.ranges) {
+/**
+ * Captured speech no batch turned into kept text (TC-758): ranges of exhausted batches,
+ * producer-failed (never batched) ranges, and the parts of completed batches that yielded none.
+ */
+function untranscribedParts(manifest: AttributedManifest, batches: Array<{ spec: AttributedBatch; status: string; result?: AttributedResult }>) {
+  const assembled = attributedPieces(manifest, batches.filter((batch) => batch.status === "completed" && batch.result).map((batch) => ({ spec: batch.spec, result: batch.result! })));
+  const batched = new Set<number>(), parts: GapPart[] = [...assembled.untranscribed];
+  for (const { spec, status } of batches) for (const range of spec.ranges) {
     batched.add(range.sequence);
-    if (status === "failed" || status === "ambiguous") out.push(range.sequence);
+    if (status === "failed" || status === "ambiguous") parts.push({ sequence: range.sequence, start_ms: range.start_ms, end_ms: range.end_ms });
   }
-  for (const range of manifest.ranges) if (!batched.has(range.sequence)) out.push(range.sequence);
-  return out;
+  for (const range of manifest.ranges) if (!batched.has(range.sequence)) parts.push({ sequence: range.sequence, start_ms: range.start_ms, end_ms: range.end_ms });
+  return { parts, assembled };
 }
 
 /**
- * Once every batch is settled, untranscribed captured speech gets one gap-fill row (TC-758). Its
- * spec is derived only from settled, immutable rows, so concurrent finalizers derive the same one.
- * Returns true when publication may proceed (no gaps, or the gap fill is settled).
+ * Once every batch is settled, untranscribed captured speech gets an align row, then (when the
+ * recording aligns) one row per chunk of voiced windows (TC-758). Specs derive only from settled,
+ * immutable rows, so concurrent finalizers derive the same ones. Returns true when publication may
+ * proceed (no gaps, or every gap-fill row is settled).
  */
 async function stageGapFill(ctx: AppContext, meetingId: string, rows: Array<typeof batchesTable.$inferSelect>): Promise<boolean> {
-  if (rows.some((row) => row.kind === "gap_fill")) return true;
   const [run] = await ctx.db.select().from(attributedTranscriptionRuns).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
   if (!run || run.status !== "processing") return true;
   const manifest = object<AttributedManifest>(run.manifestJson);
-  const missing = untranscribedSequences(manifest, rows.filter((row) => row.kind === "batch").map((row) => ({ spec: object<AttributedBatch>(row.batchJson), status: row.status })));
+  const { parts } = untranscribedParts(manifest, rows.filter((row) => row.kind === "batch").map((row) => ({ spec: object<AttributedBatch>(row.batchJson), status: row.status,
+    ...(row.status === "completed" && row.resultJson ? { result: object<AttributedResult>(row.resultJson) } : {}) })));
+  if (!parts.length) return true;
+  const spec = gapSpec(manifest, parts);
+  const align = rows.find((row) => row.id === gapAlignId(meetingId));
+  if (!align) {
+    await ctx.db.insert(batchesTable).values({ id: gapAlignId(meetingId), meetingId, ordinal: GAP_ALIGN_ORDINAL, kind: "gap_align", batchJson: json(spec) }).onConflictDoNothing();
+    ctx.log.info("recording gap fill staged", { meetingId, stage: "attributed_gap_fill", spans: spec.spans.length });
+    await ctx.queue.push({ type: "attributed.batch", meetingId, batchId: gapAlignId(meetingId) });
+    return false;
+  }
+  // An unaligned or unverifiable align row publishes every span as a listed gap.
+  const verified = align.status === "completed" && canonical(align.batchJson) === canonical(spec) ? validAlignResult(spec, object(align.resultJson ?? {})) : null;
+  if (!verified) return true;
+  const missing = gapChunks(spec, verified).map((chunk, index) => ({ chunk, index })).filter(({ index }) => !rows.some((row) => row.id === gapChunkId(meetingId, index)));
   if (!missing.length) return true;
-  await ctx.db.insert(batchesTable).values({ id: gapFillId(meetingId), meetingId, ordinal: GAP_FILL_ORDINAL, kind: "gap_fill", batchJson: json(gapSpec(manifest, missing)) }).onConflictDoNothing();
-  ctx.log.info("recording gap fill staged", { meetingId, stage: "attributed_gap_fill", ranges: missing.length });
-  await ctx.queue.push({ type: "attributed.batch", meetingId, batchId: gapFillId(meetingId) });
+  for (const { chunk, index } of missing) await ctx.db.insert(batchesTable).values({ id: gapChunkId(meetingId, index), meetingId, ordinal: gapChunkOrdinal(index), kind: "gap_fill", batchJson: json(chunk) }).onConflictDoNothing();
+  for (const { index } of missing) await ctx.queue.push({ type: "attributed.batch", meetingId, batchId: gapChunkId(meetingId, index) });
   return false;
 }
 
 /** `gaps` reports captured speech still untranscribed so the worker can alert after commit (TC-758). */
-type Publication = { meeting: typeof meetings.$inferSelect; webhook: boolean; deliveryId: string | null; gaps?: { count: number; gapMs: number } } | null;
+type Publication = { meeting: typeof meetings.$inferSelect; webhook: boolean; deliveryId: string | null; gaps?: { count: number; gapMs: number }; unverifiedGapRows?: number } | null;
 
 /** Per-meeting speech accounting stored beside the canonical transcript (TC-758). Milliseconds. */
 export interface AttributedCoverage {
   captured_ms: number; transcribed_ms: number; attributed_ms: number; recording_ms: number; silent_ms: number; gap_ms: number;
-  ranges: number; batches: number; retried_batches: number; gap_fill: "none" | "completed" | "failed" | "ambiguous";
+  ranges: number; batches: number; retried_batches: number;
+  /** Recording gap fill: align outcome, paid chunks, chunks that yielded text, rows that failed verification. */
+  gap_align: "none" | "completed" | "failed"; gap_chunks: number; gap_chunks_filled: number; gap_rows_unverified: number;
 }
 const rangeMs = (ranges: Array<{ start_ms: number; end_ms: number }>) => ranges.reduce((sum, range) => sum + Math.max(0, range.end_ms - range.start_ms), 0);
 
@@ -519,9 +624,8 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
     };
     // The recording gap fill (TC-758) is verified separately; every other row must be a batch.
     const batches = ledgerRows.filter((row) => row.kind === "batch");
-    const gapRows = ledgerRows.filter((row) => row.kind === "gap_fill");
-    if (gapRows.length > 1 || ledgerRows.length !== batches.length + gapRows.length) return reject();
-    const gapRow = gapRows[0];
+    if (ledgerRows.some((row) => !["batch", "gap_align", "gap_fill"].includes(row.kind))) return reject();
+    const rowById = new Map(ledgerRows.map((row) => [row.id, row]));
     let manifest: AttributedManifest, expected: AttributedBatch[];
     try {
       manifest = object<AttributedManifest>(run.manifestJson);
@@ -542,7 +646,7 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
       || batches.length !== expected.length || batches.some((batch) => canonical(batch.batchJson) !== canonical(expectedByOrdinal.get(batch.ordinal)))
       || batches.some((batch) => batch.ordinal < 0 || !expectedByOrdinal.has(batch.ordinal));
     if (invalidLedger) return reject();
-    const completedBatches: Array<{ spec: AttributedBatch; result: AttributedResult }> = [];
+    const settled: Array<{ spec: AttributedBatch; status: string; result?: AttributedResult }> = [];
     // Batches without usable audio lose only their own ranges; publication continues as partial.
     const settledRangeStatus: Record<string, string> = { completed: "completed", silence: "silence", failed: "failed", ambiguous: "unresolved" };
     const evidence = (batchId: string) => (attemptByBatch.get(batchId) ?? []).map((row) => row.attributed_attempts);
@@ -560,12 +664,13 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
       const result = object<{ text?: unknown; language?: unknown }>(batch.resultJson ?? {});
       if (batch.status === "completed") {
         if (typeof result.text !== "string" || !result.text.trim() || (result.language !== null && result.language !== undefined && !safeTinfoilLanguage(result.language))) return reject();
-        completedBatches.push({ spec, result: result as AttributedResult });
+        settled.push({ spec, status: batch.status, result: result as AttributedResult });
         attributedMs += rangeMs(batchRanges);
       } else if (batch.status === "silence") {
         if (result.text !== "") return reject();
         silentMs += rangeMs(batchRanges);
-      } else partial = true;
+        settled.push({ spec, status: batch.status });
+      } else { partial = true; settled.push({ spec, status: batch.status }); }
     }
     // Producer-failed ranges were never batched; they are filled from the recording or listed.
     const batchedSequences = new Set(expected.flatMap((batch) => batch.ranges.map((range) => range.sequence)));
@@ -573,36 +678,55 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
     if (skipped.some((row) => !["failed", "unresolved"].includes(row.status))) return reject();
     if (skipped.length) partial = true;
     // Untranscribed captured speech is re-derived from the verified ledger, never taken from the
-    // gap-fill row: that row must carry exactly this spec and a verified, settled attempt ledger.
-    const missing = untranscribedSequences(manifest, batches.map((batch) => ({ spec: expectedByOrdinal.get(batch.ordinal)!, status: batch.status })));
-    let recovered: RawPiece[] = [], gaps: TranscriptGap[] = [], recordingMs = 0, gapMs = 0;
-    if (missing.length) {
-      // finalize stages the gap fill before publishing; a racing finalizer simply publishes later.
-      if (!gapRow) return null;
-      const spec = gapSpec(manifest, missing);
-      if (gapRow.ordinal !== GAP_FILL_ORDINAL || gapRow.id !== gapFillId(meetingId) || canonical(gapRow.batchJson) !== canonical(spec)
-          || !["completed", "failed", "ambiguous"].includes(gapRow.status) || !attemptsVerified(gapRow.status, gapRow.attempts, evidence(gapRow.id))) return reject();
-      let result: GapFillResult | null = null;
-      if (gapRow.status === "completed") {
-        result = validGapResult(spec, object(gapRow.resultJson ?? {}));
-        if (!result) return reject();
+    // gap-fill rows: each must carry exactly the spec derived here and a verified attempt ledger.
+    // A gap-fill row is never a reason to fail the meeting (TC-758): one that fails verification
+    // only leaves its windows listed as gaps.
+    const { parts, assembled: pieces } = untranscribedParts(manifest, settled);
+    attributedMs -= partsMs(pieces.untranscribed) + pieces.silent_ms;
+    silentMs += pieces.silent_ms;
+    let recovered: RawPiece[] = [], gaps: TranscriptGap[] = [], recordingMs = 0, gapMs = 0, unverified = 0, filled = 0, chunkCount = 0;
+    let gapAlign: AttributedCoverage["gap_align"] = "none";
+    if (parts.length) {
+      partial = true;
+      const spec = gapSpec(manifest, parts);
+      const alignRow = rowById.get(gapAlignId(meetingId));
+      // finalize stages and settles the gap fill before publishing; a racing finalizer publishes later.
+      if (!alignRow || alignRow.status === "pending" || alignRow.status === "claimed") return null;
+      const alignVerified = alignRow.kind === "gap_align" && alignRow.ordinal === GAP_ALIGN_ORDINAL && canonical(alignRow.batchJson) === canonical(spec)
+        && ["completed", "failed"].includes(alignRow.status) && alignRow.attempts === 0 && evidence(alignRow.id).length === 0;
+      if (!alignVerified) unverified++;
+      gapAlign = alignRow.status === "completed" ? "completed" : "failed";
+      const align = alignVerified && alignRow.status === "completed" ? validAlignResult(spec, object(alignRow.resultJson ?? {})) : null;
+      if (alignVerified && alignRow.status === "completed" && !align) unverified++;
+      const chunks = align ? gapChunks(spec, align) : [];
+      const texts = new Map<number, GapWindowText>();
+      for (const [index, chunk] of chunks.entries()) {
+        const row = rowById.get(gapChunkId(meetingId, index));
+        if (!row || row.status === "pending" || row.status === "claimed") return null;
+        const verified = row.kind === "gap_fill" && row.ordinal === gapChunkOrdinal(index) && canonical(row.batchJson) === canonical(chunk)
+          && ["completed", "failed", "ambiguous"].includes(row.status) && attemptsVerified(row.status, row.attempts, evidence(row.id));
+        const result = verified && row.status === "completed" ? validChunkResult(chunk, object(row.resultJson ?? {})) : null;
+        if (!verified || (row.status === "completed" && !result)) { unverified++; continue; }
+        if (result) { filled++; for (const window of result.windows) texts.set(window.index, window); }
       }
-      const outcome = gapOutcome(manifest, spec, result);
-      ({ pieces: recovered, gaps, recording_ms: recordingMs, gap_ms: gapMs } = outcome);
-    } else if (gapRow) return reject();
+      chunkCount = chunks.length;
+      ({ pieces: recovered, gaps, recording_ms: recordingMs, gap_ms: gapMs } = gapOutcome(spec, chunks, texts));
+    }
     // Timed results publish as turns on the meeting clock; unresolved speech the channel cannot
     // name publishes under an unknown speaker — degraded, not failed (SPEC, TC-741/742/743).
-    const assembled = assembleAttributedTranscript(manifest, completedBatches, meeting.language, recovered);
+    const assembled = assembleRawPieces([...pieces.raw, ...recovered], meeting.language);
     const transcript = assembled.transcript;
     if (assembled.unknown) partial = true;
     const gapReport = gaps.length ? { count: gaps.length, gapMs } : undefined;
-    if (partial && !transcript.text.trim()) return reject(gapReport);
+    // With no text at all, listed gaps still publish: a failed meeting would hide what was captured
+    // but not transcribed. Only a degraded transcript with neither text nor gaps is rejected.
+    if (partial && !transcript.text.trim() && !gaps.length) return reject(gapReport);
     // No silent loss (TC-758): captured speech nothing could transcribe is listed on the meeting clock.
     const payload = { speakers: transcript.speakers, segments: transcript.segments, text: transcript.text, ...(partial ? { partial: true } : {}), ...(gaps.length ? { gaps } : {}) };
     const coverage: AttributedCoverage = {
       captured_ms: rangeMs(manifest.ranges), transcribed_ms: attributedMs + recordingMs, attributed_ms: attributedMs, recording_ms: recordingMs,
       silent_ms: silentMs, gap_ms: gapMs, ranges: manifest.ranges.length, batches: batches.length, retried_batches: retried,
-      gap_fill: gapRow ? gapRow.status as AttributedCoverage["gap_fill"] : "none",
+      gap_align: gapAlign, gap_chunks: chunkCount, gap_chunks_filled: filled, gap_rows_unverified: unverified,
     };
     const existing = await tx.select().from(transcripts).where(eq(transcripts.meetingId, meetingId)).for("update");
     if (existing[0] && (existing[0].provider !== "tinfoil-attributed" || canonical(existing[0].segmentsJson) !== canonical(payload)
@@ -630,8 +754,9 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
     });
     if (intent) await tx.insert(webhookDeliveries).values(intent)
       .onConflictDoNothing({ target: [webhookDeliveries.meetingId, webhookDeliveries.eventType] });
-    return { meeting: completed, webhook: true, deliveryId: intent?.id ?? null, ...(gapReport ? { gaps: gapReport } : {}) } satisfies Publication;
+    return { meeting: completed, webhook: true, deliveryId: intent?.id ?? null, ...(gapReport ? { gaps: gapReport } : {}), ...(unverified ? { unverifiedGapRows: unverified } : {}) } satisfies Publication;
   });
+  if (published?.unverifiedGapRows) ctx.log.error("gap-fill rows failed verification; their spans are listed as gaps", { meetingId, stage: "attributed_publication", code: "gap_fill_unverified", rows: published.unverifiedGapRows });
   // Alert outside the transaction: counts and milliseconds only, never text or names.
   if (published?.gaps) ctx.log.warn("attributed transcript has untranscribed captured speech", { meetingId, stage: "attributed_publication", code: "untranscribed_gap", gaps: published.gaps.count, gapMs: published.gaps.gapMs });
   if (published) {

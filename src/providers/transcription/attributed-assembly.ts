@@ -1,5 +1,5 @@
 import { normalizeSegments, type NormalizedTranscript, type SpeakerAttribution } from "../../domain/transcript.ts";
-import { hallucinated } from "../../domain/hallucination.ts";
+import { hallucinated, hallucinationReason } from "../../domain/hallucination.ts";
 import type { AttributedBatch, AttributedManifest, AttributedRange } from "./attributed.ts";
 
 /**
@@ -64,9 +64,18 @@ export function meetingSeconds(timeline: TimelineEntry[], offset: number): { at:
   return { at: entry.range.start_ms / 1000 + within, entry };
 }
 
-/** `energy_dbfs` is the RMS of the audio under the piece, measured before sending (TC-758). */
+/** `energy_dbfs` is the RMS of the captured audio around the piece, measured before sending (TC-758). */
 export interface TimedPiece { start: number; end: number; text: string; avg_logprob?: number; no_speech_prob?: number; compression_ratio?: number; energy_dbfs?: number }
-export interface AttributedResult { text: string; language?: string | null; segments?: TimedPiece[]; model?: string; energy_dbfs?: number }
+/**
+ * One request window of a batch, in sent-audio seconds (TC-758): `text` returned words, `empty`
+ * returned none for voiced audio, `silent` was never sent. Present only on results produced since
+ * TC-758; it is what lets publication find voiced audio that yielded no text.
+ */
+export interface ResultWindow { from: number; to: number; status: "text" | "empty" | "silent" }
+/** `fallback` marks text from the fallback model, published with `source: "fallback"` for audit. */
+export interface AttributedResult { text: string; language?: string | null; segments?: TimedPiece[]; model?: string; energy_dbfs?: number; windows?: ResultWindow[]; fallback?: boolean }
+/** Part of one range (meeting clock) whose captured audio no attempt turned into kept text. */
+export interface GapPart { sequence: number; start_ms: number; end_ms: number }
 
 const finite = (value: unknown) => typeof value === "number" && Number.isFinite(value);
 const optionalFinite = (value: unknown) => value === undefined || value === null || finite(value);
@@ -84,6 +93,39 @@ export function validPieces(result: { segments?: unknown }): TimedPiece[] | null
     && optionalFinite(piece.avg_logprob) && optionalFinite(piece.no_speech_prob) && optionalFinite(piece.compression_ratio) && optionalFinite(piece.energy_dbfs));
   return valid.length ? valid : null;
 }
+
+const MAX_WINDOWS = 64;
+/** The result's window record, or null for pre-TC-758 results (and anything malformed). */
+export function resultWindows(result: { windows?: unknown }): ResultWindow[] | null {
+  const windows = result.windows;
+  if (!Array.isArray(windows) || !windows.length || windows.length > MAX_WINDOWS) return null;
+  return windows.every((w) => !!w && typeof w === "object" && finite(w.from) && finite(w.to) && w.to >= w.from && ["text", "empty", "silent"].includes(w.status)) ? windows as ResultWindow[] : null;
+}
+
+/** Sent-audio intervals mapped onto the ranges they carried (inserted pauses map to nothing), merged per range. */
+export function audioToParts(timeline: TimelineEntry[], intervals: Array<[number, number]>): GapPart[] {
+  const byRange = new Map<number, Array<[number, number]>>();
+  for (const [from, to] of intervals) for (const entry of timeline) {
+    const a = Math.max(from, entry.audioStart), b = Math.min(to, entry.audioEnd);
+    if (b <= a) continue;
+    const start = Math.round(entry.range.start_ms + (a - entry.audioStart) * 1000), end = Math.min(entry.range.end_ms, Math.round(entry.range.start_ms + (b - entry.audioStart) * 1000));
+    if (end > start) { const list = byRange.get(entry.range.sequence) ?? []; list.push([start, end]); byRange.set(entry.range.sequence, list); }
+  }
+  const parts: GapPart[] = [];
+  for (const [sequence, list] of byRange) {
+    list.sort((x, y) => x[0] - y[0]);
+    let current: [number, number] | null = null;
+    for (const [a, b] of list) {
+      if (current && a <= current[1]) current[1] = Math.max(current[1], b);
+      else { if (current) parts.push({ sequence, start_ms: current[0], end_ms: current[1] }); current = [a, b]; }
+    }
+    if (current) parts.push({ sequence, start_ms: current[0], end_ms: current[1] });
+  }
+  return parts.sort((x, y) => x.start_ms - y.start_ms || x.sequence - y.sequence);
+}
+export const partsMs = (parts: GapPart[]) => parts.reduce((sum, part) => sum + part.end_ms - part.start_ms, 0);
+/** A dropped piece with a degenerate timestamp still marks some audio as untranscribed. */
+const MIN_DROPPED_SEC = 0.2;
 
 /** Whisper's per-piece evidence for the hallucination filter; energy only where it was measured. */
 export const pieceEvidence = (piece: TimedPiece) => ({ avg_logprob: piece.avg_logprob ?? undefined, no_speech_prob: piece.no_speech_prob ?? undefined,
@@ -122,8 +164,11 @@ export function inferUnresolvedSpeakers(manifest: AttributedManifest, windowMs =
   return inferred;
 }
 
-/** `origin: "recording"` marks text re-read from the retained mixed recording for an untranscribed span (TC-758). */
-export type RawPiece = { start: number; end: number; text: string; speaker: string; speakerKey: string; attribution: SpeakerAttribution; language: string | null; origin?: "recording" };
+/**
+ * `origin` marks text that did not come from the primary model on the speaker's own stream (TC-758):
+ * `recording` was re-read from the retained mixed recording, `fallback` came from the fallback model.
+ */
+export type RawPiece = { start: number; end: number; text: string; speaker: string; speakerKey: string; attribution: SpeakerAttribution; language: string | null; origin?: "recording" | "fallback" };
 
 /** One published identity per display name: the capture channel is not a person. */
 export const nameKey = (name: string) => `name:${name.normalize("NFC").trim().toLowerCase()}`;
@@ -147,33 +192,64 @@ function speakerFor(batch: AttributedBatch, ranges: AttributedRange[], inferred:
 
 export interface AssemblyStats { pieces: number; dropped_hallucinations: number; timed_batches: number; untimed_batches: number }
 
-/** Builds raw segments for completed batches. Untimed results keep the legacy whole-batch segment. */
-export function attributedPieces(manifest: AttributedManifest, completed: Array<{ spec: AttributedBatch; result: AttributedResult }>, inferred = inferUnresolvedSpeakers(manifest)): { raw: RawPiece[]; stats: AssemblyStats } {
+/**
+ * Builds raw segments for completed batches. Untimed results keep the legacy whole-batch segment.
+ * For results that record their windows (TC-758) it also returns the captured audio that yielded
+ * no kept text — voiced windows answered empty, text dropped as not-speech over non-silent audio,
+ * text windows without usable pieces — as `untranscribed` parts, and silent windows' audio as
+ * `silent_ms`. Pre-TC-758 results contribute neither, so they assemble exactly as before.
+ */
+export function attributedPieces(manifest: AttributedManifest, completed: Array<{ spec: AttributedBatch; result: AttributedResult }>, inferred = inferUnresolvedSpeakers(manifest)): { raw: RawPiece[]; stats: AssemblyStats; untranscribed: GapPart[]; silent_ms: number; batches: Array<{ untranscribed: GapPart[]; kept: number }> } {
   const raw: RawPiece[] = [];
   const stats: AssemblyStats = { pieces: 0, dropped_hallucinations: 0, timed_batches: 0, untimed_batches: 0 };
+  const untranscribed: GapPart[] = [], batches: Array<{ untranscribed: GapPart[]; kept: number }> = [];
+  let silentMs = 0;
   for (const { spec, result } of completed) {
     const language = typeof result.language === "string" ? result.language : null;
+    const origin = result.fallback === true ? { origin: "fallback" as const } : {};
+    const windows = resultWindows(result), timeline = batchTimeline(spec), total = timeline.at(-1)?.audioEnd ?? 0;
+    const uncovered: Array<[number, number]> = [], silent: Array<[number, number]> = [];
+    const before = raw.length;
     const pieces = validPieces(result);
     if (!pieces) {
       stats.untimed_batches++;
       const audioSec = spec.ranges.reduce((sum, range) => sum + range.audio_duration_ms, 0) / 1000;
       const energy = typeof result.energy_dbfs === "number" && Number.isFinite(result.energy_dbfs) ? { energy_dbfs: result.energy_dbfs } : {};
-      if (hallucinated(result.text, { untimed: true, audioSec, ...energy })) { stats.dropped_hallucinations++; continue; }
-      raw.push({ start: spec.start_ms / 1000, end: spec.end_ms / 1000, text: result.text, ...speakerFor(spec, spec.ranges, inferred), language });
-      continue;
+      const reason = hallucinationReason(result.text, { untimed: true, audioSec, ...energy });
+      if (reason) {
+        stats.dropped_hallucinations++;
+        if (windows) (reason === "silent" ? silent : uncovered).push([0, total]);
+      } else raw.push({ start: spec.start_ms / 1000, end: spec.end_ms / 1000, text: result.text, ...speakerFor(spec, spec.ranges, inferred), language, ...origin });
+      if (windows && !reason) for (const window of windows) if (window.status !== "text") (window.status === "silent" ? silent : uncovered).push([window.from, window.to]);
+    } else {
+      stats.timed_batches++;
+      const touched = new Set<number>();
+      for (const piece of pieces) {
+        if (!piece.text.trim()) continue;
+        const index = windows?.findIndex((window) => piece.start >= window.from && piece.start < window.to) ?? -1;
+        if (index >= 0) touched.add(index);
+        const reason = hallucinationReason(piece.text, pieceEvidence(piece));
+        if (reason) {
+          stats.dropped_hallucinations++;
+          if (windows) (reason === "silent" ? silent : uncovered).push([piece.start, Math.max(piece.end, piece.start + MIN_DROPPED_SEC)]);
+          continue;
+        }
+        const start = meetingSeconds(timeline, piece.start), end = meetingSeconds(timeline, Math.max(piece.start, piece.end - 1e-3));
+        const mid = meetingSeconds(timeline, (piece.start + piece.end) / 2);
+        raw.push({ start: start.at, end: Math.max(start.at, end.at), text: piece.text.trim(), ...speakerFor(spec, [mid.entry.range], inferred), language, ...origin });
+      }
+      if (windows) for (const [index, window] of windows.entries()) {
+        if (window.status === "silent") silent.push([window.from, window.to]);
+        else if (window.status === "empty" || !touched.has(index)) uncovered.push([window.from, window.to]);
+      }
     }
-    stats.timed_batches++;
-    const timeline = batchTimeline(spec);
-    for (const piece of pieces) {
-      if (!piece.text.trim()) continue;
-      if (hallucinated(piece.text, pieceEvidence(piece))) { stats.dropped_hallucinations++; continue; }
-      const start = meetingSeconds(timeline, piece.start), end = meetingSeconds(timeline, Math.max(piece.start, piece.end - 1e-3));
-      const mid = meetingSeconds(timeline, (piece.start + piece.end) / 2);
-      raw.push({ start: start.at, end: Math.max(start.at, end.at), text: piece.text.trim(), ...speakerFor(spec, [mid.entry.range], inferred), language });
-    }
+    const lost = audioToParts(timeline, uncovered);
+    silentMs += partsMs(audioToParts(timeline, silent));
+    untranscribed.push(...lost);
+    batches.push({ untranscribed: lost, kept: raw.length - before });
   }
   stats.pieces = raw.length;
-  return { raw, stats };
+  return { raw, stats, untranscribed, silent_ms: silentMs, batches };
 }
 
 /** Sorts pieces on the meeting clock and merges a speaker's consecutive pieces into turns. */
@@ -193,6 +269,11 @@ export function mergeTurns(raw: RawPiece[]): RawPiece[] {
 /** `recovered` are pieces re-read from the retained recording for spans the attributed path could not transcribe (TC-758). */
 export function assembleAttributedTranscript(manifest: AttributedManifest, completed: Array<{ spec: AttributedBatch; result: AttributedResult }>, language: string | null, recovered: RawPiece[] = []): { transcript: NormalizedTranscript; stats: AssemblyStats; unknown: boolean } {
   const { raw, stats } = attributedPieces(manifest, completed);
-  const transcript = normalizeSegments(mergeTurns([...raw, ...recovered]), language);
-  return { transcript, stats, unknown: transcript.segments.some((segment) => segment.attribution === "unknown") };
+  return { ...assembleRawPieces([...raw, ...recovered], language), stats };
+}
+
+/** Turns on the meeting clock from already-assessed pieces (attributed and recording-filled). */
+export function assembleRawPieces(raw: RawPiece[], language: string | null): { transcript: NormalizedTranscript; unknown: boolean } {
+  const transcript = normalizeSegments(mergeTurns(raw), language);
+  return { transcript, unknown: transcript.segments.some((segment) => segment.attribution === "unknown") };
 }

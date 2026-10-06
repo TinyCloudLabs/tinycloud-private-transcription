@@ -2,7 +2,7 @@ import { ApiError } from "../../domain/errors.ts";
 import { normalizeSegments, type NormalizedTranscript } from "../../domain/transcript.ts";
 import { decodeToPcm, rmsDbfs, sliceToWav, pcmToWav, type Pcm16 } from "./audio.ts";
 import type { AttributedBatch } from "./attributed.ts";
-import { batchTimeline, paddedBatchPcm, type AttributedResult, type TimedPiece, type TimelineEntry } from "./attributed-assembly.ts";
+import { batchTimeline, paddedBatchPcm, type AttributedResult, type ResultWindow, type TimedPiece, type TimelineEntry } from "./attributed-assembly.ts";
 import type { TranscriptionInput, TranscriptionProvider } from "./types.ts";
 
 export interface TinfoilOptions {
@@ -54,18 +54,39 @@ export const TIMED_WINDOW_SEC = 29.5;
 export const ATTEMPT_DEADLINE_MS = 8 * 60_000;
 const SILENT_WINDOW_DBFS = -60, ENERGY_FLOOR_DBFS = -120;
 
-/** RMS in dBFS of samples [from, to), floored so digital silence stays JSON-representable. */
-export function sliceDbfs(samples: Float32Array | Int16Array, from: number, to: number): number {
+/**
+ * Whisper timestamps are coarse, so a piece's energy is measured over its span widened by this much
+ * on each side (TC-758): a real "Yes." stamped a little off its audio must not read as silence.
+ */
+export const PIECE_CONTEXT_SEC = 1;
+
+const dbfs = (sum: number, count: number) => {
+  const rms = count ? Math.sqrt(sum / count) : 0;
+  return rms > 0 ? Math.max(ENERGY_FLOOR_DBFS, Math.round(20 * Math.log10(rms) * 10) / 10) : ENERGY_FLOOR_DBFS;
+};
+const sumSquares = (samples: Float32Array | Int16Array, start: number, end: number) => {
   const scale = samples instanceof Int16Array ? 32768 : 1;
-  const start = Math.max(0, Math.floor(from)), end = Math.min(samples.length, Math.ceil(to));
-  if (end <= start) return ENERGY_FLOOR_DBFS;
   let sum = 0;
   for (let i = start; i < end; i++) { const value = Math.max(-1, Math.min(1, samples[i]! / scale)); sum += value * value; }
-  const rms = Math.sqrt(sum / (end - start));
-  return rms > 0 ? Math.max(ENERGY_FLOOR_DBFS, Math.round(20 * Math.log10(rms) * 10) / 10) : ENERGY_FLOOR_DBFS;
+  return sum;
+};
+/** RMS in dBFS of samples [from, to), floored so digital silence stays JSON-representable. */
+export function sliceDbfs(samples: Float32Array | Int16Array, from: number, to: number): number {
+  const start = Math.max(0, Math.floor(from)), end = Math.min(samples.length, Math.ceil(to));
+  return end <= start ? ENERGY_FLOOR_DBFS : dbfs(sumSquares(samples, start, end), end - start);
 }
-/** Energy under a piece, at least 100 ms wide so a zero-length timestamp still measures audio. */
-const pieceDbfs = (samples: Float32Array | Int16Array, rate: number, from: number, to: number) => sliceDbfs(samples, from * rate, Math.max(to, from + 0.1) * rate);
+/**
+ * RMS in dBFS over only the captured audio inside [from, to) seconds of a spliced batch: the pauses
+ * inserted between ranges are excluded, so silence is judged on what was actually captured.
+ */
+export function capturedDbfs(padded: Float32Array, timeline: TimelineEntry[], rate: number, from: number, to: number): number {
+  let sum = 0, count = 0;
+  for (const entry of timeline) {
+    const start = Math.max(0, Math.round(Math.max(from, entry.audioStart) * rate)), end = Math.min(padded.length, Math.round(Math.min(to, entry.audioEnd) * rate));
+    if (end > start) { sum += sumSquares(padded, start, end); count += end - start; }
+  }
+  return dbfs(sum, count);
+}
 
 /** Windows of the padded batch audio, cut only where a range (and its leading pause) begins. */
 export function timedWindows(timeline: TimelineEntry[], total: number, maxSec = TIMED_WINDOW_SEC): Array<{ from: number; to: number }> {
@@ -157,7 +178,8 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     }
     if (!input.length || 20 * Math.log10(Math.sqrt(energy / input.length) || 0) < (this.opts.silenceDbfs ?? -60)) throw new ApiError("transcription_failed", "Attributed audio is silent");
     const padded = paddedBatchPcm(batch, input);
-    const rate = first.sample_rate;
+    const rate = first.sample_rate, timeline = batchTimeline(batch);
+    const captured = (from: number, to: number) => capturedDbfs(padded, timeline, rate, from, to);
     const wav = (from: number, to: number) => {
       const slice = padded.subarray(Math.round(from * rate), Math.round(to * rate));
       const pcm16 = new Int16Array(slice.length);
@@ -172,15 +194,17 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     const total = padded.length / rate;
     if (!timed) {
       const body = await this.post(wav(0, total), `${batch.idempotency_key}.wav`, language, model, false, this.untilDeadline(this.opts.timeoutMs ?? 120_000, deadline));
-      return { text: body.text, language: body.language, model, energy_dbfs: sliceDbfs(padded, 0, padded.length) };
+      return { text: body.text, language: body.language, model, energy_dbfs: captured(0, total), windows: [{ from: 0, to: total, status: body.text.trim() ? "text" : "empty" }] };
     }
-    const texts: string[] = [], segments: TimedPiece[] = [];
+    const texts: string[] = [], segments: TimedPiece[] = [], windows: ResultWindow[] = [];
     let language_: string | undefined, untimed = false;
     const retryBudget = Math.min(deadline, Date.now() + BATCH_RETRY_BUDGET_MS);
-    for (const [index, window] of timedWindows(batchTimeline(batch), total).entries()) {
-      // A window of digital or near silence is never sent: Whisper captions silence (TC-758).
-      if (sliceDbfs(padded, window.from * rate, window.to * rate) < SILENT_WINDOW_DBFS) continue;
+    for (const [index, window] of timedWindows(timeline, total).entries()) {
+      // A window whose captured audio is digital or near silence is never sent: Whisper captions
+      // silence (TC-758). Every window is recorded, so a voiced one answered empty is not lost.
+      if (captured(window.from, window.to) < SILENT_WINDOW_DBFS) { windows.push({ ...window, status: "silent" }); continue; }
       const body = await this.postUnlessRateLimited(wav(window.from, window.to), `${batch.idempotency_key}-${index}.wav`, language, model, retryBudget, deadline);
+      windows.push({ ...window, status: body.text.trim() ? "text" : "empty" });
       if (body.text.trim()) texts.push(body.text.trim());
       language_ ??= body.language;
       const pieces = timedPieces(body.segments);
@@ -189,33 +213,30 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
       // Whisper may place a trailing caption past the end of the audio; it has no audio to map to.
       for (const piece of pieces) if (piece.start < length) {
         const start = piece.start + window.from, end = Math.min(Math.max(piece.end, piece.start), length) + window.from;
-        segments.push({ ...piece, start, end, energy_dbfs: pieceDbfs(padded, rate, start, end) });
+        segments.push({ ...piece, start, end, energy_dbfs: captured(start - PIECE_CONTEXT_SEC, end + PIECE_CONTEXT_SEC) });
       }
     }
     // Text without usable offsets must not be published at invented times.
-    return { text: texts.join(" "), language: language_, model, ...(untimed ? {} : { segments }) };
+    return { text: texts.join(" "), language: language_, model, ...(untimed ? {} : { segments }), windows };
   }
 
   /**
-   * Re-reads spans of the retained mixed recording that the attributed path could not transcribe
-   * (TC-758). `windows` are recording seconds, each under TIMED_WINDOW_SEC so Whisper offsets stay
-   * window-relative. Like attributed batches, the caller owns one durable attempt for the whole
-   * call: nothing is retried here except a definite 429, and nothing is sent past `deadline`.
+   * Transcribes cuts of the retained mixed recording for speech the attributed path could not
+   * transcribe (TC-758). Each cut is under TIMED_WINDOW_SEC so Whisper offsets stay cut-relative.
+   * Like attributed batches, the caller owns one durable attempt for the whole call: nothing is
+   * retried here except a definite 429, and nothing is sent past `deadline`.
    */
-  async transcribeRecordingWindows(pcm: Pcm16, windows: Array<{ from: number; to: number }>, language: string | null, model: string, deadline: number): Promise<Array<{ text: string; language?: string; segments?: TimedPiece[]; energy_dbfs: number }>> {
-    const timed = timestampedModel(model), rate = pcm.sampleRate, out: Array<{ text: string; language?: string; segments?: TimedPiece[]; energy_dbfs: number }> = [];
+  async transcribeRecordingWindows(cuts: Pcm16[], language: string | null, model: string, deadline: number): Promise<Array<{ text: string; language?: string; segments?: TimedPiece[]; energy_dbfs: number }>> {
+    const timed = timestampedModel(model), out: Array<{ text: string; language?: string; segments?: TimedPiece[]; energy_dbfs: number }> = [];
     const retryBudget = Math.min(deadline, Date.now() + BATCH_RETRY_BUDGET_MS);
-    for (const [index, window] of windows.entries()) {
-      const from = Math.max(0, Math.floor(window.from * rate)), to = Math.min(pcm.samples.length, Math.ceil(window.to * rate));
-      const slice = pcm.samples.subarray(from, Math.max(from, to));
-      const energy_dbfs = sliceDbfs(slice, 0, slice.length);
-      const body = await this.postUnlessRateLimited(pcmToWav(slice, rate), `gap-${index}.wav`, language, model, retryBudget, deadline, timed);
-      const length = slice.length / rate;
+    for (const [index, cut] of cuts.entries()) {
+      const rate = cut.sampleRate, length = cut.samples.length / rate;
+      const body = await this.postUnlessRateLimited(pcmToWav(cut.samples, rate), `gap-${index}.wav`, language, model, retryBudget, deadline, timed);
       const pieces = timed ? timedPieces(body.segments) : undefined;
-      out.push({ text: body.text, ...(body.language ? { language: body.language } : {}), energy_dbfs,
+      out.push({ text: body.text, ...(body.language ? { language: body.language } : {}), energy_dbfs: sliceDbfs(cut.samples, 0, cut.samples.length),
         ...(pieces ? { segments: pieces.filter((piece) => piece.start < length).map((piece) => {
           const end = Math.min(Math.max(piece.end, piece.start), length);
-          return { ...piece, end, energy_dbfs: pieceDbfs(slice, rate, piece.start, end) };
+          return { ...piece, end, energy_dbfs: sliceDbfs(cut.samples, (piece.start - PIECE_CONTEXT_SEC) * rate, (end + PIECE_CONTEXT_SEC) * rate) };
         }) } : {}) });
     }
     return out;

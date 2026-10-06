@@ -30,6 +30,14 @@ export async function processJob(ctx: AppContext, job: Job): Promise<JobOutcome>
   }
 }
 
+/**
+ * Attributed batch and gap-fill jobs can hold a paid Tinfoil call (up to the 8 min attempt
+ * deadline) or a recording download. They run in this many background slots — the number of
+ * Tinfoil dispatch slots — so the serial loop keeps popping meeting.start/poll jobs meanwhile and
+ * another meeting's opening is never delayed (TC-758). Claim fencing makes duplicates harmless.
+ */
+export const ATTRIBUTED_LANE_SLOTS = 2;
+
 export interface WorkerHandle {
   stop(): Promise<void>;
 }
@@ -53,6 +61,7 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number; hea
   let queueFailures = 0;
   let attributedJobFailures = 0;
   let heartbeatInFlight = false;
+  const lane = new Set<Promise<void>>();
   let lastWebhookReconciliation = 0;
 
   // Redis is a wakeup transport, not the work ledger. This repairs lost enqueue acknowledgements
@@ -134,7 +143,8 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number; hea
   };
 
   const heartbeat = async () => {
-    if (!running || heartbeatInFlight) return;
+    // Draining lane jobs may still own paid calls; their owner heartbeat must stay live until they settle.
+    if ((!running && !lane.size) || heartbeatInFlight) return;
     heartbeatInFlight = true;
     try {
       await reconcileAttributed();
@@ -155,6 +165,27 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number; hea
     }
   };
 
+  // Only a real durable batch/finalization result can heal a failing publisher. Queue duplicates,
+  // missing meetings, and deferred configuration are intentionally neutral.
+  const attributedOutcome = async (outcome: JobOutcome) => {
+    if (outcome !== "processed") return;
+    const recovered = attributedJobFailures >= 3;
+    attributedJobFailures = 0;
+    if (recovered && attributedEnabled && ctx.attributedReconciliationReady) {
+      await recordAttributedWorkerReadiness(ctx, ctx.attributedWorkerHealthy, "heartbeat");
+    }
+  };
+  const jobFailed = async (job: Job) => {
+    if (job.type.startsWith("attributed.") || (attributedEnabled && (job.type === "meeting.poll" || job.type === "meeting.start"))) {
+      if (job.type.startsWith("attributed.")) {
+        attributedJobFailures++;
+        if (attributedJobFailures >= 3) await recordAttributedWorkerReadiness(ctx, false, "reconciliation_failed").catch(() => {});
+      }
+      ctx.log.error("attributed job failed", { stage: job.type, code: "job_error" });
+    }
+    else ctx.log.error("job failed", { stage: job.type, code: "job_error" });
+  };
+
   const loop = (async () => {
     if (attributedEnabled) ctx.attributedReconciliationReady = false;
     // Do not await startup reconciliation: a transient attributed failure must never prevent
@@ -167,7 +198,9 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number; hea
     while (running) {
       let job: Job | null = null;
       try {
-        job = await ctx.queue.pop(opts.popTimeoutSec ?? 1);
+        // A blocking pop computes its wait before lane jobs queue their delayed retries; while lane
+        // work is active, pop in short slices so those retries are promoted on time.
+        job = await ctx.queue.pop(lane.size ? Math.min(0.25, opts.popTimeoutSec ?? 1) : opts.popTimeoutSec ?? 1);
         queueFailures = 0;
       } catch (e) {
         queueFailures++;
@@ -182,32 +215,30 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number; hea
           // Batch jobs requeue deduped so piled-up wakeups behind the gate collapse into one
           // delayed retry per batch; other attributed jobs keep their own entry (TC-576).
           await ctx.queue.push(job, 1_000, job.type === "attributed.batch" ? `batch:${job.batchId}` : undefined);
+        } else if (job.type === "attributed.batch") {
+          if (lane.size >= ATTRIBUTED_LANE_SLOTS) {
+            // Both slots busy: the deduped delayed entry folds repeat wakeups for this batch. One
+            // poll interval, like other batch requeues, so a due retry is never pushed back far.
+            await ctx.queue.push(job, ctx.config.vexa.pollIntervalMs, `batch:${job.batchId}`);
+            continue;
+          }
+          const laneJob = job;
+          const task: Promise<void> = (async () => {
+            try { await attributedOutcome(await processJob(ctx, laneJob)); }
+            catch { await jobFailed(laneJob); }
+          })().finally(() => { lane.delete(task); });
+          lane.add(task);
         } else {
           const outcome = await processJob(ctx, job);
-          if (job.type.startsWith("attributed.")) {
-            // Only a real durable batch/finalization result can heal a failing publisher. Queue
-            // duplicates, missing meetings, and deferred configuration are intentionally neutral.
-            if (outcome === "processed") {
-              const recovered = attributedJobFailures >= 3;
-              attributedJobFailures = 0;
-              if (recovered && attributedEnabled && ctx.attributedReconciliationReady) {
-                await recordAttributedWorkerReadiness(ctx, ctx.attributedWorkerHealthy, "heartbeat");
-              }
-            }
-          }
+          if (job.type.startsWith("attributed.")) await attributedOutcome(outcome);
         }
       } catch (e) {
-        if (job.type.startsWith("attributed.") || (attributedEnabled && (job.type === "meeting.poll" || job.type === "meeting.start"))) {
-          if (job.type.startsWith("attributed.")) {
-            attributedJobFailures++;
-            if (attributedJobFailures >= 3) await recordAttributedWorkerReadiness(ctx, false, "reconciliation_failed").catch(() => {});
-          }
-          ctx.log.error("attributed job failed", { stage: job.type, code: "job_error" });
-        }
-        else ctx.log.error("job failed", { stage: job.type, code: "job_error" });
+        await jobFailed(job);
         await Bun.sleep(250);
       }
     }
+    // Graceful stop lets lane jobs settle their attempts; the heartbeat keeps their owner live.
+    await Promise.allSettled([...lane]);
     clearInterval(heartbeatTimer);
     if (attributedEnabled) await recordAttributedWorkerReadiness(ctx, false, "stopped").catch(() => {});
   })();
