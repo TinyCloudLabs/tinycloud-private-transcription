@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rename, rm, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { and, desc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
@@ -6,8 +6,8 @@ import type { AppContext } from "../context.ts";
 import { attributedAttempts, attributedBatches as batchesTable, attributedRanges, attributedTranscriptionRuns, attributedWorkerReadiness, meetings, tinfoilDispatchSlots, transcripts, webhookDeliveries } from "../db/schema.ts";
 import { attributedBatches, bySequence, readAttributedBatch, type AttributedBatch, type AttributedCapability, type AttributedManifest } from "../providers/transcription/attributed.ts";
 import { assembleRawPieces, attributedPieces, partsMs, type AttributedResult, type GapPart, type RawPiece } from "../providers/transcription/attributed-assembly.ts";
-import { decodeCut, recordingLevels, type Pcm16 } from "../providers/transcription/audio.ts";
-import { acceptWindowText, alignRecording, gapChunks, gapOutcome, gapSpec, planAlignment, priorOffsetMs, validAlignResult, validChunkResult, voicedFrames, type GapChunkResult, type GapChunkSpec, type GapSpec, type GapWindowText } from "../providers/transcription/gap-fill.ts";
+import { recordingCuts, recordingLevels, type Pcm16 } from "../providers/transcription/audio.ts";
+import { acceptWindowText, alignRecording, envelopeMatch, frameLevels, gapChunks, gapOutcome, gapSpec, planAlignment, priorOffsetMs, validAlignResult, validChunkResult, voicedFrames, type GapChunkResult, type GapChunkSpec, type GapSpec, type GapWindowText } from "../providers/transcription/gap-fill.ts";
 import { ATTEMPT_DEADLINE_MS, safeTinfoilLanguage, TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
 import type { TranscriptGap } from "../domain/transcript.ts";
 import { attemptLimit, attemptModel, attemptsVerified, retryDelayMs } from "./attributed-ledger.ts";
@@ -150,6 +150,36 @@ export async function stageAttributedManifest(ctx: AppContext, meetingId: string
   // state is therefore resumed explicitly, rather than treated as a no-op.
   await resumeAttributedRun(ctx, meetingId);
   return staged;
+}
+
+/**
+ * Dispatch tokens of paid calls this process is running right now (TC-758). A stale heartbeat row
+ * (a slow database write, a paused timer) must never let reconcileClaim take this process's own
+ * in-flight call for dead: that would free its slot mid-call and discard its result.
+ */
+const liveDispatches = new Set<string>();
+
+/** Claims are renewed this often while unpaid preparation runs; a dead process stops renewing. */
+const CLAIM_RENEW_MS = CLAIM_MS / 5;
+/**
+ * Renewal stops after this long even if the work has not returned: every preparation step is
+ * bounded far below it (300 s download, 300 s decode), so a stall past it is treated like a crash
+ * and reaped, never renewed forever.
+ */
+const MAX_PREPARATION_MS = 20 * 60_000;
+/**
+ * Unpaid preparation (range fetch, recording download, level scan, cuts) can outlast CLAIM_MS on a
+ * slow store. Renewing the claim while the work runs keeps a live preparation from being reaped as
+ * a crash; a process that dies stops renewing, so crash detection is unchanged (TC-758).
+ */
+export async function withClaimHeartbeat<T>(ctx: AppContext, batchId: string, token: string, work: () => Promise<T>, everyMs = CLAIM_RENEW_MS): Promise<T> {
+  const renew = () => ctx.db.update(batchesTable).set({ claimedAt: new Date() })
+    .where(and(eq(batchesTable.id, batchId), eq(batchesTable.status, "claimed"), eq(batchesTable.claimToken, token), isNull(batchesTable.dispatchToken))).catch(() => {});
+  const until = Date.now() + MAX_PREPARATION_MS;
+  let renewing: Promise<unknown> = Promise.resolve();
+  const timer = setInterval(() => { if (Date.now() < until) renewing = renew(); else clearInterval(timer); }, everyMs);
+  // No renewal may land after the work returns (it would refresh a claim its caller moved on from).
+  try { return await work(); } finally { clearInterval(timer); await renewing; }
 }
 
 /** Only a pending row whose durable backoff has elapsed, with paid attempts left, can be claimed. */
@@ -314,7 +344,7 @@ export async function processAttributedBatch(ctx: AppContext, meetingId: string,
       return outcome;
     };
     let prepared;
-    try { prepared = await readAttributedBatch(spec, async (range) => (await ctx.vexa.fetchBytes(range.path!)).bytes); }
+    try { prepared = await withClaimHeartbeat(ctx, batchId, claimed.token, () => readAttributedBatch(spec, async (range) => (await ctx.vexa.fetchBytes(range.path!)).bytes)); }
     catch {
       // A fetch/checksum failure happens before any paid call; bounded requeue is safe (L3). Only
       // the failed fetch spends the durable retry budget — capacity deferrals and other non-failure
@@ -327,7 +357,11 @@ export async function processAttributedBatch(ctx: AppContext, meetingId: string,
     // Make the process identity durable before it can own a paid request. This also lets a
     // recovery scanner distinguish a paused continuation from a dead worker.
     await recordAttributedWorkerReadiness(ctx, ctx.attributedWorkerHealthy, "heartbeat");
-    const eligibility = await admitTinfoilDispatch(ctx, meetingId, batchId, claimed.token, provider);
+    // Registered before admission commits, so no instant exists where this process's own admitted
+    // call is unprotected from reconcileClaim.
+    liveDispatches.add(claimed.token);
+    const eligibility = await admitTinfoilDispatch(ctx, meetingId, batchId, claimed.token, provider).catch((error) => { liveDispatches.delete(claimed.token); throw error; });
+    if (eligibility.kind !== "admitted") liveDispatches.delete(claimed.token);
     if (eligibility.kind === "capacity") {
       // Requeue only the delayed batch job (deduped per batch: concurrent finalize/reconcile
       // wakeups fold into the same entry instead of piling up retries). An immediate finalize
@@ -355,6 +389,7 @@ export async function processAttributedBatch(ctx: AppContext, meetingId: string,
       if (kept) await settle(ctx, batchId, claimed.token, "completed", meetingId, rangeSequences, result, eligibility.attemptId);
       else await settleFailedAttempt(ctx, meetingId, batchId, claimed.token, rangeSequences, eligibility, "failed", "empty_transcript", "attributed_batch");
     } catch { await settleFailedAttempt(ctx, meetingId, batchId, claimed.token, rangeSequences, eligibility, "ambiguous", "external_call_uncertain", "attributed_batch"); }
+    finally { liveDispatches.delete(claimed.token); }
   await ctx.queue.push({ type: "attributed.finalize", meetingId });
   return "processed";
 }
@@ -378,22 +413,51 @@ async function gapContext(ctx: AppContext, meetingId: string) {
 }
 
 /**
- * The recording is streamed to a private temp directory removed when the step ends. A process
- * killed mid-step (e.g. OOM) leaves its directory behind; later steps sweep stale ones.
+ * Per-meeting recording cache (TC-758): the align step and every chunk of a meeting read one
+ * downloaded copy instead of re-listing and re-downloading the recording. It lives in a private
+ * temp directory and is removed when the meeting publishes or fails, when a step finds the meeting
+ * no longer eligible (ending, deleted), and by a sweep that also drops caches of meetings no longer
+ * processing and anything untouched for STALE_CACHE_MS (e.g. left by a killed worker).
  */
-async function withRecording<T>(ctx: AppContext, vexaMeetingId: number, use: (file: string) => Promise<T>): Promise<T> {
-  await readdir(tmpdir()).then(async (names) => {
-    for (const name of names) if (name.startsWith(GAP_TMP_PREFIX)) {
-      const path = join(tmpdir(), name);
-      if (Date.now() - (await stat(path)).mtimeMs > STALE_TMP_MS) await rm(path, { recursive: true, force: true });
-    }
-  }).catch(() => {});
-  const dir = await mkdtemp(join(tmpdir(), GAP_TMP_PREFIX));
+const RECORDING_CACHE_PREFIX = "ptx-recording-", STALE_CACHE_MS = 6 * 60 * 60_000, SWEEP_EVERY_MS = 60_000;
+const cacheDir = (meetingId: string) => join(tmpdir(), `${RECORDING_CACHE_PREFIX}${/^[A-Za-z0-9_-]{1,64}$/.test(meetingId) ? meetingId : Bun.hash(meetingId).toString(16)}`);
+export const recordingCachePath = (meetingId: string) => join(cacheDir(meetingId), "recording");
+export async function removeRecordingCache(meetingId: string): Promise<void> {
+  await rm(cacheDir(meetingId), { recursive: true, force: true }).catch(() => {});
+}
+
+async function cachedRecording(ctx: AppContext, meetingId: string, vexaMeetingId: number): Promise<string> {
+  const dir = cacheDir(meetingId), file = recordingCachePath(meetingId);
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const now = new Date();
+  if (await stat(file).then((info) => info.size > 0, () => false)) { await utimes(dir, now, now).catch(() => {}); return file; }
+  // Download beside the cache and rename into place, so a reader never sees a partial file.
+  const part = join(dir, `${crypto.randomUUID()}.part`);
   try {
-    const file = join(dir, "recording");
-    await fetchRetainedRecordingToFile(ctx, vexaMeetingId, file);
-    return await use(file);
-  } finally { await rm(dir, { recursive: true, force: true }).catch(() => {}); }
+    await fetchRetainedRecordingToFile(ctx, vexaMeetingId, part);
+    await rename(part, file);
+  } finally { await rm(part, { force: true }).catch(() => {}); }
+  return file;
+}
+
+let lastSweep = 0;
+/** Removes recording caches of meetings no longer processing, stale caches, and stale check scratch dirs. */
+export async function sweepRecordingCaches(ctx: AppContext, force = false): Promise<void> {
+  if (!force && Date.now() - lastSweep < SWEEP_EVERY_MS) return;
+  lastSweep = Date.now();
+  const names = await readdir(tmpdir()).catch(() => [] as string[]);
+  for (const name of names) {
+    const path = join(tmpdir(), name);
+    if (name.startsWith(GAP_TMP_PREFIX)) {
+      if (Date.now() - (await stat(path).then((info) => info.mtimeMs, () => Date.now())) > STALE_TMP_MS) await rm(path, { recursive: true, force: true }).catch(() => {});
+      continue;
+    }
+    if (!name.startsWith(RECORDING_CACHE_PREFIX)) continue;
+    const [meeting] = await ctx.db.select({ status: meetings.status, deletionToken: meetings.deletionToken, dispatchBlocked: meetings.dispatchBlocked })
+      .from(meetings).where(eq(meetings.id, name.slice(RECORDING_CACHE_PREFIX.length))).catch(() => [] as never[]);
+    const stale = Date.now() - (await stat(path).then((info) => info.mtimeMs, () => 0)) > STALE_CACHE_MS;
+    if (!meeting || meeting.status !== "processing" || meeting.deletionToken || meeting.dispatchBlocked || stale) await rm(path, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 /**
@@ -407,10 +471,11 @@ async function processGapAlign(ctx: AppContext, meetingId: string, batchId: stri
     if (await settle(ctx, batchId, token, "failed", meetingId, [], { outcome })) ctx.log.warn("recording gap fill unavailable", { meetingId, stage: "attributed_gap_fill", code: outcome });
     return done();
   };
+  await sweepRecordingCaches(ctx);
   const gap = await gapContext(ctx, meetingId);
-  if (!gap) return unfilled("ineligible_dispatch");
+  if (!gap) { await removeRecordingCache(meetingId); return unfilled("ineligible_dispatch"); }
   let levels: { levels: Float64Array; durationSec: number };
-  try { levels = await withRecording(ctx, gap.vexaMeetingId, (file) => recordingLevels(file)); }
+  try { levels = await withClaimHeartbeat(ctx, batchId, token, async () => recordingLevels(await cachedRecording(ctx, meetingId, gap.vexaMeetingId))); }
   catch {
     // Vexa finalizes the recording after the meeting; not ready yet is retried on the fetch budget.
     if (await releaseFailedFetch(ctx, meetingId, batchId, token, fetchAttempts)) return "deferred";
@@ -436,21 +501,26 @@ async function processGapChunk(ctx: AppContext, meetingId: string, batchId: stri
     if (await settle(ctx, batchId, token, "failed", meetingId, [], { outcome })) ctx.log.warn("recording gap fill unavailable", { meetingId, stage: "attributed_gap_fill", code: outcome });
     return done();
   };
+  await sweepRecordingCaches(ctx);
   const gap = await gapContext(ctx, meetingId);
-  if (!gap) return unfilled("ineligible_dispatch");
+  if (!gap) { await removeRecordingCache(meetingId); return unfilled("ineligible_dispatch"); }
   let cuts: Pcm16[];
-  try {
-    cuts = await withRecording(ctx, gap.vexaMeetingId, async (file) => {
-      const out: Pcm16[] = [];
-      for (const window of chunk.windows) out.push(await decodeCut(file, window.from, window.to));
-      return out;
-    });
-  } catch {
+  try { cuts = await withClaimHeartbeat(ctx, batchId, token, async () => recordingCuts(await cachedRecording(ctx, meetingId, gap.vexaMeetingId), chunk.windows)); }
+  catch {
     if (await releaseFailedFetch(ctx, meetingId, batchId, token, fetchAttempts)) return "deferred";
     return unfilled("recording_unavailable");
   }
+  // Each cut must be the moment alignment planned: its measured envelope is compared with the
+  // planned one. A cut that disagrees (a clock or file change since alignment) is never sent; its
+  // window is listed as a gap rather than risk another moment's words under this speaker.
+  const checks = chunk.windows.map((window, index) => envelopeMatch(window.levels, frameLevels(cuts[index]!.samples, cuts[index]!.sampleRate)));
+  const send = chunk.windows.map((_, index) => index).filter((index) => checks[index]!.match);
+  if (send.length < chunk.windows.length) ctx.log.warn("recording cut does not match its alignment", { meetingId, stage: "attributed_gap_fill", code: "recording_mismatch", windows: chunk.windows.length - send.length });
+  if (!send.length) return unfilled("recording_mismatch");
   await recordAttributedWorkerReadiness(ctx, ctx.attributedWorkerHealthy, "heartbeat");
-  const eligibility = await admitTinfoilDispatch(ctx, meetingId, batchId, token, provider);
+  liveDispatches.add(token);
+  const eligibility = await admitTinfoilDispatch(ctx, meetingId, batchId, token, provider).catch((error) => { liveDispatches.delete(token); throw error; });
+  if (eligibility.kind !== "admitted") liveDispatches.delete(token);
   if (eligibility.kind === "capacity") {
     if (await releaseBatchClaim(ctx, batchId, token)) await ctx.queue.push({ type: "attributed.batch", meetingId, batchId }, ctx.config.vexa.pollIntervalMs, `batch:${batchId}`);
     return "deferred";
@@ -462,16 +532,20 @@ async function processGapChunk(ctx: AppContext, meetingId: string, batchId: stri
   const deadline = Date.now() + ATTEMPT_DEADLINE_MS;
   try {
     // No await is permitted between the durable admission above and invoking the paid provider.
-    const responses = await provider.transcribeRecordingWindows(cuts, eligibility.language, eligibility.model, deadline);
+    const responses = await provider.transcribeRecordingWindows(send.map((index) => cuts[index]!), eligibility.language, eligibility.model, deadline);
     // Bounds and the not-speech filter apply here, before anything settles: an over-long or
     // filtered answer is an empty window that is retried, never a result publication rejects.
-    const windows = chunk.windows.map((window, index) => acceptWindowText(window, responses[index] ?? { text: "" }));
+    const windows: GapWindowText[] = chunk.windows.map((window, index) => {
+      const sent = send.indexOf(index);
+      return sent < 0 ? { index: window.index, status: "mismatch" } : acceptWindowText(window, responses[sent] ?? { text: "" });
+    });
     if (!windows.some((window) => window.status === "text")) await settleFailedAttempt(ctx, meetingId, batchId, token, [], eligibility, "failed", "empty_transcript", "attributed_gap_fill");
     else {
       const result: GapChunkResult = { model: eligibility.model, ...(eligibility.model !== provider.attributedModel ? { fallback: true } : {}), windows };
       await settle(ctx, batchId, token, "completed", meetingId, [], result, eligibility.attemptId);
     }
   } catch { await settleFailedAttempt(ctx, meetingId, batchId, token, [], eligibility, "ambiguous", "external_call_uncertain", "attributed_gap_fill"); }
+  finally { liveDispatches.delete(token); }
   return done();
 }
 
@@ -479,6 +553,7 @@ async function reconcileClaim(ctx: AppContext, batchId: string): Promise<boolean
   return ctx.db.transaction(async (tx) => {
     const [batch] = await tx.select().from(batchesTable).where(eq(batchesTable.id, batchId)).for("update");
     if (!batch || batch.status !== "claimed" || !batch.claimedAt) return false;
+    if (batch.dispatchToken && liveDispatches.has(batch.dispatchToken)) return false;
     const expired = batch.claimedAt.getTime() <= Date.now() - CLAIM_MS;
     if (batch.dispatchToken) {
       // An admitted call's slot and continuation stay fenced while the named owner is live. Once
@@ -756,6 +831,8 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
       .onConflictDoNothing({ target: [webhookDeliveries.meetingId, webhookDeliveries.eventType] });
     return { meeting: completed, webhook: true, deliveryId: intent?.id ?? null, ...(gapReport ? { gaps: gapReport } : {}), ...(unverified ? { unverifiedGapRows: unverified } : {}) } satisfies Publication;
   });
+  // The meeting is terminal: its recording cache is no longer needed.
+  if (published) await removeRecordingCache(meetingId);
   if (published?.unverifiedGapRows) ctx.log.error("gap-fill rows failed verification; their spans are listed as gaps", { meetingId, stage: "attributed_publication", code: "gap_fill_unverified", rows: published.unverifiedGapRows });
   // Alert outside the transaction: counts and milliseconds only, never text or names.
   if (published?.gaps) ctx.log.warn("attributed transcript has untranscribed captured speech", { meetingId, stage: "attributed_publication", code: "untranscribed_gap", gaps: published.gaps.count, gapMs: published.gaps.gapMs });
@@ -777,6 +854,7 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
 }
 
 export async function reconcileAttributedRuns(ctx: AppContext): Promise<void> {
+  await sweepRecordingCaches(ctx);
   const claimed = await ctx.db.select().from(batchesTable).where(eq(batchesTable.status, "claimed"));
   for (const row of claimed) {
     await reconcileClaim(ctx, row.id);
@@ -804,4 +882,57 @@ export async function reconcileAttributedRuns(ctx: AppContext): Promise<void> {
     if (await ctx.queue.hasPollLease(meeting.id).catch(() => false)) continue;
     await ctx.queue.push({ type: "meeting.poll", meetingId: meeting.id });
   }
+}
+
+export interface GapFillCheckWindow { index: number; speaker_name: string; start: number; end: number; from: number; to: number; planned_db: number; measured_db: number; diff_db: number; r: number | null; match: boolean }
+export interface GapFillCheckReport {
+  meetingId: string; vexaMeetingId: number; spans_from: "untranscribed" | "all_ranges"; spans: number; windows: number; voiced_windows: number;
+  recording_sec: number; prior_offset_ms: number | null; alignment: { offset_ms: number; score: number } | null; checked: GapFillCheckWindow[];
+}
+
+/**
+ * Operator dry run of the recording gap fill (TC-758, `bun run cli gapfill-check`): downloads the
+ * meeting's retained recording to a scratch directory, aligns it exactly as the align step does,
+ * cuts a few voiced windows exactly as the chunk step does, and reports planned vs measured
+ * energy. Nothing is sent to Tinfoil and no ledger row is written. Spans are the meeting's
+ * untranscribed speech, or every captured range when there is none (or `all`).
+ */
+export async function gapFillCheck(ctx: AppContext, meetingRef: string, opts: { windows?: number; all?: boolean } = {}): Promise<GapFillCheckReport> {
+  const [meeting] = /^\d+$/.test(meetingRef)
+    ? await ctx.db.select().from(meetings).where(eq(meetings.vexaMeetingId, Number(meetingRef)))
+    : await ctx.db.select().from(meetings).where(eq(meetings.id, meetingRef));
+  if (!meeting?.vexaMeetingId) throw new Error("Meeting not found or has no Vexa capture");
+  if (meeting.deletionToken || meeting.dispatchBlocked) throw new Error("Meeting is being deleted");
+  const [run] = await ctx.db.select().from(attributedTranscriptionRuns).where(eq(attributedTranscriptionRuns.meetingId, meeting.id));
+  if (!run || run.status === "fallback") throw new Error("Meeting has no staged attributed manifest");
+  const manifest = object<AttributedManifest>(run.manifestJson);
+  const rows = await ctx.db.select().from(batchesTable).where(eq(batchesTable.meetingId, meeting.id));
+  let { parts } = untranscribedParts(manifest, rows.filter((row) => row.kind === "batch").map((row) => ({ spec: object<AttributedBatch>(row.batchJson), status: row.status,
+    ...(row.status === "completed" && row.resultJson ? { result: object<AttributedResult>(row.resultJson) } : {}) })));
+  const spansFrom = !parts.length || opts.all ? "all_ranges" as const : "untranscribed" as const;
+  if (spansFrom === "all_ranges") parts = manifest.ranges.map((range) => ({ sequence: range.sequence, start_ms: range.start_ms, end_ms: range.end_ms }));
+  const spec = gapSpec(manifest, parts);
+  const dir = await mkdtemp(join(tmpdir(), GAP_TMP_PREFIX));
+  try {
+    const file = join(dir, "recording");
+    await fetchRetainedRecordingToFile(ctx, meeting.vexaMeetingId, file);
+    const { levels, durationSec } = await recordingLevels(file);
+    const prior = priorOffsetMs(manifest.clock_origin_ms, meeting.captureDiagnostics?.started_at);
+    const alignment = alignRecording(manifest, voicedFrames(levels), prior);
+    const base = { meetingId: meeting.id, vexaMeetingId: meeting.vexaMeetingId, spans_from: spansFrom, spans: spec.spans.length, recording_sec: Math.round(durationSec * 10) / 10, prior_offset_ms: prior, alignment };
+    if (!alignment) return { ...base, windows: 0, voiced_windows: 0, checked: [] };
+    const plan = planAlignment(spec, levels, durationSec, alignment);
+    const voiced = gapChunks(spec, plan).flatMap((chunk) => chunk.windows);
+    const count = Math.min(voiced.length, Math.max(1, opts.windows ?? 4));
+    // Evenly spread across the meeting, so a clock drift late in the recording shows up too.
+    const picked = Array.from({ length: count }, (_, i) => voiced[Math.floor(i * voiced.length / count)]!);
+    const cuts = await recordingCuts(file, picked);
+    const meanDb = (values: ArrayLike<number>) => { const xs = Array.from(values); const p = xs.reduce((sum, x) => sum + 10 ** (x / 10), 0) / Math.max(1, xs.length); return p > 0 ? Math.round(10 * Math.log10(p) * 10) / 10 : -120; };
+    const checked = picked.map((window, i) => {
+      const measured = frameLevels(cuts[i]!.samples, cuts[i]!.sampleRate), check = envelopeMatch(window.levels, measured);
+      return { index: window.index, speaker_name: spec.spans[window.span]!.speaker_name, start: window.start_ms / 1000, end: window.end_ms / 1000, from: window.from, to: window.to,
+        planned_db: meanDb(window.levels), measured_db: meanDb(measured), diff_db: check.diff_db, r: check.r, match: check.match };
+    });
+    return { ...base, windows: plan.windows.length, voiced_windows: voiced.length, checked };
+  } finally { await rm(dir, { recursive: true, force: true }).catch(() => {}); }
 }

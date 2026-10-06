@@ -13,6 +13,9 @@ const USAGE = `usage: bun run cli <create-key --project <name> [--scopes <scope>
   eval reference --meeting <id> --source <name> < file   store a reference transcript (e.g. Gemini) and re-score
   eval report --meeting <id>                          coverage (captured vs transcribed speech) and metrics for the published transcript and every eval
   eval show --meeting <id> [--eval <evalId>]          print the published (or an eval's) transcript
+  gapfill-check --meeting <id|vexa id> [--windows N] [--all]   align the retained recording and cut a few voiced
+                                                      windows exactly as gap fill would; prints planned vs measured
+                                                      energy. Sends nothing to Tinfoil, writes no ledger rows (TC-758)
   scopes: ${API_KEY_SCOPES.join(", ")} (default ${DEFAULT_KEY_SCOPES.join(",")}; quote them in the shell, e.g. --scopes 'transcriptions:*')`;
 const fail = (message: string): never => {
   console.error(message);
@@ -74,6 +77,19 @@ switch (cmd) {
     } else if (sub === "show") {
       console.log(await transcriptEvalText(ctx, meetingId, flag("eval")));
     } else fail(`unknown eval command: ${sub}`);
+    process.exit(0);
+  }
+  case "gapfill-check": {
+    const { gapFillCheck } = await import("./services/attributed-transcription.ts");
+    const meetingId = flag("meeting") ?? fail("--meeting is required");
+    const windows = flag("windows") ? Number(flag("windows")) : undefined;
+    if (windows !== undefined && (!Number.isSafeInteger(windows) || windows <= 0)) fail("--windows must be a positive integer");
+    const ctx = createContext();
+    const report = await gapFillCheck(ctx, meetingId, { windows, all: rest.includes("--all") });
+    const { checked, ...summary } = report;
+    console.log(JSON.stringify(summary, null, 2));
+    if (checked.length) console.table(checked);
+    else console.log(report.alignment ? "no voiced windows to cut" : "recording did not align: gap fill would send nothing and list every span as a gap");
     process.exit(0);
   }
   default:

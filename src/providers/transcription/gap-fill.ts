@@ -57,10 +57,12 @@ export interface GapSpan { start_ms: number; end_ms: number; speaker_name: strin
 export interface GapSpec { kind: "gap_fill"; spans: GapSpan[] }
 export interface GapWindow { span: number; start_ms: number; end_ms: number }
 export type AlignWindowStatus = "voiced" | "silent" | "missing";
-export interface GapAlignResult { offset_ms: number; score: number; duration_ms: number; windows: Array<{ status: AlignWindowStatus; energy_db?: number }> }
-export interface GapChunkWindow extends GapWindow { index: number; from: number; to: number; cut_start_ms: number }
+/** Voiced windows carry the planned 100 ms levels (dB, rounded) of their cut, checked again at cut time. */
+export interface GapAlignResult { offset_ms: number; score: number; duration_ms: number; windows: Array<{ status: AlignWindowStatus; energy_db?: number; levels?: number[] }> }
+export interface GapChunkWindow extends GapWindow { index: number; from: number; to: number; cut_start_ms: number; levels: number[] }
 export interface GapChunkSpec { kind: "gap_chunk"; windows: GapChunkWindow[] }
-export interface GapWindowText { index: number; status: "text" | "empty"; text?: string; language?: string; segments?: TimedPiece[]; energy_dbfs?: number }
+/** `mismatch`: the cut's audio did not match the aligned plan, so it was never sent (listed as a gap). */
+export interface GapWindowText { index: number; status: "text" | "empty" | "mismatch"; text?: string; language?: string; segments?: TimedPiece[]; energy_dbfs?: number }
 export interface GapChunkResult { model?: string; fallback?: boolean; windows: GapWindowText[] }
 
 /** Named ranges keep their speaker; unresolved ones take the same-channel inference or Unknown. */
@@ -152,11 +154,15 @@ export function alignRecording(manifest: AttributedManifest, voiced: Uint8Array,
   return { offset_ms: (best + lo) * FRAME_MS, score: Math.round(top * 1000) / 1000 };
 }
 
-/** Padded recording cut for a window, in recording seconds; null when it lies outside the recording. */
+/**
+ * Padded recording cut for a window, in recording seconds, widened to whole 100 ms level frames so
+ * its planned and measured envelopes compare frame for frame; null when outside the recording.
+ */
 export function recordingCut(window: GapWindow, offsetMs: number, durationSec: number): { from: number; to: number; cutStartMs: number } | null {
-  const from = Math.max(0, (window.start_ms - GAP_PAD_MS + offsetMs) / 1000), to = Math.min(durationSec, (window.end_ms + GAP_PAD_MS + offsetMs) / 1000);
-  if (to - from < 0.2) return null;
-  return { from: Math.round(from * 1000) / 1000, to: Math.round(to * 1000) / 1000, cutStartMs: Math.round(from * 1000 - offsetMs) };
+  const lastFrame = Math.floor(durationSec * 1000 / FRAME_MS);
+  const first = Math.max(0, Math.floor((window.start_ms - GAP_PAD_MS + offsetMs) / FRAME_MS)), last = Math.min(lastFrame, Math.ceil((window.end_ms + GAP_PAD_MS + offsetMs) / FRAME_MS));
+  if (last - first < 2) return null;
+  return { from: first * FRAME_MS / 1000, to: last * FRAME_MS / 1000, cutStartMs: first * FRAME_MS - offsetMs };
 }
 
 /** Mean power (dB) of the 100 ms levels covering [from, to) recording seconds. */
@@ -172,9 +178,31 @@ export function planAlignment(spec: GapSpec, levels: Float64Array, durationSec: 
     const cut = recordingCut(window, alignment.offset_ms, durationSec);
     if (!cut) return { status: "missing" as const };
     const energy_db = cutLevel(levels, cut.from, cut.to);
-    return { status: energy_db < SILENT_DB ? "silent" as const : "voiced" as const, energy_db };
+    if (energy_db < SILENT_DB) return { status: "silent" as const, energy_db };
+    const first = Math.round(cut.from * 1000 / FRAME_MS), last = Math.round(cut.to * 1000 / FRAME_MS);
+    return { status: "voiced" as const, energy_db, levels: Array.from(levels.subarray(first, last), (level) => Math.round(level)) };
   });
   return { ...alignment, duration_ms: Math.round(durationSec * 1000), windows };
+}
+
+/** Planned frames compared; measured below this floor counts as the floor (both near silence). */
+const ENVELOPE_FLOOR_DB = -80, ENVELOPE_MAX_DIFF_DB = 6, ENVELOPE_MIN_R = 0.5, ENVELOPE_FLAT_STD_DB = 3, ENVELOPE_MIN_COVER = 0.9;
+/**
+ * Whether a cut's measured 100 ms envelope is the moment alignment planned (TC-758): the mean
+ * absolute level difference must be small and, where the plan has structure, the shapes must
+ * correlate. The same decode on the same clock agrees within about a decibel; audio from another
+ * moment (a shifted clock, a changed file) does not, and is never sent.
+ */
+export function envelopeMatch(planned: number[], measured: ArrayLike<number>): { match: boolean; diff_db: number; r: number | null } {
+  const n = Math.min(planned.length, measured.length);
+  if (!n || n < planned.length * ENVELOPE_MIN_COVER) return { match: false, diff_db: Infinity, r: null };
+  const a = Array.from({ length: n }, (_, i) => Math.max(ENVELOPE_FLOOR_DB, planned[i]!)), b = Array.from({ length: n }, (_, i) => Math.max(ENVELOPE_FLOOR_DB, measured[i]!));
+  const diff = a.reduce((sum, value, i) => sum + Math.abs(value - b[i]!), 0) / n;
+  const mean = (xs: number[]) => xs.reduce((sum, x) => sum + x, 0) / xs.length, ma = mean(a), mb = mean(b);
+  const sa = Math.sqrt(mean(a.map((x) => (x - ma) ** 2))), sb = Math.sqrt(mean(b.map((x) => (x - mb) ** 2)));
+  const r = sa > 0 && sb > 0 ? mean(a.map((x, i) => (x - ma) * (b[i]! - mb))) / (sa * sb) : null;
+  const shaped = sa >= ENVELOPE_FLAT_STD_DB;
+  return { match: diff <= ENVELOPE_MAX_DIFF_DB && (!shaped || (r !== null && r >= ENVELOPE_MIN_R)), diff_db: Math.round(diff * 10) / 10, r: r === null ? null : Math.round(r * 1000) / 1000 };
 }
 
 const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
@@ -183,7 +211,8 @@ export function validAlignResult(spec: GapSpec, value: unknown): GapAlignResult 
   const result = value as GapAlignResult, expected = gapWindows(spec).length;
   if (!result || typeof result !== "object" || !finite(result.offset_ms) || !finite(result.score) || result.score < ALIGN_MIN_SCORE || !finite(result.duration_ms) || result.duration_ms <= 0
       || !Array.isArray(result.windows) || result.windows.length !== expected || expected > MAX_WINDOWS
-      || result.windows.some((window) => !window || !["voiced", "silent", "missing"].includes(window.status))) return null;
+      || result.windows.some((window) => !window || !["voiced", "silent", "missing"].includes(window.status)
+        || (window.status === "voiced" && (!Array.isArray(window.levels) || window.levels.length > 400 || !window.levels.every(finite))))) return null;
   return result;
 }
 
@@ -193,7 +222,7 @@ export function gapChunks(spec: GapSpec, align: GapAlignResult): GapChunkSpec[] 
   for (const [index, window] of gapWindows(spec).entries()) {
     if (align.windows[index]?.status !== "voiced") continue;
     const cut = recordingCut(window, align.offset_ms, align.duration_ms / 1000);
-    if (cut) voiced.push({ index, ...window, from: cut.from, to: cut.to, cut_start_ms: cut.cutStartMs });
+    if (cut) voiced.push({ index, ...window, from: cut.from, to: cut.to, cut_start_ms: cut.cutStartMs, levels: align.windows[index]!.levels ?? [] });
   }
   const chunks: GapChunkSpec[] = [];
   for (let i = 0; i < voiced.length; i += GAP_CHUNK_WINDOWS) chunks.push({ kind: "gap_chunk", windows: voiced.slice(i, i + GAP_CHUNK_WINDOWS) });
@@ -251,7 +280,7 @@ export function validChunkResult(chunk: GapChunkSpec, value: unknown): GapChunkR
   const result = value as GapChunkResult;
   if (!result || typeof result !== "object" || !Array.isArray(result.windows) || result.windows.length !== chunk.windows.length) return null;
   for (const [i, window] of result.windows.entries()) {
-    if (!window || window.index !== chunk.windows[i]!.index || !["text", "empty"].includes(window.status)) return null;
+    if (!window || window.index !== chunk.windows[i]!.index || !["text", "empty", "mismatch"].includes(window.status)) return null;
     if (window.status === "text" && (typeof window.text !== "string" || !window.text.trim() || window.text.length > MAX_WINDOW_TEXT
         || (window.language !== undefined && !safeTinfoilLanguage(window.language)) || (window.energy_dbfs !== undefined && !finite(window.energy_dbfs)))) return null;
   }

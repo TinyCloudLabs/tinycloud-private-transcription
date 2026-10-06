@@ -1,3 +1,4 @@
+import { open } from "node:fs/promises";
 import { ApiError } from "../../domain/errors.ts";
 import type {
   VexaMeetingCreate,
@@ -126,10 +127,19 @@ export class VexaClient {
     return { bytes: new Uint8Array(await res.arrayBuffer()), contentType: res.headers.get("content-type") ?? "application/octet-stream" };
   }
 
-  /** Streams a retained file to disk instead of memory (recordings can be large, TC-758). Returns its size. */
+  /**
+   * Streams a retained file to disk instead of memory (recordings can be large, TC-758). Returns its
+   * size. The body is read chunk by chunk under the request's abort timeout: `Bun.write(path,
+   * response)` was seen to stall indefinitely on a streamed body.
+   */
   async fetchToFile(path: string, destination: string): Promise<number> {
     const res = await this.raw("GET", path, undefined, 300_000);
-    return Bun.write(destination, res);
+    const file = await open(destination, "w", 0o600);
+    let size = 0;
+    try {
+      if (res.body) for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) { await file.write(chunk); size += chunk.byteLength; }
+    } finally { await file.close(); }
+    return size;
   }
 
   async health(): Promise<boolean> {

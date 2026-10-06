@@ -71,47 +71,73 @@ export function wavHeader(dataBytes: number, sampleRate: number): Uint8Array {
   return new Uint8Array(view.buffer);
 }
 
-/** Runs ffmpeg to stdout with a hard wall-clock bound; the process is killed past it. */
-function spawnFfmpeg(args: string[], ffmpegPath: string | undefined, timeoutMs: number) {
-  const proc = Bun.spawn([ffmpegPath ?? "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", ...args], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
-  const timer = setTimeout(() => proc.kill(), timeoutMs);
-  const finished = async () => {
-    const [error, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
-    clearTimeout(timer);
-    if (code !== 0) throw new Error(`ffmpeg failed (exit ${code}): ${error.trim().slice(0, 300)}`);
-  };
-  return { proc, finished };
-}
-
-const LEVEL_RATE = 8_000, LEVEL_FRAME = 800, LEVEL_FLOOR_DB = -120;
 /**
- * 100 ms RMS levels (dB) of a recording file (TC-758). The audio is streamed through ffmpeg at
- * 8 kHz and folded into frame levels as it arrives, so memory is O(frames), not O(samples):
- * a whole meeting is never held decoded.
+ * One decode path for every gap-fill read of a recording (TC-758): the same ffmpeg arguments, the
+ * same 16 kHz rate, and `aresample=async=1`, which fills container-timestamp gaps (concatenated
+ * chunks, a recorder pause) with silence. Levels, alignment and cuts therefore share one clock —
+ * decoded sample index / 16 kHz — and cuts are taken by sample offset, never by `-ss` seeking,
+ * which would follow container timestamps instead.
  */
-export async function recordingLevels(path: string, opts: { ffmpegPath?: string; timeoutMs?: number } = {}): Promise<{ levels: Float64Array; durationSec: number }> {
-  const { proc, finished } = spawnFfmpeg(["-i", path, "-vn", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", String(LEVEL_RATE), "pipe:1"], opts.ffmpegPath, opts.timeoutMs ?? 300_000);
-  const levels: number[] = [];
-  let sum = 0, count = 0, samples = 0, carry = -1;
-  const take = (sample: number) => {
-    const value = sample / 32768; sum += value * value; count++; samples++;
-    if (count === LEVEL_FRAME) { levels.push(sum > 0 ? Math.max(LEVEL_FLOOR_DB, 10 * Math.log10(sum / count)) : LEVEL_FLOOR_DB); sum = 0; count = 0; }
-  };
-  for await (const chunk of proc.stdout as unknown as AsyncIterable<Uint8Array>) {
-    let i = 0;
-    if (carry >= 0 && chunk.length) { take(((carry | (chunk[0]! << 8)) << 16) >> 16); carry = -1; i = 1; }
-    for (; i + 1 < chunk.length; i += 2) take(((chunk[i]! | (chunk[i + 1]! << 8)) << 16) >> 16);
-    if (i < chunk.length) carry = chunk[i]!;
-  }
-  await finished();
-  return { levels: Float64Array.from(levels), durationSec: samples / LEVEL_RATE };
+const RECORDING_ARGS = (path: string) => ["-hide_banner", "-loglevel", "error", "-nostdin", "-i", path, "-vn", "-af", "aresample=async=1",
+  "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", String(PCM_RATE), "pipe:1"];
+const LEVEL_FRAME = PCM_RATE / 10, LEVEL_FLOOR_DB = -120;
+
+/**
+ * Streams decoded samples to `take(samples, firstIndex)` as they arrive; `take` returns false to
+ * stop early. Memory is O(chunk). ffmpeg is killed past `timeoutMs` (default 5 min).
+ */
+async function streamRecording(path: string, take: (samples: Int16Array, firstIndex: number) => boolean | void, opts: { ffmpegPath?: string; timeoutMs?: number } = {}): Promise<number> {
+  const proc = Bun.spawn([opts.ffmpegPath ?? "ffmpeg", ...RECORDING_ARGS(path)], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  let timedOut = false, stopped = false, index = 0, carry: number | null = null;
+  const timer = setTimeout(() => { timedOut = true; proc.kill(); }, opts.timeoutMs ?? 300_000);
+  const stderr = new Response(proc.stderr).text();
+  try {
+    for await (const chunk of proc.stdout as unknown as AsyncIterable<Uint8Array>) {
+      // s16le samples may straddle chunk boundaries: carry an odd trailing byte forward.
+      let bytes = chunk;
+      if (carry !== null) { bytes = new Uint8Array(chunk.byteLength + 1); bytes[0] = carry; bytes.set(chunk, 1); }
+      const even = bytes.byteLength & ~1;
+      carry = even < bytes.byteLength ? bytes[even]! : null;
+      const samples = new Int16Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + even));
+      if (samples.length && take(samples, index) === false) { stopped = true; index += samples.length; proc.kill(); break; }
+      index += samples.length;
+    }
+  } finally { clearTimeout(timer); }
+  const [error, code] = await Promise.all([stderr, proc.exited]);
+  if (timedOut) throw new Error("ffmpeg timed out");
+  if (!stopped && code !== 0) throw new Error(`ffmpeg failed (exit ${code}): ${error.trim().slice(0, 300)}`);
+  return index;
 }
 
-/** Decodes only [fromSec, toSec) of a recording file to 16 kHz mono PCM (input seeking). */
-export async function decodeCut(path: string, fromSec: number, toSec: number, opts: { ffmpegPath?: string; timeoutMs?: number } = {}): Promise<Pcm16> {
-  const { proc, finished } = spawnFfmpeg(["-ss", fromSec.toFixed(3), "-t", Math.max(0, toSec - fromSec).toFixed(3), "-i", path, "-vn", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", String(PCM_RATE), "pipe:1"],
-    opts.ffmpegPath, opts.timeoutMs ?? 60_000);
-  const [out] = await Promise.all([new Response(proc.stdout).arrayBuffer(), finished()]);
-  const samples = new Int16Array(out.slice(0, out.byteLength - (out.byteLength % 2)));
-  return { samples, sampleRate: PCM_RATE, durationSec: samples.length / PCM_RATE };
+/** 100 ms RMS levels (dB) of a recording file, on the shared decode clock; memory is O(frames). */
+export async function recordingLevels(path: string, opts: { ffmpegPath?: string; timeoutMs?: number } = {}): Promise<{ levels: Float64Array; durationSec: number }> {
+  const levels: number[] = [];
+  let sum = 0, count = 0;
+  const samples = await streamRecording(path, (chunk) => {
+    for (const sample of chunk) {
+      const value = sample / 32768; sum += value * value;
+      if (++count === LEVEL_FRAME) { levels.push(sum > 0 ? Math.max(LEVEL_FLOOR_DB, 10 * Math.log10(sum / count)) : LEVEL_FLOOR_DB); sum = 0; count = 0; }
+    }
+  }, opts);
+  return { levels: Float64Array.from(levels), durationSec: samples / PCM_RATE };
+}
+
+/**
+ * Cuts [from, to) seconds out of a recording file by decoded sample index, on the same clock as
+ * `recordingLevels`. One pass, stopping after the last cut; cuts are tiny (≤ 30 s each).
+ */
+export async function recordingCuts(path: string, cuts: Array<{ from: number; to: number }>, opts: { ffmpegPath?: string; timeoutMs?: number } = {}): Promise<Pcm16[]> {
+  const bounds = cuts.map((cut) => [Math.round(cut.from * PCM_RATE), Math.round(cut.to * PCM_RATE)] as const);
+  const out = bounds.map(([a, b]) => new Int16Array(Math.max(0, b - a)));
+  const filled = bounds.map(() => 0), last = Math.max(0, ...bounds.map(([, b]) => b));
+  await streamRecording(path, (chunk, first) => {
+    const end = first + chunk.length;
+    for (const [i, [a, b]] of bounds.entries()) {
+      const lo = Math.max(a, first), hi = Math.min(b, end);
+      if (hi > lo) { out[i]!.set(chunk.subarray(lo - first, hi - first), lo - a); filled[i] = Math.max(filled[i]!, hi - a); }
+    }
+    return end < last;
+  }, opts);
+  // A recording shorter than planned yields a shorter cut, never invented samples.
+  return out.map((samples, i) => { const kept = samples.subarray(0, filled[i]); return { samples: kept, sampleRate: PCM_RATE, durationSec: kept.length / PCM_RATE }; });
 }

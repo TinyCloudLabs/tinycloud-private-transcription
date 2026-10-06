@@ -37,6 +37,15 @@ export async function processJob(ctx: AppContext, job: Job): Promise<JobOutcome>
  * another meeting's opening is never delayed (TC-758). Claim fencing makes duplicates harmless.
  */
 export const ATTRIBUTED_LANE_SLOTS = 2;
+/** One meeting's gap-fill steps hold at most this many lane slots, so other meetings' batches are not starved. */
+export const GAP_FILL_SLOTS_PER_MEETING = 1;
+const isGapFillJob = (job: { batchId: string }) => /:gap(?:align|fill:\d+)$/.test(job.batchId);
+
+/** Whether the lane can start this batch job now, given the jobs it is running. */
+export function laneAdmits(running: Array<{ meetingId: string; batchId: string }>, job: { meetingId: string; batchId: string }): boolean {
+  if (running.length >= ATTRIBUTED_LANE_SLOTS) return false;
+  return !isGapFillJob(job) || running.filter((other) => other.meetingId === job.meetingId && isGapFillJob(other)).length < GAP_FILL_SLOTS_PER_MEETING;
+}
 
 export interface WorkerHandle {
   stop(): Promise<void>;
@@ -62,6 +71,7 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number; hea
   let attributedJobFailures = 0;
   let heartbeatInFlight = false;
   const lane = new Set<Promise<void>>();
+  const laneJobs = new Map<Promise<void>, { meetingId: string; batchId: string }>();
   let lastWebhookReconciliation = 0;
 
   // Redis is a wakeup transport, not the work ledger. This repairs lost enqueue acknowledgements
@@ -216,8 +226,9 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number; hea
           // delayed retry per batch; other attributed jobs keep their own entry (TC-576).
           await ctx.queue.push(job, 1_000, job.type === "attributed.batch" ? `batch:${job.batchId}` : undefined);
         } else if (job.type === "attributed.batch") {
-          if (lane.size >= ATTRIBUTED_LANE_SLOTS) {
-            // Both slots busy: the deduped delayed entry folds repeat wakeups for this batch. One
+          if (!laneAdmits([...laneJobs.values()], job)) {
+            // Slots busy (or this meeting's gap fill already holds its share): the deduped delayed
+            // entry folds repeat wakeups for this batch. One
             // poll interval, like other batch requeues, so a due retry is never pushed back far.
             await ctx.queue.push(job, ctx.config.vexa.pollIntervalMs, `batch:${job.batchId}`);
             continue;
@@ -226,8 +237,8 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number; hea
           const task: Promise<void> = (async () => {
             try { await attributedOutcome(await processJob(ctx, laneJob)); }
             catch { await jobFailed(laneJob); }
-          })().finally(() => { lane.delete(task); });
-          lane.add(task);
+          })().finally(() => { lane.delete(task); laneJobs.delete(task); });
+          lane.add(task); laneJobs.set(task, { meetingId: job.meetingId, batchId: job.batchId });
         } else {
           const outcome = await processJob(ctx, job);
           if (job.type.startsWith("attributed.")) await attributedOutcome(outcome);

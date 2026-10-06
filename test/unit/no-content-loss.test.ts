@@ -3,8 +3,12 @@ import { createHash } from "node:crypto";
 import { hallucinated } from "../../src/domain/hallucination.ts";
 import { attributedBatches, type AttributedManifest, type AttributedRange } from "../../src/providers/transcription/attributed.ts";
 import { assembleAttributedTranscript, attributedPieces, batchTimeline, type AttributedResult } from "../../src/providers/transcription/attributed-assembly.ts";
-import { PCM_RATE } from "../../src/providers/transcription/audio.ts";
-import { acceptWindowText, alignRecording, frameLevels, GAP_PAD_MS, gapChunks, gapOutcome, gapSpec, gapWindows, MAX_WINDOW_TEXT, priorOffsetMs, recordingCut, validChunkResult, voicedFrames, type GapAlignResult, type GapChunkSpec, type GapWindowText } from "../../src/providers/transcription/gap-fill.ts";
+import { PCM_RATE, recordingCuts, recordingLevels } from "../../src/providers/transcription/audio.ts";
+import { laneAdmits } from "../../src/worker/index.ts";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { acceptWindowText, alignRecording, envelopeMatch, frameLevels, GAP_PAD_MS, gapChunks, gapOutcome, gapSpec, gapWindows, MAX_WINDOW_TEXT, priorOffsetMs, recordingCut, validChunkResult, voicedFrames, type GapAlignResult, type GapChunkSpec, type GapWindowText } from "../../src/providers/transcription/gap-fill.ts";
 import { sliceDbfs, TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
 import { attemptLimit, attemptModel, attemptsVerified, retryDelayMs } from "../../src/services/attributed-ledger.ts";
 
@@ -194,7 +198,8 @@ describe("recording gap fill (TC-758)", () => {
     const align: GapAlignResult = { offset_ms: 1_000, score: 0.9, duration_ms: 400_000, windows: windows.map((_, i) => ({ status: i === 3 ? "silent" : "voiced" })) };
     const chunks = gapChunks(spec, align);
     expect(chunks.map((chunk) => chunk.windows.map((w) => w.index))).toEqual([[0, 1, 2, 4], [5, 6, 7, 8], [9, 10]]);
-    expect(chunks[0]!.windows[0]).toMatchObject({ from: 0.75, cut_start_ms: -250 });
+    // Cuts are widened to whole 100 ms level frames: 0.75 s → 0.7 s.
+    expect(chunks[0]!.windows[0]).toMatchObject({ from: 0.7, cut_start_ms: -300 });
   });
 
   test("an offset is used only when the recording verifies it", () => {
@@ -221,14 +226,14 @@ describe("recording gap fill (TC-758)", () => {
     expect(priorOffsetMs(Date.parse(start), null)).toBeNull();
   });
 
-  test("windows map to the recording clock and back, clamped to the recording", () => {
-    expect(recordingCut({ span: 0, start_ms: 10_000, end_ms: 12_000 }, 2_000, 60)).toEqual({ from: 11.75, to: 14.25, cutStartMs: 9_750 });
-    expect(recordingCut({ span: 0, start_ms: 0, end_ms: 1_000 }, -100, 60)).toEqual({ from: 0, to: 1.15, cutStartMs: 100 });
+  test("windows map to the recording clock and back on whole level frames, clamped to the recording", () => {
+    expect(recordingCut({ span: 0, start_ms: 10_000, end_ms: 12_000 }, 2_000, 60)).toEqual({ from: 11.7, to: 14.3, cutStartMs: 9_700 });
+    expect(recordingCut({ span: 0, start_ms: 0, end_ms: 1_000 }, -100, 60)).toEqual({ from: 0, to: 1.2, cutStartMs: 100 });
     expect(recordingCut({ span: 0, start_ms: 100_000, end_ms: 101_000 }, 0, 60)).toBeNull();
   });
 
   test("over-long, malformed or filtered recording answers are empty windows at processing time", () => {
-    const window = { index: 0, span: 0, start_ms: 0, end_ms: 2_000, from: 0, to: 2.5, cut_start_ms: -250 };
+    const window = { index: 0, span: 0, start_ms: 0, end_ms: 2_000, from: 0, to: 2.5, cut_start_ms: -250, levels: [] };
     expect(acceptWindowText(window, { text: "x".repeat(MAX_WINDOW_TEXT + 1), energy_dbfs: -20 }).status).toBe("empty");
     expect(acceptWindowText(window, { text: "Hello! How can I assist you today?", energy_dbfs: -20 }).status).toBe("empty");
     expect(acceptWindowText(window, { text: "Ship it.", language: "en", energy_dbfs: -20 })).toEqual({ index: 0, status: "text", text: "Ship it.", language: "en", energy_dbfs: -20 });
@@ -248,12 +253,13 @@ describe("recording gap fill (TC-758)", () => {
       [2, { index: 2, status: "empty", energy_dbfs: -20 }],
     ]);
     const outcome = gapOutcome(spec, chunks, texts);
-    // Alice's dropped caption [11.05, 11.95] s and Bob's empty window are gaps.
-    expect(outcome.gaps).toEqual([{ start: 11.05, end: 11.95, speaker_name: "Alice" }, { start: 50, end: 51, speaker_name: "Bob" }]);
+    // Alice's dropped caption [11.0, 11.9] s and Bob's empty window are gaps.
+    expect(outcome.gaps).toEqual([{ start: 11, end: 11.9, speaker_name: "Alice" }, { start: 50, end: 51, speaker_name: "Bob" }]);
     expect([outcome.recording_ms, outcome.gap_ms]).toEqual([3_100, 1_900]);
     const { transcript } = assembleAttributedTranscript(input, [], "en", outcome.pieces);
-    expect(transcript.segments.map((s) => [s.speaker_name, s.text, s.start, s.end, s.attribution, s.source])).toEqual([
-      ["Alice", "Alice words.", 10.05, 10.95, "provisional", "recording"],
+    const ms = (x: number) => Math.round(x * 1000) / 1000;
+    expect(transcript.segments.map((s) => [s.speaker_name, s.text, ms(s.start), ms(s.end), s.attribution, s.source])).toEqual([
+      ["Alice", "Alice words.", 10, 10.9, "provisional", "recording"],
       ["Bob", "Bob words.", 20, 22, "provisional", "recording"],
     ]);
     // Unaligned (no chunks) or exhausted (no texts): every captured part is a gap.
@@ -275,5 +281,49 @@ describe("recording gap fill (TC-758)", () => {
   test("energy is measured in dBFS and floored for digital silence", () => {
     expect(sliceDbfs(new Float32Array(100).fill(0.1), 0, 100)).toBe(-20);
     expect(sliceDbfs(new Int16Array(100), 0, 100)).toBe(-120);
+  });
+});
+
+describe("recording clock and cut verification (TC-758 re-review)", () => {
+  test("a cut must reproduce the envelope alignment planned for it", () => {
+    const planned = [-90, -90, -20, -18, -20, -90, -90, -22, -21, -90];
+    // Frames below the -80 dB floor compare as the floor, so only the voiced frames differ here.
+    expect(envelopeMatch(planned, planned.map((level) => level + 0.4))).toMatchObject({ match: true, diff_db: 0.2 });
+    // The same shape shifted by two frames (another moment) does not match.
+    expect(envelopeMatch(planned, [-90, -90, -90, -90, -20, -18, -20, -90, -90, -22]).match).toBe(false);
+    // Flat speech: the level must agree.
+    expect(envelopeMatch([-20, -20, -20], [-21, -20, -19]).match).toBe(true);
+    expect(envelopeMatch([-20, -20, -20], [-45, -44, -46]).match).toBe(false);
+    // A truncated cut (recording shorter than planned) is not the planned moment.
+    expect(envelopeMatch(planned, planned.slice(0, 5)).match).toBe(false);
+  });
+
+  test("levels and cuts share one clock across a container timestamp gap", async () => {
+    // 3 s quiet tone, a 2 s PTS gap, then 3 s loud tone: concatenated recorder chunks.
+    const dir = await mkdtemp(join(tmpdir(), "ptx-test-")), file = join(dir, "gap.webm");
+    try {
+      const proc = Bun.spawn(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=6:sample_rate=48000",
+        "-af", "volume='if(lt(t,3),0.02,0.5)':eval=frame,asetpts='if(gte(T,3),PTS+2/TB,PTS)'", "-c:a", "libopus", file], { stdout: "ignore", stderr: "ignore" });
+      expect(await proc.exited).toBe(0);
+      const { levels, durationSec } = await recordingLevels(file);
+      // The gap is filled on the decode clock, so recording time stays container time (≈ 8 s).
+      expect(durationSec).toBeGreaterThan(7.8);
+      expect(levels[40]!).toBeLessThan(-60);
+      expect(levels[60]!).toBeGreaterThan(-35);
+      // A cut after the gap is exactly the moment the levels describe.
+      const [cut] = await recordingCuts(file, [{ from: 5.5, to: 7.0 }]);
+      expect(cut!.durationSec).toBeCloseTo(1.5);
+      expect(envelopeMatch(Array.from(levels.subarray(55, 70), Math.round), frameLevels(cut!.samples, cut!.sampleRate)).match).toBe(true);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  test("one meeting's gap fill holds at most one lane slot; batches use the rest", () => {
+    const gap = (meetingId: string, n: number) => ({ meetingId, batchId: `${meetingId}:gapfill:${n}` });
+    const batch = (meetingId: string, n: number) => ({ meetingId, batchId: `${meetingId}:batch:${n}` });
+    expect(laneAdmits([gap("m1", 0)], gap("m1", 1))).toBe(false);
+    expect(laneAdmits([gap("m1", 0)], { meetingId: "m1", batchId: "m1:gapalign" })).toBe(false);
+    expect(laneAdmits([gap("m1", 0)], gap("m2", 0))).toBe(true);
+    expect(laneAdmits([gap("m1", 0)], batch("m1", 3))).toBe(true);
+    expect(laneAdmits([gap("m1", 0), batch("m2", 0)], batch("m3", 0))).toBe(false);
   });
 });
