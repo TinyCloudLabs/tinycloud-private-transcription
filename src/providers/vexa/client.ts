@@ -1,3 +1,4 @@
+import { open } from "node:fs/promises";
 import { ApiError } from "../../domain/errors.ts";
 import type {
   VexaMeetingCreate,
@@ -124,6 +125,26 @@ export class VexaClient {
   async fetchBytes(path: string): Promise<{ bytes: Uint8Array; contentType: string }> {
     const res = await this.raw("GET", path, undefined, 60_000);
     return { bytes: new Uint8Array(await res.arrayBuffer()), contentType: res.headers.get("content-type") ?? "application/octet-stream" };
+  }
+
+  /**
+   * Streams a retained file to disk instead of memory (recordings can be large, TC-758). Returns its
+   * size. The body is read chunk by chunk under the request's abort timeout: `Bun.write(path,
+   * response)` was seen to stall indefinitely on a streamed body.
+   */
+  async fetchToFile(path: string, destination: string): Promise<number> {
+    const res = await this.raw("GET", path, undefined, 300_000);
+    const file = await open(destination, "w", 0o600);
+    let size = 0;
+    try {
+      if (res.body) for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) { await file.write(chunk); size += chunk.byteLength; }
+    } finally { await file.close(); }
+    // A connection cut mid-body can end the stream quietly; a short file must never be cached as
+    // the recording. Not-ready is retried on the caller's fetch budget (TC-758).
+    // (A content-encoded body's length is the encoded size, so it cannot be compared.)
+    const declared = res.headers.get("content-length"), encoding = res.headers.get("content-encoding");
+    if (declared !== null && (!encoding || encoding === "identity") && Number(declared) !== size) throw new ApiError("provider_unavailable", "Retained file download was truncated");
+    return size;
   }
 
   async health(): Promise<boolean> {

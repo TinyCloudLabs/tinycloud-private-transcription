@@ -146,8 +146,8 @@ export async function setReferenceTranscript(ctx: AppContext, meetingId: string,
 
 export interface EvalReportRow { source: string; status: string; created_at: string; calls: number | null; metrics: Partial<TranscriptMetrics> | Record<string, unknown> }
 
-/** The canonical transcript first, then every eval, newest first; metrics against the reference. */
-export async function transcriptEvalReport(ctx: AppContext, meetingId: string): Promise<{ reference: string | null; rows: EvalReportRow[] }> {
+/** The canonical transcript first, then every eval, newest first; metrics against the reference. Coverage is the published run's speech accounting (TC-758). */
+export async function transcriptEvalReport(ctx: AppContext, meetingId: string): Promise<{ reference: string | null; rows: EvalReportRow[]; coverage: Record<string, unknown> | null }> {
   const [reference] = await ctx.db.select().from(referenceTranscripts).where(eq(referenceTranscripts.meetingId, meetingId));
   const turns = reference ? parseReferenceTranscript(reference.text) : null;
   const rows: EvalReportRow[] = [];
@@ -159,7 +159,8 @@ export async function transcriptEvalReport(ctx: AppContext, meetingId: string): 
   for (const row of await ctx.db.select().from(transcriptEvals).where(eq(transcriptEvals.meetingId, meetingId)).orderBy(desc(transcriptEvals.createdAt))) {
     rows.push({ source: `${row.provider}:${row.model} (${row.id})`, status: row.status, created_at: row.createdAt.toISOString(), calls: row.calls, metrics: object(row.metricsJson ?? {}) });
   }
-  return { reference: reference ? `${reference.source} (${turns!.length} turns)` : null, rows };
+  const [run] = await ctx.db.select({ coverage: attributedTranscriptionRuns.coverageJson }).from(attributedTranscriptionRuns).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
+  return { reference: reference ? `${reference.source} (${turns!.length} turns)` : null, rows, coverage: run?.coverage ? object<Record<string, unknown>>(run.coverage) : null };
 }
 
 /** Plain-text view of an eval's (or the canonical) transcript for operator review on the server. */

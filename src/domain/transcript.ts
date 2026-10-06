@@ -11,6 +11,11 @@ export interface RawSegment {
   speakerKey?: string | null;
   attribution?: SpeakerAttribution;
   language?: string | null;
+  /**
+   * Text re-read from the retained mixed recording for a span the per-speaker path lost (TC-758);
+   * published as `source: "recording"`. Not named `source`: Vexa rows carry their own `source`.
+   */
+  origin?: "recording" | "fallback";
 }
 
 export interface Speaker {
@@ -25,6 +30,8 @@ export interface Segment {
   end: number;
   text: string;
   attribution?: SpeakerAttribution;
+  /** `recording`: re-read from the mixed recording; `fallback`: from the fallback model (TC-758). */
+  source?: "recording" | "fallback";
 }
 export interface NormalizedTranscript {
   language: string;
@@ -35,6 +42,9 @@ export interface NormalizedTranscript {
   /** Additive marker: ranges without usable audio, or a mixed-recording fallback for a failed manifest. */
   partial?: boolean;
 }
+
+/** Captured speech that no path could transcribe, on the meeting clock (TC-758). Never silently dropped. */
+export interface TranscriptGap { start: number; end: number; speaker_name: string }
 
 const UNKNOWN = "Unknown";
 
@@ -62,6 +72,7 @@ export function normalizeSegments(raw: RawSegment[], languageHint?: string | nul
       end: s.end,
       text: s.text.trim(),
       ...(s.attribution ? { attribution: s.attribution } : {}),
+      ...(s.origin === "recording" || s.origin === "fallback" ? { source: s.origin } : {}),
     };
   });
   const language = languageHint || sorted.find((s) => s.language)?.language || "en";

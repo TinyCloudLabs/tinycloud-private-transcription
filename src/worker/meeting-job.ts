@@ -14,7 +14,7 @@ import { attributedTranscriptionRuns, meetings } from "../db/schema.ts";
 import { normalizeSegments } from "../domain/transcript.ts";
 import { openSignalCapability } from "../providers/signal/capability.ts";
 import { AttributedStagingError, markAttributedRecovery, resumeAttributedRun, stageAttributedManifest, type AttributedStageOutcome } from "../services/attributed-transcription.ts";
-import { admitRecordingRecovery, failMeetingUnlessRecoveryLive, heartbeatRecordingRecovery, recoveryAckBudgetMs, releaseRecordingRecovery, settleRecordingRecovery } from "../services/recording-recovery.ts";
+import { admitRecordingRecovery, failMeetingUnlessRecoveryLive, fetchRetainedRecording, heartbeatRecordingRecovery, RecoveryRecordingNotReadyError, recoveryAckBudgetMs, releaseRecordingRecovery, settleRecordingRecovery } from "../services/recording-recovery.ts";
 import type { VexaAttributedAudioManifest, VexaTranscriptionResponse } from "../providers/vexa/types.ts";
 import type { TranscriptionInput } from "../providers/transcription/types.ts";
 import type { Job } from "./queue.ts";
@@ -768,31 +768,5 @@ export function isMateriallyIncomplete(vexa: VexaTranscriptionResponse, segments
     || (uncovered > MATERIAL_GAP_SECONDS && covered / duration < MIN_MATERIAL_COVERAGE_RATIO);
 }
 
-async function fetchVexaAudio(ctx: AppContext, vexa: VexaTranscriptionResponse) {
-  try {
-    const recordings = await ctx.vexa.listRecordings();
-    const recording = recordings.recordings.find((candidate) => candidate.meeting_id === vexa.id && candidate.media_files.some((file) => file.type === "audio"));
-    if (!recording) throw new RecoveryRecordingNotReadyError();
-    const master = await ctx.vexa.recordingMaster(recording.id);
-    if (!master.raw_url) throw new RecoveryRecordingNotReadyError();
-    const { bytes, contentType } = await ctx.vexa.fetchBytes(master.raw_url);
-    if (!bytes.length) throw new RecoveryRecordingNotReadyError();
-    return { bytes, filename: "meeting.webm", contentType };
-  } catch (error) {
-    if (error instanceof RecoveryRecordingNotReadyError || isRetryableRecordingFetchError(error)) {
-      throw new RecoveryRecordingNotReadyError();
-    }
-    throw error;
-  }
-}
-
-class RecoveryRecordingNotReadyError extends Error {
-  constructor() {
-    super("The retained recording is not ready");
-    this.name = "RecoveryRecordingNotReadyError";
-  }
-}
-
-const isRetryableRecordingFetchError = (error: unknown) =>
-  (error instanceof ApiError && (error.code === "provider_unavailable" || error.code === "provider_timeout"))
-  || (error instanceof VexaHttpError && (error.notFound || error.status === 429 || error.status >= 500));
+/** The retained mixed recording of this Vexa meeting (shared with attributed gap fill, TC-758). */
+const fetchVexaAudio = (ctx: AppContext, vexa: VexaTranscriptionResponse) => fetchRetainedRecording(ctx, vexa.id);

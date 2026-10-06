@@ -2,7 +2,8 @@ import { and, eq, isNotNull, isNull, sql } from "drizzle-orm";
 import type { AppContext } from "../context.ts";
 import type { Db } from "../db/client.ts";
 import { meetings, recordingRecoveryRuns, type MeetingRow } from "../db/schema.ts";
-import type { ErrorCode } from "../domain/errors.ts";
+import { ApiError, type ErrorCode } from "../domain/errors.ts";
+import { VexaHttpError } from "../providers/vexa/client.ts";
 import { terminalTransition } from "./meetings.ts";
 
 /** What `db.transaction` hands to its callback; structurally a Db without transaction(). */
@@ -170,4 +171,52 @@ export async function resetRecordingRecovery(db: DbSession, meetingId: string): 
   await db.update(recordingRecoveryRuns)
     .set({ ownerToken: null, admittedAt: null, admissions: 0, outcome: null, updatedAt: sql`now()` })
     .where(and(eq(recordingRecoveryRuns.meetingId, meetingId), isNotNull(recordingRecoveryRuns.outcome)));
+}
+
+export class RecoveryRecordingNotReadyError extends Error {
+  constructor() {
+    super("The retained recording is not ready");
+    this.name = "RecoveryRecordingNotReadyError";
+  }
+}
+
+const isRetryableRecordingFetchError = (error: unknown) =>
+  (error instanceof ApiError && (error.code === "provider_unavailable" || error.code === "provider_timeout"))
+  || (error instanceof VexaHttpError && (error.notFound || error.status === 429 || error.status >= 500));
+
+/**
+ * Downloads Vexa's retained mixed recording of one capture (unpaid). A missing, unfinished or
+ * transiently unreachable recording is `RecoveryRecordingNotReadyError`, which callers retry.
+ */
+export async function fetchRetainedRecording(ctx: AppContext, vexaMeetingId: number) {
+  try {
+    const recordings = await ctx.vexa.listRecordings();
+    const recording = recordings.recordings.find((candidate) => candidate.meeting_id === vexaMeetingId && candidate.media_files.some((file) => file.type === "audio"));
+    if (!recording) throw new RecoveryRecordingNotReadyError();
+    const master = await ctx.vexa.recordingMaster(recording.id);
+    if (!master.raw_url) throw new RecoveryRecordingNotReadyError();
+    const { bytes, contentType } = await ctx.vexa.fetchBytes(master.raw_url);
+    if (!bytes.length) throw new RecoveryRecordingNotReadyError();
+    return { bytes, filename: "meeting.webm", contentType };
+  } catch (error) {
+    if (error instanceof RecoveryRecordingNotReadyError || isRetryableRecordingFetchError(error)) {
+      throw new RecoveryRecordingNotReadyError();
+    }
+    throw error;
+  }
+}
+
+/** Streams the retained recording to `destination` (unpaid). Not ready is `RecoveryRecordingNotReadyError`. */
+export async function fetchRetainedRecordingToFile(ctx: AppContext, vexaMeetingId: number, destination: string): Promise<void> {
+  try {
+    const recordings = await ctx.vexa.listRecordings();
+    const recording = recordings.recordings.find((candidate) => candidate.meeting_id === vexaMeetingId && candidate.media_files.some((file) => file.type === "audio"));
+    if (!recording) throw new RecoveryRecordingNotReadyError();
+    const master = await ctx.vexa.recordingMaster(recording.id);
+    if (!master.raw_url) throw new RecoveryRecordingNotReadyError();
+    if (!(await ctx.vexa.fetchToFile(master.raw_url, destination))) throw new RecoveryRecordingNotReadyError();
+  } catch (error) {
+    if (error instanceof RecoveryRecordingNotReadyError || isRetryableRecordingFetchError(error)) throw new RecoveryRecordingNotReadyError();
+    throw error;
+  }
 }
