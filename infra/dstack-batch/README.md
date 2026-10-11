@@ -66,9 +66,9 @@ gh workflow run deploy-batch.yml -R $R --ref main -f confirm=ptx-batch
   `phala deploy --cvm-id … --wait` → allowed_envs sync → health gate (`/health/live`, then
   `checks.upload_transcription.ready`) → admission gate (reports `drain`) → `{"mode":"open"}`. A drain response without
   three non-negative integer counts fails the run (never read as drained).
-- **Sizing `drain_timeout_minutes`** (1–300, default 130): an accepted create may upload for up to 120 min, then jobs
-  process one at a time, each bounded by the 240-min processing ceiling but typically far shorter. The worst case is
-  `120 + (awaiting_upload + queued + processing) × 240` minutes; the run prints it at drain start and warns when the
+- **Sizing `drain_timeout_minutes`** (1–300, default 130): an accepted create may upload for up to 480 min, then jobs
+  process one at a time, each bounded by the 480-min processing ceiling but typically far shorter. The worst case is
+  `480 + (awaiting_upload + queued + processing) × 480` minutes; the run prints it at drain start and warns when the
   timeout is below it. Check the queue first (`GET /v1/admin/admission`) and size to what you see; with a deep queue,
   drain ahead of time (`PUT … {"mode":"drain"}`) and dispatch once `active` is 0.
 - A failure after the drain leaves admission in **drain**. Investigate, then reopen deliberately:
@@ -100,10 +100,11 @@ PCM is normal. An OOM kill happens when what the kernel cannot reclaim fills the
 flushed. The kill stays inside that container. The envelope therefore reports anon + shmem, not anon alone.
 
 The decode path never holds a recording in memory: ffmpeg writes 16 kHz s16le PCM to disk per channel, the VAD reads
-it in 60 s slices (a 2 h channel is 72,000 frame energies, 576 KB), and each dispatch reads one region of at most
+it in 60 s slices (a 3 h channel is 108,000 frame energies, 864 KB), and each dispatch reads one region of at most
 30 s (~0.96 MB WAV). [`batch-envelope.yml`](../../.github/workflows/batch-envelope.yml) proves the envelope on every
 change to the batch runtime: it runs this compose (limits unchanged) on one CPU with Tinfoil mocked, uploads a
-synthetic 2-hour stereo 128 kbps MP3 three times at once, and fails on any OOM kill or restart.
+synthetic 2-hour stereo 128 kbps MP3 three times at once, and fails on any OOM kill or restart. That measured envelope
+has not yet been rerun for three-hour audio; the PCM disk figures below are the calculated three-hour bound.
 Run on PR #69 (GitHub runner, 1 CPU, 3 × 115 MB PUTs at localhost speed, 708 regions; 30 parallel clients polled the job
 for 15 s while it decoded, 4,305 GETs, all 200):
 
@@ -114,20 +115,20 @@ for 15 s while it decoded, 4,305 GETs, all 200):
 | postgres | 192 MiB | 20 MiB | 71 MiB (61 MiB) | | 0 / 0 |
 
 **Disk (20 GB).** The data disk holds Docker images, Postgres and the upload volume; a live tdx.small shows an
-18.87 GiB filesystem. Worst case for a 2 h recording (16 kHz s16le = 32,000 B/s per channel):
+18.87 GiB filesystem. Worst case for a 3 h recording (16 kHz s16le = 32,000 B/s per channel):
 
 | item | bound |
 |---|---|
 | images (api ~0.25 GB, postgres ~0.27 GB, one update overlap; dstack prunes after `compose up`), dstack data | ≤ 2.4 GB (a live tdx.small uses 1.77 GB) |
 | container logs: json-file, `max-size: 10m`, `max-file: "3"` on each of the 3 services | ≤ 90 MB |
 | Postgres data + WAL (`max_wal_size=256MB`) | ≤ 0.5 GB |
-| accepted audio + in-flight `.part` files (`BATCH_MAX_RESERVED_BYTES`) | ≤ 1.21 GB |
-| PCM of the one processing job: 2 ch × 7,200 s × 32,000 B/s = 0.46 GB; ×2 while a crashed claim's work dir awaits the sweeper | ≤ 0.92 GB |
-| **total** | **≤ 5.1 GB ≈ 26% of 20 GB** |
+| accepted audio + in-flight `.part` files (`BATCH_MAX_RESERVED_BYTES`) | ≤ 1.82 GB |
+| PCM of the one processing job: 2 ch × 10,800 s × 32,000 B/s = 0.69 GB; ×2 while a crashed claim's work dir awaits the sweeper | ≤ 1.38 GB |
+| **total** | **≤ 6.2 GB ≈ 32% of 20 GB** |
 
 Bounded use never reaches the 80% high-water (`BATCH_DISK_HIGH_WATER_PERCENT`, unchanged), which stays fail-closed for
-leaks: at 80%, creates and PUTs are refused, and what can still be written after that point (3 in-flight PUTs, 0.36 GB;
-one job's PCM, ≤ 0.92 GB; WAL, ~0.25 GB; ≈ 1.5 GB) fits in the remaining 4 GB with 2.6× margin.
+leaks: at 80%, creates and PUTs are refused, and what can still be written after that point (3 in-flight PUTs, 0.54 GB;
+one job's PCM, ≤ 1.38 GB; WAL, ~0.25 GB; ≈ 2.2 GB) fits in the remaining 4 GB with 1.8× margin.
 
 ## Browser uploads (CORS)
 

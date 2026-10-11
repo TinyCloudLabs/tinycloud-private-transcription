@@ -26,8 +26,8 @@ on:
       drain_timeout_minutes:
         description: >-
           Update only. Minutes (1-300) to wait for active jobs to reach 0 before deploying. Size it to the queue:
-          an accepted create may upload for up to 120 min, and each job then processes one at a time (ceiling
-          240 min each; typical far less). The run prints the worst case at drain start. On timeout admission
+          an accepted create may upload for up to 480 min, and each job then processes one at a time (ceiling
+          480 min each; typical far less). The run prints the worst case at drain start. On timeout admission
           stays in drain.
         required: true
         default: "130"

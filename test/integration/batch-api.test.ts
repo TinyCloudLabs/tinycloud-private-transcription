@@ -11,6 +11,7 @@ import { createBatchApp } from "../../src/roles/batch.ts";
 import { parseCorsOrigins } from "../../src/uploads/cors.ts";
 import { runSweep } from "../../src/uploads/ledger.ts";
 import { audioName, jobDir } from "../../src/uploads/storage.ts";
+import { recordWorkerHeartbeat } from "../../src/uploads/worker.ts";
 import { audio, exists, laceBombWebm, sha256, startBatchHarness, TENANT_A, TENANT_B, tenant, trickle, type BatchHarness } from "./batch-harness.ts";
 
 let h: BatchHarness;
@@ -23,7 +24,7 @@ afterEach(async () => {
   // Each test starts from an empty job table, open admission and the default limits.
   await h.ctx.db.execute(sql`truncate table transcriptions, transcription_tenant_usage cascade`);
   await h.ctx.db.execute(sql`update transcription_admission set mode = 'open' where id = 1`);
-  Object.assign(h.ctx.config.limits, { maxActiveJobs: 10, maxReservedBytes: 1_209_600_000, maxConcurrentUploads: 3, diskHighWaterPercent: 99, tenantDailyBytes: 362_880_000, maxDurationSeconds: 7_200, durationScanSeconds: 45 });
+  Object.assign(h.ctx.config.limits, { maxActiveJobs: 10, maxReservedBytes: 1_814_400_000, maxConcurrentUploads: 3, diskHighWaterPercent: 99, tenantDailyBytes: 544_320_000, maxDurationSeconds: 10_800, durationScanSeconds: 45 });
   Object.assign(h.ctx.config.upload, { maxPutSeconds: 1_800, minBytesPerSecond: 32_768, progressGraceSeconds: 60, idleTimeoutSeconds: 60, leaseStaleSeconds: 120 });
   h.tinfoil.calls = [];
 });
@@ -80,12 +81,12 @@ describe("scopes on every batch route", () => {
 });
 
 describe("create and admission", () => {
-  test("validates the body and caps byte_size at 120,960,000 before any state is written", async () => {
+  test("validates the body and caps byte_size at 181,440,000 before any state is written", async () => {
     const bytes = await audio("stereo");
     const bad = [
       [{ content_type: "audio/aac" }, 400, "invalid_request"],
       [{ byte_size: 0 }, 400, "invalid_request"],
-      [{ byte_size: 120_960_001 }, 413, "recording_too_large"],
+      [{ byte_size: 181_440_001 }, 413, "recording_too_large"],
       [{ sha256: "XYZ" }, 400, "invalid_request"],
       [{ language: "en; drop" }, 400, "invalid_request"],
       [{ channel_labels: ["a", "b", "c"] }, 400, "invalid_request"],
@@ -282,6 +283,9 @@ describe("create and admission", () => {
 
   test("capabilities list every accepted container and report diarization unavailable", async () => {
     expect(await (await h.api("/v1/transcriptions/capabilities")).json()).toMatchObject({
+      max_bytes: 181_440_000,
+      max_duration_seconds: 10_800,
+      max_channels: 2,
       content_types: ["audio/mpeg", "audio/wav", "audio/ogg", "audio/mp4", "audio/webm", "audio/flac"],
       diarization: false,
     });
@@ -613,7 +617,7 @@ describe("upload validation fails the job and deletes its bytes", () => {
     ["declared mp4, bytes are wav", "mono_wav", "audio/mp4", {}, "invalid_audio"],
     ["declared webm, bytes are m4a", "stereo_m4a", "audio/webm", {}, "invalid_audio"],
     ["three channels", "three_channel_wav", "audio/wav", {}, "unsupported_recording"],
-    ["over the 7,200 s cap", "over_cap_mp3", "audio/mpeg", {}, "recording_too_long"],
+    ["over the 10,800 s cap", "over_cap_mp3", "audio/mpeg", {}, "recording_too_long"],
   ] as const;
   for (const [label, fixture, contentType, body, code] of cases) {
     test(label, async () => {
@@ -625,9 +629,22 @@ describe("upload validation fails the job and deletes its bytes", () => {
       expect(await h.row(job.id)).toMatchObject({ status: "failed", errorCode: code, deletionState: "files_deleted" });
       expect(await exists(jobDir(h.uploadDir, job.id))).toBe(false);
       expect((await h.put(job.id, job.upload.capability, bytes, { contentType })).status).toBe(401);
-    }, 60_000); // generating the real 7,201 s fixture takes seconds on CI runners
+    }, 60_000); // generating the real 10,801 s fixture takes seconds on CI runners
   }
 });
+
+test("a three-hour stereo upload is accepted and advertised", async () => {
+  const capabilities = await (await h.api("/v1/transcriptions/capabilities")).json();
+  expect(capabilities).toMatchObject({ max_duration_seconds: 10_800, max_channels: 2 });
+  const bytes = await audio("three_hour_mp3");
+  await recordWorkerHeartbeat(h.ctx);
+  const created = await h.create(bytes, { contentType: "audio/mpeg" });
+  expect(created.status).toBe(201);
+  const job = await created.json();
+  const uploaded = await h.put(job.id, job.upload.capability, bytes, { contentType: "audio/mpeg" });
+  expect(uploaded.status).toBe(201);
+  expect(await h.row(job.id)).toMatchObject({ status: "queued", channels: 2, durationSeconds: expect.closeTo(10_799, 0) });
+}, 60_000);
 
 describe("measuring a recording without a container duration is bounded", () => {
   const upload = async (bytes: Uint8Array) => {

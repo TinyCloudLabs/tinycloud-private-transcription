@@ -186,7 +186,7 @@ export async function startBatchHarness(opts: { config?: DeepPartial<BatchConfig
 
 const fixtureCache = new Map<string, Uint8Array>();
 
-type Fixture = "stereo" | "mono_wav" | "silent_wav" | "three_channel_wav" | "over_cap_mp3" | "stereo_dense"
+type Fixture = "stereo" | "mono_wav" | "silent_wav" | "three_channel_wav" | "over_cap_mp3" | "three_hour_mp3" | "stereo_dense"
   | "stereo_m4a" | "stereo_webm" | "stereo_webm_no_duration" | "stereo_webm_offset" | "stereo_flac" | "stereo_mp4_with_video";
 
 // ch0 speaks 0.5–2.5 s, ch1 speaks 3.5–5.5 s; 7 s stereo. Re-encoded per container below. Inputs and graph only:
@@ -221,7 +221,8 @@ export async function audio(kind: Fixture): Promise<Uint8Array> {
     mono_wav: ["-f", "lavfi", "-i", "sine=f=440:d=1", "-af", "apad=whole_dur=2", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le"],
     silent_wav: ["-f", "lavfi", "-i", "anullsrc=r=16000:cl=stereo", "-t", "3", "-c:a", "pcm_s16le"],
     three_channel_wav: ["-f", "lavfi", "-i", "sine=f=440:d=1", "-ac", "3", "-ar", "16000", "-c:a", "pcm_s16le"],
-    over_cap_mp3: ["-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono", "-t", "7201", "-c:a", "libmp3lame", "-b:a", "8k"],
+    over_cap_mp3: ["-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono", "-t", "10801", "-c:a", "libmp3lame", "-b:a", "8k"],
+    three_hour_mp3: ["-f", "lavfi", "-i", "anullsrc=r=8000:cl=stereo", "-t", "10799", "-c:a", "libmp3lame", "-b:a", "8k"],
   };
   const proc = Bun.spawn(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", ...args[kind], out], { stdout: "ignore", stderr: "pipe" });
   const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);

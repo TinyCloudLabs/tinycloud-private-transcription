@@ -34,12 +34,12 @@ services:
       BATCH_TINFOIL_API_KEY: ${BATCH_TINFOIL_API_KEY:-}
       BATCH_TINFOIL_MODEL: voxtral-small-24b
       BATCH_MAX_ACTIVE_JOBS: "10"
-      BATCH_MAX_RESERVED_BYTES: "1209600000"
+      BATCH_MAX_RESERVED_BYTES: "1814400000"
       BATCH_MAX_CONCURRENT_UPLOADS: "3"
       BATCH_DISK_HIGH_WATER_PERCENT: "80"
-      BATCH_TENANT_DAILY_BYTES: "362880000"
-      BATCH_UPLOAD_MAX_PUT_SECONDS: "1800"
-      BATCH_UPLOAD_MIN_BYTES_PER_SECOND: "32768"
+      BATCH_TENANT_DAILY_BYTES: "544320000"
+      BATCH_UPLOAD_MAX_PUT_SECONDS: "25200"
+      BATCH_UPLOAD_MIN_BYTES_PER_SECOND: "8192"
       # Browser and app origins allowed to PUT /uploads/{id} directly (Exo web, Pages previews, desktop, mobile).
       BATCH_CORS_ORIGINS: "https://tinycloud.chat,https://tinychat-4jq.pages.dev,https://*.tinychat-4jq.pages.dev,tauri://localhost,http://tauri.localhost,capacitor://localhost,https://localhost"
       # Speaker diarization (create diarize: true); set on both api (capabilities) and upload-worker (runs it).

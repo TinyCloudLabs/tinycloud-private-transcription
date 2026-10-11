@@ -124,12 +124,12 @@ bun run cli create-key --project tinychat --scopes 'transcriptions:*'
 | `BATCH_TINFOIL_BASE_URL` / `BATCH_TINFOIL_MODEL` / `BATCH_TINFOIL_TIMEOUT_MS` | `https://inference.tinfoil.sh` / `voxtral-small-24b` / `180000` | |
 | `BATCH_UPLOAD_DIR` | `/var/lib/ptx-batch/uploads` | accepted audio, in-flight uploads, PCM work files (both processes mount it) |
 | `BATCH_MAX_ACTIVE_JOBS` | `10` | service-wide awaiting_upload + queued + processing |
-| `BATCH_MAX_RESERVED_BYTES` | `1209600000` | service-wide declared bytes of those jobs (10 × the 120,960,000-byte cap) |
+| `BATCH_MAX_RESERVED_BYTES` | `1814400000` | service-wide declared bytes of those jobs (10 × the 181,440,000-byte cap) |
 | `BATCH_MAX_CONCURRENT_UPLOADS` | `3` | service-wide live PUTs |
 | `BATCH_DISK_HIGH_WATER_PERCENT` | `80` | creates and PUTs refused at or above this volume usage |
-| `BATCH_TENANT_DAILY_BYTES` | `362880000` | per tenant per UTC day (3 × cap) |
-| `BATCH_UPLOAD_MAX_PUT_SECONDS` | `1800` | absolute cap on one PUT (also clamped to the job's 2 h upload deadline) |
-| `BATCH_UPLOAD_MIN_BYTES_PER_SECOND` | `32768` | minimum average PUT rate after 60 s |
+| `BATCH_TENANT_DAILY_BYTES` | `544320000` | per tenant per UTC day (3 × cap) |
+| `BATCH_UPLOAD_MAX_PUT_SECONDS` | `25200` | absolute cap on one PUT (7 h; also clamped to the job's 8 h upload deadline) |
+| `BATCH_UPLOAD_MIN_BYTES_PER_SECOND` | `8192` | minimum average PUT rate after 60 s |
 | `BATCH_CORS_ORIGINS` | unset | comma-separated browser origins allowed to `PUT /uploads/{id}` directly (exact, or one leading `*.` label, e.g. `https://*.tinychat-4jq.pages.dev`); unset = no CORS headers; a malformed entry fails boot |
 | `BATCH_DIARIZATION_ENABLED` | `false` | `true` offers speaker diarization (`capabilities.diarization`, create `diarize: true`) when the install below is complete; set it on both processes. Benchmark and sizing: [docs/diarization-benchmark.md](./docs/diarization-benchmark.md) |
 | `BATCH_DIARIZATION_DIR` | `/opt/sherpa-onnx` | the image's sherpa-onnx install: `diarize` (launcher of `src/uploads/diarize-window.c`), `models/segmentation.onnx`, `models/embedding.onnx`, `models/onnxruntime.config` |

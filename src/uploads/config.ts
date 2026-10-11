@@ -1,9 +1,9 @@
 import { positiveIntegerEnv } from "../config.ts";
 import { parseCorsOrigins } from "./cors.ts";
 
-/** 2 h at 128 kbps stereo + 5% (the same formula Exo uses for its 8 h local cap). */
-export const MAX_UPLOAD_BYTES = 120_960_000;
-export const MAX_DURATION_SECONDS = 7_200;
+/** 3 h at 128 kbps stereo + 5% (the same formula Exo uses for its 8 h local cap). */
+export const MAX_UPLOAD_BYTES = 181_440_000;
+export const MAX_DURATION_SECONDS = 10_800;
 export const MAX_CHANNELS = 2;
 export const CONTENT_TYPES = ["audio/mpeg", "audio/wav", "audio/ogg", "audio/mp4", "audio/webm", "audio/flac"] as const;
 export type UploadContentType = (typeof CONTENT_TYPES)[number];
@@ -120,9 +120,9 @@ export function batchConfigFromEnv(): BatchConfig {
     upload: {
       capabilityTtlSeconds: 3_600,
       maxLiveCapabilities: 5,
-      deadlineSeconds: 7_200,
-      maxPutSeconds: positiveIntegerEnv("BATCH_UPLOAD_MAX_PUT_SECONDS", "1800"),
-      minBytesPerSecond: positiveIntegerEnv("BATCH_UPLOAD_MIN_BYTES_PER_SECOND", "32768"),
+      deadlineSeconds: 28_800,
+      maxPutSeconds: positiveIntegerEnv("BATCH_UPLOAD_MAX_PUT_SECONDS", "25200"),
+      minBytesPerSecond: positiveIntegerEnv("BATCH_UPLOAD_MIN_BYTES_PER_SECOND", "8192"),
       progressGraceSeconds: 60,
       idleTimeoutSeconds: 60,
       leaseHeartbeatSeconds: 10,
@@ -140,7 +140,7 @@ export function batchConfigFromEnv(): BatchConfig {
       retryAfterMaxSeconds: 120,
       maxNotSentAttempts: 5,
       notSentBackoffMs: 1_000,
-      maxProcessingSeconds: 4 * 3_600,
+      maxProcessingSeconds: 8 * 3_600,
     },
     retention: {
       transcriptTtlSeconds: 86_400,

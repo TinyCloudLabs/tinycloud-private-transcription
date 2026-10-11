@@ -106,7 +106,7 @@ describe("single-slot arbiter", () => {
     try {
       await h.work();
     } finally {
-      h.ctx.config.limits.maxDurationSeconds = 7_200;
+      h.ctx.config.limits.maxDurationSeconds = 10_800;
     }
     const body = await (await result(id)).json();
     expect(body.segments.map((s: { speaker_id: string; end: number }) => [s.speaker_id, s.end <= 3])).toEqual([["channel_0", true]]);
@@ -129,7 +129,7 @@ describe("single-slot arbiter", () => {
 });
 
 describe("region insert", () => {
-  // Postgres binds at most 65,535 parameters per statement; ~12,000 regions is the 2 h stereo worst case.
+  // Postgres binds at most 65,535 parameters per statement; three hours can produce ~18,000 stereo regions.
   const many = Array.from({ length: 12_345 }, (_, i) => ({ channel: i % 2, startMs: i * 600, endMs: i * 600 + 400 }));
 
   test("one statement cannot hold 12,000+ regions (the bind limit this guards against)", async () => {

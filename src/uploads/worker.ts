@@ -176,8 +176,8 @@ async function runPipeline(ctx: BatchContext, job: TranscriptionRow, fence: Fenc
 }
 
 /**
- * Rows per INSERT. Postgres binds at most 65,535 parameters per statement; a region row binds about ten, so a 2 h
- * stereo recording's worst case (~12,000 regions) needs several statements. The caller runs them all in one transaction.
+ * Rows per INSERT. Postgres binds at most 65,535 parameters per statement; a region row binds about ten, so a 3 h
+ * stereo recording's worst case (~18,000 regions) needs several statements. The caller runs them all in one transaction.
  */
 export const REGION_INSERT_CHUNK = 1_000;
 
