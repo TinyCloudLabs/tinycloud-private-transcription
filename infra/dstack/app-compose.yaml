@@ -9,9 +9,12 @@
 # (digest-pinned v012 upstream components),
 # PTX_BOT_IMAGE (fork bot image override; defaults to the pinned fork image below),
 # PTX_BOOTSTRAP_KEYS (optional hashed API keys for the api service; see .env.example).
-# The PTX API/worker and three-seat Signal Desktop images are immutable production pins in this
+# The PTX API/worker and Signal Desktop seat images are immutable production pins in this
 # file, not sealed-environment overrides. Signal profile volumes are deliberately persistent:
 # linking each Signal account is an operator action, never a deployment side effect.
+# One Signal seat (TC-901): seats 2 and 3 were never linked and their idle Desktops cost ~800 MB
+# on tdx.large. VEXA_MAX_CONCURRENT_BOTS (sealed env, default 2) caps concurrent meeting bots,
+# each a ~1-1.2 GB Chromium, so the CVM cannot be driven out of memory (TC-902).
 #
 # Vexa service topology mirrors infra/vexa/upstream/deploy/compose/docker-compose.yml. Bot,
 # meeting-api, and gateway are pinned to the accepted TinyCloud fork merge; unchanged components
@@ -60,15 +63,16 @@ services:
       # Empty = no bootstrap management; keys minted with `create-key` are never touched.
       PTX_BOOTSTRAP_KEYS: "${PTX_BOOTSTRAP_KEYS:-}"
       LOG_LEVEL: info
-      SIGNAL_MAX_CONCURRENT_CALLS: "3"
-      SIGNAL_HEALTH_PATHS: /run/signal-health-1/health.json,/run/signal-health-2/health.json,/run/signal-health-3/health.json
+      # POST /v1/meetings answers 429 capacity_exhausted once this many meeting bots are live or
+      # queued (TC-902). vexa-provision applies the same value to the Vexa user as a backstop.
+      VEXA_MAX_CONCURRENT_BOTS: ${VEXA_MAX_CONCURRENT_BOTS:-2}
+      SIGNAL_MAX_CONCURRENT_CALLS: "1"
+      SIGNAL_HEALTH_PATHS: /run/signal-health-1/health.json
     volumes:
       - vexa-provision:/run/vexa:ro
       # Keep the existing volume name so upgrades preserve the already-generated AES key.
       - signal-runtime:/run/signal-capability:ro
       - signal-health:/run/signal-health-1:ro
-      - signal-health-2:/run/signal-health-2:ro
-      - signal-health-3:/run/signal-health-3:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -80,7 +84,7 @@ services:
 
   worker:
     image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:67b08f343e63b19616b9d653530f5f7b94f80740@sha256:b1c8a2c73e7ad97b79ba801dccd179285f789b568b2e0d39f0f5d9ae2fefe7b6
-    command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && [ -s /run/signal-control-1/token ] && [ -s /run/signal-control-2/token ] && [ -s /run/signal-control-3/token ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && [ -s /run/signal-control-1/token ] && [ -s /run/signal-control-2/token ] && [ -s /run/signal-control-3/token ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal-capability/capability-key); exec bun run src/worker/index.ts"]
+    command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && [ -s /run/signal-control-1/token ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && [ -s /run/signal-control-1/token ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal-capability/capability-key); exec bun run src/worker/index.ts"]
     restart: unless-stopped
     environment:
       DATABASE_URL: postgres://ptx:${POSTGRES_PASSWORD}@postgres:5432/ptx
@@ -106,26 +110,25 @@ services:
       # models and keep the results in the ptx DB for comparison (`bun run cli eval report`).
       EVAL_MODELS: ${EVAL_MODELS:-voxtral-small-24b}
       EVAL_TINYCHAT_ADDRESSES: ${EVAL_TINYCHAT_ADDRESSES:-0xd671eece61b27a73a9abbe07aa5b3002626fef5a,0x7d0333579c19e8fa149c2dbf8405cb6f66c373f2,0xd559ccd9eb87c530a9a349262669386de93cf412,0xa8763f2b67aa9c807d2277a698cb071e3d86204a}
-      # Each seat has a private control network and token. Its unauthenticated CDP remains bound
-      # only to that seat's own loopback namespace.
-      SIGNAL_CAPTURE_URLS: http://signal-capture:18076,http://signal-capture-2:18077,http://signal-capture-3:18078
-      SIGNAL_CAPTURE_TOKEN_PATHS: /run/signal-control-1/token,/run/signal-control-2/token,/run/signal-control-3/token
-      SIGNAL_MAX_CONCURRENT_CALLS: "3"
+      # The seat has a private control network and token. Its unauthenticated CDP remains bound
+      # only to the seat's own loopback namespace.
+      SIGNAL_CAPTURE_URLS: http://signal-capture:18076
+      SIGNAL_CAPTURE_TOKEN_PATHS: /run/signal-control-1/token
+      SIGNAL_MAX_CONCURRENT_CALLS: "1"
       LOG_LEVEL: info
     volumes:
       - vexa-provision:/run/vexa:ro
       - signal-runtime:/run/signal-capability:ro
       - signal-control-1:/run/signal-control-1:ro
-      - signal-control-2:/run/signal-control-2:ro
-      - signal-control-3:/run/signal-control-3:ro
     depends_on:
       api:
         condition: service_healthy
-    networks: [ptx, vexa, signal-seat-1, signal-seat-2, signal-seat-3]
+    networks: [ptx, vexa, signal-seat-1]
 
-  # Three independently linked Signal Desktops. Separate network namespaces keep each
-  # unauthenticated CDP endpoint loopback-only and unreachable from sibling Signal containers.
-  # Seat 1 retains the original service/volume names so an in-place upgrade preserves its link.
+  # One linked Signal Desktop. Its own network namespace keeps the unauthenticated CDP endpoint
+  # loopback-only. Seat 1 retains the original service/volume names so an in-place upgrade
+  # preserves its link. A further seat is a copy of this service with its own ports, profile,
+  # health, control volume and internal network (see git history before TC-901).
   signal-capture:
     image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f
     restart: unless-stopped
@@ -143,7 +146,9 @@ services:
       SIGNAL_TRANSCRIBER: "/opt/ptx/signal-transcriber"
       SIGNAL_WHISPER_URL: http://whisper:8000/v1/audio/transcriptions
       SIGNAL_WHISPER_HEALTH_URL: http://whisper:8000/health
-      SIGNAL_WHISPER_MODEL: small.en
+      # Same name as whisper's WHISPER__MODEL (Vexa's "whisper-1" resolves to it): faster-whisper-server
+      # keys loaded models by the requested name, so "small.en" loaded a second copy (TC-901).
+      SIGNAL_WHISPER_MODEL: ${WHISPER_MODEL:-Systran/faster-whisper-small.en}
       SIGNAL_MAX_CONCURRENT_CALLS: "1"
       SIGNAL_PROFILE_DIR: /var/lib/signal
       SIGNAL_HEALTH_PATH: /run/signal-health/health.json
@@ -160,77 +165,9 @@ services:
       signal-seat-1: {}
       vexa: {}
 
-  signal-capture-2:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:6081:6081"
-    environment:
-      SIGNAL_CAPTURE_BIND: 0.0.0.0
-      SIGNAL_CAPTURE_PORT: "18077"
-      SIGNAL_CAPTURE_TOKEN_PATH: /run/signal-control/token
-      SIGNAL_CDP_URL: http://127.0.0.1:9223
-      SIGNAL_CDP_PORT: "9223"
-      SIGNAL_VNC_PORT: "5901"
-      SIGNAL_NOVNC_PORT: "6081"
-      SIGNAL_PULSE_SOURCE: ${SIGNAL_PULSE_SOURCE:-ptx_sink.monitor}
-      SIGNAL_TRANSCRIBER: "/opt/ptx/signal-transcriber"
-      SIGNAL_WHISPER_URL: http://whisper:8000/v1/audio/transcriptions
-      SIGNAL_WHISPER_HEALTH_URL: http://whisper:8000/health
-      SIGNAL_WHISPER_MODEL: small.en
-      SIGNAL_MAX_CONCURRENT_CALLS: "1"
-      SIGNAL_PROFILE_DIR: /var/lib/signal
-      SIGNAL_HEALTH_PATH: /run/signal-health/health.json
-    volumes:
-      - signal-profile-2:/var/lib/signal
-      - signal-health-2:/run/signal-health
-      - signal-control-2:/run/signal-control:ro
-    depends_on:
-      whisper:
-        condition: service_healthy
-      signal-control-provision:
-        condition: service_completed_successfully
-    networks:
-      signal-seat-2: {}
-      vexa: {}
-
-  signal-capture-3:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:6082:6082"
-    environment:
-      SIGNAL_CAPTURE_BIND: 0.0.0.0
-      SIGNAL_CAPTURE_PORT: "18078"
-      SIGNAL_CAPTURE_TOKEN_PATH: /run/signal-control/token
-      SIGNAL_CDP_URL: http://127.0.0.1:9224
-      SIGNAL_CDP_PORT: "9224"
-      SIGNAL_VNC_PORT: "5902"
-      SIGNAL_NOVNC_PORT: "6082"
-      SIGNAL_PULSE_SOURCE: ${SIGNAL_PULSE_SOURCE:-ptx_sink.monitor}
-      SIGNAL_TRANSCRIBER: "/opt/ptx/signal-transcriber"
-      SIGNAL_WHISPER_URL: http://whisper:8000/v1/audio/transcriptions
-      SIGNAL_WHISPER_HEALTH_URL: http://whisper:8000/health
-      SIGNAL_WHISPER_MODEL: small.en
-      SIGNAL_MAX_CONCURRENT_CALLS: "1"
-      SIGNAL_PROFILE_DIR: /var/lib/signal
-      SIGNAL_HEALTH_PATH: /run/signal-health/health.json
-    volumes:
-      - signal-profile-3:/var/lib/signal
-      - signal-health-3:/run/signal-health
-      - signal-control-3:/run/signal-control:ro
-    depends_on:
-      whisper:
-        condition: service_healthy
-      signal-control-provision:
-        condition: service_completed_successfully
-    networks:
-      signal-seat-3: {}
-      vexa: {}
-
   signal-control-provision:
     # Per-seat control tokens authenticate PTX without exposing one Desktop's control plane to
-    # either sibling seat. They are generated and retained entirely inside the CVM.
+    # any other seat. They are generated and retained entirely inside the CVM.
     image: curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b
     user: root
     entrypoint: ["/bin/sh", "-c"]
@@ -238,7 +175,7 @@ services:
       - |
         set -eu
         umask 077
-        for dir in /run/signal-control-1 /run/signal-control-2 /run/signal-control-3; do
+        for dir in /run/signal-control-1; do
           [ -s "$$dir/token" ] && continue
           head -c 32 /dev/urandom | base64 | tr -d '\n' > "$$dir/token.next"
           chmod 600 "$$dir/token.next"
@@ -246,8 +183,6 @@ services:
         done
     volumes:
       - signal-control-1:/run/signal-control-1
-      - signal-control-2:/run/signal-control-2
-      - signal-control-3:/run/signal-control-3
     restart: on-failure
 
   signal-capability-provision:
@@ -431,7 +366,13 @@ services:
     environment:
       WHISPER__MODEL: ${WHISPER_MODEL:-Systran/faster-whisper-small.en}
       WHISPER__INFERENCE_DEVICE: cpu
-      WHISPER__TTL: "-1"
+      # TC-901: unload the model after 5 idle minutes; the next request lazy-loads it from the cache
+      # (~4-8 s on 4 vCPU). /health never needs a loaded model. Live users are Signal (once per
+      # finished call) and Jitsi live STT; Google Meet transcribes through Tinfoil. meeting-api's
+      # own STT probe reloads it about every 15 minutes. Without the mmap threshold glibc kept
+      # ~450 MB of the freed model resident; with it, unload returns the container to ~190 MB.
+      WHISPER__TTL: "300"
+      MALLOC_MMAP_THRESHOLD_: "1048576"
     volumes:
       - whisper-cache:/root/.cache/huggingface
     healthcheck:
@@ -517,7 +458,9 @@ services:
     restart: unless-stopped
     # Not published: only our api/worker talk to Vexa. Vexa's gateway is internal to the CVM.
 
-  # One-shot: create the service-owned Vexa user + `bot,tx` API key and hand it to api/worker.
+  # One-shot on every boot: create the service-owned Vexa user + `bot,tx` API key and hand it to
+  # api/worker, and keep that user's max_concurrent_bots equal to VEXA_MAX_CONCURRENT_BOTS. The
+  # user predates the cap, so it is updated in place (PATCH) rather than only set at creation.
   vexa-provision:
     image: curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b
     user: root
@@ -525,17 +468,24 @@ services:
     command:
       - |
         set -e
-        [ -s /run/vexa/api-key ] && { echo "vexa api key already provisioned"; exit 0; }
+        N="$$VEXA_MAX_CONCURRENT_BOTS"
+        case "$$N" in ''|*[!0-9]*|0*) echo "VEXA_MAX_CONCURRENT_BOTS must be a positive integer"; exit 1;; esac
         H='X-Admin-API-Key: '"$$VEXA_ADMIN_TOKEN"
         until curl -sf http://admin-api:8001/health >/dev/null; do sleep 2; done
         U=$$(curl -sf -H "$$H" http://admin-api:8001/admin/users/email/self-host@vexa.ai || true)
-        [ -n "$$U" ] || U=$$(curl -sf -H "$$H" -H 'Content-Type: application/json' -X POST http://admin-api:8001/admin/users -d '{"email":"self-host@vexa.ai","max_concurrent_bots":5}')
-        ID=$$(echo "$$U" | sed -n 's/.*"id":[ ]*\([0-9]*\).*/\1/p')
+        [ -n "$$U" ] || U=$$(curl -sf -H "$$H" -H 'Content-Type: application/json' -X POST http://admin-api:8001/admin/users -d '{"email":"self-host@vexa.ai","max_concurrent_bots":'"$$N"'}')
+        ID=$$(echo "$$U" | sed -n 's/^{"id":[ ]*\([0-9]*\).*/\1/p')
+        [ -n "$$ID" ] || { echo "vexa user lookup failed"; exit 1; }
+        P=$$(curl -sf -H "$$H" -H 'Content-Type: application/json' -X PATCH "http://admin-api:8001/admin/users/$$ID" -d '{"max_concurrent_bots":'"$$N"'}')
+        echo "$$P" | grep -q '"max_concurrent_bots":[ ]*'"$$N"'[,}]' || { echo "vexa max_concurrent_bots update failed"; exit 1; }
+        echo "vexa user $$ID max_concurrent_bots=$$N"
+        [ -s /run/vexa/api-key ] && { echo "vexa api key already provisioned"; exit 0; }
         T=$$(curl -sf -H "$$H" -X POST "http://admin-api:8001/admin/users/$$ID/tokens?scopes=bot,tx")
         echo "$$T" | sed -n 's/.*"token":[ ]*"\([^"]*\)".*/\1/p' > /run/vexa/api-key
         [ -s /run/vexa/api-key ] && echo "vexa api key provisioned for user $$ID"
     environment:
       VEXA_ADMIN_TOKEN: ${VEXA_ADMIN_TOKEN}
+      VEXA_MAX_CONCURRENT_BOTS: ${VEXA_MAX_CONCURRENT_BOTS:-2}
     volumes:
       - vexa-provision:/run/vexa
     depends_on:
@@ -553,17 +503,11 @@ volumes:
   whisper-cache:
   vexa-provision:
   signal-profile:
-  signal-profile-2:
-  signal-profile-3:
   # Legacy name retained to preserve the existing capability key across in-place upgrades.
   signal-runtime:
   # Legacy seat-1 health volume name is retained across in-place upgrades.
   signal-health:
-  signal-health-2:
-  signal-health-3:
   signal-control-1:
-  signal-control-2:
-  signal-control-3:
 
 networks:
   ptx: {}
@@ -571,14 +515,13 @@ networks:
     name: ptx-vexa   # fixed: runtime's DOCKER_NETWORK must equal this (bots are attached here)
   signal-seat-1:
     internal: true
-  signal-seat-2:
-    internal: true
-  signal-seat-3:
-    internal: true
 
 # Operational notes
 # - Bootstrap an API key for callers: `phala ssh -- docker exec <api container> bun run src/cli.ts create-key --project demo`.
 # - Sizing (docs/vexa-findings.md): whisper small.en ~1.4 GB RSS + ~10 cores while decoding, one bot
 #   ~470 MB + Chromium launch burst, control plane ~1 GB → tdx.large (4 vCPU / 8 GB) is the smallest
 #   viable dev size; production wants ≥ tdx.xlarge. Disk ≥ 40 GB (bot image 3.6 GB + whisper model + recordings).
+#   Measured on ptx-dev (TC-900, Oct 2026): a Google Meet bot holds ~1-1.2 GB; two Meet bots next to a
+#   pinned 2.45 GB Whisper and three Signal seats OOM-killed a bot. Raise VEXA_MAX_CONCURRENT_BOTS only
+#   with more RAM. The Vexa v0.12 runtime sets no memory limit on bot containers and has no setting for one.
 # - Egress: bots join public meetings over the CVM's NAT; only :8080 (our API) is published.

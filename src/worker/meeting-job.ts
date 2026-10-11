@@ -160,6 +160,19 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
 type ContinueStart = (delayMs: number, nextAttempt: number) => Promise<void>;
 
 async function handleStartError(ctx: AppContext, meeting: MeetingRow, e: unknown, attempt: number, continueStart: ContinueStart) {
+  // Vexa answers 429 at its user's max_concurrent_bots. PTX admission already reserved this
+  // meeting's slot, so the refusal is transient (e.g. a leaving bot Vexa still counts): retry while
+  // the row stays queued, bounded by a durable deadline on the row, and keep the 5xx budget intact.
+  if (e instanceof VexaHttpError && e.status === 429) {
+    const delayMs = ctx.config.vexa.capacityRetryIntervalMs;
+    if (Date.now() + delayMs <= meeting.createdAt.getTime() + ctx.config.vexa.capacityRetryWindowMs) {
+      ctx.log.info("vexa bot capacity busy; retrying", { meetingId: meeting.id, attempt, stage: "create", code: "capacity_exhausted" });
+      // A queue/Redis failure must not fail the meeting: reconciliation re-arms the start chain.
+      await continueStart(delayMs, attempt).catch(() =>
+        ctx.log.warn("vexa capacity wait lost its wakeup; reconciliation will re-arm", { meetingId: meeting.id, stage: "start", code: "queue_unavailable" }));
+      return;
+    }
+  }
   const retryable = e instanceof ApiError && (e.code === "provider_unavailable" || e.code === "provider_timeout");
   const vexa5xx = e instanceof VexaHttpError && e.status >= 500;
   if ((retryable || vexa5xx) && attempt < MAX_START_ATTEMPTS) {
@@ -168,10 +181,17 @@ async function handleStartError(ctx: AppContext, meeting: MeetingRow, e: unknown
     return;
   }
   ctx.log.error("vexa createBot failed", { meetingId: meeting.id, stage: "create", code: e instanceof ApiError ? e.code : "provider_error" });
-  const code = e instanceof ApiError ? e.code : e instanceof VexaHttpError && e.status === 409 ? "meeting_join_failed" : "provider_unavailable";
+  // Vexa still refused after the capacity retry window (its max_concurrent_bots is kept equal to
+  // VEXA_MAX_CONCURRENT_BOTS; API admission normally rejects first) (TC-902).
+  const code = e instanceof ApiError ? e.code
+    : e instanceof VexaHttpError && e.status === 409 ? "meeting_join_failed"
+    : e instanceof VexaHttpError && e.status === 429 ? "capacity_exhausted"
+    : "provider_unavailable";
   const message =
     code === "meeting_join_failed"
       ? "A bot is already in this meeting or the meeting could not be joined."
+      : code === "capacity_exhausted"
+        ? "All meeting notetakers were busy when this meeting started. Try again when one of the current meetings ends."
       : e instanceof ApiError
         ? e.message
         : "Meeting capture provider is unavailable.";

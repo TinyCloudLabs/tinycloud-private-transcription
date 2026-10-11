@@ -124,7 +124,15 @@ webhooks then also carry `transcript_partial: true`.
 `speaker_id` is stable within a meeting only. `provider` is `"vexa"`: Vexa owns the transcript and speaker attribution, while TinyCloud normalizes the completed segments. `DELETE /v1/meetings/{id}` removes our record + transcript and the Vexa meeting.
 `GET /health` → `{status:"ok","checks":{postgres,redis,vexa,bot_capacity:{running,max},transcription_provider}}` (`bot_capacity.max` from `VEXA_MAX_CONCURRENT_BOTS`).
 
-Errors: `{"error":{"type":"meeting_join_failed","code":"waiting_room_timeout","message":"…"}}`. Codes: invalid_meeting_url, unsupported_platform, meeting_not_found, meeting_join_failed, waiting_room_timeout, bot_removed, meeting_ended, capture_failed, transcription_failed, provider_timeout, provider_unavailable, internal_error (+ request-level `unauthorized` 401, `insufficient_scope` 403, `invalid_request`, `idempotency_conflict`). Never leak Vexa errors raw.
+Bot cap (TC-902): `POST /v1/meetings` for any non-Signal platform answers `429 capacity_exhausted` (type
+`provider_error`, `Retry-After: 60`, `retry_after_seconds: 60`) when `VEXA_MAX_CONCURRENT_BOTS` meetings are already
+queued, joining, waiting for admission or in progress. Admission is serialized, nothing is stored for a rejected
+request, and an `Idempotency-Key` replay of an admitted request is still answered. If Vexa itself refuses a bot
+(its user's `max_concurrent_bots`), the worker retries every `VEXA_CAPACITY_RETRY_INTERVAL_MS` (10 s) while the meeting
+stays `queued`, and fails it with `capacity_exhausted` only after `VEXA_CAPACITY_RETRY_WINDOW_MS` (2 min) from creation. Signal calls instead wait for a
+free Desktop seat (`SIGNAL_MAX_CONCURRENT_CALLS`).
+
+Errors: `{"error":{"type":"meeting_join_failed","code":"waiting_room_timeout","message":"…"}}`. Codes: invalid_meeting_url, unsupported_platform, meeting_not_found, meeting_join_failed, waiting_room_timeout, bot_removed, meeting_ended, capture_failed, transcription_failed, provider_timeout, provider_unavailable, capacity_exhausted (429), internal_error (+ request-level `unauthorized` 401, `insufficient_scope` 403, `invalid_request`, `idempotency_conflict`). Never leak Vexa errors raw.
 
 Platform detection: meet.google.com→google_meet, zoom.us→zoom, teams.microsoft.com→microsoft_teams, meet.jit.si / self-hosted Jitsi→jitsi. Only platforms in `ENABLED_PLATFORMS` (default `jitsi`) are accepted; a detected-but-disabled platform answers 400 `unsupported_platform` naming the platform.
 

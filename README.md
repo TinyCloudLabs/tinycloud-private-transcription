@@ -146,12 +146,14 @@ bun run cli create-key --project tinychat --scopes 'transcriptions:*'
 | `VEXA_API_KEY` | – | sent as `X-API-Key` |
 | `VEXA_POLL_INTERVAL_MS` | `5000` | worker status/transcript poll |
 | `VEXA_MAX_TIME_LEFT_ALONE_MS` | `300000` | per-meeting window without remote participant audio (milliseconds). After five minutes without hearing anyone else, Vexa completes the bot as `left_alone`; applies to Jitsi and Google Meet. |
-| `VEXA_MAX_CONCURRENT_BOTS` | `5` | provisioned bot ceiling (matches `max_concurrent_bots` in infra/dstack/app-compose.yaml); reported as `bot_capacity.max` in `/health` |
+| `VEXA_MAX_CONCURRENT_BOTS` | `2` | concurrent meeting-bot cap (TC-902): a non-Signal `POST /v1/meetings` over it answers 429 `capacity_exhausted`; reported as `bot_capacity.max` in `/health`. The dstack compose also defaults it to `2` and applies it to the Vexa user's `max_concurrent_bots` at every boot |
+| `VEXA_CAPACITY_RETRY_INTERVAL_MS` | `10000` | a Vexa 429 at bot start (its `max_concurrent_bots`, e.g. a leaving bot it still counts) is retried at this interval while the meeting stays `queued` |
+| `VEXA_CAPACITY_RETRY_WINDOW_MS` | `120000` | how long after creation those retries continue before the meeting fails with `capacity_exhausted` |
 | `ENABLED_PLATFORMS` | `jitsi` | comma-separated platforms accepted by `POST /v1/meetings`. Others (zoom, google_meet, microsoft_teams) are still detected but answer 400 `unsupported_platform` |
 | `SIGNAL_CAPTURE_URLS` | `http://127.0.0.1:18076` | ordered capture-worker endpoints, one per persistent Signal Desktop seat |
 | `SIGNAL_CAPTURE_TOKEN_PATHS` | none | ordered private control-token files; required for non-loopback capture endpoints |
 | `SIGNAL_CAPABILITY_KEY` | none | required only outside dstack; dstack self-provisions a durable private-volume key used to encrypt Signal call URL fragments at rest |
-| `SIGNAL_MAX_CONCURRENT_CALLS` | `1` | provisioned Signal Desktop seat count; production compose pins `3` |
+| `SIGNAL_MAX_CONCURRENT_CALLS` | `1` | provisioned Signal Desktop seat count; production compose pins `1` |
 | `SIGNAL_PULSE_SOURCE` | `ptx_sink.monitor` in dstack | PulseAudio monitor captured by the isolated Signal seat |
 | `SIGNAL_TRANSCRIBER` | bundled dstack adapter | local WAV-to-JSON adapter using the in-CVM Whisper service |
 | `JOIN_TIMEOUT_SECONDS` | `600` | worker-side join deadline: a meeting still `joining`/`waiting_for_admission` this long after bot dispatch is failed (`meeting_join_failed`/`waiting_room_timeout`), its bot stopped, and `meeting.failed` emitted |
@@ -380,14 +382,13 @@ Everything in that
 file is encrypted client-side and sealed into
 the CVM (`phala deploy -e`); nothing secret lives in `app-compose.yaml`.
 
-**Signal three-seat rig.** `signal-capture`, `signal-capture-2`, and `signal-capture-3` are headless
-Signal Desktop images with Xvfb, PulseAudio/`parec`, noVNC, and one Bun capture worker each. Every seat
-has its own network namespace, loopback-only CDP, private control token, readiness volume, and persistent
-profile. PTX routes durable `seatN.<session>` IDs over three private control networks; no capture/CDP port
-is public. noVNC is host-loopback-only on ports `6080`, `6081`, and `6082` for SSH-tunnel bootstrap. The
-existing `signal-profile` volume remains seat 1, while `signal-profile-2` and `signal-profile-3` start
-unlinked. Link each seat manually, preferably to a distinct Signal identity for reliable simultaneous
-calls, then confirm `/health` reports ready with capacity `0/3`. A missing linked profile, display host,
+**Signal seat.** `signal-capture` is a headless Signal Desktop image with Xvfb, PulseAudio/`parec`, noVNC,
+and a Bun capture worker. The seat has its own network namespace, loopback-only CDP, private control token,
+readiness volume, and persistent profile (`signal-profile`). PTX routes durable `seat1.<session>` IDs over a
+private control network; no capture/CDP port is public. noVNC is host-loopback-only on port `6080` for
+SSH-tunnel bootstrap. Link the seat manually, then confirm `/health` reports ready with capacity `0/1`. A
+second simultaneous Signal call waits for the seat. The rig supports more seats (one `SIGNAL_CAPTURE_URLS`
+entry each); seats 2 and 3 were removed in TC-901 because they were never linked and cost ~800 MB idle. A missing linked profile, display host,
 or audio source is an environment gate, not evidence of a passed Signal call. TinyChat needs no change:
 its existing `POST /v1/meetings` proxy accepts Signal URLs once production enables `signal`.
 
@@ -402,9 +403,10 @@ phala cvms get ptx-dev --json | jq '{status, app_id, gateway}'
 phala deploy --cvm-id ptx-dev -c infra/dstack/app-compose.yaml -e infra/dstack/.env --wait
 ```
 
-`tdx.large` (4 vCPU / 8 GB, ~$0.24/h incl. 40 GB disk) fits the control plane, Whisper small.en, and three
-idle Signal Desktop seats. Treat three simultaneous captures/transcriptions as unpromoted until the live
-three-call benchmark passes; Whisper may serialize CPU-heavy completion work. First boot takes ~5–10 min
+`tdx.large` (4 vCPU / 7.5 GB usable, ~$0.24/h incl. 40 GB disk) fits the control plane, one Signal seat, an
+on-demand Whisper small.en, and two Google Meet bots (`VEXA_MAX_CONCURRENT_BOTS=2`; each bot is ~1-1.2 GB). Whisper
+unloads its model after 5 idle minutes (`WHISPER__TTL=300`) and lazy-loads it again in ~4-8 s. A third concurrent
+bot request answers 429 `capacity_exhausted`; raise the cap only together with the CVM size (TC-900). First boot takes ~5–10 min
 (Vexa images ≈ 3.6 GB bot image + whisper model download).
 
 **Verify.** `https://<app_id>-8080.<gateway base_domain>/health` →
