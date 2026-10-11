@@ -102,6 +102,18 @@ services:
       # (6 tries). Shortening the schedule settles over-limit rows exhausted; it never strands them.
       TINFOIL_ATTRIBUTED_FALLBACK_MODEL: ${TINFOIL_ATTRIBUTED_FALLBACK_MODEL:-voxtral-small-24b}
       ATTRIBUTED_RETRY_BACKOFF_MS: ${ATTRIBUTED_RETRY_BACKOFF_MS:-30000,60000,120000,240000,480000}
+      # TC-904: retention for Vexa's MinIO artifacts (recordings, attributed audio, signal tapes) of
+      # meetings published more than ARTIFACT_RETENTION_DAYS ago. Reference-transcript meetings, running
+      # evals, failed (recoverable) meetings and the keep list are never touched. dry-run only logs the
+      # plan ("artifact retention plan"); apply deletes. Orphans = artifacts with no ptx meeting.
+      ARTIFACT_RETENTION_MODE: ${ARTIFACT_RETENTION_MODE:-dry-run}
+      ARTIFACT_RETENTION_DAYS: ${ARTIFACT_RETENTION_DAYS:-14}
+      ARTIFACT_RETENTION_ORPHANS: ${ARTIFACT_RETENTION_ORPHANS:-false}
+      ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS: ${ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS:-88}
+      VEXA_MINIO_ENDPOINT: http://minio:9000
+      VEXA_MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      VEXA_MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      VEXA_MINIO_BUCKET: vexa
       # Internal eval (TC-745): after publication, re-transcribe internal team meetings with these
       # models and keep the results in the ptx DB for comparison (`bun run cli eval report`).
       EVAL_MODELS: ${EVAL_MODELS:-voxtral-small-24b}
@@ -398,6 +410,49 @@ services:
     restart: "no"
     network_mode: none
 
+  # TC-904: Vexa's runtime never removes a finished bot container. Each keeps its local copy of the
+  # meeting's signal tapes (~250 MB, already in MinIO) and pins the bot image it ran, so superseded
+  # bot images (~4.6 GB each) survive dstack's post-deploy prune too. Every 6 h this removes bot
+  # containers (label runtime.managed=true) that finished more than BOT_CONTAINER_RETENTION_DAYS
+  # ago, then bot images OLDER than the pinned PTX_BOT_IMAGE that no container uses. The pinned image
+  # and anything newer are never touched. BOT_JANITOR_MODE=dry-run (default) only logs; apply removes.
+  bot-janitor:
+    image: docker:27.5.1-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        log() { echo "bot-janitor [$$BOT_JANITOR_MODE] $$*"; }
+        act() { if [ "$$BOT_JANITOR_MODE" = apply ]; then "$$@" >/dev/null || log "failed: $$*"; fi; }
+        older() { awk -v a="$$1" -v b="$$2" 'BEGIN { exit !(a < b) }'; }
+        sweep() {
+          cutoff=$$(date -u -d "@$$(( $$(date +%s) - BOT_CONTAINER_RETENTION_DAYS * 86400 ))" +%Y-%m-%dT%H:%M:%S)
+          ids=$$(docker ps -aq --filter label=runtime.managed=true --filter status=exited --filter status=dead)
+          [ -z "$$ids" ] || docker inspect -f '{{.Id}} {{.State.FinishedAt}} {{.Name}}' $$ids |
+            while read -r id finished name; do
+              older "$$finished" "$$cutoff" || continue
+              log "remove container $$name finished $$finished"; act docker rm "$$id"
+            done
+          pin=$$(docker image inspect -f '{{.Id}} {{.Created}}' "$$BOT_IMAGE") || { log "pinned bot image missing; not pruning images"; return; }
+          docker images --no-trunc --format '{{.Repository}} {{.ID}}' | awk '$$1 == "ghcr.io/tinycloudlabs/vexa/bot" || $$1 == "vexaai/vexa-bot" { print $$2 }' | sort -u |
+            while read -r img; do
+              [ "$$img" != "$${pin% *}" ] || continue
+              created=$$(docker image inspect -f '{{.Created}}' "$$img") || continue
+              older "$$created" "$${pin#* }" || continue
+              [ -z "$$(docker ps -aq --filter ancestor=$$img)" ] || continue
+              log "remove image $$img created $$created"; act docker rmi -f "$$img"
+            done
+        }
+        while :; do sweep; sleep "$$BOT_JANITOR_INTERVAL_SECONDS"; done
+    environment:
+      BOT_JANITOR_MODE: ${BOT_JANITOR_MODE:-dry-run}
+      BOT_CONTAINER_RETENTION_DAYS: ${BOT_CONTAINER_RETENTION_DAYS:-7}
+      BOT_JANITOR_INTERVAL_SECONDS: "21600"
+      BOT_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-429a94e@sha256:7c48312c11bee1ac66b1461215bacf4bbf06a05f2ac02af3546f1ee41efea16e}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    network_mode: none
+    restart: unless-stopped
+
   runtime:
     image: ${VEXA_RUNTIME_IMAGE:-vexaai/v012-runtime:v012@sha256:a1f6448fbb380b9433364e8b572ec25a12aa4f274bf403f1d83a89cbf5812f2d}
     group_add: ["0"]
@@ -581,4 +636,7 @@ networks:
 # - Sizing (docs/vexa-findings.md): whisper small.en ~1.4 GB RSS + ~10 cores while decoding, one bot
 #   ~470 MB + Chromium launch burst, control plane ~1 GB → tdx.large (4 vCPU / 8 GB) is the smallest
 #   viable dev size; production wants ≥ tdx.xlarge. Disk ≥ 40 GB (bot image 3.6 GB + whisper model + recordings).
+# - Disk (TC-904): GET /health → checks.disk; the worker logs "disk usage above high-water mark" at
+#   DISK_HIGH_WATER_PERCENT (80). `docker exec <worker> bun run src/cli.ts artifact-retention` prints the
+#   MinIO retention plan per Vexa meeting without deleting; the bot-janitor logs what it removes.
 # - Egress: bots join public meetings over the CVM's NAT; only :8080 (our API) is published.

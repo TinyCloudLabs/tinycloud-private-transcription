@@ -17,6 +17,26 @@ export const backoffEnv = (name: string, fallback: string): number[] => {
   return values;
 };
 
+/** Comma-separated positive integers; empty is an empty list. */
+export const integerListEnv = (name: string, fallback: string): number[] => {
+  const values = env(name, fallback).split(",").map((value) => value.trim()).filter(Boolean).map(Number);
+  if (values.some((value) => !Number.isSafeInteger(value) || value <= 0)) throw new Error(`${name} must be comma-separated positive integers`);
+  return values;
+};
+
+export const percentEnv = (name: string, fallback: string): number => {
+  const value = positiveIntegerEnv(name, fallback);
+  if (value > 100) throw new Error(`${name} must be a percentage from 1 to 100`);
+  return value;
+};
+
+/** `off` does nothing, `dry-run` logs what would be deleted, `apply` deletes (TC-904). */
+export type ArtifactRetentionMode = "off" | "dry-run" | "apply";
+export function parseArtifactRetentionMode(value: string): ArtifactRetentionMode {
+  if (value !== "off" && value !== "dry-run" && value !== "apply") throw new Error(`ARTIFACT_RETENTION_MODE must be "off", "dry-run" or "apply", got ${JSON.stringify(value)}`);
+  return value;
+}
+
 export type TranscriptionProviderName = "vexa" | "tinfoil";
 
 /**
@@ -125,6 +145,35 @@ export const config = {
      * the worker treats an acknowledgement older than the leftover budget as a fence miss.
      */
     admissionMs: positiveIntegerEnv("RECORDING_RECOVERY_ADMISSION_MS", "600000"),
+  },
+  /**
+   * Disk-usage signal (TC-904). On the meeting CVM, `/` inside a container reports the one
+   * persistent volume that holds Docker images, MinIO and Postgres. Shown in /health; the worker
+   * logs a warning while usage is at or above the high-water mark.
+   */
+  disk: {
+    path: env("DISK_CHECK_PATH", "/"),
+    highWaterPercent: percentEnv("DISK_HIGH_WATER_PERCENT", "80"),
+  },
+  /**
+   * Retention for Vexa's bulky per-meeting artifacts in MinIO: recordings, attributed audio and
+   * signal tapes (TC-904). Off by default. Only a meeting published (`completed`) more than `days`
+   * ago qualifies; meetings with a reference transcript, a running eval, or listed in
+   * `keepVexaMeetingIds` are kept. Artifacts with no ptx meeting are deleted only with `orphans`.
+   */
+  artifactRetention: {
+    mode: parseArtifactRetentionMode(env("ARTIFACT_RETENTION_MODE", "off")),
+    days: positiveIntegerEnv("ARTIFACT_RETENTION_DAYS", "14"),
+    intervalMs: positiveIntegerEnv("ARTIFACT_RETENTION_INTERVAL_MS", "21600000"),
+    orphans: env("ARTIFACT_RETENTION_ORPHANS", "false") === "true",
+    keepVexaMeetingIds: integerListEnv("ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS", ""),
+    /** Vexa's MinIO. Retention lists and deletes objects directly: Vexa has no delete API for them. */
+    s3: {
+      endpoint: env("VEXA_MINIO_ENDPOINT", ""),
+      accessKeyId: env("VEXA_MINIO_ACCESS_KEY", ""),
+      secretAccessKey: env("VEXA_MINIO_SECRET_KEY", ""),
+      bucket: env("VEXA_MINIO_BUCKET", "vexa"),
+    },
   },
   logLevel: env("LOG_LEVEL", "info"),
   /**

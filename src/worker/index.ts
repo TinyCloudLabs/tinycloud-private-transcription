@@ -8,6 +8,7 @@ import { TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil
 import { MIN_RECOVERY_ACK_BUDGET_MS, recoveryAckBudgetMs } from "../services/recording-recovery.ts";
 import { handleEvalJob } from "../services/transcript-eval.ts";
 import type { Job } from "./queue.ts";
+import { startHousekeeping } from "./housekeeping.ts";
 
 export type JobOutcome = "processed" | "noop" | "deferred";
 
@@ -269,7 +270,9 @@ if (import.meta.main) {
   }
   ctx.log.info("worker started", { provider: ctx.transcription.name });
   const w = startWorker(ctx);
+  const housekeeping = startHousekeeping(ctx);
   const shutdown = async () => {
+    housekeeping.stop();
     await w.stop();
     process.exit(0);
   };
