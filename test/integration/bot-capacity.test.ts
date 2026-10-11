@@ -21,6 +21,19 @@ async function withHarness(opts: Parameters<typeof startHarness>[0], fn: (h: Har
 }
 
 const vexaCreates = (h: Harness) => h.vexa.requests.filter((r) => r.method === "POST" && r.path === "/bots").length;
+const vexaCreatesFor = (h: Harness, roomName: string) =>
+  h.vexa.requests.filter((r) => r.method === "POST" && r.path === "/bots" && (r.body as { meeting_url?: string })?.meeting_url?.endsWith(`/${roomName}`)).length;
+
+/** A bot PTX does not track takes the mock Vexa user's slot, then sits in `status`. */
+async function occupyVexaSlot(h: Harness, status: "active" | "stopping") {
+  const untracked = await fetch(`${h.vexa.baseUrl}/bots`, {
+    method: "POST",
+    headers: { "X-API-Key": h.vexa.apiKey, "Content-Type": "application/json" },
+    body: JSON.stringify({ platform: "jitsi", native_meeting_id: "untracked-room" }),
+  });
+  expect(untracked.status).toBe(201);
+  await h.vexa.control("jitsi", "untracked-room", { status });
+}
 
 describe("meeting bot cap (TC-902)", () => {
   test("a request over the cap fails fast with 429 capacity_exhausted and the running bots are unaffected", async () => {
@@ -104,16 +117,29 @@ describe("meeting bot cap (TC-902)", () => {
     });
   });
 
-  test("a Vexa max_concurrent_bots rejection fails the meeting with capacity_exhausted, not provider_unavailable", async () => {
-    // A bot PTX does not track already holds Vexa's only slot.
-    await withHarness({ maxConcurrentBots: 2, vexaMaxConcurrentBots: 1 }, async (h) => {
-      const untracked = await fetch(`${h.vexa.baseUrl}/bots`, {
-        method: "POST",
-        headers: { "X-API-Key": h.vexa.apiKey, "Content-Type": "application/json" },
-        body: JSON.stringify({ platform: "jitsi", native_meeting_id: "untracked-room" }),
-      });
-      expect(untracked.status).toBe(201);
+  test("a Vexa max_concurrent_bots rejection is retried while the meeting stays queued, and the bot starts once Vexa frees a slot", async () => {
+    // A leaving bot Vexa still counts (stopping) holds its only slot after PTX already freed it.
+    await withHarness({ maxConcurrentBots: 2, vexaMaxConcurrentBots: 1, capacityRetryIntervalMs: 50, capacityRetryWindowMs: 10_000 }, async (h) => {
+      await occupyVexaSlot(h, "stopping");
+      const r = await h.api("/v1/meetings", { method: "POST", json: room("VexaBusy") });
+      expect(r.status).toBe(201);
+      const { id } = await r.json();
+      await h.waitFor(async () => vexaCreatesFor(h, "VexaBusy") >= 2, { label: "start retried after a 429" });
+      expect((await (await h.api(`/v1/meetings/${id}`)).json()).status).toBe("queued");
 
+      await h.vexa.control("jitsi", "untracked-room", { status: "completed" });
+      const joined = await h.waitFor(async () => {
+        const m = await (await h.api(`/v1/meetings/${id}`)).json();
+        return m.status === "joining" ? m : null;
+      }, { label: "bot dispatched after Vexa freed the slot" });
+      expect(joined.error).toBeUndefined();
+    });
+  });
+
+  test("a Vexa max_concurrent_bots rejection past the retry window fails the meeting with capacity_exhausted, not provider_unavailable", async () => {
+    // A bot PTX does not track holds Vexa's only slot for longer than the retry window.
+    await withHarness({ maxConcurrentBots: 2, vexaMaxConcurrentBots: 1, capacityRetryIntervalMs: 50, capacityRetryWindowMs: 1_500 }, async (h) => {
+      await occupyVexaSlot(h, "active");
       const r = await h.api("/v1/meetings", { method: "POST", json: room("VexaFull") });
       expect(r.status).toBe(201);
       const { id } = await r.json();
@@ -121,6 +147,7 @@ describe("meeting bot cap (TC-902)", () => {
         const m = await (await h.api(`/v1/meetings/${id}`)).json();
         return m.status === "failed" ? m : null;
       }, { label: "meeting failed" });
+      expect(vexaCreatesFor(h, "VexaFull")).toBeGreaterThan(1);
       expect(failed.error).toEqual({
         type: "provider_error",
         code: "capacity_exhausted",

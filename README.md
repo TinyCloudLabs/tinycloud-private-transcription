@@ -146,7 +146,9 @@ bun run cli create-key --project tinychat --scopes 'transcriptions:*'
 | `VEXA_API_KEY` | – | sent as `X-API-Key` |
 | `VEXA_POLL_INTERVAL_MS` | `5000` | worker status/transcript poll |
 | `VEXA_MAX_TIME_LEFT_ALONE_MS` | `300000` | per-meeting window without remote participant audio (milliseconds). After five minutes without hearing anyone else, Vexa completes the bot as `left_alone`; applies to Jitsi and Google Meet. |
-| `VEXA_MAX_CONCURRENT_BOTS` | `5` | concurrent meeting-bot cap (TC-902): a non-Signal `POST /v1/meetings` over it answers 429 `capacity_exhausted`; reported as `bot_capacity.max` in `/health`. The dstack compose defaults it to `2` and applies it to the Vexa user's `max_concurrent_bots` at every boot |
+| `VEXA_MAX_CONCURRENT_BOTS` | `2` | concurrent meeting-bot cap (TC-902): a non-Signal `POST /v1/meetings` over it answers 429 `capacity_exhausted`; reported as `bot_capacity.max` in `/health`. The dstack compose also defaults it to `2` and applies it to the Vexa user's `max_concurrent_bots` at every boot |
+| `VEXA_CAPACITY_RETRY_INTERVAL_MS` | `10000` | a Vexa 429 at bot start (its `max_concurrent_bots`, e.g. a leaving bot it still counts) is retried at this interval while the meeting stays `queued` |
+| `VEXA_CAPACITY_RETRY_WINDOW_MS` | `120000` | how long after creation those retries continue before the meeting fails with `capacity_exhausted` |
 | `ENABLED_PLATFORMS` | `jitsi` | comma-separated platforms accepted by `POST /v1/meetings`. Others (zoom, google_meet, microsoft_teams) are still detected but answer 400 `unsupported_platform` |
 | `SIGNAL_CAPTURE_URLS` | `http://127.0.0.1:18076` | ordered capture-worker endpoints, one per persistent Signal Desktop seat |
 | `SIGNAL_CAPTURE_TOKEN_PATHS` | none | ordered private control-token files; required for non-loopback capture endpoints |

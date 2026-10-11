@@ -73,7 +73,8 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
     if (existing && !["completed", "failed"].includes(existing.status)) {
       return c.json({ detail: "Bot already exists for this meeting" }, 409);
     }
-    const live = [...meetings.values()].filter((x) => ["requested", "joining", "awaiting_admission", "active"].includes(x.status)).length;
+    // Counts a leaving (stopping) bot too: PTX must not assume Vexa freed a slot when PTX did.
+    const live = [...meetings.values()].filter((x) => ["requested", "joining", "awaiting_admission", "active", "stopping"].includes(x.status)).length;
     if (opts.maxConcurrentBots !== undefined && live >= opts.maxConcurrentBots) {
       return c.json({ detail: `User has reached the maximum concurrent bot limit (${opts.maxConcurrentBots}).` }, 429);
     }

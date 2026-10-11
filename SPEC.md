@@ -128,7 +128,8 @@ Bot cap (TC-902): `POST /v1/meetings` for any non-Signal platform answers `429 c
 `provider_error`, `Retry-After: 60`, `retry_after_seconds: 60`) when `VEXA_MAX_CONCURRENT_BOTS` meetings are already
 queued, joining, waiting for admission or in progress. Admission is serialized, nothing is stored for a rejected
 request, and an `Idempotency-Key` replay of an admitted request is still answered. If Vexa itself refuses a bot
-(its user's `max_concurrent_bots`), the meeting fails with `capacity_exhausted`. Signal calls instead wait for a
+(its user's `max_concurrent_bots`), the worker retries every `VEXA_CAPACITY_RETRY_INTERVAL_MS` (10 s) while the meeting
+stays `queued`, and fails it with `capacity_exhausted` only after `VEXA_CAPACITY_RETRY_WINDOW_MS` (2 min) from creation. Signal calls instead wait for a
 free Desktop seat (`SIGNAL_MAX_CONCURRENT_CALLS`).
 
 Errors: `{"error":{"type":"meeting_join_failed","code":"waiting_room_timeout","message":"…"}}`. Codes: invalid_meeting_url, unsupported_platform, meeting_not_found, meeting_join_failed, waiting_room_timeout, bot_removed, meeting_ended, capture_failed, transcription_failed, provider_timeout, provider_unavailable, capacity_exhausted (429), internal_error (+ request-level `unauthorized` 401, `insufficient_scope` 403, `invalid_request`, `idempotency_conflict`). Never leak Vexa errors raw.
