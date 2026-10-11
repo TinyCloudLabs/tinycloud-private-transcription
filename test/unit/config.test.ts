@@ -31,3 +31,24 @@ test("config load rejects an invalid RECORDING_RECOVERY_ADMISSION_MS", () => {
     expect(proc.stderr.toString()).toContain("RECORDING_RECOVERY_ADMISSION_MS must be a positive integer");
   }
 });
+
+test("config load rejects an invalid VEXA_MAX_CONCURRENT_BOTS (TC-902)", () => {
+  // NaN would never compare >= running, silently disabling the meeting bot cap.
+  for (const value of ["0", "-1", "1.5", "bad", ""]) {
+    const proc = Bun.spawnSync(
+      [process.execPath, "-e", 'await import("./src/config.ts")'],
+      {
+        cwd: new URL("../..", import.meta.url).pathname,
+        env: { ...process.env, VEXA_MAX_CONCURRENT_BOTS: value },
+        stderr: "pipe",
+      },
+    );
+    expect(proc.exitCode).toBe(1);
+    expect(proc.stderr.toString()).toContain("VEXA_MAX_CONCURRENT_BOTS must be a positive integer");
+  }
+  const ok = Bun.spawnSync(
+    [process.execPath, "-e", 'const { config } = await import("./src/config.ts"); console.log(config.vexa.maxConcurrentBots)'],
+    { cwd: new URL("../..", import.meta.url).pathname, env: { ...process.env, VEXA_MAX_CONCURRENT_BOTS: "2" }, stdout: "pipe" },
+  );
+  expect(ok.stdout.toString().trim()).toBe("2");
+});

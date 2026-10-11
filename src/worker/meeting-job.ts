@@ -168,10 +168,17 @@ async function handleStartError(ctx: AppContext, meeting: MeetingRow, e: unknown
     return;
   }
   ctx.log.error("vexa createBot failed", { meetingId: meeting.id, stage: "create", code: e instanceof ApiError ? e.code : "provider_error" });
-  const code = e instanceof ApiError ? e.code : e instanceof VexaHttpError && e.status === 409 ? "meeting_join_failed" : "provider_unavailable";
+  // Vexa answers 429 when its user's max_concurrent_bots (kept equal to VEXA_MAX_CONCURRENT_BOTS)
+  // is reached. API admission normally rejects first; this covers bots PTX does not track (TC-902).
+  const code = e instanceof ApiError ? e.code
+    : e instanceof VexaHttpError && e.status === 409 ? "meeting_join_failed"
+    : e instanceof VexaHttpError && e.status === 429 ? "capacity_exhausted"
+    : "provider_unavailable";
   const message =
     code === "meeting_join_failed"
       ? "A bot is already in this meeting or the meeting could not be joined."
+      : code === "capacity_exhausted"
+        ? "All meeting notetakers were busy when this meeting started. Try again when one of the current meetings ends."
       : e instanceof ApiError
         ? e.message
         : "Meeting capture provider is unavailable.";

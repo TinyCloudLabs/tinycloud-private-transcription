@@ -33,6 +33,9 @@ function serviceEnv(service: string): string {
   return envEnd === -1 ? envRest : envRest.slice(0, envEnd);
 }
 
+/** Exact (trimmed) lines, so a value cannot pass by being a prefix of a longer list. */
+const lines = (block: string) => block.split("\n").map((line) => line.trim());
+
 function serviceImage(service: string): string {
   const start = compose.indexOf(`\n  ${service}:\n`);
   expect(start).toBeGreaterThan(-1);
@@ -53,7 +56,7 @@ describe("infra/dstack/app-compose.yaml", () => {
     );
     expect(rendered.exitCode).toBe(0);
     const services = Object.values(JSON.parse(rendered.stdout.toString()).services) as Array<Record<string, unknown>>;
-    expect(services.length).toBe(20);
+    expect(services.length).toBe(18);
     for (const service of services) {
       expect(service.build).toBeUndefined();
       expect(service.image).toBeString();
@@ -83,8 +86,6 @@ describe("infra/dstack/app-compose.yaml", () => {
       api: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:67b08f343e63b19616b9d653530f5f7b94f80740@sha256:b1c8a2c73e7ad97b79ba801dccd179285f789b568b2e0d39f0f5d9ae2fefe7b6",
       worker: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:67b08f343e63b19616b9d653530f5f7b94f80740@sha256:b1c8a2c73e7ad97b79ba801dccd179285f789b568b2e0d39f0f5d9ae2fefe7b6",
       "signal-capture": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f",
-      "signal-capture-2": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f",
-      "signal-capture-3": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f",
       "signal-control-provision": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
       "signal-capability-provision": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
       postgres: "postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685",
@@ -233,25 +234,24 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(line).toContain("300000");
   });
 
-  test("ships three authenticated Signal seats with isolated CDP namespaces", () => {
+  test("ships one authenticated Signal seat with an isolated CDP namespace (TC-901)", () => {
     const api = serviceEnv("api");
-    expect(api).toContain("SIGNAL_MAX_CONCURRENT_CALLS: \"3\"");
-    expect(api).toContain("SIGNAL_HEALTH_PATHS: /run/signal-health-1/health.json,/run/signal-health-2/health.json,/run/signal-health-3/health.json");
+    expect(api).toContain("SIGNAL_MAX_CONCURRENT_CALLS: \"1\"");
+    expect(lines(api)).toContain("SIGNAL_HEALTH_PATHS: /run/signal-health-1/health.json");
     const worker = serviceEnv("worker");
-    expect(worker).toContain("SIGNAL_CAPTURE_URLS: http://signal-capture:18076,http://signal-capture-2:18077,http://signal-capture-3:18078");
-    expect(worker).toContain("SIGNAL_CAPTURE_TOKEN_PATHS: /run/signal-control-1/token,/run/signal-control-2/token,/run/signal-control-3/token");
-    expect(worker).toContain("SIGNAL_MAX_CONCURRENT_CALLS: \"3\"");
+    expect(lines(worker)).toContain("SIGNAL_CAPTURE_URLS: http://signal-capture:18076");
+    expect(lines(worker)).toContain("SIGNAL_CAPTURE_TOKEN_PATHS: /run/signal-control-1/token");
+    expect(worker).toContain("SIGNAL_MAX_CONCURRENT_CALLS: \"1\"");
     const workerStart = compose.indexOf("\n  worker:\n");
     const workerBlock = compose.slice(workerStart, compose.indexOf("\n  signal-capture:\n", workerStart));
     expect(workerBlock).toContain("signal-runtime:/run/signal-capability:ro");
     expect(workerBlock).toContain("signal-control-1:/run/signal-control-1:ro");
-    expect(workerBlock).toContain("signal-control-2:/run/signal-control-2:ro");
-    expect(workerBlock).toContain("signal-control-3:/run/signal-control-3:ro");
+    expect(workerBlock).toContain("networks: [ptx, vexa, signal-seat-1]");
     expect(workerBlock).not.toContain("signal-health:");
+    // Seats 2 and 3 were never linked; their services, volumes, tokens and networks are gone.
+    expect(compose).not.toMatch(/signal-capture-[23]|signal-(profile|health|control)-[23]|signal-seat-[23]/);
     const seats = [
       { service: "signal-capture", capture: "18076", cdp: "9222", vnc: "5900", novnc: "6080", profile: "signal-profile", health: "signal-health", control: "signal-control-1", network: "signal-seat-1" },
-      { service: "signal-capture-2", capture: "18077", cdp: "9223", vnc: "5901", novnc: "6081", profile: "signal-profile-2", health: "signal-health-2", control: "signal-control-2", network: "signal-seat-2" },
-      { service: "signal-capture-3", capture: "18078", cdp: "9224", vnc: "5902", novnc: "6082", profile: "signal-profile-3", health: "signal-health-3", control: "signal-control-3", network: "signal-seat-3" },
     ];
     for (const [index, seat] of seats.entries()) {
       const start = compose.indexOf(`\n  ${seat.service}:\n`);
@@ -268,7 +268,8 @@ describe("infra/dstack/app-compose.yaml", () => {
       expect(capture).toContain(`127.0.0.1:${seat.novnc}:${seat.novnc}`);
       expect(capture).toContain("SIGNAL_HEALTH_PATH: /run/signal-health/health.json");
       expect(capture).toContain("SIGNAL_WHISPER_HEALTH_URL: http://whisper:8000/health");
-      expect(capture).toContain("SIGNAL_WHISPER_MODEL: small.en");
+      // The same name as whisper's own model, so Signal and Vexa share one loaded copy.
+      expect(capture).toContain("SIGNAL_WHISPER_MODEL: ${WHISPER_MODEL:-Systran/faster-whisper-small.en}");
       expect(capture).toContain(`${seat.profile}:/var/lib/signal`);
       expect(capture).toContain(`${seat.health}:/run/signal-health`);
       expect(capture).toContain(`${seat.control}:/run/signal-control:ro`);
@@ -297,6 +298,46 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(signalTranscriber).toContain('model="${SIGNAL_WHISPER_MODEL:-small.en}"');
     expect(signalTranscriber).toContain('ptx-signal-whisper-model-ready');
     expect(signalTranscriber).toContain('-F "model=${model}"');
+  });
+
+  test("whisper unloads its model when idle and releases the memory (TC-901)", () => {
+    const env = serviceEnv("whisper");
+    expect(env).toContain("WHISPER__MODEL: ${WHISPER_MODEL:-Systran/faster-whisper-small.en}");
+    expect(env).toContain('WHISPER__TTL: "300"');
+    expect(env).not.toContain('WHISPER__TTL: "-1"');
+    // Without a fixed mmap threshold glibc keeps ~450 MB of an unloaded model resident.
+    expect(env).toContain('MALLOC_MMAP_THRESHOLD_: "1048576"');
+  });
+
+  test("caps concurrent meeting bots per deploy and applies the cap to the Vexa user (TC-902)", () => {
+    const line = "VEXA_MAX_CONCURRENT_BOTS: ${VEXA_MAX_CONCURRENT_BOTS:-2}";
+    expect(serviceEnv("api")).toContain(line);
+    expect(serviceEnv("vexa-provision")).toContain(line);
+    expect(envExample).toMatch(/^VEXA_MAX_CONCURRENT_BOTS=2$/m);
+    const start = compose.indexOf("\n  vexa-provision:\n");
+    const provision = compose.slice(start, compose.indexOf("\nvolumes:\n", start));
+    // The existing user predates the cap, so every boot updates it in place before the key check.
+    const patch = provision.indexOf("-X PATCH \"http://admin-api:8001/admin/users/$$ID\" -d '{\"max_concurrent_bots\":'\"$$N\"'}'");
+    expect(patch).toBeGreaterThan(-1);
+    expect(patch).toBeLessThan(provision.indexOf("[ -s /run/vexa/api-key ] && {"));
+    expect(provision).toContain(`'{"email":"self-host@vexa.ai","max_concurrent_bots":'"$$N"'}'`);
+    expect(provision).not.toContain('"max_concurrent_bots":5');
+
+    const dir = mkdtempSync(join(tmpdir(), "ptx-bot-cap-env-"));
+    try {
+      const envFile = join(dir, ".env");
+      writeFileSync(envFile, envExample.replace(/^VEXA_MAX_CONCURRENT_BOTS=2$/m, "VEXA_MAX_CONCURRENT_BOTS=3"));
+      const rendered = Bun.spawnSync(
+        ["docker", "compose", "-f", "infra/dstack/app-compose.yaml", "--env-file", envFile, "config", "--format", "json"],
+        { cwd: repo, stdout: "pipe", stderr: "pipe" },
+      );
+      expect(rendered.exitCode).toBe(0);
+      const services = JSON.parse(rendered.stdout.toString()).services as Record<string, { environment: Record<string, string> }>;
+      expect(services.api!.environment.VEXA_MAX_CONCURRENT_BOTS).toBe("3");
+      expect(services["vexa-provision"]!.environment.VEXA_MAX_CONCURRENT_BOTS).toBe("3");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test("publishes and CI-builds the Signal seat image", () => {

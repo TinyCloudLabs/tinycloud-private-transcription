@@ -44,7 +44,10 @@ export function createApp(ctx: AppContext, groups: ScopedGroups = meetingGroups(
   const app = new Hono<AuthEnv>();
 
   app.onError((err, c) => {
-    if (err instanceof ApiError) return c.json(err.toBody(), err.status as 400);
+    if (err instanceof ApiError) {
+      if (err.retryAfterSeconds) c.header("Retry-After", String(err.retryAfterSeconds));
+      return c.json(err.toBody(), err.status as 400);
+    }
     // Request errors can contain SQL, request bodies, provider data, or Signal fragments.  Keep
     // lifecycle telemetry intentionally finite and content-free.
     ctx.log.error("api request failed", { stage: "api_unhandled", code: "internal_error" });
