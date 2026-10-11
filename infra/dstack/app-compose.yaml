@@ -31,7 +31,7 @@
 services:
   # ─── ours ────────────────────────────────────────────────────────────────────────────────────
   api:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:2b11d7821c3d98518792e694fa09df5b685058e5@sha256:c7473e6378c34e56dc2dc6a0340d4c42b0d721cfd4bb7e2b2b1dfa28b5ae4a6b
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:b5856574878e90edb2862a7876ef89aea788fd89@sha256:9f86ca84360305f12e1d8f518a8025a03f9b9181386457312997fa693e05bb5d
     # VEXA_API_KEY is minted at first boot by `vexa-provision` (below) into a shared volume.
     command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal-capability/capability-key); exec bun run src/api/server.ts"]
     restart: unless-stopped
@@ -83,7 +83,7 @@ services:
     networks: [ptx, vexa]
 
   worker:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:2b11d7821c3d98518792e694fa09df5b685058e5@sha256:c7473e6378c34e56dc2dc6a0340d4c42b0d721cfd4bb7e2b2b1dfa28b5ae4a6b
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:b5856574878e90edb2862a7876ef89aea788fd89@sha256:9f86ca84360305f12e1d8f518a8025a03f9b9181386457312997fa693e05bb5d
     command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && [ -s /run/signal-control-1/token ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && [ -s /run/signal-control-1/token ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal-capability/capability-key); exec bun run src/worker/index.ts"]
     restart: unless-stopped
     environment:
@@ -328,7 +328,7 @@ services:
   # image no container references. This no-op service makes compose pull the fork bot image at boot (~1.6 GB
   # compressed) and its exited container pins the image so the prune keeps it.
   bot-image-keeper:
-    image: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-429a94e@sha256:7c48312c11bee1ac66b1461215bacf4bbf06a05f2ac02af3546f1ee41efea16e}
+    image: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-e5b5307@sha256:32404172d0c843d29ec2617df52d8ca9cb09d510f6423e6aa355aac859196253}
     entrypoint: ["/bin/true"]
     restart: "no"
     network_mode: none
@@ -337,7 +337,7 @@ services:
     image: ${VEXA_RUNTIME_IMAGE:-vexaai/v012-runtime:v012@sha256:a1f6448fbb380b9433364e8b572ec25a12aa4f274bf403f1d83a89cbf5812f2d}
     group_add: ["0"]
     environment:
-      BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-429a94e@sha256:7c48312c11bee1ac66b1461215bacf4bbf06a05f2ac02af3546f1ee41efea16e}
+      BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-e5b5307@sha256:32404172d0c843d29ec2617df52d8ca9cb09d510f6423e6aa355aac859196253}
       AGENT_IMAGE: ${VEXA_AGENT_IMAGE:-vexaai/v012-agent-api:v012@sha256:6eb37574b33aab233aabbe5907e06e106bae44a403e5df781a436da8201a928d}
       AGENT_WORKER_IMAGE: ${VEXA_AGENT_WORKER_IMAGE:-vexaai/v012-agent-worker:v012@sha256:a1120b24765ff6b1c86c5f9ddee35b5e71fdbb9543a23b918b278373ad705022}
       REDIS_URL: redis://redis:6379/0
