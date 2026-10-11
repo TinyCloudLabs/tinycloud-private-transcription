@@ -1,4 +1,4 @@
-import { and, eq, isNotNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, ne, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { AppContext } from "../context.ts";
 import { attributedBatches, attributedTranscriptionRuns, meetings, transcripts, type MeetingRow, type TranscriptRow } from "../db/schema.ts";
@@ -258,6 +258,31 @@ export async function terminalTransition(
     // marker atomically; an abandoned process is recovered by the durable claim reconciler.
     await Bun.sleep(10);
   }
+}
+
+/** Statuses in which a meeting's Vexa bot is (or was just) in the call. */
+const LIVE_CAPTURE_STATUSES = ["joining", "waiting_for_admission", "in_progress", "processing"] as const;
+
+/**
+ * Another meeting, in any project, that is capturing the same Vexa meeting. Vexa answers 409 when
+ * its single user already has a bot there, and every project shares that user (TC-581). The
+ * result only says a sibling exists; callers must not expose its id or project.
+ */
+export async function findLiveMeetingForNativeId(
+  ctx: AppContext,
+  vexaPlatform: string,
+  vexaNativeMeetingId: string,
+  excludeId: string,
+): Promise<{ id: string } | null> {
+  const [row] = await ctx.db.select({ id: meetings.id }).from(meetings)
+    .where(and(
+      eq(meetings.vexaPlatform, vexaPlatform),
+      eq(meetings.vexaNativeMeetingId, vexaNativeMeetingId),
+      ne(meetings.id, excludeId),
+      inArray(meetings.status, [...LIVE_CAPTURE_STATUSES]),
+    ))
+    .limit(1);
+  return row ?? null;
 }
 
 export async function failMeeting(ctx: AppContext, meeting: MeetingRow, code: ErrorCode, message: string) {

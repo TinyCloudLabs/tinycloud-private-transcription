@@ -3,6 +3,7 @@ export type ErrorCode =
   | "unsupported_platform"
   | "meeting_not_found"
   | "meeting_join_failed"
+  | "meeting_already_captured"
   | "waiting_room_timeout"
   | "bot_removed"
   | "meeting_ended"
@@ -37,6 +38,7 @@ const CODE_TYPE: Record<ErrorCode, ErrorType> = {
   insufficient_scope: "authentication_error",
   meeting_not_found: "not_found_error",
   meeting_join_failed: "meeting_join_failed",
+  meeting_already_captured: "meeting_join_failed",
   waiting_room_timeout: "meeting_join_failed",
   bot_removed: "capture_error",
   meeting_ended: "capture_error",
