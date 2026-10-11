@@ -6,7 +6,7 @@ import { isTerminal, mapVexaFailure, mapVexaStatus, type MeetingStatus } from ".
 import { VexaHttpError } from "../providers/vexa/client.ts";
 import { adaptVexaSegments, completionReasonOf } from "../providers/vexa/adapter.ts";
 import { toVexaPlatform } from "../providers/vexa/platform-map.ts";
-import { completeMeetingWithTranscript, failMeeting, getMeetingById, transition } from "../services/meetings.ts";
+import { completeMeetingWithTranscript, failMeeting, findLiveMeetingForNativeId, getMeetingById, transition } from "../services/meetings.ts";
 import { enqueueMeetingWebhook } from "../webhooks/dispatcher.ts";
 import { observeCapture, recordCapture } from "../services/capture.ts";
 import { and, eq, isNull, sql } from "drizzle-orm";
@@ -179,6 +179,17 @@ async function handleStartError(ctx: AppContext, meeting: MeetingRow, e: unknown
     ctx.log.warn("vexa createBot failed, retrying", { meetingId: meeting.id, attempt, stage: "create", code: e instanceof ApiError ? e.code : "provider_error" });
     await continueStart(1_000 * attempt, attempt + 1);
     return;
+  }
+  // Vexa answers 409 when its one user already has a bot in this meeting. If that bot is another
+  // live PTX meeting (any project: they all share the Vexa user), say so without naming it (TC-581).
+  if (e instanceof VexaHttpError && e.status === 409 && meeting.vexaNativeMeetingId) {
+    const vexaPlatform = toVexaPlatform(meeting.platform as Exclude<Platform, "signal">);
+    if (await findLiveMeetingForNativeId(ctx, vexaPlatform, meeting.vexaNativeMeetingId, meeting.id)) {
+      ctx.log.warn("vexa createBot refused: meeting already captured", { meetingId: meeting.id, stage: "create", code: "meeting_already_captured" });
+      const { meeting: failed, changed } = await failMeeting(ctx, meeting, "meeting_already_captured", "Another notetaker from this service is already in this meeting.");
+      if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+      return;
+    }
   }
   ctx.log.error("vexa createBot failed", { meetingId: meeting.id, stage: "create", code: e instanceof ApiError ? e.code : "provider_error" });
   // Vexa still refused after the capacity retry window (its max_concurrent_bots is kept equal to

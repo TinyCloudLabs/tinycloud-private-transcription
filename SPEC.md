@@ -132,7 +132,7 @@ request, and an `Idempotency-Key` replay of an admitted request is still answere
 stays `queued`, and fails it with `capacity_exhausted` only after `VEXA_CAPACITY_RETRY_WINDOW_MS` (2 min) from creation. Signal calls instead wait for a
 free Desktop seat (`SIGNAL_MAX_CONCURRENT_CALLS`).
 
-Errors: `{"error":{"type":"meeting_join_failed","code":"waiting_room_timeout","message":"…"}}`. Codes: invalid_meeting_url, unsupported_platform, meeting_not_found, meeting_join_failed, waiting_room_timeout, bot_removed, meeting_ended, capture_failed, transcription_failed, provider_timeout, provider_unavailable, capacity_exhausted (429), internal_error (+ request-level `unauthorized` 401, `insufficient_scope` 403, `invalid_request`, `idempotency_conflict`). Never leak Vexa errors raw.
+Errors: `{"error":{"type":"meeting_join_failed","code":"waiting_room_timeout","message":"…"}}`. Codes: invalid_meeting_url, unsupported_platform, meeting_not_found, meeting_join_failed, meeting_already_captured (type `meeting_join_failed`: Vexa refused the bot because another live meeting from this service, in any project, is already capturing the same call; the message never names it), waiting_room_timeout, bot_removed, meeting_ended, capture_failed, transcription_failed, provider_timeout, provider_unavailable, capacity_exhausted (429), internal_error (+ request-level `unauthorized` 401, `insufficient_scope` 403, `invalid_request`, `idempotency_conflict`). Never leak Vexa errors raw.
 
 Platform detection: meet.google.com→google_meet, zoom.us→zoom, teams.microsoft.com→microsoft_teams, meet.jit.si / self-hosted Jitsi→jitsi. Only platforms in `ENABLED_PLATFORMS` (default `jitsi`) are accepted; a detected-but-disabled platform answers 400 `unsupported_platform` naming the platform.
 
