@@ -83,8 +83,8 @@ describe("infra/dstack/app-compose.yaml", () => {
 
   test("pins every deploy and runtime-pulled image to an approved immutable digest", () => {
     const expected = {
-      api: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:d6a843a04cc1ca1c86138489bd370b1bfb3af97e@sha256:b9f82d64c6116253035a5cf5212e4a7ef778e53980bf3b3487f62a702f4f9eda",
-      worker: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:d6a843a04cc1ca1c86138489bd370b1bfb3af97e@sha256:b9f82d64c6116253035a5cf5212e4a7ef778e53980bf3b3487f62a702f4f9eda",
+      api: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:b8d3aed474aec3869f89c0745a1e7683a4d62726@sha256:4df3cedb18e35070b8fc3666ff54b6abbcf49b9ea36864acc7f7899ebc30f9a8",
+      worker: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:b8d3aed474aec3869f89c0745a1e7683a4d62726@sha256:4df3cedb18e35070b8fc3666ff54b6abbcf49b9ea36864acc7f7899ebc30f9a8",
       "signal-capture": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f",
       "signal-control-provision": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
       "signal-capability-provision": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
