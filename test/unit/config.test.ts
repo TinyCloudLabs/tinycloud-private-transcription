@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { positiveIntegerEnv, requireDatabaseUrl } from "../../src/config.ts";
 
 test("VEXA_MAX_TIME_LEFT_ALONE_MS accepts only positive integers", () => {
@@ -68,4 +71,26 @@ test("DATABASE_URL has no committed default and fails clearly when missing (TC-9
   expect(api.stderr.toString()).toContain("DATABASE_URL is required");
   const load = Bun.spawnSync([process.execPath, "--no-env-file", "-e", 'await import("./src/config.ts")'], { cwd, env, stderr: "pipe" });
   expect(load.exitCode).toBe(0);
+});
+
+test("signal smoke rejects a missing DATABASE_URL before spawning any child (TC-929)", () => {
+  // The script spawns its children as `bun …` from PATH; a `bun` shim first on PATH records any spawn.
+  const shimDir = mkdtempSync(join(tmpdir(), "signal-smoke-shim-"));
+  const marker = join(shimDir, "spawned");
+  try {
+    writeFileSync(join(shimDir, "bun"), `#!/bin/sh\ntouch "${marker}"\nexit 0\n`);
+    chmodSync(join(shimDir, "bun"), 0o755);
+    const { DATABASE_URL: _db, SMOKE_DATABASE_URL: _smoke, ...env } = process.env;
+    const proc = Bun.spawnSync([process.execPath, "--no-env-file", "scripts/signal-smoke.ts"], {
+      cwd: new URL("../..", import.meta.url).pathname,
+      env: { ...env, PATH: `${shimDir}:${env.PATH ?? ""}` },
+      stderr: "pipe",
+      timeout: 20_000,
+    });
+    expect(proc.exitCode).toBe(1);
+    expect(proc.stderr.toString()).toContain("DATABASE_URL is required");
+    expect(existsSync(marker)).toBe(false);
+  } finally {
+    rmSync(shimDir, { recursive: true, force: true });
+  }
 });
