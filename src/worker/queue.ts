@@ -258,8 +258,9 @@ export class Queue {
 
   /** Ready and delayed jobs; delayed members keep their dedup suffix so each push is counted. */
   async pending(): Promise<{ ready: Job[]; delayed: { job: Job; runAt: number }[] }> {
-    const ready = (await this.redis.lrange(this.ready, 0, -1)).map((raw) => JSON.parse(raw) as Job);
+    // Delayed before ready: promotion moves a job delayed -> ready, so this order sees it in one of them.
     const delayedRows = (await this.redis.zrangebyscore(this.delayed, "-inf", "+inf", "WITHSCORES")) as unknown as [string, number][];
+    const ready = (await this.redis.lrange(this.ready, 0, -1)).map((raw) => JSON.parse(raw) as Job);
     const delayed = delayedRows.map(([member, score]) => ({ job: JSON.parse(member.slice(0, member.lastIndexOf("|"))) as Job, runAt: Number(score) }));
     return { ready, delayed };
   }

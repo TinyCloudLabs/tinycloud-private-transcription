@@ -160,10 +160,14 @@ export async function planArtifactRetention(ctx: AppContext, store: ArtifactStor
 
   const groups = new Map<number, { keys: string[]; bytes: number; bytesByKind: Partial<Record<ArtifactKind, number>>; newest: Date }>();
   for (const { object, kind, vexaMeetingId } of owned) {
-    // A recording links to its meeting only if it was written during that meeting; otherwise its
-    // owner is unknown and it is kept (unmapped).
-    if (kind === "recordings" && !rows.filter((row) => row.links.includes(vexaMeetingId)).every((row) => recordingWithinLifetime(object.lastModified, row))) {
-      unmappedObjects++; unmappedBytes += object.size; continue;
+    // A recording links to its meeting only if it was written during that meeting's ptx lifetime;
+    // with no linked ptx row there is nothing to check it against (its id may be reused after a
+    // Vexa reset), so its owner is unknown and it is kept (unmapped).
+    if (kind === "recordings") {
+      const linked = rows.filter((row) => row.links.includes(vexaMeetingId));
+      if (!linked.length || !linked.every((row) => recordingWithinLifetime(object.lastModified, row))) {
+        unmappedObjects++; unmappedBytes += object.size; continue;
+      }
     }
     let group = groups.get(vexaMeetingId);
     if (!group) groups.set(vexaMeetingId, group = { keys: [], bytes: 0, bytesByKind: {}, newest: object.lastModified });

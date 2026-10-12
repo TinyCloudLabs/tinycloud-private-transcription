@@ -119,8 +119,9 @@ test("dry-run reports a plan with a reason per meeting and deletes nothing", asy
   expect(plan.eligibleBytes).toBe(3_200);
   expect(plan.meetings.find((m) => m.vexaMeetingId === V.botOnlyFailed)!.ptxMeetingIds).toEqual([`mtg_ret_${base}_botfailed`]);
   expect(plan.meetings.find((m) => m.vexaMeetingId === V.expired)!.bytesByKind).toEqual({ recordings: 500, "attributed-audio": 100, signal: 1_000 });
-  // The unlisted recording, and the reused meeting's recording written long after that meeting.
-  expect(plan.unmappedObjects).toBe(2);
+  // The unlisted recording, the reused meeting's recording written long after that meeting, and both
+  // orphans' recordings: with no linked ptx row there is no lifetime to check a recording against.
+  expect(plan.unmappedObjects).toBe(4);
 });
 
 test("apply deletes only expired published meetings' artifacts, including those linked only by vexa_bot_id", async () => {
@@ -134,7 +135,9 @@ test("orphan retention deletes only orphans whose newest object is past the cuto
   const { store, recordings } = fixture();
   const plan = (await runArtifactRetention(contextWith(recordings, { orphans: true }), store, "apply", now))!;
   expect(plan.meetings.find((m) => m.vexaMeetingId === V.orphanNew)!.reason).toBe("orphan_recent");
-  expect(store.deleted.sort()).toEqual([...keysOf(V.expired), ...keysOf(V.botOnlyExpired), ...keysOf(V.orphanOld)].sort());
+  // An orphan's recording is kept even then: its recording id may have been reused after a Vexa reset.
+  expect(store.deleted.sort()).toEqual([...keysOf(V.expired), ...keysOf(V.botOnlyExpired), ...keysOf(V.orphanOld).filter((k) => !k.startsWith("recordings/"))].sort());
+  expect(store.objects.has(`recordings/1/${V.orphanOld * 10}/sess/audio/000000.webm`)).toBe(true);
 });
 
 test("off does nothing, and a failed recordings lookup aborts the sweep before any delete", async () => {
@@ -171,5 +174,6 @@ test("a recording links to its meeting only if it was written during that meetin
   const plan = (await runArtifactRetention(contextWith(recordings), store, "apply", now))!;
   expect(store.deleted.sort()).toEqual([...keysOf(V.expired), inSlack, ...keysOf(V.botOnlyExpired)].sort());
   expect(store.objects.has(before) && store.objects.has(after)).toBe(true);
-  expect(plan.unmappedObjects).toBe(4);
+  // before + after, plus the unlisted, reused and two orphan recordings from the fixture.
+  expect(plan.unmappedObjects).toBe(6);
 });
