@@ -213,7 +213,7 @@ export const config = {
   /**
    * Retention for Vexa's bulky per-meeting artifacts in MinIO: recordings, attributed audio and
    * signal tapes (TC-904). Off by default. Only a meeting published (`completed`) more than `days`
-   * ago qualifies; meetings with a reference transcript, a running eval, or listed in
+   * ago qualifies; meetings with a reference transcript, a queued or running eval, or listed in
    * `keepVexaMeetingIds` are kept. Artifacts with no ptx meeting are deleted only with `orphans`.
    */
   artifactRetention: artifactRetentionConfig(),

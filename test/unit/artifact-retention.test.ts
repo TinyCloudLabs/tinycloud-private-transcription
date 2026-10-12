@@ -1,12 +1,12 @@
 import { expect, test } from "bun:test";
 import { integerListEnv, parseArtifactRetentionMode, percentEnv } from "../../src/config.ts";
 import type { AppContext } from "../../src/context.ts";
-import { artifactMeetingId, retentionDecision, type PtxMeetingState } from "../../src/services/artifact-retention.ts";
+import { artifactMeetingId, linkedVexaMeetingIds, retentionDecision, type PtxMeetingState } from "../../src/services/artifact-retention.ts";
 import { checkDisk } from "../../src/worker/housekeeping.ts";
 
 const cutoff = new Date("2026-10-01T00:00:00Z");
 const policy = { cutoff, keepVexaMeetingIds: new Set<number>(), orphans: false };
-const row = (over: Partial<PtxMeetingState> = {}): PtxMeetingState => ({ id: "mtg_1", status: "completed", completedAt: new Date("2026-09-01T00:00:00Z"), reference: false, evalRunning: false, ...over });
+const row = (over: Partial<PtxMeetingState> = {}): PtxMeetingState => ({ id: "mtg_1", status: "completed", completedAt: new Date("2026-09-01T00:00:00Z"), reference: false, evalPending: false, ...over });
 
 test("artifact keys map to their Vexa meeting; recordings go through Vexa's recording id", () => {
   const recordings = new Map([[106999103683, 35]]);
@@ -78,4 +78,12 @@ test("the worker warns while disk usage is at or above the high-water mark", asy
   warnings.length = 0;
   await checkDisk(ctx(1));
   expect(warnings).toEqual([["disk usage above high-water mark", { path: "/", used_percent: expect.any(Number), high_water_percent: 1 }]]);
+});
+
+test("a ptx meeting links to Vexa by vexa_meeting_id or by the id in vexa_bot_id", () => {
+  expect(linkedVexaMeetingIds({ vexaMeetingId: 88, vexaBotId: "mtg-88-258d8099" })).toEqual([88]);
+  expect(linkedVexaMeetingIds({ vexaMeetingId: null, vexaBotId: "mtg-27-3e19c00a" })).toEqual([27]);
+  expect(linkedVexaMeetingIds({ vexaMeetingId: 90, vexaBotId: "mtg-91-x" })).toEqual([90, 91]);
+  expect(linkedVexaMeetingIds({ vexaMeetingId: null, vexaBotId: "bot-27" })).toEqual([]);
+  expect(linkedVexaMeetingIds({ vexaMeetingId: null, vexaBotId: null })).toEqual([]);
 });

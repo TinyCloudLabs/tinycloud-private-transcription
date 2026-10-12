@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, inArray, like, or } from "drizzle-orm";
 import type { AppContext } from "../context.ts";
 import type { ArtifactRetentionMode } from "../config.ts";
 import { meetings, referenceTranscripts, transcriptEvals } from "../db/schema.ts";
@@ -27,7 +27,8 @@ export interface PtxMeetingState {
   status: string;
   completedAt: Date | null;
   reference: boolean;
-  evalRunning: boolean;
+  /** A transcript eval is queued or running and still needs the attributed audio. */
+  evalPending: boolean;
 }
 
 export interface RetentionPolicy {
@@ -46,7 +47,7 @@ export function retentionDecision(vexaMeetingId: number, rows: PtxMeetingState[]
   // A Vexa meeting maps to one ptx meeting; if it ever maps to several, every one must qualify.
   for (const row of rows) {
     if (row.reference) return { eligible: false, reason: "reference_transcript" };
-    if (row.evalRunning) return { eligible: false, reason: "eval_running" };
+    if (row.evalPending) return { eligible: false, reason: "eval_pending" };
     // failed meetings stay recoverable (POST /v1/meetings/:id/recover re-reads these artifacts).
     if (row.status !== "completed" || !row.completedAt) return { eligible: false, reason: `status_${row.status}` };
     if (row.completedAt > policy.cutoff) return { eligible: false, reason: "completed_recently" };
@@ -55,6 +56,18 @@ export function retentionDecision(vexaMeetingId: number, rows: PtxMeetingState[]
   // with a new meeting's artifacts. Those artifacts are recent; never delete them on the old row's age.
   if (newestObject > policy.cutoff) return { eligible: false, reason: "objects_recent" };
   return { eligible: true, reason: "completed_expired" };
+}
+
+/**
+ * Vexa meeting ids a ptx meeting links to: `vexa_meeting_id`, and the id inside `vexa_bot_id`
+ * (`mtg-<vexa meeting id>-<hash>`). Older rows predate `vexa_meeting_id` and carry only the bot id.
+ */
+export function linkedVexaMeetingIds(row: { vexaMeetingId: number | null; vexaBotId: string | null }): number[] {
+  const ids = new Set<number>();
+  if (row.vexaMeetingId !== null) ids.add(row.vexaMeetingId);
+  const fromBot = row.vexaBotId?.match(/^mtg-(\d+)-/);
+  if (fromBot) ids.add(Number(fromBot[1]));
+  return [...ids];
 }
 
 /** Vexa meeting id an object belongs to, or null when it cannot be determined (never deleted). */
@@ -119,18 +132,21 @@ export async function planArtifactRetention(ctx: AppContext, store: ArtifactStor
   }
 
   const vexaIds = [...groups.keys()];
-  const rows = vexaIds.length ? await ctx.db.select({ id: meetings.id, vexaMeetingId: meetings.vexaMeetingId, status: meetings.status, completedAt: meetings.completedAt })
-    .from(meetings).where(inArray(meetings.vexaMeetingId, vexaIds)) : [];
+  const vexaIdSet = new Set(vexaIds);
+  const rows = (vexaIds.length ? await ctx.db.select({ id: meetings.id, vexaMeetingId: meetings.vexaMeetingId, vexaBotId: meetings.vexaBotId, status: meetings.status, completedAt: meetings.completedAt })
+    .from(meetings).where(or(inArray(meetings.vexaMeetingId, vexaIds), like(meetings.vexaBotId, "mtg-%"))) : [])
+    .map((row) => ({ ...row, links: linkedVexaMeetingIds(row) }))
+    .filter((row) => row.links.some((id) => vexaIdSet.has(id)));
   const rowIds = rows.map((row) => row.id);
   const references = new Set(rowIds.length ? (await ctx.db.select({ meetingId: referenceTranscripts.meetingId }).from(referenceTranscripts)
     .where(inArray(referenceTranscripts.meetingId, rowIds))).map((r) => r.meetingId) : []);
-  const evalsRunning = new Set(rowIds.length ? (await ctx.db.select({ meetingId: transcriptEvals.meetingId }).from(transcriptEvals)
-    .where(and(inArray(transcriptEvals.meetingId, rowIds), eq(transcriptEvals.status, "running")))).map((r) => r.meetingId) : []);
+  const evalsPending = new Set(rowIds.length ? (await ctx.db.select({ meetingId: transcriptEvals.meetingId }).from(transcriptEvals)
+    .where(and(inArray(transcriptEvals.meetingId, rowIds), inArray(transcriptEvals.status, ["queued", "running"])))).map((r) => r.meetingId) : []);
 
   const plan: RetentionPlan = { cutoff: policy.cutoff.toISOString(), meetings: [], eligibleMeetings: 0, eligibleObjects: 0, eligibleBytes: 0, keptBytes: 0, unmappedObjects, unmappedBytes };
   for (const [vexaMeetingId, group] of [...groups].sort(([a], [b]) => a - b)) {
-    const states: PtxMeetingState[] = rows.filter((row) => row.vexaMeetingId === vexaMeetingId).map((row) => ({
-      id: row.id, status: row.status, completedAt: row.completedAt, reference: references.has(row.id), evalRunning: evalsRunning.has(row.id),
+    const states: PtxMeetingState[] = rows.filter((row) => row.links.includes(vexaMeetingId)).map((row) => ({
+      id: row.id, status: row.status, completedAt: row.completedAt, reference: references.has(row.id), evalPending: evalsPending.has(row.id),
     }));
     const { eligible, reason } = retentionDecision(vexaMeetingId, states, group.newest, policy);
     plan.meetings.push({ vexaMeetingId, ptxMeetingIds: states.map((s) => s.id), eligible, reason, objects: group.keys.length, bytes: group.bytes, bytesByKind: group.bytesByKind, keys: group.keys });
