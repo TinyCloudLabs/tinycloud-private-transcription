@@ -220,8 +220,8 @@ All 429/503 answers carry `retry_after_seconds` and `Retry-After`.
 The capability is 32 random bytes (`tcu_…`), stored as sha256, compared in constant time, valid only for
 `PUT /uploads/{its job}` with that job's declared length, type and hash, for min(60 min, the job's upload deadline);
 it grants no read. The job's upload deadline is create + 4 h, after which it fails `upload_expired`. One PUT at a
-time per job (a DB lease: `409 upload_in_progress`), one live PUT per tenant across projects, and at most
-`BATCH_MAX_CONCURRENT_UPLOADS` service-wide (`429 service_busy`). A PUT is cut off (`408 upload_interrupted`, job unchanged)
+time per job (a DB lease: `409 upload_in_progress`) and at most `BATCH_MAX_CONCURRENT_UPLOADS` service-wide
+(`429 service_busy`). A project/tenant can have one active job at a time. A PUT is cut off (`408 upload_interrupted`, job unchanged)
 when: no bytes arrive for 60 s; its average rate is below `BATCH_UPLOAD_MIN_BYTES_PER_SECOND` after 60 s; or it passes
 its hard expiry, min(start + `BATCH_UPLOAD_MAX_PUT_SECONDS`, the upload deadline). Lease heartbeats never move the hard expiry. A body that
 ends early or errors is also `408 upload_interrupted`; a wrong `Content-Length` is `400 upload_length_mismatch`; a wrong

@@ -62,9 +62,9 @@ Two parts:
 Peak memory barely grows with the recording (174 → 216 MiB from 10 min to 2 h, against the 320 MiB cap): each window is
 its own process, and the Bun side keeps only segment lists and one 192-float centroid per speaker. For comparison, the
 full-file CLI peaked at 1,340 MB RSS on 2 h (part 2). These runs' outputs are identical to the accuracy runs below (same
-DER on all three inputs). The earlier 2 h envelope run measured `upload-worker` at 199 MiB anon + shmem and
-`diarize-window` at 196 MiB RSS, with no OOM kill (its two synthetic voices take less embedding work: 750 s of
-processing). The current envelope exercises 3 h; its measured result is recorded in CI.
+DER on all three inputs). The 3 h envelope run (CI run 38235367728) measured the diarized 10,799 s job at 1,251 s of
+processing: `upload-worker` peaked at 202 MiB anon + shmem and `diarize-window` at 198 MiB RSS, with no OOM kill or
+container restart. The cgroup peak was 320 MiB including reclaimable page cache.
 
 **Why the allocator settings.** With onnxruntime's defaults (CPU memory arena and memory patterns on) and glibc's
 defaults, one 10-minute window peaked at 340–380 MB RSS: TitaNet-S runs once per (10 s chunk, local speaker) with
@@ -166,7 +166,7 @@ five speakers into three (DER 30.3). The default 0.1 stays.
   new one, overlap evidence, a strong voice match outranking overlap evidence, overlap speech emitted once, the merge
   pass and its same-window rule, the 32-speaker cap, one process per window run one at a time with abort between
   windows, abort killing a running window process, and output parsing.
-- `.github/workflows/batch-envelope.yml` runs a 2 h two-voice diarized job through the deployed compose limits (1 CPU,
+- `.github/workflows/batch-envelope.yml` runs a 3 h two-voice diarized job through the deployed compose limits (1 CPU,
   320 MiB, no swap) and fails on an OOM kill, a restart, more than 3 speakers, or a turn that is not one ≤ 30 s request.
 
 # Part 2: model choice (2026-10-03)

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ptx-batch memory envelope. CI: .github/workflows/batch-envelope.yml. Needs docker (compose v2, cgroup v2), curl, jq,
-# python3 and openssl on the host; ENVELOPE_IMAGE is the api image built from this commit.
+# python3 and openssl on the host; ENVELOPE_IMAGE is the api image built from this commit. RUNNER_TEMP must be set.
 #
 # Runs infra/dstack-batch/app-compose.yaml as deployed (memory limits, no swap, Postgres settings) with that image,
 # pinned to one CPU like tdx.small, and Tinfoil replaced by test/envelope/mock-tinfoil.ts (test/envelope/compose.ci.yaml).

@@ -3,7 +3,6 @@ import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { eq, sql } from "drizzle-orm";
 import { createApp } from "../../src/api/app.ts";
-import { createApiKey } from "../../src/api/auth.ts";
 import { createContext } from "../../src/context.ts";
 import { createDb } from "../../src/db/client.ts";
 import { transcriptionCapabilities, transcriptions, transcriptionWorkers } from "../../src/db/schema.ts";
@@ -441,22 +440,6 @@ describe("upload capability", () => {
     expect({ status: late.status, code: (await errorOf(late)).code }).toEqual({ status: 401, code: "upload_capability_invalid" });
   });
 
-  test("a tenant can hold only one live PUT across projects", async () => {
-    const bytes = await audio("stereo");
-    const tenantRef = TENANT_A;
-    const otherKey = (await createApiKey(h.ctx as never, "another-project", ["transcriptions:*"])).key;
-    const first = await h.create(bytes, { tenant: tenantRef });
-    const second = await h.create(bytes, { tenant: tenantRef, key: otherKey });
-    const a = await first.json();
-    const b = await second.json();
-    expect([first.status, second.status]).toEqual([201, 201]);
-
-    const activePut = h.put(a.id, a.upload.capability, trickle(bytes, 4, 30), { contentLength: bytes.byteLength });
-    await Bun.sleep(15);
-    const refused = await h.put(b.id, b.upload.capability, bytes);
-    expect({ status: refused.status, code: (await errorOf(refused)).code }).toEqual({ status: 429, code: "service_busy" });
-    expect((await activePut).status).toBe(201);
-  });
 });
 
 describe("upload CORS", () => {

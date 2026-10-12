@@ -40,8 +40,6 @@ export interface BatchConfig {
     maxReservedBytes: number;
     /** Service-wide PUTs holding a live upload lease. */
     maxConcurrentUploads: number;
-    /** Live PUTs per tenant, across projects. */
-    maxConcurrentUploadsPerTenant: number;
     /** Creates and PUTs are refused while the upload volume is at or above this used percentage. */
     diskHighWaterPercent: number;
     /** Per tenant per UTC day, charged at create. */
@@ -116,7 +114,6 @@ export function batchConfigFromEnv(): BatchConfig {
       maxActiveJobs: positiveIntegerEnv("BATCH_MAX_ACTIVE_JOBS", "10"),
       maxReservedBytes: positiveIntegerEnv("BATCH_MAX_RESERVED_BYTES", String(10 * MAX_UPLOAD_BYTES)),
       maxConcurrentUploads: positiveIntegerEnv("BATCH_MAX_CONCURRENT_UPLOADS", "3"),
-      maxConcurrentUploadsPerTenant: 1,
       diskHighWaterPercent: percent,
       tenantDailyBytes: positiveIntegerEnv("BATCH_TENANT_DAILY_BYTES", String(3 * MAX_UPLOAD_BYTES)),
     },

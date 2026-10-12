@@ -62,8 +62,9 @@ gh workflow run deploy-batch.yml -R $R --ref main -f confirm=ptx-batch
   admission `closed` (migration 0018) and must report `closed` to the admin key before `{"mode":"open"}`. A failed
   create leaves admission closed. Record the CVM id it prints:
   `gh variable set PTX_BATCH_CVM_ID --env ptx-batch -R $R --body <id>`.
-- **Compatibility:** deploy tinychat's `MAX_RECORDING_BYTES = 181,440,000` change before pinning this PTX image;
-  otherwise tinychat rejects the advertised capabilities response.
+- **Compatibility:** merge and deploy tinychat [#311](https://github.com/TinyCloudLabs/tinychat/pull/311), which removes
+  the backend ceiling on `max_bytes`, before pinning and deploying this PTX image. The order is tinychat backend first,
+  then PTX image; otherwise the tinychat backend rejects the larger capabilities response.
 - **Update**: `PUT /v1/admin/admission {"mode":"drain"}` → wait until `awaiting_upload + queued + processing = 0` →
   `phala deploy --cvm-id … --wait` → allowed_envs sync → health gate (`/health/live`, then
   `checks.upload_transcription.ready`) → admission gate (reports `drain`) → `{"mode":"open"}`. A drain response
@@ -106,17 +107,24 @@ The decode path never holds a recording in memory: ffmpeg writes 16 kHz s16le PC
 it in 60 s slices (a 3 h channel is 108,000 frame energies, 864 KB), and each dispatch reads one region of at most
 30 s (~0.96 MB WAV). [`batch-envelope.yml`](../../.github/workflows/batch-envelope.yml) proves the envelope on every
 change to the batch runtime: it runs this compose (limits unchanged) on one CPU with Tinfoil mocked, uploads a
-synthetic 3-hour stereo 128 kbps MP3 three times at once, and fails on any OOM kill or restart. The duration-less
-WebM packet scan is bounded to 45 seconds; a 3-hour file without container duration must be measurable within that
-scan budget. The PCM disk figures below are the calculated three-hour bound.
-Run on PR #69 (GitHub runner, 1 CPU, 3 × 115 MB PUTs at localhost speed, 708 regions; 30 parallel clients polled the job
-for 15 s while it decoded, 4,305 GETs, all 200):
+synthetic 3-hour stereo 128 kbps MP3 three times at once, and fails on any OOM kill or restart. In run 38235367728,
+the 10,799 s, 172,785,206 B stereo file uploaded in 4 s; the worker completed 1,062 regions in 67 s and deleted the
+audio. During a 15 s burst, 30 clients made 5,571 successful polls. The 10,799 s diarized mono job (86,393,133 B)
+completed 916 turns in 1,251 s and deleted its audio. The duration-less WebM scan for a 3-hour file has **not been
+measured**; its packet scan is bounded to 45 s, so a long WebM whose duration cannot be determined in that time will be
+rejected as `invalid_audio`. Exo mobile notes use AAC; this unmeasured case concerns long Web/desktop MediaRecorder
+uploads. The PCM disk figures below are the calculated three-hour bound.
 
-| container | limit | pid 1 peak RSS (VmHWM) | peak anon + shmem (during the burst) | other peaks | OOM kills / restarts |
-|---|---|---|---|---|---|
-| api | 320 MiB | 104 MiB (bun) | 57 MiB (50 MiB) | ffprobe 25 MiB | 0 / 0 |
-| upload-worker | 320 MiB | 86 MiB (bun) | 47 MiB (32 MiB) | ffmpeg 46 MiB | 0 / 0 |
-| postgres | 192 MiB | 20 MiB | 71 MiB (61 MiB) | | 0 / 0 |
+Measured memory in run 38235367728 (GitHub runner, 1 CPU; cgroup peak includes reclaimable page cache):
+
+| container | limit | pid 1 peak RSS | peak anon + shmem | cgroup peak incl. page cache | OOM kills / restarts |
+|---|---:|---:|---:|---:|---:|
+| api | 320 MiB | 113 MiB | 59 MiB | 320 MiB | 0 / 0 |
+| upload-worker | 320 MiB | 101 MiB | **202 MiB** | 320 MiB | 0 / 0 |
+| postgres | 192 MiB | 19 MiB | 82 MiB | 166 MiB | 0 / 0 |
+
+The upload-worker's 202 MiB anon + shmem peak occurred during diarization; the `diarize-window` process peaked at 198 MiB RSS.
+Its 320 MiB cgroup peak includes page cache, which the kernel reclaims; the envelope observed no OOM kill or restart.
 
 **Disk (20 GB).** The data disk holds Docker images, Postgres and the upload volume; a live tdx.small shows an
 18.87 GiB filesystem. Worst case for a 3 h recording (16 kHz s16le = 32,000 B/s per channel):

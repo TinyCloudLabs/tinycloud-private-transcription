@@ -126,7 +126,6 @@ bun run cli create-key --project tinychat --scopes 'transcriptions:*'
 | `BATCH_MAX_ACTIVE_JOBS` | `10` | service-wide awaiting_upload + queued + processing |
 | `BATCH_MAX_RESERVED_BYTES` | `1814400000` | service-wide declared bytes of those jobs (10 × the 181,440,000-byte cap) |
 | `BATCH_MAX_CONCURRENT_UPLOADS` | `3` | service-wide live PUTs |
-| per-tenant live PUTs | `1` | fixed cap across projects |
 | `BATCH_DISK_HIGH_WATER_PERCENT` | `80` | creates and PUTs refused at or above this volume usage |
 | `BATCH_TENANT_DAILY_BYTES` | `544320000` | per tenant per UTC day (3 × cap) |
 | `BATCH_UPLOAD_MAX_PUT_SECONDS` | `11700` | absolute cap on one PUT (3 h 15 min; also clamped to the 4 h upload deadline) |

@@ -136,17 +136,6 @@ async function acquireUploadLease(ctx: BatchContext, job: TranscriptionRow): Pro
   const staleBefore = new Date(now - ctx.config.upload.leaseStaleSeconds * 1000);
   return ctx.db.transaction(async (tx) => {
     await tx.select({ id: transcriptionAdmission.id }).from(transcriptionAdmission).where(eq(transcriptionAdmission.id, 1)).for("update");
-    const [tenantLive] = await tx.select({ count: sql<number>`count(*)::int` }).from(transcriptions).where(and(
-      eq(transcriptions.tenantRef, job.tenantRef),
-      eq(transcriptions.status, "awaiting_upload"),
-      isNotNull(transcriptions.uploadLeaseToken),
-      gt(transcriptions.uploadLeaseHeartbeatAt, staleBefore),
-      gt(transcriptions.uploadLeaseHardExpiresAt, new Date(now)),
-      sql`${transcriptions.id} <> ${job.id}`,
-    ));
-    if (Number(tenantLive!.count) >= ctx.config.limits.maxConcurrentUploadsPerTenant) {
-      throw new BatchError("service_busy", "This tenant already has an upload in progress", { retry_after_seconds: 30 });
-    }
     const [live] = await tx.select({ count: sql<number>`count(*)::int` }).from(transcriptions).where(and(
       eq(transcriptions.status, "awaiting_upload"),
       isNotNull(transcriptions.uploadLeaseToken),
