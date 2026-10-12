@@ -4,5 +4,6 @@ export default defineConfig({
   dialect: "postgresql",
   schema: "./src/db/schema.ts",
   out: "./src/db/migrations",
-  dbCredentials: { url: process.env.DATABASE_URL ?? "postgres://ptx:ptx@localhost:55432/ptx" },
+  // No default URL (TC-929). `db:generate` needs none; commands that connect need DATABASE_URL set.
+  ...(process.env.DATABASE_URL ? { dbCredentials: { url: process.env.DATABASE_URL } } : {}),
 });

@@ -91,7 +91,7 @@ export function batchConfigFromEnv(): BatchConfig {
   if (percent >= 100) throw new Error("BATCH_DISK_HIGH_WATER_PERCENT must be below 100");
   return {
     port: positiveIntegerEnv("PORT", "8080"),
-    databaseUrl: str("DATABASE_URL", "postgres://ptx:ptx@localhost:55432/ptx"),
+    databaseUrl: str("DATABASE_URL", ""),
     uploadDir: str("BATCH_UPLOAD_DIR", "/var/lib/ptx-batch/uploads"),
     ffmpegPath: str("FFMPEG_PATH", "ffmpeg"),
     ffprobePath: str("FFPROBE_PATH", "ffprobe"),

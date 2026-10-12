@@ -18,7 +18,7 @@
  * end to end — the evidence records which of the two ran, and a replay run is never evidence of
  * live Signal capture.
  *
- * Env: DATABASE_URL, REDIS_URL (docker-compose.dev.yml defaults), SIGNAL_CALL_URL (required for
+ * Env: DATABASE_URL (required; .env.example), REDIS_URL (docker-compose.dev.yml default), SIGNAL_CALL_URL (required for
  *      a live desktop backend; never logged or written to evidence), SIGNAL_REPLAY_SCRIPT,
  *      SIGNAL_EXPECTED_PHRASE (required for live capture; checked in-memory only),
  *      SMOKE_CAPTURE_SECONDS (30), SMOKE_TIMEOUT_S (120). On a dev rig shared with `bun test` (which truncates tables and

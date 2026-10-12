@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { positiveIntegerEnv } from "../../src/config.ts";
+import { positiveIntegerEnv, requireDatabaseUrl } from "../../src/config.ts";
 
 test("VEXA_MAX_TIME_LEFT_ALONE_MS accepts only positive integers", () => {
   const previous = process.env.VEXA_MAX_TIME_LEFT_ALONE_MS;
@@ -51,4 +51,21 @@ test("config load rejects an invalid VEXA_MAX_CONCURRENT_BOTS (TC-902)", () => {
     { cwd: new URL("../..", import.meta.url).pathname, env: { ...process.env, VEXA_MAX_CONCURRENT_BOTS: "2" }, stdout: "pipe" },
   );
   expect(ok.stdout.toString().trim()).toBe("2");
+});
+
+test("DATABASE_URL has no committed default and fails clearly when missing (TC-929)", () => {
+  for (const value of [undefined, ""]) expect(() => requireDatabaseUrl(value)).toThrow("DATABASE_URL is required");
+  // An unexpanded ${POSTGRES_PASSWORD} in .env leaves an empty password.
+  expect(() => requireDatabaseUrl("postgres://ptx:@localhost:55432/ptx")).toThrow("DATABASE_URL has an empty password");
+  expect(requireDatabaseUrl("postgres://ptx:s3cret@localhost:55432/ptx")).toBe("postgres://ptx:s3cret@localhost:55432/ptx");
+  expect(requireDatabaseUrl("postgres://ptx@localhost:55432/ptx")).toBe("postgres://ptx@localhost:55432/ptx");
+
+  // The API refuses to start without it; a process that never opens Postgres still loads config.
+  const cwd = new URL("../..", import.meta.url).pathname;
+  const { DATABASE_URL: _omit, ...env } = process.env;
+  const api = Bun.spawnSync([process.execPath, "--no-env-file", "src/api/server.ts"], { cwd, env, stderr: "pipe" });
+  expect(api.exitCode).toBe(1);
+  expect(api.stderr.toString()).toContain("DATABASE_URL is required");
+  const load = Bun.spawnSync([process.execPath, "--no-env-file", "-e", 'await import("./src/config.ts")'], { cwd, env, stderr: "pipe" });
+  expect(load.exitCode).toBe(0);
 });
