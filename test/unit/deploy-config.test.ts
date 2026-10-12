@@ -56,7 +56,7 @@ describe("infra/dstack/app-compose.yaml", () => {
     );
     expect(rendered.exitCode).toBe(0);
     const services = Object.values(JSON.parse(rendered.stdout.toString()).services) as Array<Record<string, unknown>>;
-    expect(services.length).toBe(18);
+    expect(services.length).toBe(19);
     for (const service of services) {
       expect(service.build).toBeUndefined();
       expect(service.image).toBeString();
@@ -96,6 +96,7 @@ describe("infra/dstack/app-compose.yaml", () => {
       "minio-init": "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727",
       "admin-api": "vexaai/v012-admin-api:v012@sha256:4c702354384eafe3a933cd537a106b7c15067cfd368a5f6da1a6e675e7e03e04",
       "bot-image-keeper": "ghcr.io/tinycloudlabs/vexa/bot:tc-e5b5307@sha256:32404172d0c843d29ec2617df52d8ca9cb09d510f6423e6aa355aac859196253",
+      "bot-janitor": "docker:27.5.1-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c",
       runtime: "vexaai/v012-runtime:v012@sha256:a1f6448fbb380b9433364e8b572ec25a12aa4f274bf403f1d83a89cbf5812f2d",
       whisper: "fedirz/faster-whisper-server:latest-cpu@sha256:760e5e43d427dc6cfbbc4731934b908b7de9c7e6d5309c6a1f0c8c923a5b6030",
       "meeting-api": "ghcr.io/tinycloudlabs/vexa/meeting-api:tc-c8d7f33@sha256:944c2c36d1ba8617d1c49eae5453750a14db2587ba53f40533f8bcfdcfa37566",
@@ -226,6 +227,28 @@ describe("infra/dstack/app-compose.yaml", () => {
     const api = compose.slice(apiStart, compose.indexOf("\n  worker:\n", apiStart));
     expect(api).toContain("/health/live");
     expect(api).not.toContain("127.0.0.1:8080/health').then");
+  });
+
+  test("artifact retention and the bot janitor ship in dry-run (TC-904)", () => {
+    const worker = serviceEnv("worker");
+    expect(worker).toContain("ARTIFACT_RETENTION_MODE: ${ARTIFACT_RETENTION_MODE:-dry-run}");
+    expect(worker).toContain("ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS: ${ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS:-88}");
+    expect(worker).toContain("VEXA_MINIO_ENDPOINT: http://minio:9000");
+    // Least privilege: a provisioned list+delete-only user, never the MinIO root credentials.
+    expect(worker).toContain("VEXA_MINIO_ACCESS_KEY: ptx-retention");
+    expect(worker).toContain("VEXA_MINIO_SECRET_KEY_FILE: /run/minio-retention/secret-key");
+    expect(worker).not.toContain("MINIO_ROOT");
+    const init = compose.slice(compose.indexOf("\n  minio-init:\n"), compose.indexOf("\n  admin-api:\n"));
+    const policy = JSON.parse(init.match(/printf '%s' '(\{.*\})'/)![1]!);
+    expect(policy.Statement).toEqual([
+      { Effect: "Allow", Action: ["s3:ListBucket"], Resource: ["arn:aws:s3:::vexa"] },
+      { Effect: "Allow", Action: ["s3:DeleteObject"], Resource: ["arn:aws:s3:::vexa/recordings/*", "arn:aws:s3:::vexa/attributed-audio/*", "arn:aws:s3:::vexa/signal/*"] },
+    ]);
+    expect(init).toContain("- minio-retention:/run/minio-retention");
+    const janitor = serviceEnv("bot-janitor");
+    expect(janitor).toContain("BOT_JANITOR_MODE: ${BOT_JANITOR_MODE:-dry-run}");
+    // Must name the same pinned bot image as the runtime, or it could treat the live pin as superseded.
+    expect(janitor).toContain(`BOT_IMAGE: ${serviceEnv("runtime").match(/BROWSER_IMAGE: (\S+)/)![1]}`);
   });
 
   test("the worker gives every Vexa meeting the TinyCloud empty-room window", () => {

@@ -145,7 +145,17 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
   });
 
   const recordingsOf = (m: MockMeeting) => m.recording ? [{ id: m.id * 1000, meeting_id: m.id, media_files: [{ id: m.id * 1000 + 1, type: "audio" }] }] : [];
-  app.get("/recordings", (c) => c.json({ recordings: [...meetings.values()].flatMap(recordingsOf) }));
+  // Paged like Vexa (default 50, max 200, newest first) with its meeting_id filter.
+  app.get("/recordings", (c) => {
+    const limit = Math.min(Number(c.req.query("limit") ?? 50), 200);
+    const offset = Number(c.req.query("offset") ?? 0);
+    const meetingId = c.req.query("meeting_id");
+    const all = [...meetings.values()].flatMap(recordingsOf)
+      .filter((r) => meetingId === undefined || r.meeting_id === Number(meetingId))
+      .sort((a, b) => b.id - a.id);
+    const page = all.slice(offset, offset + limit);
+    return c.json({ recordings: page, total: all.length, limit, offset, has_more: offset + page.length < all.length });
+  });
   app.get("/recordings/:id/master", (c) => {
     const m = [...meetings.values()].find((meeting) => meeting.id * 1000 === Number(c.req.param("id")));
     return m?.recording ? c.json({ raw_url: `/recordings/${m.id * 1000}/raw` }) : c.json({ detail: "Recording not found" }, 404);

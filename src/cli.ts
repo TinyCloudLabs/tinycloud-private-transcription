@@ -16,6 +16,9 @@ const USAGE = `usage: bun run cli <create-key --project <name> [--scopes <scope>
   gapfill-check --meeting <id|vexa id> [--windows N] [--all]   align the retained recording and cut a few voiced
                                                       windows exactly as gap fill would; prints planned vs measured
                                                       energy. Sends nothing to Tinfoil, writes no ledger rows (TC-758)
+  artifact-retention [--orphans]                      dry run of Vexa artifact retention with the ARTIFACT_RETENTION_* settings:
+                                                      per Vexa meeting, its MinIO bytes and whether a sweep would delete them.
+                                                      Never deletes (TC-904). --orphans previews ARTIFACT_RETENTION_ORPHANS=true
   scopes: ${API_KEY_SCOPES.join(", ")} (default ${DEFAULT_KEY_SCOPES.join(",")}; quote them in the shell, e.g. --scopes 'transcriptions:*')`;
 const fail = (message: string): never => {
   console.error(message);
@@ -92,6 +95,19 @@ switch (cmd) {
     console.log(`alignment: ${a.accepted ? "ACCEPTED" : "REJECTED"} — best ${a.best ? `${a.best.offset_ms} ms r=${a.best.r} z=${a.best.z}` : "none"}; runner-up (>1.5 s away) ${a.runner_up ? `${a.runner_up.offset_ms} ms r=${a.runner_up.r}` : "none"}; prior ${a.prior_ms ?? "none"} ms; ${a.offsets} offsets, r mean ${a.mean_r} sd ${a.sd_r}; speech frames ${a.speech_frames}, recording frames ${a.recording_frames}, voiced share ${a.voiced_share}`);
     if (checked.length) console.table(checked);
     else console.log(report.alignment ? "no voiced windows to cut" : "recording did not align: gap fill would send nothing and list every span as a gap");
+    process.exit(0);
+  }
+  case "artifact-retention": {
+    const { artifactStoreFromConfig, planArtifactRetention } = await import("./services/artifact-retention.ts");
+    const ctx = createContext();
+    if (rest.includes("--orphans")) ctx.config.artifactRetention.orphans = true;
+    const store = artifactStoreFromConfig(ctx.config.artifactRetention.s3)
+      ?? fail("VEXA_MINIO_ENDPOINT, VEXA_MINIO_ACCESS_KEY and VEXA_MINIO_SECRET_KEY (or a readable VEXA_MINIO_SECRET_KEY_FILE) are required");
+    const plan = await planArtifactRetention(ctx, store, new Date());
+    const mb = (bytes: number) => Math.round(bytes / 1e5) / 10;
+    console.table(plan.meetings.map((m) => ({ vexa_meeting: m.vexaMeetingId, ptx_meeting: m.ptxMeetingIds.join(",") || "-", delete: m.eligible, reason: m.reason, objects: m.objects,
+      mb: mb(m.bytes), recordings_mb: mb(m.bytesByKind.recordings ?? 0), attributed_mb: mb(m.bytesByKind["attributed-audio"] ?? 0), signal_mb: mb(m.bytesByKind.signal ?? 0) })));
+    console.log(`mode ${ctx.config.artifactRetention.mode}; cutoff ${plan.cutoff}; would delete ${plan.eligibleObjects} objects, ${mb(plan.eligibleBytes)} MB from ${plan.eligibleMeetings} meetings; keeps ${mb(plan.keptBytes)} MB; ${plan.unmappedObjects} unmapped objects (${mb(plan.unmappedBytes)} MB) are always kept`);
     process.exit(0);
   }
   default:

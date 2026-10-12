@@ -1,3 +1,5 @@
+import { logger } from "./log.ts";
+
 const env = (name: string, fallback?: string): string => {
   const v = process.env[name] ?? fallback;
   if (v === undefined) throw new Error(`Missing required env var ${name}`);
@@ -16,6 +18,68 @@ export const backoffEnv = (name: string, fallback: string): number[] => {
   if (!values.length || values.length > 15 || values.some((value) => !Number.isSafeInteger(value) || value <= 0)) throw new Error(`${name} must be 1-15 comma-separated positive integers`);
   return values;
 };
+
+/** Comma-separated positive integers; empty is an empty list. */
+export const integerListEnv = (name: string, fallback: string): number[] => {
+  const values = env(name, fallback).split(",").map((value) => value.trim()).filter(Boolean).map(Number);
+  if (values.some((value) => !Number.isSafeInteger(value) || value <= 0)) throw new Error(`${name} must be comma-separated positive integers`);
+  return values;
+};
+
+export const percentEnv = (name: string, fallback: string): number => {
+  const value = positiveIntegerEnv(name, fallback);
+  if (value > 100) throw new Error(`${name} must be a percentage from 1 to 100`);
+  return value;
+};
+
+/** `off` does nothing, `dry-run` logs what would be deleted, `apply` deletes (TC-904). */
+export type ArtifactRetentionMode = "off" | "dry-run" | "apply";
+export function parseArtifactRetentionMode(value: string): ArtifactRetentionMode {
+  if (value !== "off" && value !== "dry-run" && value !== "apply") throw new Error(`ARTIFACT_RETENTION_MODE must be "off", "dry-run" or "apply", got ${JSON.stringify(value)}`);
+  return value;
+}
+
+/** An invalid ops setting logs a warning and yields `fallback`: a typo must never stop api/worker boot (TC-904). */
+export function lenientSetting<T>(name: string, fallback: T, parse: () => T, invalid?: string[]): T {
+  try {
+    return parse();
+  } catch (error) {
+    logger.warn("invalid setting ignored; using the default", { setting: name, default: fallback, error: (error as Error).message });
+    invalid?.push(name);
+    return fallback;
+  }
+}
+
+/** Retention settings. Any invalid one also forces dry-run: a misread setting must never delete. */
+export function artifactRetentionConfig() {
+  const invalid: string[] = [];
+  const mode = lenientSetting<ArtifactRetentionMode>("ARTIFACT_RETENTION_MODE", "dry-run", () => parseArtifactRetentionMode(env("ARTIFACT_RETENTION_MODE", "off")), invalid);
+  const days = lenientSetting("ARTIFACT_RETENTION_DAYS", 14, () => positiveIntegerEnv("ARTIFACT_RETENTION_DAYS", "14"), invalid);
+  const intervalMs = lenientSetting("ARTIFACT_RETENTION_INTERVAL_MS", 21_600_000, () => positiveIntegerEnv("ARTIFACT_RETENTION_INTERVAL_MS", "21600000"), invalid);
+  const orphans = lenientSetting("ARTIFACT_RETENTION_ORPHANS", false, () => {
+    const value = env("ARTIFACT_RETENTION_ORPHANS", "false");
+    if (value !== "true" && value !== "false") throw new Error(`ARTIFACT_RETENTION_ORPHANS must be "true" or "false", got ${JSON.stringify(value)}`);
+    return value === "true";
+  }, invalid);
+  const keepVexaMeetingIds = lenientSetting("ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS", [] as number[], () => integerListEnv("ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS", ""), invalid);
+  if (invalid.length && mode === "apply") logger.warn("artifact retention forced to dry-run: a setting is invalid", { invalid });
+  return {
+    mode: invalid.length && mode === "apply" ? "dry-run" as const : mode,
+    days,
+    intervalMs,
+    orphans,
+    keepVexaMeetingIds,
+    /** Vexa's MinIO. Retention lists and deletes objects directly: Vexa has no delete API for them. */
+    s3: {
+      endpoint: env("VEXA_MINIO_ENDPOINT", ""),
+      accessKeyId: env("VEXA_MINIO_ACCESS_KEY", ""),
+      secretAccessKey: env("VEXA_MINIO_SECRET_KEY", ""),
+      /** File holding the secret key (the CVM self-provisions a least-privilege MinIO user; read per sweep). */
+      secretAccessKeyFile: env("VEXA_MINIO_SECRET_KEY_FILE", ""),
+      bucket: env("VEXA_MINIO_BUCKET", "vexa"),
+    },
+  };
+}
 
 export type TranscriptionProviderName = "vexa" | "tinfoil";
 
@@ -137,6 +201,22 @@ export const config = {
      */
     admissionMs: positiveIntegerEnv("RECORDING_RECOVERY_ADMISSION_MS", "600000"),
   },
+  /**
+   * Disk-usage signal (TC-904). On the meeting CVM, `/` inside a container reports the one
+   * persistent volume that holds Docker images, MinIO and Postgres. Shown in /health; the worker
+   * logs a warning while usage is at or above the high-water mark.
+   */
+  disk: {
+    path: env("DISK_CHECK_PATH", "/"),
+    highWaterPercent: lenientSetting("DISK_HIGH_WATER_PERCENT", 80, () => percentEnv("DISK_HIGH_WATER_PERCENT", "80")),
+  },
+  /**
+   * Retention for Vexa's bulky per-meeting artifacts in MinIO: recordings, attributed audio and
+   * signal tapes (TC-904). Off by default. Only a meeting published (`completed`) more than `days`
+   * ago qualifies; meetings with a reference transcript, a queued or running eval, or listed in
+   * `keepVexaMeetingIds` are kept. Artifacts with no ptx meeting are deleted only with `orphans`.
+   */
+  artifactRetention: artifactRetentionConfig(),
   logLevel: env("LOG_LEVEL", "info"),
   /**
    * Sealed JSON array of `{id, project, scopes, sha256}` (hashes only) that the API makes the exact set of

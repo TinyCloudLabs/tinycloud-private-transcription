@@ -5,12 +5,16 @@ import type {
   VexaMeetingResponse,
   VexaTranscriptionResponse,
   VexaBotStatusResponse,
+  VexaRecording,
   VexaRecordingsResponse,
   VexaRecordingMasterResponse,
   VexaStopBotResponse,
   VexaDeleteMeetingResponse,
   VexaAttributedAudioManifest,
 } from "./types.ts";
+
+/** Vexa's maximum /recordings page size. */
+const RECORDINGS_PAGE_LIMIT = 200;
 
 export interface VexaClientOptions {
   baseUrl: string;
@@ -120,7 +124,22 @@ export class VexaClient {
     return this.request<VexaBotStatusResponse>("GET", "/bots/status");
   }
 
-  listRecordings() { return this.request<VexaRecordingsResponse>("GET", "/recordings"); }
+  /**
+   * Every recording, or only `meetingId`'s (Vexa's server-side filter). GET /recordings is paged
+   * (default 50, max 200, newest first) and says `has_more`; reading one page silently dropped older
+   * recordings. A Vexa without paging ignores the parameters and returns everything with no `has_more`.
+   */
+  async listRecordings(opts: { meetingId?: number } = {}): Promise<VexaRecordingsResponse> {
+    const recordings: VexaRecording[] = [];
+    for (let offset = 0; ;) {
+      const query = new URLSearchParams({ limit: String(RECORDINGS_PAGE_LIMIT), offset: String(offset) });
+      if (opts.meetingId !== undefined) query.set("meeting_id", String(opts.meetingId));
+      const page = await this.request<VexaRecordingsResponse & { has_more?: boolean }>("GET", `/recordings?${query}`);
+      recordings.push(...page.recordings);
+      if (page.has_more !== true || !page.recordings.length) return { recordings };
+      offset += page.recordings.length;
+    }
+  }
   recordingMaster(recordingId: number) { return this.request<VexaRecordingMasterResponse>("GET", `/recordings/${recordingId}/master?type=audio`); }
   async fetchBytes(path: string): Promise<{ bytes: Uint8Array; contentType: string }> {
     const res = await this.raw("GET", path, undefined, 60_000);

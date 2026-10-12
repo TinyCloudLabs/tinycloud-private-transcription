@@ -4,6 +4,7 @@ import { Hono } from "hono";
 import type { AppContext } from "../../context.ts";
 import { TinfoilTranscriptionProvider } from "../../providers/transcription/tinfoil.ts";
 import { attributedWorkerReady } from "../../services/attributed-transcription.ts";
+import { diskUsedPercent } from "../../uploads/storage.ts";
 
 export function healthRoutes(ctx: AppContext) {
   const r = new Hono();
@@ -18,10 +19,11 @@ export function healthRoutes(ctx: AppContext) {
     return c.json({ status: postgres && redis ? "ok" : "error", checks: { postgres, redis } }, postgres && redis ? 200 : 503);
   });
   r.get("/health", async (c) => {
-    const [postgres, redis, vexa] = await Promise.all([
+    const [postgres, redis, vexa, diskUsed] = await Promise.all([
       ctx.db.execute(sql`select 1`).then(() => true, () => false),
       ctx.redis.ping().then(() => true, () => false),
       ctx.vexa.botStatus().then((s) => ({ ok: true, running_bots: s.running_bots.length }), () => ({ ok: false, running_bots: null })),
+      diskUsedPercent(ctx.config.disk.path).catch(() => null),
     ]);
     const signal = signalReadiness(
       ctx.config.signal.healthPaths,
@@ -49,6 +51,8 @@ export function healthRoutes(ctx: AppContext) {
           transcription_provider: ctx.transcription.name,
           attributed_transcription: attributed,
           signal,
+          // Informational (TC-904): a full disk is an operator alarm, not a reason to fail readiness.
+          disk: { used_percent: diskUsed, high_water_percent: ctx.config.disk.highWaterPercent, ok: diskUsed !== null && diskUsed < ctx.config.disk.highWaterPercent },
         },
       },
       // Status-only deployment checks must fail closed when the enabled attributed path cannot

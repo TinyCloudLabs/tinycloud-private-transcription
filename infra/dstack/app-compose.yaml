@@ -106,6 +106,19 @@ services:
       # (6 tries). Shortening the schedule settles over-limit rows exhausted; it never strands them.
       TINFOIL_ATTRIBUTED_FALLBACK_MODEL: ${TINFOIL_ATTRIBUTED_FALLBACK_MODEL:-voxtral-small-24b}
       ATTRIBUTED_RETRY_BACKOFF_MS: ${ATTRIBUTED_RETRY_BACKOFF_MS:-30000,60000,120000,240000,480000}
+      # TC-904: retention for Vexa's MinIO artifacts (recordings, attributed audio, signal tapes) of
+      # meetings published more than ARTIFACT_RETENTION_DAYS ago. Reference-transcript meetings, running
+      # evals, failed (recoverable) meetings and the keep list are never touched. dry-run only logs the
+      # plan ("artifact retention plan"); apply deletes. Orphans = artifacts with no ptx meeting.
+      ARTIFACT_RETENTION_MODE: ${ARTIFACT_RETENTION_MODE:-dry-run}
+      ARTIFACT_RETENTION_DAYS: ${ARTIFACT_RETENTION_DAYS:-14}
+      ARTIFACT_RETENTION_ORPHANS: ${ARTIFACT_RETENTION_ORPHANS:-false}
+      ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS: ${ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS:-88}
+      VEXA_MINIO_ENDPOINT: http://minio:9000
+      # Least-privilege user provisioned by minio-init (list + delete artifact prefixes only).
+      VEXA_MINIO_ACCESS_KEY: ptx-retention
+      VEXA_MINIO_SECRET_KEY_FILE: /run/minio-retention/secret-key
+      VEXA_MINIO_BUCKET: vexa
       # Internal eval (TC-745): after publication, re-transcribe internal team meetings with these
       # models and keep the results in the ptx DB for comparison (`bun run cli eval report`).
       EVAL_MODELS: ${EVAL_MODELS:-voxtral-small-24b}
@@ -120,6 +133,7 @@ services:
       - vexa-provision:/run/vexa:ro
       - signal-runtime:/run/signal-capability:ro
       - signal-control-1:/run/signal-control-1:ro
+      - minio-retention:/run/minio-retention:ro
     depends_on:
       api:
         condition: service_healthy
@@ -294,6 +308,19 @@ services:
       - |
         until mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"; do sleep 1; done
         mc mb -p local/vexa || true
+        # TC-904: least-privilege MinIO user for ptx artifact retention: list the vexa bucket and
+        # delete under its three artifact prefixes; no read or write. The secret is generated once
+        # into the minio-retention volume (never printed) and reapplied every boot. A failure here
+        # only leaves retention without credentials; it never fails this init or Vexa.
+        K=/run/minio-retention/secret-key
+        { [ -s "$$K" ] || { head -c 20 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$$K.tmp" && chmod 0400 "$$K.tmp" && mv "$$K.tmp" "$$K"; }; } &&
+          printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:ListBucket"],"Resource":["arn:aws:s3:::vexa"]},{"Effect":"Allow","Action":["s3:DeleteObject"],"Resource":["arn:aws:s3:::vexa/recordings/*","arn:aws:s3:::vexa/attributed-audio/*","arn:aws:s3:::vexa/signal/*"]}]}' > /tmp/ptx-retention.json &&
+          mc admin policy create local ptx-retention /tmp/ptx-retention.json >/dev/null &&
+          mc admin user add local ptx-retention "$$(cat "$$K")" >/dev/null &&
+          { mc admin policy attach local ptx-retention --user ptx-retention >/dev/null 2>&1 || mc admin policy entities local --user ptx-retention | grep -q ptx-retention; } &&
+          echo "ptx-retention MinIO user ready" || echo "ptx-retention MinIO user setup failed; artifact retention has no credentials"
+    volumes:
+      - minio-retention:/run/minio-retention
     depends_on:
       minio:
         condition: service_healthy
@@ -332,6 +359,53 @@ services:
     entrypoint: ["/bin/true"]
     restart: "no"
     network_mode: none
+
+  # TC-904: Vexa's runtime never removes a finished bot container. Each keeps its local copy of the
+  # meeting's signal tapes (~250 MB, already in MinIO) and pins the bot image it ran, so superseded
+  # bot images (~4.6 GB each) survive dstack's post-deploy prune too. Every 6 h this removes bot
+  # containers (label runtime.managed=true) that finished more than BOT_CONTAINER_RETENTION_DAYS
+  # ago, then bot images OLDER than the pinned PTX_BOT_IMAGE that no container uses. The pinned image
+  # and anything newer are never touched. BOT_JANITOR_MODE=dry-run (default) only logs; apply removes.
+  bot-janitor:
+    image: docker:27.5.1-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        # Invalid settings fall back to defaults and never remove anything.
+        case "$$BOT_JANITOR_MODE" in apply|dry-run) ;; *) echo "bot-janitor: invalid BOT_JANITOR_MODE; using dry-run"; BOT_JANITOR_MODE=dry-run;; esac
+        case "$$BOT_CONTAINER_RETENTION_DAYS" in ''|*[!0-9]*|0*) echo "bot-janitor: invalid BOT_CONTAINER_RETENTION_DAYS; using 7 in dry-run"; BOT_CONTAINER_RETENTION_DAYS=7; BOT_JANITOR_MODE=dry-run;; esac
+        case "$$BOT_JANITOR_INTERVAL_SECONDS" in ''|*[!0-9]*|0*) BOT_JANITOR_INTERVAL_SECONDS=21600;; esac
+        log() { echo "bot-janitor [$$BOT_JANITOR_MODE] $$*"; }
+        act() { if [ "$$BOT_JANITOR_MODE" = apply ]; then "$$@" >/dev/null || log "failed: $$*"; fi; }
+        older() { awk -v a="$$1" -v b="$$2" 'BEGIN { exit !(a < b) }'; }
+        sweep() {
+          cutoff=$$(date -u -d "@$$(( $$(date +%s) - BOT_CONTAINER_RETENTION_DAYS * 86400 ))" +%Y-%m-%dT%H:%M:%S)
+          ids=$$(docker ps -aq --filter label=runtime.managed=true --filter status=exited --filter status=dead)
+          [ -z "$$ids" ] || docker inspect -f '{{.Id}} {{.State.FinishedAt}} {{.Name}}' $$ids |
+            while read -r id finished name; do
+              older "$$finished" "$$cutoff" || continue
+              log "remove container $$name finished $$finished"; act docker rm "$$id"
+            done
+          pin=$$(docker image inspect -f '{{.Id}} {{.Created}}' "$$BOT_IMAGE") || { log "pinned bot image missing; not pruning images"; return; }
+          docker images --no-trunc --format '{{.Repository}} {{.ID}}' | awk '$$1 == "ghcr.io/tinycloudlabs/vexa/bot" || $$1 == "vexaai/vexa-bot" { print $$2 }' | sort -u |
+            while read -r img; do
+              [ "$$img" != "$${pin% *}" ] || continue
+              created=$$(docker image inspect -f '{{.Created}}' "$$img") || continue
+              older "$$created" "$${pin#* }" || continue
+              [ -z "$$(docker ps -aq --filter ancestor=$$img)" ] || continue
+              log "remove image $$img created $$created"; act docker rmi "$$img"
+            done
+        }
+        while :; do sweep; sleep "$$BOT_JANITOR_INTERVAL_SECONDS"; done
+    environment:
+      BOT_JANITOR_MODE: ${BOT_JANITOR_MODE:-dry-run}
+      BOT_CONTAINER_RETENTION_DAYS: ${BOT_CONTAINER_RETENTION_DAYS:-7}
+      BOT_JANITOR_INTERVAL_SECONDS: "21600"
+      BOT_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-e5b5307@sha256:32404172d0c843d29ec2617df52d8ca9cb09d510f6423e6aa355aac859196253}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    network_mode: none
+    restart: unless-stopped
 
   runtime:
     image: ${VEXA_RUNTIME_IMAGE:-vexaai/v012-runtime:v012@sha256:a1f6448fbb380b9433364e8b572ec25a12aa4f274bf403f1d83a89cbf5812f2d}
@@ -500,6 +574,7 @@ volumes:
   vexa-postgres:
   vexa-redis:
   minio-data:
+  minio-retention:
   whisper-cache:
   vexa-provision:
   signal-profile:
@@ -524,4 +599,7 @@ networks:
 #   Measured on ptx-dev (TC-900, Oct 2026): a Google Meet bot holds ~1-1.2 GB; two Meet bots next to a
 #   pinned 2.45 GB Whisper and three Signal seats OOM-killed a bot. Raise VEXA_MAX_CONCURRENT_BOTS only
 #   with more RAM. The Vexa v0.12 runtime sets no memory limit on bot containers and has no setting for one.
+# - Disk (TC-904): GET /health → checks.disk; the worker logs "disk usage above high-water mark" at
+#   DISK_HIGH_WATER_PERCENT (80). `docker exec <worker> bun run src/cli.ts artifact-retention` prints the
+#   MinIO retention plan per Vexa meeting without deleting; the bot-janitor logs what it removes.
 # - Egress: bots join public meetings over the CVM's NAT; only :8080 (our API) is published.
