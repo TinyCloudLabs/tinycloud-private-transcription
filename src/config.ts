@@ -81,6 +81,18 @@ export function artifactRetentionConfig() {
   };
 }
 
+/**
+ * DATABASE_URL has no default: a committed one is a shared, public credential (TC-929). Checked where a
+ * connection is built (createDb), so processes that never touch Postgres still load this module without it.
+ */
+export function requireDatabaseUrl(value: string | undefined): string {
+  const setup = "Set it to your Postgres URL, e.g. postgres://ptx:<password>@localhost:55432/ptx for docker-compose.dev.yml, " +
+    "with the POSTGRES_PASSWORD you generated (`openssl rand -hex 24`) in an untracked .env; see .env.example";
+  if (!value) throw new Error(`DATABASE_URL is required. ${setup}`);
+  if (/^[a-z]+:\/\/[^/@:]*:@/i.test(value)) throw new Error(`DATABASE_URL has an empty password (is POSTGRES_PASSWORD set in .env?). ${setup}`);
+  return value;
+}
+
 export type TranscriptionProviderName = "vexa" | "tinfoil";
 
 /**
@@ -97,7 +109,8 @@ export function parseRole(value: string): PtxRole {
 export const config = {
   role: parseRole(env("PTX_ROLE", "meeting")),
   port: Number(env("PORT", "8080")),
-  databaseUrl: env("DATABASE_URL", "postgres://ptx:ptx@localhost:55432/ptx"),
+  /** Required by every process that opens Postgres; createDb rejects it when unset (requireDatabaseUrl). */
+  databaseUrl: env("DATABASE_URL", ""),
   redisUrl: env("REDIS_URL", "redis://localhost:56379"),
   vexa: {
     /** Real gateway of the capture rig (infra/README.md). Tests point this at the in-process mock (:18056 when run standalone). */

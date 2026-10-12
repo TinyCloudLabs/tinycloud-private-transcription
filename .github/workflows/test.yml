@@ -36,6 +36,15 @@ jobs:
       - name: Build Signal seat image
         run: docker build --file infra/signal-seat/Dockerfile --tag ptx-signal-seat:test .
 
+      - name: Generate a throwaway Postgres password
+        # No credential is committed (TC-929). Each run makes its own for the ephemeral compose Postgres,
+        # masks it, and exports POSTGRES_PASSWORD (read by docker-compose.dev.yml) and DATABASE_URL.
+        run: |
+          password=$(openssl rand -hex 24)
+          echo "::add-mask::$password"
+          echo "POSTGRES_PASSWORD=$password" >> "$GITHUB_ENV"
+          echo "DATABASE_URL=postgres://ptx:$password@localhost:55432/ptx" >> "$GITHUB_ENV"
+
       - name: Start Postgres + Redis
         run: docker compose -f docker-compose.dev.yml up -d --wait
 
@@ -54,13 +63,22 @@ jobs:
       - name: Build the api image
         run: docker build --tag ptx-api:test .
 
+      - name: Generate a throwaway Postgres password
+        # No credential is committed (TC-929). Each run makes its own for the ephemeral compose Postgres,
+        # masks it, and exports POSTGRES_PASSWORD (read by docker-compose.dev.yml) and DATABASE_URL.
+        run: |
+          password=$(openssl rand -hex 24)
+          echo "::add-mask::$password"
+          echo "POSTGRES_PASSWORD=$password" >> "$GITHUB_ENV"
+          echo "DATABASE_URL=postgres://ptx:$password@localhost:55432/ptx" >> "$GITHUB_ENV"
+
       - name: Start Postgres + Redis
         run: docker compose -f docker-compose.dev.yml up -d --wait
 
       - name: Run tests inside the api image
         run: |
           set -euo pipefail
-          in_image() { docker run --rm --network host --volume "$PWD/test:/app/test:ro" ptx-api:test "$@"; }
+          in_image() { docker run --rm --network host --env DATABASE_URL --volume "$PWD/test:/app/test:ro" ptx-api:test "$@"; }
           in_image bun --version
           in_image bun test test/integration/batch-api.test.ts --test-name-pattern "cold connection pool"
           in_image bun test test/unit/queue.test.ts

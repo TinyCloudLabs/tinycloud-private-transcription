@@ -14,8 +14,9 @@ second transcription pass. The full contract is in [SPEC.md](./SPEC.md).
 
 ```bash
 bun install
-sudo docker compose -f docker-compose.dev.yml up -d      # Postgres :55432, Redis :56379
-cp .env.example .env
+cp .env.example .env                                     # untracked (gitignored)
+perl -pi -e "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 24)/" .env   # your own dev DB secret
+sudo docker compose -f docker-compose.dev.yml up -d      # Postgres 127.0.0.1:55432, Redis 127.0.0.1:56379
 VEXA_API_KEY=vxa_mock bun run mock-vexa                  # built-in Vexa mock on :18056
 VEXA_API_KEY=vxa_mock bun run api                        # API on :8080 (runs migrations)
 VEXA_API_KEY=vxa_mock bun run worker                     # queue worker
@@ -65,8 +66,9 @@ Requires Bun ≥ 1.3 and Docker (`sudo docker` on the dev host).
 
 ```bash
 bun install
-sudo docker compose -f docker-compose.dev.yml up -d      # Postgres :55432, Redis :56379
-cp .env.example .env                                     # defaults match the compose above
+cp .env.example .env                                     # untracked (gitignored); compose and Bun both read it
+perl -pi -e "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 24)/" .env
+sudo docker compose -f docker-compose.dev.yml up -d      # Postgres 127.0.0.1:55432, Redis 127.0.0.1:56379
 
 # 1) a Vexa: the real stack (VEXA_BASE_URL/VEXA_API_KEY) or the built-in mock
 VEXA_API_KEY=vxa_mock bun run mock-vexa                  # http://localhost:18056
@@ -79,6 +81,11 @@ VEXA_API_KEY=vxa_mock bun run worker
 bun run cli create-key --project demo                       # scopes default to meetings:*
 bun run cli create-key --project demo --scopes 'transcriptions:*'   # quote: zsh globs a bare *
 ```
+
+No database password is committed (TC-929): each developer generates their own `POSTGRES_PASSWORD` as above and
+keeps it only in the untracked `.env`, from which `DATABASE_URL` is built. `DATABASE_URL` has no default; the API,
+worker and CLI refuse to start without it. On a shared, internet-facing host, bind dev ports to `127.0.0.1` (Docker
+publishes a bare `HOST:CONTAINER` port on every interface, past ufw); `docker-compose.dev.yml` already does.
 
 ### API-key scopes
 
@@ -140,7 +147,7 @@ bun run cli create-key --project tinychat --scopes 'transcriptions:*'
 | var | default | notes |
 |---|---|---|
 | `PORT` | `8080` | API port |
-| `DATABASE_URL` | `postgres://ptx:ptx@localhost:55432/ptx` | |
+| `DATABASE_URL` | – (required) | Postgres URL. Locally `postgres://ptx:${POSTGRES_PASSWORD}@localhost:55432/ptx` from `.env` (see `.env.example`); no default is committed (TC-929) |
 | `REDIS_URL` | `redis://localhost:56379` | queue |
 | `VEXA_BASE_URL` | `http://localhost:18066` | Vexa API gateway (capture rig). Mock: `http://localhost:18056` |
 | `VEXA_API_KEY` | – | sent as `X-API-Key` |

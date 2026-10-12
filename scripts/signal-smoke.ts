@@ -18,7 +18,7 @@
  * end to end — the evidence records which of the two ran, and a replay run is never evidence of
  * live Signal capture.
  *
- * Env: DATABASE_URL, REDIS_URL (docker-compose.dev.yml defaults), SIGNAL_CALL_URL (required for
+ * Env: DATABASE_URL (required; .env.example), REDIS_URL (docker-compose.dev.yml default), SIGNAL_CALL_URL (required for
  *      a live desktop backend; never logged or written to evidence), SIGNAL_REPLAY_SCRIPT,
  *      SIGNAL_EXPECTED_PHRASE (required for live capture; checked in-memory only),
  *      SMOKE_CAPTURE_SECONDS (30), SMOKE_TIMEOUT_S (120). On a dev rig shared with `bun test` (which truncates tables and
@@ -28,7 +28,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { createApiKey } from "../src/api/auth.ts";
-import { config } from "../src/config.ts";
+import { config, requireDatabaseUrl } from "../src/config.ts";
 import { createContext } from "../src/context.ts";
 import { runMigrations } from "../src/db/migrate.ts";
 import { isSignalCallUrl } from "../src/domain/platform.ts";
@@ -73,7 +73,8 @@ async function waitForHttp(url: string, timeoutMs = 30_000) {
 }
 
 async function main() {
-  const databaseUrl = process.env.SMOKE_DATABASE_URL ?? config.databaseUrl;
+  // Checked before any child is spawned: a failure after capture starts would leave the capture worker running (TC-929).
+  const databaseUrl = requireDatabaseUrl(process.env.SMOKE_DATABASE_URL ?? config.databaseUrl);
   const redisUrl = process.env.SMOKE_REDIS_URL ?? config.redisUrl;
   const capabilityKey = randomBytes(32).toString("base64");
   const capturePort = freePort();

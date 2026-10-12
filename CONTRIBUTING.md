@@ -7,8 +7,9 @@ discussed in an issue first.
 
 ```bash
 bun install
-sudo docker compose -f docker-compose.dev.yml up -d   # Postgres + Redis
-cp .env.example .env
+cp .env.example .env                                  # untracked; set POSTGRES_PASSWORD (below)
+perl -pi -e "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 24)/" .env
+sudo docker compose -f docker-compose.dev.yml up -d   # Postgres + Redis, bound to 127.0.0.1
 bun run typecheck && bun test                          # unit + integration (mock Vexa in-process)
 ```
 
