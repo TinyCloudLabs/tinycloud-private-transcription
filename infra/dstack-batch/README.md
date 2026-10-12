@@ -62,15 +62,18 @@ gh workflow run deploy-batch.yml -R $R --ref main -f confirm=ptx-batch
   admission `closed` (migration 0018) and must report `closed` to the admin key before `{"mode":"open"}`. A failed
   create leaves admission closed. Record the CVM id it prints:
   `gh variable set PTX_BATCH_CVM_ID --env ptx-batch -R $R --body <id>`.
+- **Compatibility:** deploy tinychat's `MAX_RECORDING_BYTES = 181,440,000` change before pinning this PTX image;
+  otherwise tinychat rejects the advertised capabilities response.
 - **Update**: `PUT /v1/admin/admission {"mode":"drain"}` → wait until `awaiting_upload + queued + processing = 0` →
   `phala deploy --cvm-id … --wait` → allowed_envs sync → health gate (`/health/live`, then
-  `checks.upload_transcription.ready`) → admission gate (reports `drain`) → `{"mode":"open"}`. A drain response without
-  three non-negative integer counts fails the run (never read as drained).
-- **Sizing `drain_timeout_minutes`** (1–300, default 130): an accepted create may upload for up to 480 min, then jobs
-  process one at a time, each bounded by the 480-min processing ceiling but typically far shorter. The worst case is
-  `480 + (awaiting_upload + queued + processing) × 480` minutes; the run prints it at drain start and warns when the
-  timeout is below it. Check the queue first (`GET /v1/admin/admission`) and size to what you see; with a deep queue,
-  drain ahead of time (`PUT … {"mode":"drain"}`) and dispatch once `active` is 0.
+  `checks.upload_transcription.ready`) → admission gate (reports `drain`) → `{"mode":"open"}`. A drain response
+  without three non-negative integer counts fails the run (never read as drained).
+- **Sizing `drain_timeout_minutes`** (1–300, default 130): accepted uploads have a 240-min deadline and queued jobs
+  process one at a time, each bounded by the 360-min worker ceiling but typically far shorter. The worst case is
+  `(awaiting_upload > 0 ? 240 : 0) + (awaiting_upload + queued + processing) × 360` minutes; the run prints it at
+  drain start and warns when the timeout is below it. A single 3-hour upload or processing job can outlast the
+  workflow's 300-minute drain limit. When any 3-hour work is active, drain ahead with
+  `PUT /v1/admin/admission {"mode":"drain"}`, wait for `active` to reach 0, then dispatch the deploy workflow.
 - A failure after the drain leaves admission in **drain**. Investigate, then reopen deliberately:
   `curl -X PUT $URL/v1/admin/admission -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d '{"mode":"open"}'`.
 
@@ -103,8 +106,9 @@ The decode path never holds a recording in memory: ffmpeg writes 16 kHz s16le PC
 it in 60 s slices (a 3 h channel is 108,000 frame energies, 864 KB), and each dispatch reads one region of at most
 30 s (~0.96 MB WAV). [`batch-envelope.yml`](../../.github/workflows/batch-envelope.yml) proves the envelope on every
 change to the batch runtime: it runs this compose (limits unchanged) on one CPU with Tinfoil mocked, uploads a
-synthetic 2-hour stereo 128 kbps MP3 three times at once, and fails on any OOM kill or restart. That measured envelope
-has not yet been rerun for three-hour audio; the PCM disk figures below are the calculated three-hour bound.
+synthetic 3-hour stereo 128 kbps MP3 three times at once, and fails on any OOM kill or restart. The duration-less
+WebM packet scan is bounded to 45 seconds; a 3-hour file without container duration must be measurable within that
+scan budget. The PCM disk figures below are the calculated three-hour bound.
 Run on PR #69 (GitHub runner, 1 CPU, 3 × 115 MB PUTs at localhost speed, 708 regions; 30 parallel clients polled the job
 for 15 s while it decoded, 4,305 GETs, all 200):
 
@@ -151,7 +155,7 @@ choice, numbers and sizing in [docs/diarization-benchmark.md](../../docs/diariza
 with `BATCH_DIARIZATION_ENABLED=true` on **both** the `api` and `upload-worker` services, which
 [`app-compose.yaml`](./app-compose.yaml) sets. It fits tdx.small: the worker diarizes 10-minute windows one at a time,
 each in its own process inside the `upload-worker` cgroup, and links speakers across windows; the envelope CI runs a
-diarized 2-hour job under the compose limits. To turn it off, set it to `"false"` on both services (a re-pin-style PR
+diarized 3-hour job under the compose limits. To turn it off, set it to `"false"` on both services (a re-pin-style PR
 and a deploy); capabilities then report `diarization: false` and the apps disable "Identify speakers".
 Check after a deploy: `GET /v1/transcriptions/capabilities` reports `"diarization": true`, and the `batch worker
 started` log line has `diarization: true`.

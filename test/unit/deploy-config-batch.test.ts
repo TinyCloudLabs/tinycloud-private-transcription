@@ -214,7 +214,7 @@ sed -n "$((n + 1))p" "${dir}/gets"
   test("drain waits for zero active jobs and prints the worst case", () => {
     const run = runDrain(counts(0, 1, 1), [counts(0, 1, 0), counts(0, 0, 0)]);
     expect(run.exitCode).toBe(0);
-    expect(run.out).toContain("worst case 480 min");
+    expect(run.out).toContain("worst case 720 min");
     expect(run.out).toContain("::warning title=Drain may time out::");
     expect(run.out).toContain("active=0");
   });

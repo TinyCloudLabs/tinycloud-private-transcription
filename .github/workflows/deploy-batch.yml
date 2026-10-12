@@ -26,8 +26,10 @@ on:
       drain_timeout_minutes:
         description: >-
           Update only. Minutes (1-300) to wait for active jobs to reach 0 before deploying. Size it to the queue:
-          an accepted create may upload for up to 480 min, and each job then processes one at a time (ceiling
-          480 min each; typical far less). The run prints the worst case at drain start. On timeout admission
+          an accepted create may upload for up to 240 min, and each job then processes one at a time (ceiling
+          360 min each; typical far less). A single 3-hour upload or processing job can outlast this workflow's
+          300-minute drain limit, so drain ahead and dispatch only after active work reaches zero. The run prints
+          the worst case at drain start. On timeout admission
           stays in drain.
         required: true
         default: "130"
@@ -192,7 +194,7 @@ jobs:
           body="$(admission -X PUT -d '{"mode":"drain"}')"
           jq -e '.mode == "drain"' <<<"$body" >/dev/null || { echo "::error title=Drain refused::admission did not report mode=drain"; exit 1; }
           read_counts "$body"
-          worst=$(( (awaiting > 0 ? 120 : 0) + (awaiting + queued + processing) * 240 ))
+          worst=$(( (awaiting > 0 ? 240 : 0) + (awaiting + queued + processing) * 360 ))
           echo "draining: awaiting_upload=$awaiting queued=$queued processing=$processing; worst case ${worst} min (typical far less)"
           if [ "$worst" -gt "$DRAIN_TIMEOUT_MINUTES" ]; then
             echo "::warning title=Drain may time out::worst case ${worst} min exceeds drain_timeout_minutes=${DRAIN_TIMEOUT_MINUTES}"

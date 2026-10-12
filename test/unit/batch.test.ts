@@ -40,8 +40,9 @@ describe("role", () => {
     expect(MAX_UPLOAD_BYTES).toBe(Math.round(10_800 * 128_000 / 8 * 1.05));
     const config = batchConfigFromEnv();
     expect(config.limits.maxDurationSeconds).toBe(10_800);
-    expect(config.upload).toMatchObject({ deadlineSeconds: 28_800, maxPutSeconds: 25_200, minBytesPerSecond: 8_192 });
-    expect(config.worker.maxProcessingSeconds).toBe(28_800);
+    expect(config.upload).toMatchObject({ deadlineSeconds: 14_400, maxPutSeconds: 11_700, minBytesPerSecond: 16_384 });
+    expect(config.limits.maxConcurrentUploadsPerTenant).toBe(1);
+    expect(config.worker.maxProcessingSeconds).toBe(21_600);
     expect(config.tinfoil.timeoutMs).toBe(180_000); // applies to each <=30 s VAD region sent by the worker
   });
 });

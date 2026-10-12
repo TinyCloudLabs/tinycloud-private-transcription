@@ -3,6 +3,7 @@ import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { eq, sql } from "drizzle-orm";
 import { createApp } from "../../src/api/app.ts";
+import { createApiKey } from "../../src/api/auth.ts";
 import { createContext } from "../../src/context.ts";
 import { createDb } from "../../src/db/client.ts";
 import { transcriptionCapabilities, transcriptions, transcriptionWorkers } from "../../src/db/schema.ts";
@@ -25,6 +26,7 @@ afterEach(async () => {
   await h.ctx.db.execute(sql`truncate table transcriptions, transcription_tenant_usage cascade`);
   await h.ctx.db.execute(sql`update transcription_admission set mode = 'open' where id = 1`);
   Object.assign(h.ctx.config.limits, { maxActiveJobs: 10, maxReservedBytes: 1_814_400_000, maxConcurrentUploads: 3, diskHighWaterPercent: 99, tenantDailyBytes: 544_320_000, maxDurationSeconds: 10_800, durationScanSeconds: 45 });
+  // The harness deliberately keeps shorter PUT and faster-rate thresholds than production to keep lease tests quick.
   Object.assign(h.ctx.config.upload, { maxPutSeconds: 1_800, minBytesPerSecond: 32_768, progressGraceSeconds: 60, idleTimeoutSeconds: 60, leaseStaleSeconds: 120 });
   h.tinfoil.calls = [];
 });
@@ -437,6 +439,23 @@ describe("upload capability", () => {
     // After acceptance the other capability is dead too (post-acceptance contract).
     const late = await h.put(second.id, second.upload.capability, bytes);
     expect({ status: late.status, code: (await errorOf(late)).code }).toEqual({ status: 401, code: "upload_capability_invalid" });
+  });
+
+  test("a tenant can hold only one live PUT across projects", async () => {
+    const bytes = await audio("stereo");
+    const tenantRef = TENANT_A;
+    const otherKey = (await createApiKey(h.ctx as never, "another-project", ["transcriptions:*"])).key;
+    const first = await h.create(bytes, { tenant: tenantRef });
+    const second = await h.create(bytes, { tenant: tenantRef, key: otherKey });
+    const a = await first.json();
+    const b = await second.json();
+    expect([first.status, second.status]).toEqual([201, 201]);
+
+    const activePut = h.put(a.id, a.upload.capability, trickle(bytes, 4, 30), { contentLength: bytes.byteLength });
+    await Bun.sleep(15);
+    const refused = await h.put(b.id, b.upload.capability, bytes);
+    expect({ status: refused.status, code: (await errorOf(refused)).code }).toEqual({ status: 429, code: "service_busy" });
+    expect((await activePut).status).toBe(201);
   });
 });
 

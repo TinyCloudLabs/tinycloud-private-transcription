@@ -40,6 +40,8 @@ export interface BatchConfig {
     maxReservedBytes: number;
     /** Service-wide PUTs holding a live upload lease. */
     maxConcurrentUploads: number;
+    /** Live PUTs per tenant, across projects. */
+    maxConcurrentUploadsPerTenant: number;
     /** Creates and PUTs are refused while the upload volume is at or above this used percentage. */
     diskHighWaterPercent: number;
     /** Per tenant per UTC day, charged at create. */
@@ -114,15 +116,16 @@ export function batchConfigFromEnv(): BatchConfig {
       maxActiveJobs: positiveIntegerEnv("BATCH_MAX_ACTIVE_JOBS", "10"),
       maxReservedBytes: positiveIntegerEnv("BATCH_MAX_RESERVED_BYTES", String(10 * MAX_UPLOAD_BYTES)),
       maxConcurrentUploads: positiveIntegerEnv("BATCH_MAX_CONCURRENT_UPLOADS", "3"),
+      maxConcurrentUploadsPerTenant: 1,
       diskHighWaterPercent: percent,
       tenantDailyBytes: positiveIntegerEnv("BATCH_TENANT_DAILY_BYTES", String(3 * MAX_UPLOAD_BYTES)),
     },
     upload: {
       capabilityTtlSeconds: 3_600,
       maxLiveCapabilities: 5,
-      deadlineSeconds: 28_800,
-      maxPutSeconds: positiveIntegerEnv("BATCH_UPLOAD_MAX_PUT_SECONDS", "25200"),
-      minBytesPerSecond: positiveIntegerEnv("BATCH_UPLOAD_MIN_BYTES_PER_SECOND", "8192"),
+      deadlineSeconds: 14_400,
+      maxPutSeconds: positiveIntegerEnv("BATCH_UPLOAD_MAX_PUT_SECONDS", "11700"),
+      minBytesPerSecond: positiveIntegerEnv("BATCH_UPLOAD_MIN_BYTES_PER_SECOND", "16384"),
       progressGraceSeconds: 60,
       idleTimeoutSeconds: 60,
       leaseHeartbeatSeconds: 10,
@@ -140,7 +143,7 @@ export function batchConfigFromEnv(): BatchConfig {
       retryAfterMaxSeconds: 120,
       maxNotSentAttempts: 5,
       notSentBackoffMs: 1_000,
-      maxProcessingSeconds: 8 * 3_600,
+      maxProcessingSeconds: 6 * 3_600,
     },
     retention: {
       transcriptTtlSeconds: 86_400,

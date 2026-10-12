@@ -62,9 +62,9 @@ Two parts:
 Peak memory barely grows with the recording (174 → 216 MiB from 10 min to 2 h, against the 320 MiB cap): each window is
 its own process, and the Bun side keeps only segment lists and one 192-float centroid per speaker. For comparison, the
 full-file CLI peaked at 1,340 MB RSS on 2 h (part 2). These runs' outputs are identical to the accuracy runs below (same
-DER on all three inputs). The envelope CI (`batch-envelope.yml`, the deployed compose on one CPU of a GitHub runner)
-runs a 2 h diarized job too: `upload-worker` peaked at 199 MiB anon + shmem, `diarize-window` at 196 MiB RSS, no OOM
-kill (its two synthetic voices take less embedding work: 750 s of processing).
+DER on all three inputs). The earlier 2 h envelope run measured `upload-worker` at 199 MiB anon + shmem and
+`diarize-window` at 196 MiB RSS, with no OOM kill (its two synthetic voices take less embedding work: 750 s of
+processing). The current envelope exercises 3 h; its measured result is recorded in CI.
 
 **Why the allocator settings.** With onnxruntime's defaults (CPU memory arena and memory patterns on) and glibc's
 defaults, one 10-minute window peaked at 340–380 MB RSS: TitaNet-S runs once per (10 s chunk, local speaker) with
@@ -87,7 +87,7 @@ more memory but spend most of the extra time in page faults.
 (a tdx.small vCPU may be slower), then one Tinfoil request per speaker turn, as without diarization. Batch jobs are
 asynchronous: create, upload, then the client polls `GET /v1/transcriptions/{id}`. The worker holds the job's claim
 with a renewal timer while the diarizer runs (it is a child process; a lost claim kills it), and the job's ceiling is
-`maxProcessingSeconds` = 4 h. While diarizing, the job reports `status: processing`, `progress.stage: decoding` and
+`maxProcessingSeconds` = 6 h. While diarizing, the job reports `status: processing`, `progress.stage: decoding` and
 `regions_total: 0`; TinyChat's upload panel shows "Transcribing…" and then "Transcribing… X of Y parts" once the turns
 are known. The TinyChat poller has no overall deadline (it gives up only after 10 minutes of failed polls), so a long
 diarization needs nothing from the apps.
@@ -237,14 +237,14 @@ running side by side on the host, so these are upper bounds (one job alone on 4 
 | ResNet34-LM | 0.261 | 387 MB |
 | ERes2Net | 0.277 | 569 MB |
 
-2 h (7,200 s, the upload cap) with TitaNet-S @ 1.0 on 4 pinned cores: see "2 h run" below.
+2 h (7,200 s, the then-current upload cap) with TitaNet-S @ 1.0 on 4 pinned cores: see "2 h run" below.
 
 ## 2 h run
 
 A 7,200 s file (the four long inputs above concatenated and repeated; 16 distinct real speakers), TitaNet-S @ 1.0,
 alone on cores 0–3: **wall 698 s (RTF 0.097), peak RSS 1,340 MB**. The CLI returned 22 labels; after the worker's
 turn building, 21 speakers hold 743 turns (= Tinfoil requests) covering 6,892 s, and 9 speakers hold ≥ 5 % of it. Memory
-grows with duration (the CLI holds the whole waveform and all embeddings), so 2 h is the worst case.
+grows with duration (the CLI holds the whole waveform and all embeddings), so 2 h was the largest benchmark input.
 
 ## Real speech vs. synthetic (TTS) voices
 

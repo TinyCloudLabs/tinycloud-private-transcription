@@ -6,12 +6,12 @@
 # pinned to one CPU like tdx.small, and Tinfoil replaced by test/envelope/mock-tinfoil.ts (test/envelope/compose.ci.yaml).
 # Then, only through the public API:
 #   1. the fresh install reports admission closed; the admin key opens it;
-#   2. three tenants create and PUT a synthetic 2-hour stereo 128 kbps MP3 at once (BATCH_MAX_CONCURRENT_UPLOADS = 3);
+#   2. three tenants create and PUT a synthetic 3-hour stereo 128 kbps MP3 at once (BATCH_MAX_CONCURRENT_UPLOADS = 3);
 #   3. the two later uploads are cancelled, and the worker runs the oldest: ffmpeg decode per channel, VAD, one mocked
 #      provider call per region; the job must complete with its audio deleted;
 #   4. while it processes, a burst of BURST_CLIENTS (30) parallel clients polls GET /v1/transcriptions/{id} for
 #      BURST_SECONDS; every poll must answer 200;
-#   5. capabilities offer diarization, and a 2-hour two-voice MP3 (the repo's fixtures/alice.wav and bob.wav, looped)
+#   5. capabilities offer diarization, and a 3-hour two-voice MP3 (the repo's fixtures/alice.wav and bob.wav, looped)
 #      goes through create with diarize: true, PUT, and the worker's windowed diarization (one sherpa-onnx process per
 #      window, in the upload-worker cgroup) + per-turn dispatch; the job must complete diarized with its audio deleted.
 # Fails on a timeout, an OOM kill or a restart in any container; prints peak memory per container (and to
@@ -21,10 +21,10 @@ set -euo pipefail
 : "${ENVELOPE_IMAGE:?ENVELOPE_IMAGE (the api image built from this commit) is required}"
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 export ENVELOPE_IMAGE ENVELOPE_DIR="$REPO/test/envelope"
-WORK="$(mktemp -d "${RUNNER_TEMP:-/tmp}/ptx-envelope.XXXXXX")"
-PROCESS_DEADLINE_SECONDS="${PROCESS_DEADLINE_SECONDS:-1200}"
-DIARIZE_DEADLINE_SECONDS="${DIARIZE_DEADLINE_SECONDS:-2700}"
-DURATION_SECONDS=7199 # the 7,200 s cap minus room for MP3 encoder padding
+WORK="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is required}/ptx-envelope.XXXXXX")"
+PROCESS_DEADLINE_SECONDS="${PROCESS_DEADLINE_SECONDS:-1800}"
+DIARIZE_DEADLINE_SECONDS="${DIARIZE_DEADLINE_SECONDS:-4050}"
+DURATION_SECONDS=10799 # the 10,800 s cap minus room for MP3 encoder padding
 URL=http://127.0.0.1:8080
 MOCK=http://127.0.0.1:18081
 SERVICES=(api upload-worker postgres)
@@ -45,7 +45,7 @@ finish() {
   rm -f "$WORK/sampling"
   if [ "$code" -ne 0 ] && [ -f "$WORK/sealed.env" ]; then compose logs --no-color --tail 200 || true; fi
   if [ -f "$WORK/sealed.env" ]; then compose down -v --remove-orphans >/dev/null 2>&1 || true; fi
-  rm -rf "$WORK"
+  rm -r "$WORK"
   exit "$code"
 }
 trap finish EXIT
@@ -65,7 +65,7 @@ docker run --rm --user "$(id -u):$(id -g)" --volume "$WORK:/out" "$ENVELOPE_IMAG
 SIZE="$(stat -c %s "$MP3")"
 SHA="$(sha256sum "$MP3" | cut -d' ' -f1)"
 echo "recording.mp3: $SIZE bytes in $((SECONDS - started)) s"
-[ "$SIZE" -le 120960000 ] || fail "the fixture is over the 120,960,000-byte upload cap"
+[ "$SIZE" -le 181440000 ] || fail "the fixture is over the 181,440,000-byte upload cap"
 echo "::endgroup::"
 
 echo "::group::Generate a ${DURATION_SECONDS} s two-voice mono MP3 for diarization"
@@ -195,7 +195,7 @@ for i in 1 2 3; do
 done
 echo "::endgroup::"
 
-echo "::group::Process the 2-hour stereo job (deadline ${PROCESS_DEADLINE_SECONDS} s)"
+echo "::group::Process the 3-hour stereo job (deadline ${PROCESS_DEADLINE_SECONDS} s)"
 poll_burst() { # one client: GET the job until the burst window closes; one HTTP code per line
   local until=$((SECONDS + BURST_SECONDS))
   while [ "$SECONDS" -lt "$until" ]; do
@@ -244,7 +244,7 @@ jq -e '.bad_wav == 0 and .max_wav_bytes <= 960100' <<<"$stats" >/dev/null || fai
 jq -e '.retention.audio == "deleted"' <<<"$job" >/dev/null || fail "the audio was not deleted: $(jq -c .retention <<<"$job")"
 processing="$(jq -r '((.finished_at | sub("\\.[0-9]+"; "") | fromdateiso8601) - (.processing_started_at | sub("\\.[0-9]+"; "") | fromdateiso8601))' <<<"$job")"
 
-echo "::group::Diarize the 2-hour two-voice recording (deadline ${DIARIZE_DEADLINE_SECONDS} s)"
+echo "::group::Diarize the 3-hour two-voice recording (deadline ${DIARIZE_DEADLINE_SECONDS} s)"
 curl -fsS -H "Authorization: Bearer $CLIENT_KEY" -H "X-Tenant-Ref: ${TENANT[$keep]}" "$URL/v1/transcriptions/capabilities" \
   | jq -e '.diarization == true' >/dev/null || fail "capabilities do not offer diarization"
 d=$((keep == 1 ? 2 : 1)) # a tenant whose job was cancelled

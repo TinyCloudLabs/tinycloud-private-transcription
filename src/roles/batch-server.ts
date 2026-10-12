@@ -14,7 +14,7 @@ if (config.bootstrapKeys !== "") {
 }
 await ensureStorageRoot(ctx.config.uploadDir);
 const app = createBatchApp(ctx);
-// Bun's default maxRequestBodySize (128 MiB) is above the 120,960,000-byte upload cap. Its default 10 s
-// idle timeout is raised above the upload's own 60 s idle rule, which then decides (with a stable code).
-const server = Bun.serve({ port: ctx.config.port, fetch: app.fetch, idleTimeout: 120 });
+// Match Bun's body limit to the PTX byte cap; its default 128 MiB is too small for a three-hour upload. Its default
+// 10 s idle timeout is raised above the upload's own 60 s idle rule, which then decides (with a stable code).
+const server = Bun.serve({ port: ctx.config.port, fetch: app.fetch, idleTimeout: 120, maxRequestBodySize: ctx.config.limits.maxBytes });
 ctx.log.info("batch api listening", { port: server.port, role: "batch", providerConfigured: ctx.provider !== null, diarization: ctx.diarizer !== null });

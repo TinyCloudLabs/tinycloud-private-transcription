@@ -15,7 +15,7 @@
 # reports ~1.27 GB used, so ~1 GiB is left to the guest OS, dstack and dockerd. The three services are capped at
 # 832 MiB together (api 320m + upload-worker 320m + postgres 192m), with no swap, so a runaway process is OOM-killed
 # inside its own container instead of taking the guest down. The cgroup limit also counts page cache, which the kernel
-# reclaims first. Container logs are json-file, capped at 3 x 10 MB per service. .github/workflows/batch-envelope.yml proves these limits with a 2-hour stereo recording on one CPU.
+# reclaims first. Container logs are json-file, capped at 3 x 10 MB per service. .github/workflows/batch-envelope.yml proves these limits with a 3-hour stereo recording on one CPU.
 services:
   api:
     image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:7bad6d7770111facaa4d419a0b90e4e2114b7d7c@sha256:821844b89ee6d0334ecf4eb532c6c13c731c5fbdbc00aeed947bfcd7246e3e8a
@@ -38,8 +38,8 @@ services:
       BATCH_MAX_CONCURRENT_UPLOADS: "3"
       BATCH_DISK_HIGH_WATER_PERCENT: "80"
       BATCH_TENANT_DAILY_BYTES: "544320000"
-      BATCH_UPLOAD_MAX_PUT_SECONDS: "25200"
-      BATCH_UPLOAD_MIN_BYTES_PER_SECOND: "8192"
+      BATCH_UPLOAD_MAX_PUT_SECONDS: "11700"
+      BATCH_UPLOAD_MIN_BYTES_PER_SECOND: "16384"
       # Browser and app origins allowed to PUT /uploads/{id} directly (Exo web, Pages previews, desktop, mobile).
       BATCH_CORS_ORIGINS: "https://tinycloud.chat,https://tinychat-4jq.pages.dev,https://*.tinychat-4jq.pages.dev,tauri://localhost,http://tauri.localhost,capacitor://localhost,https://localhost"
       # Speaker diarization (create diarize: true); set on both api (capabilities) and upload-worker (runs it).

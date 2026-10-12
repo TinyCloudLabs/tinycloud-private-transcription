@@ -164,7 +164,7 @@ other-tenant or deleted job is the same `404 transcription_not_found`.
 
 ```http
 POST /v1/transcriptions   Idempotency-Key: <1..200 printable ASCII>   X-Tenant-Ref   X-Correlation-Id?
-{"content_type":"audio/mpeg|audio/wav|audio/ogg|audio/mp4|audio/webm|audio/flac","byte_size":1..120960000,"sha256":"<64 hex>",
+{"content_type":"audio/mpeg|audio/wav|audio/ogg|audio/mp4|audio/webm|audio/flac","byte_size":1..181440000,"sha256":"<64 hex>",
  "language":"en"?, "channel_mode":"separate|mixed"?, "channel_labels":["Speaker 1","Speaker 2"]?, "diarize":false?}
 → 201 new | 200 replay (same key + same body + same tenant): <job> + "upload":{"path":"/uploads/trn_…","capability":"tcu_…","expires_at","max_live":5}
   ("upload" is present only while the job is awaiting_upload; each replay issues one more capability and revokes none)
@@ -174,7 +174,7 @@ GET  /v1/transcriptions/{id}                    <job>
 GET  /v1/transcriptions/{id}/result             202 {id,status} | 200 completed transcript | 200 {id,status:"failed"|"cancelled",error} | 410 transcript_expired
 POST /v1/transcriptions/{id}/cancel             {id,status} (idempotent)
 DELETE /v1/transcriptions/{id}                  204; the job is gone from every read at once
-GET  /v1/transcriptions/capabilities            {max_bytes,max_duration_seconds:7200,max_channels:2,content_types,diarization,transcript_ttl_seconds:86400,admission,ready}
+GET  /v1/transcriptions/capabilities            {max_bytes:181440000,max_duration_seconds:10800,max_channels:2,content_types,diarization,transcript_ttl_seconds:86400,admission,ready}
 PUT  /uploads/{id}   Authorization: Bearer <capability>   Content-Length = byte_size   Content-Type = content_type
 GET|PUT /v1/admin/admission  (admin:*)          {"mode":"open|drain|closed"} → {mode, active:{awaiting_upload,queued,processing}, retention_lag_seconds}
 ```
@@ -219,17 +219,17 @@ All 429/503 answers carry `retry_after_seconds` and `Retry-After`.
 ### Upload
 The capability is 32 random bytes (`tcu_…`), stored as sha256, compared in constant time, valid only for
 `PUT /uploads/{its job}` with that job's declared length, type and hash, for min(60 min, the job's upload deadline);
-it grants no read. The job's upload deadline is create + 2 h, after which it fails `upload_expired`. One PUT at a
-time per job (a DB lease: `409 upload_in_progress`) and at most `BATCH_MAX_CONCURRENT_UPLOADS` service-wide
-(`429 service_busy`). A PUT is cut off (`408 upload_interrupted`, job unchanged) when: no bytes arrive for 60 s;
-its average rate is below `BATCH_UPLOAD_MIN_BYTES_PER_SECOND` after 60 s; or it passes its hard expiry,
-min(start + `BATCH_UPLOAD_MAX_PUT_SECONDS`, the upload deadline). Lease heartbeats never move the hard expiry. A body that
+it grants no read. The job's upload deadline is create + 4 h, after which it fails `upload_expired`. One PUT at a
+time per job (a DB lease: `409 upload_in_progress`), one live PUT per tenant across projects, and at most
+`BATCH_MAX_CONCURRENT_UPLOADS` service-wide (`429 service_busy`). A PUT is cut off (`408 upload_interrupted`, job unchanged)
+when: no bytes arrive for 60 s; its average rate is below `BATCH_UPLOAD_MIN_BYTES_PER_SECOND` after 60 s; or it passes
+its hard expiry, min(start + `BATCH_UPLOAD_MAX_PUT_SECONDS`, the upload deadline). Lease heartbeats never move the hard expiry. A body that
 ends early or errors is also `408 upload_interrupted`; a wrong `Content-Length` is `400 upload_length_mismatch`; a wrong
 `Content-Type` is `415 unsupported_media_type`. The bytes are streamed to a temp file while hashed, then verified:
-sha256, then ffprobe (the container is the declared `content_type`'s, exactly one audio stream, 1–2 channels, ≤ 7,200 s;
+sha256, then ffprobe (the container is the declared `content_type`'s, exactly one audio stream, 1–2 channels, ≤ 10,800 s;
 video and data streams are ignored: never transcoded or transcribed). When the container carries no duration,
 as browser MediaRecorder WebM does not, the length is the last audio packet's end minus the start time, measured within
-45 s of wall clock (else `invalid_audio`); more packets than 7,200 s of 2.5 ms Opus frames is `recording_too_long`
+45 s of wall clock (else `invalid_audio`); more packets than 10,800 s of 2.5 ms Opus frames is `recording_too_long`
 whatever the timestamps say. The bytes are then renamed and committed. Validation failures end the job before any
 provider call: `422 upload_rejected {status:"failed", job_error:{code: upload_integrity_failed | invalid_audio |
 unsupported_recording | recording_too_long}}`. `invalid_audio` covers unreadable bytes, a container other than the
@@ -253,10 +253,10 @@ replay); anything else → the upload was accepted or the job ended.
 
 ### Processing
 One job end-to-end at a time, service-wide. Per channel (`separate` + 2 channels; otherwise a mono downmix), ffmpeg
-decodes to 16 kHz PCM on disk, stopping at 7,200 s of PCM (counted in bytes, whatever the timestamps say); an energy VAD
+decodes to 16 kHz PCM on disk, stopping at 10,800 s of PCM (counted in bytes, whatever the timestamps say); an energy VAD
 (100 ms frames; voiced ≥ max(−50 dBFS, p10 + 12 dB); gaps ≤ 1 s merged;
 ±0.25 s padding; regions > 30 s split at the quietest frame in their last 10 s) produces regions; each region is one
-Tinfoil request. No speech → `no_speech`.
+Tinfoil request (at most 30 s of audio per request; each Tinfoil request has a 180 s timeout). No speech → `no_speech`.
 
 **Diarization** (`diarize: true`; [docs/diarization-benchmark.md](./docs/diarization-benchmark.md)). After the mono
 decode, speech is labelled with speakers in equal windows of at most 10 min that overlap by 60 s, one window at a time,
@@ -291,7 +291,7 @@ request is in flight at any time. Outcomes:
 | timeout, reset, 5xx, other status, unparseable body, worker died while admitted | attempt `ambiguous`, **never re-sent** → `provider_outcome_unknown` |
 
 A worker that dies before any admission is requeued (regions and completed results kept; ≤ 3 claims → `processing_failed`).
-A job processing longer than 4 h fails `processing_timeout`.
+A job processing longer than 6 h fails `processing_timeout`.
 
 **Fencing.** Every claim bumps the job's `generation` and gets a random claim token. Every worker write (stage
 transitions, region inserts, region text, counters, result assembly, terminal commit) is a compare-and-swap on
