@@ -245,6 +245,9 @@ describe("infra/dstack/app-compose.yaml", () => {
       { Effect: "Allow", Action: ["s3:DeleteObject"], Resource: ["arn:aws:s3:::vexa/recordings/*", "arn:aws:s3:::vexa/attributed-audio/*", "arn:aws:s3:::vexa/signal/*"] },
     ]);
     expect(init).toContain("- minio-retention:/run/minio-retention");
+    // The secret goes to mc on stdin, never as an argument visible to ps (TC-938).
+    expect(init).toContain(`mc admin user add local ptx-retention < "$$K" >/dev/null`);
+    expect(init).not.toMatch(/mc admin user add[^\n]*\$\$\(cat/);
     const janitor = serviceEnv("bot-janitor");
     expect(janitor).toContain("BOT_JANITOR_MODE: ${BOT_JANITOR_MODE:-dry-run}");
     // Must name the same pinned bot image as the runtime, or it could treat the live pin as superseded.

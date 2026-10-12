@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test";
 import { integerListEnv, parseArtifactRetentionMode, percentEnv } from "../../src/config.ts";
 import type { AppContext } from "../../src/context.ts";
-import { artifactMeetingId, linkedVexaMeetingIds, retentionDecision, type PtxMeetingState } from "../../src/services/artifact-retention.ts";
+import { artifactMeetingId, linkedVexaMeetingIds, queuedEvalMeetingIds, RECORDING_LIFETIME_SLACK_MS, recordingWithinLifetime, retentionDecision, type PtxMeetingState } from "../../src/services/artifact-retention.ts";
+import type { Queue } from "../../src/worker/queue.ts";
 import { checkDisk } from "../../src/worker/housekeeping.ts";
 
 const cutoff = new Date("2026-10-01T00:00:00Z");
@@ -86,4 +87,28 @@ test("a ptx meeting links to Vexa by vexa_meeting_id or by the id in vexa_bot_id
   expect(linkedVexaMeetingIds({ vexaMeetingId: 90, vexaBotId: "mtg-91-x" })).toEqual([90, 91]);
   expect(linkedVexaMeetingIds({ vexaMeetingId: null, vexaBotId: "bot-27" })).toEqual([]);
   expect(linkedVexaMeetingIds({ vexaMeetingId: null, vexaBotId: null })).toEqual([]);
+});
+
+test("queued evals are eval.meeting jobs in the delayed set or the ready list (TC-938)", async () => {
+  const queue = {
+    pending: async () => ({
+      ready: [{ type: "eval.meeting", meetingId: "mtg_ready" }, { type: "meeting.poll", meetingId: "mtg_poll" }],
+      delayed: [{ job: { type: "eval.meeting", meetingId: "mtg_delayed", models: ["m"] }, runAt: 0 }, { job: { type: "attributed.finalize", meetingId: "mtg_fin" }, runAt: 0 }],
+    }),
+  } as unknown as Pick<Queue, "pending">;
+  expect([...await queuedEvalMeetingIds(queue)].sort()).toEqual(["mtg_delayed", "mtg_ready"]);
+});
+
+test("a recording matches a meeting only between created_at - 1 day and completed_at (or ended_at) + 1 day (TC-938)", () => {
+  const created = new Date("2026-09-01T10:00:00Z");
+  const done = new Date("2026-09-01T11:00:00Z");
+  const at = (ms: number) => new Date(ms);
+  const completed = { createdAt: created, completedAt: done, endedAt: null };
+  expect(recordingWithinLifetime(at(created.getTime() - RECORDING_LIFETIME_SLACK_MS), completed)).toBe(true);
+  expect(recordingWithinLifetime(at(created.getTime() - RECORDING_LIFETIME_SLACK_MS - 1), completed)).toBe(false);
+  expect(recordingWithinLifetime(at(done.getTime() + RECORDING_LIFETIME_SLACK_MS), completed)).toBe(true);
+  expect(recordingWithinLifetime(at(done.getTime() + RECORDING_LIFETIME_SLACK_MS + 1), completed)).toBe(false);
+  // A failed meeting ends without completing; a live one has no end yet.
+  expect(recordingWithinLifetime(at(done.getTime() + RECORDING_LIFETIME_SLACK_MS + 1), { createdAt: created, completedAt: null, endedAt: done })).toBe(false);
+  expect(recordingWithinLifetime(new Date("2027-01-01T00:00:00Z"), { createdAt: created, completedAt: null, endedAt: null })).toBe(true);
 });

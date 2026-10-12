@@ -311,12 +311,13 @@ services:
         # TC-904: least-privilege MinIO user for ptx artifact retention: list the vexa bucket and
         # delete under its three artifact prefixes; no read or write. The secret is generated once
         # into the minio-retention volume (never printed) and reapplied every boot. A failure here
-        # only leaves retention without credentials; it never fails this init or Vexa.
+        # only leaves retention without credentials; it never fails this init or Vexa. mc reads the
+        # secret from stdin, so it never appears on a command line (ps).
         K=/run/minio-retention/secret-key
         { [ -s "$$K" ] || { head -c 20 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$$K.tmp" && chmod 0400 "$$K.tmp" && mv "$$K.tmp" "$$K"; }; } &&
           printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:ListBucket"],"Resource":["arn:aws:s3:::vexa"]},{"Effect":"Allow","Action":["s3:DeleteObject"],"Resource":["arn:aws:s3:::vexa/recordings/*","arn:aws:s3:::vexa/attributed-audio/*","arn:aws:s3:::vexa/signal/*"]}]}' > /tmp/ptx-retention.json &&
           mc admin policy create local ptx-retention /tmp/ptx-retention.json >/dev/null &&
-          mc admin user add local ptx-retention "$$(cat "$$K")" >/dev/null &&
+          mc admin user add local ptx-retention < "$$K" >/dev/null &&
           { mc admin policy attach local ptx-retention --user ptx-retention >/dev/null 2>&1 || mc admin policy entities local --user ptx-retention | grep -q ptx-retention; } &&
           echo "ptx-retention MinIO user ready" || echo "ptx-retention MinIO user setup failed; artifact retention has no credentials"
     volumes:
