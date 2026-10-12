@@ -248,6 +248,9 @@ describe("infra/dstack/app-compose.yaml", () => {
     // The secret goes to mc on stdin, never as an argument visible to ps (TC-938).
     expect(init).toContain(`mc admin user add local ptx-retention < "$$K" >/dev/null`);
     expect(init).not.toMatch(/mc admin user add[^\n]*\$\$\(cat/);
+    // The root keys reach `mc alias set` on stdin too; the root password is never an mc argument.
+    expect(init).toContain(`printf '%s\\n%s\\n' "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" | mc alias set local http://minio:9000`);
+    expect(init).not.toMatch(/mc [^\n|]*MINIO_ROOT_PASSWORD/);
     const janitor = serviceEnv("bot-janitor");
     expect(janitor).toContain("BOT_JANITOR_MODE: ${BOT_JANITOR_MODE:-dry-run}");
     // Must name the same pinned bot image as the runtime, or it could treat the live pin as superseded.
