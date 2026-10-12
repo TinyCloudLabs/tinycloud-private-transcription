@@ -1,4 +1,4 @@
-import { and, eq, isNotNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, ne, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { AppContext } from "../context.ts";
 import { attributedBatches, attributedTranscriptionRuns, meetings, transcripts, type MeetingRow, type TranscriptRow } from "../db/schema.ts";
@@ -70,25 +70,26 @@ export async function createMeeting(
       `The ${detected.platform} platform was detected but is not enabled on this deployment.`,
     );
   }
-  const [row] = await ctx.db
-    .insert(meetings)
-    .values({
-      id: newMeetingId(),
-      projectId,
-      meetingUrl: storedMeetingUrl,
-      platform: detected.platform,
-      status: "queued",
-      botName: input.bot_name ?? null,
-      language: input.language ?? null,
-      webhookUrl: input.webhook_url ?? null,
-      vexaNativeMeetingId: detected.nativeMeetingId,
-      metadata: input.metadata ?? {},
-      idempotencyKey,
-      requestHash,
-      ...(signalCapability ? { signalCapability: sealSignalCapability(signalCapability, ctx.config.signal.capabilityKey) } : {}),
-    })
-    .onConflictDoNothing()
-    .returning();
+  const values: typeof meetings.$inferInsert = {
+    id: newMeetingId(),
+    projectId,
+    meetingUrl: storedMeetingUrl,
+    platform: detected.platform,
+    status: "queued",
+    botName: input.bot_name ?? null,
+    language: input.language ?? null,
+    webhookUrl: input.webhook_url ?? null,
+    vexaNativeMeetingId: detected.nativeMeetingId,
+    metadata: input.metadata ?? {},
+    idempotencyKey,
+    requestHash,
+    ...(signalCapability ? { signalCapability: sealSignalCapability(signalCapability, ctx.config.signal.capabilityKey) } : {}),
+  };
+  // A Signal call waits in the worker for a free Desktop seat; every other platform gets its own
+  // Vexa bot container and is admitted only within the bot cap.
+  const [row] = detected.platform === "signal"
+    ? await ctx.db.insert(meetings).values(values).onConflictDoNothing().returning()
+    : await insertWithinBotCapacity(ctx, projectId, idempotencyKey, values);
   if (!row) {
     // Lost a race on the idempotency key; return the winner.
     return createMeeting(ctx, projectId, input, idempotencyKey);
@@ -99,6 +100,49 @@ export async function createMeeting(
     ctx.log.warn("meeting start wakeup deferred", { meetingId: row.id, stage: "queue_wakeup" });
   });
   return { meeting: row, created: true };
+}
+
+/** Statuses in which a non-Signal meeting holds, or is about to be given, a Vexa bot container. */
+const BOT_HOLDING_STATUSES = ["queued", "joining", "waiting_for_admission", "in_progress"] as const;
+const CAPACITY_RETRY_AFTER_SECONDS = 60;
+
+/**
+ * Each Vexa bot is a ~1-1.2 GB Chromium; one too many OOMs the CVM and every live meeting with
+ * it (TC-900). Count-and-insert is serialized across API processes so concurrent requests cannot
+ * oversubscribe VEXA_MAX_CONCURRENT_BOTS; a request over the cap fails fast with 429 (TC-902).
+ * Returns no row when a concurrent create with the same Idempotency-Key committed first.
+ */
+async function insertWithinBotCapacity(
+  ctx: AppContext,
+  projectId: string,
+  idempotencyKey: string | null,
+  values: typeof meetings.$inferInsert,
+): Promise<MeetingRow[]> {
+  return ctx.db.transaction(async (tx) => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext('ptx-vexa-bot-capacity'))`);
+    if (idempotencyKey) {
+      const [winner] = await tx.select({ id: meetings.id }).from(meetings)
+        .where(and(eq(meetings.projectId, projectId), eq(meetings.idempotencyKey, idempotencyKey))).limit(1);
+      if (winner) return [];
+    }
+    const [usage] = await tx.execute<{ running: string }>(sql`
+      select count(*)::text as running from ${meetings}
+      where ${meetings.platform} <> 'signal'
+        and ${meetings.status} in (${sql.join(BOT_HOLDING_STATUSES.map((status) => sql`${status}`), sql`, `)})
+    `);
+    const running = Number(usage?.running ?? 0);
+    const max = ctx.config.vexa.maxConcurrentBots;
+    if (running >= max) {
+      ctx.log.warn("meeting bot capacity reached", { stage: "admission", code: "capacity_exhausted", running, max });
+      throw new ApiError(
+        "capacity_exhausted",
+        `All ${max} meeting notetakers are busy right now. Try again when one of the current meetings ends.`,
+        undefined,
+        CAPACITY_RETRY_AFTER_SECONDS,
+      );
+    }
+    return tx.insert(meetings).values(values).onConflictDoNothing().returning();
+  });
 }
 
 export async function getMeeting(ctx: AppContext, projectId: string, id: string): Promise<MeetingRow> {
@@ -214,6 +258,31 @@ export async function terminalTransition(
     // marker atomically; an abandoned process is recovered by the durable claim reconciler.
     await Bun.sleep(10);
   }
+}
+
+/** Statuses in which a meeting's Vexa bot is (or was just) in the call. */
+const LIVE_CAPTURE_STATUSES = ["joining", "waiting_for_admission", "in_progress", "processing"] as const;
+
+/**
+ * Another meeting, in any project, that is capturing the same Vexa meeting. Vexa answers 409 when
+ * its single user already has a bot there, and every project shares that user (TC-581). The
+ * result only says a sibling exists; callers must not expose its id or project.
+ */
+export async function findLiveMeetingForNativeId(
+  ctx: AppContext,
+  vexaPlatform: string,
+  vexaNativeMeetingId: string,
+  excludeId: string,
+): Promise<{ id: string } | null> {
+  const [row] = await ctx.db.select({ id: meetings.id }).from(meetings)
+    .where(and(
+      eq(meetings.vexaPlatform, vexaPlatform),
+      eq(meetings.vexaNativeMeetingId, vexaNativeMeetingId),
+      ne(meetings.id, excludeId),
+      inArray(meetings.status, [...LIVE_CAPTURE_STATUSES]),
+    ))
+    .limit(1);
+  return row ?? null;
 }
 
 export async function failMeeting(ctx: AppContext, meeting: MeetingRow, code: ErrorCode, message: string) {

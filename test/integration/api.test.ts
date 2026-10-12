@@ -52,7 +52,7 @@ describe("health", () => {
     const b = await r.json();
     expect(b.status).toBe("ok");
     expect(b.checks).toMatchObject({ postgres: true, redis: true, vexa: true, transcription_provider: "vexa" });
-    expect(b.checks.bot_capacity).toEqual({ running: expect.any(Number), max: 5 });
+    expect(b.checks.bot_capacity).toEqual({ running: expect.any(Number), max: 2 });
     expect(b.checks.signal).toEqual({ enabled: false, ready: true, reason: null, capacity: null });
     // TC-904: informational; a full disk never fails readiness on its own.
     expect(b.checks.disk).toEqual({ used_percent: expect.any(Number), high_water_percent: 80, ok: expect.any(Boolean) });

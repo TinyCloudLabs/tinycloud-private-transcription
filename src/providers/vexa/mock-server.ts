@@ -35,6 +35,8 @@ interface MockMeeting extends VexaMeetingResponse {
 
 export interface MockVexaOptions {
   apiKey?: string;
+  /** The user's max_concurrent_bots: POST /bots answers 429 at the cap, like meeting-api (TC-902). */
+  maxConcurrentBots?: number;
 }
 
 export function createMockVexa(opts: MockVexaOptions = {}) {
@@ -70,6 +72,11 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
     const existing = meetings.get(k);
     if (existing && !["completed", "failed"].includes(existing.status)) {
       return c.json({ detail: "Bot already exists for this meeting" }, 409);
+    }
+    // Counts a leaving (stopping) bot too: PTX must not assume Vexa freed a slot when PTX did.
+    const live = [...meetings.values()].filter((x) => ["requested", "joining", "awaiting_admission", "active", "stopping"].includes(x.status)).length;
+    if (opts.maxConcurrentBots !== undefined && live >= opts.maxConcurrentBots) {
+      return c.json({ detail: `User has reached the maximum concurrent bot limit (${opts.maxConcurrentBots}).` }, 429);
     }
     const m: MockMeeting = {
       id: nextId++,

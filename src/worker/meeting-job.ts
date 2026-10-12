@@ -6,7 +6,7 @@ import { isTerminal, mapVexaFailure, mapVexaStatus, type MeetingStatus } from ".
 import { VexaHttpError } from "../providers/vexa/client.ts";
 import { adaptVexaSegments, completionReasonOf } from "../providers/vexa/adapter.ts";
 import { toVexaPlatform } from "../providers/vexa/platform-map.ts";
-import { completeMeetingWithTranscript, failMeeting, getMeetingById, transition } from "../services/meetings.ts";
+import { completeMeetingWithTranscript, failMeeting, findLiveMeetingForNativeId, getMeetingById, transition } from "../services/meetings.ts";
 import { enqueueMeetingWebhook } from "../webhooks/dispatcher.ts";
 import { observeCapture, recordCapture } from "../services/capture.ts";
 import { and, eq, isNull, sql } from "drizzle-orm";
@@ -160,6 +160,19 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
 type ContinueStart = (delayMs: number, nextAttempt: number) => Promise<void>;
 
 async function handleStartError(ctx: AppContext, meeting: MeetingRow, e: unknown, attempt: number, continueStart: ContinueStart) {
+  // Vexa answers 429 at its user's max_concurrent_bots. PTX admission already reserved this
+  // meeting's slot, so the refusal is transient (e.g. a leaving bot Vexa still counts): retry while
+  // the row stays queued, bounded by a durable deadline on the row, and keep the 5xx budget intact.
+  if (e instanceof VexaHttpError && e.status === 429) {
+    const delayMs = ctx.config.vexa.capacityRetryIntervalMs;
+    if (Date.now() + delayMs <= meeting.createdAt.getTime() + ctx.config.vexa.capacityRetryWindowMs) {
+      ctx.log.info("vexa bot capacity busy; retrying", { meetingId: meeting.id, attempt, stage: "create", code: "capacity_exhausted" });
+      // A queue/Redis failure must not fail the meeting: reconciliation re-arms the start chain.
+      await continueStart(delayMs, attempt).catch(() =>
+        ctx.log.warn("vexa capacity wait lost its wakeup; reconciliation will re-arm", { meetingId: meeting.id, stage: "start", code: "queue_unavailable" }));
+      return;
+    }
+  }
   const retryable = e instanceof ApiError && (e.code === "provider_unavailable" || e.code === "provider_timeout");
   const vexa5xx = e instanceof VexaHttpError && e.status >= 500;
   if ((retryable || vexa5xx) && attempt < MAX_START_ATTEMPTS) {
@@ -167,11 +180,29 @@ async function handleStartError(ctx: AppContext, meeting: MeetingRow, e: unknown
     await continueStart(1_000 * attempt, attempt + 1);
     return;
   }
+  // Vexa answers 409 when its one user already has a bot in this meeting. If that bot is another
+  // live PTX meeting (any project: they all share the Vexa user), say so without naming it (TC-581).
+  if (e instanceof VexaHttpError && e.status === 409 && meeting.vexaNativeMeetingId) {
+    const vexaPlatform = toVexaPlatform(meeting.platform as Exclude<Platform, "signal">);
+    if (await findLiveMeetingForNativeId(ctx, vexaPlatform, meeting.vexaNativeMeetingId, meeting.id)) {
+      ctx.log.warn("vexa createBot refused: meeting already captured", { meetingId: meeting.id, stage: "create", code: "meeting_already_captured" });
+      const { meeting: failed, changed } = await failMeeting(ctx, meeting, "meeting_already_captured", "Another notetaker from this service is already in this meeting.");
+      if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+      return;
+    }
+  }
   ctx.log.error("vexa createBot failed", { meetingId: meeting.id, stage: "create", code: e instanceof ApiError ? e.code : "provider_error" });
-  const code = e instanceof ApiError ? e.code : e instanceof VexaHttpError && e.status === 409 ? "meeting_join_failed" : "provider_unavailable";
+  // Vexa still refused after the capacity retry window (its max_concurrent_bots is kept equal to
+  // VEXA_MAX_CONCURRENT_BOTS; API admission normally rejects first) (TC-902).
+  const code = e instanceof ApiError ? e.code
+    : e instanceof VexaHttpError && e.status === 409 ? "meeting_join_failed"
+    : e instanceof VexaHttpError && e.status === 429 ? "capacity_exhausted"
+    : "provider_unavailable";
   const message =
     code === "meeting_join_failed"
       ? "A bot is already in this meeting or the meeting could not be joined."
+      : code === "capacity_exhausted"
+        ? "All meeting notetakers were busy when this meeting started. Try again when one of the current meetings ends."
       : e instanceof ApiError
         ? e.message
         : "Meeting capture provider is unavailable.";

@@ -52,9 +52,16 @@ export async function startHarness(
     workerPopTimeoutSec?: number;
     /** Attributed retry schedule (TC-758); tests default to the poll interval (the pre-TC-758 fetch requeue cadence) so retries settle quickly. */
     attributedRetryBackoffMs?: number[];
+    /** PTX's VEXA_MAX_CONCURRENT_BOTS admission cap (TC-902). */
+    maxConcurrentBots?: number;
+    /** The mock Vexa user's own max_concurrent_bots. */
+    vexaMaxConcurrentBots?: number;
+    /** Vexa 429 retry cadence and window at bot start (TC-902 review). */
+    capacityRetryIntervalMs?: number;
+    capacityRetryWindowMs?: number;
   } = {},
 ): Promise<Harness> {
-  const vexa = startMockVexa(0);
+  const vexa = startMockVexa(0, opts.vexaMaxConcurrentBots !== undefined ? { maxConcurrentBots: opts.vexaMaxConcurrentBots } : {});
   const config = {
     ...baseConfig,
     vexa: { ...baseConfig.vexa, baseUrl: vexa.baseUrl, apiKey: vexa.apiKey, pollIntervalMs: 50 },
@@ -68,6 +75,9 @@ export async function startHarness(
     ...(opts.attributedTranscriptionEnabled !== undefined ? { attributedTranscriptionEnabled: opts.attributedTranscriptionEnabled } : {}),
     attributedRetry: { backoffMs: opts.attributedRetryBackoffMs ?? [50, 50, 50, 50, 50] },
   };
+  if (opts.maxConcurrentBots !== undefined) config.vexa = { ...config.vexa, maxConcurrentBots: opts.maxConcurrentBots };
+  if (opts.capacityRetryIntervalMs !== undefined) config.vexa = { ...config.vexa, capacityRetryIntervalMs: opts.capacityRetryIntervalMs };
+  if (opts.capacityRetryWindowMs !== undefined) config.vexa = { ...config.vexa, capacityRetryWindowMs: opts.capacityRetryWindowMs };
   const db = await runMigrations(config.databaseUrl);
   // attributed_worker_readiness and tinfoil_dispatch_slots are included: a prior harness's stopped
   // worker stays "live" for the 15s staleness window and held slots would block this harness's

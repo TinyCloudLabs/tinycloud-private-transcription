@@ -64,8 +64,19 @@ export const config = {
     pollIntervalMs: positiveIntegerEnv("VEXA_POLL_INTERVAL_MS", "5000"),
     /** Per-meeting Vexa remote-participant audio silence window before the bot completes with `left_alone`. */
     maxTimeLeftAloneMs: positiveIntegerEnv("VEXA_MAX_TIME_LEFT_ALONE_MS", "300000"),
-    /** Provisioned bot ceiling (matches `max_concurrent_bots` in infra/dstack/app-compose.yaml). Reported in /health. */
-    maxConcurrentBots: Number(env("VEXA_MAX_CONCURRENT_BOTS", "5")),
+    /**
+     * Concurrent meeting-bot ceiling, enforced when POST /v1/meetings admits a non-Signal meeting
+     * (TC-902) and reported in /health. Each bot is a ~1-1.2 GB Chromium container; the dstack
+     * compose sets it per deploy and applies the same value to the Vexa user's max_concurrent_bots.
+     */
+    maxConcurrentBots: positiveIntegerEnv("VEXA_MAX_CONCURRENT_BOTS", "2"),
+    /**
+     * A Vexa 429 at bot start (its user's max_concurrent_bots, e.g. a leaving bot Vexa still counts)
+     * is retried at this interval while the meeting stays queued, until this window after creation
+     * has passed; only then does the meeting fail with capacity_exhausted.
+     */
+    capacityRetryIntervalMs: positiveIntegerEnv("VEXA_CAPACITY_RETRY_INTERVAL_MS", "10000"),
+    capacityRetryWindowMs: positiveIntegerEnv("VEXA_CAPACITY_RETRY_WINDOW_MS", "120000"),
   },
   /** Opt-in until the Vexa producer contract is deployed everywhere. */
   attributedTranscriptionEnabled: env("ATTRIBUTED_TRANSCRIPTION_ENABLED", "false") === "true",

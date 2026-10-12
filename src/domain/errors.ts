@@ -3,6 +3,7 @@ export type ErrorCode =
   | "unsupported_platform"
   | "meeting_not_found"
   | "meeting_join_failed"
+  | "meeting_already_captured"
   | "waiting_room_timeout"
   | "bot_removed"
   | "meeting_ended"
@@ -10,6 +11,7 @@ export type ErrorCode =
   | "transcription_failed"
   | "provider_timeout"
   | "provider_unavailable"
+  | "capacity_exhausted"
   | "internal_error"
   // request-level codes
   | "unauthorized"
@@ -36,6 +38,7 @@ const CODE_TYPE: Record<ErrorCode, ErrorType> = {
   insufficient_scope: "authentication_error",
   meeting_not_found: "not_found_error",
   meeting_join_failed: "meeting_join_failed",
+  meeting_already_captured: "meeting_join_failed",
   waiting_room_timeout: "meeting_join_failed",
   bot_removed: "capture_error",
   meeting_ended: "capture_error",
@@ -43,6 +46,7 @@ const CODE_TYPE: Record<ErrorCode, ErrorType> = {
   transcription_failed: "transcription_error",
   provider_timeout: "provider_error",
   provider_unavailable: "provider_error",
+  capacity_exhausted: "provider_error",
   internal_error: "internal_error",
 };
 
@@ -55,6 +59,7 @@ const CODE_STATUS: Partial<Record<ErrorCode, number>> = {
   meeting_not_found: 404,
   idempotency_conflict: 409,
   provider_unavailable: 503,
+  capacity_exhausted: 429,
   provider_timeout: 504,
 };
 
@@ -65,13 +70,15 @@ export class ApiError extends Error {
     readonly code: ErrorCode,
     message: string,
     status?: number,
+    /** Sent as `Retry-After` and `retry_after_seconds` when the caller should simply try again later. */
+    readonly retryAfterSeconds?: number,
   ) {
     super(message);
     this.type = CODE_TYPE[code];
     this.status = status ?? CODE_STATUS[code] ?? 500;
   }
   toBody() {
-    return { error: { type: this.type, code: this.code, message: this.message } };
+    return { error: { type: this.type, code: this.code, message: this.message, ...(this.retryAfterSeconds ? { retry_after_seconds: this.retryAfterSeconds } : {}) } };
   }
 }
 
