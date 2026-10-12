@@ -1,7 +1,7 @@
 # dstack / Phala CVM app-compose for tinycloud-private-transcription (V1).
 # ONE CVM runs: our api + worker + postgres + redis, and the pinned TinyCloud Vexa capture stack
 # (control plane + CPU whisper) that spawns meeting bots. Deploy:
-#   phala deploy -n ptx-dev -c infra/dstack/app-compose.yaml -e infra/dstack/.env -t tdx.large --disk-size 40G
+#   phala deploy -n ptx-dev -c infra/dstack/app-compose.yaml -e infra/dstack/.env -t tdx.large --disk-size 40G --no-public-logs
 # Encrypted env (never in this file): POSTGRES_PASSWORD, VEXA_DB_PASSWORD, VEXA_ADMIN_TOKEN,
 # VEXA_INTERNAL_API_SECRET, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD,
 # TRANSCRIPTION_PROVIDER (PTX compatibility label; does not configure Vexa's STT endpoint),
