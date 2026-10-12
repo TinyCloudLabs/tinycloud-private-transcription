@@ -48,10 +48,10 @@ writeFileSync(join(dir, "sleep"), "#!/bin/sh\nkill $PPID\n");
 chmodSync(join(dir, "docker"), 0o755);
 chmodSync(join(dir, "sleep"), 0o755);
 
-function run(mode: string) {
+function run(mode: string, days = "7") {
   rmSync(join(dir, "calls"), { force: true });
   const proc = Bun.spawnSync(["sh", "-c", script], {
-    env: { PATH: `${dir}:/usr/bin:/bin`, BOT_JANITOR_MODE: mode, BOT_CONTAINER_RETENTION_DAYS: "7", BOT_JANITOR_INTERVAL_SECONDS: "1", BOT_IMAGE: "ghcr.io/tinycloudlabs/vexa/bot:pinned" },
+    env: { PATH: `${dir}:/usr/bin:/bin`, BOT_JANITOR_MODE: mode, BOT_CONTAINER_RETENTION_DAYS: days, BOT_JANITOR_INTERVAL_SECONDS: "1", BOT_IMAGE: "ghcr.io/tinycloudlabs/vexa/bot:pinned" },
     stdout: "pipe", stderr: "pipe",
   });
   const calls = readFileSync(join(dir, "calls"), "utf8").trim().split("\n");
@@ -70,5 +70,13 @@ test("dry-run logs what it would remove and removes nothing", () => {
 
 test("apply removes old bot containers and unused superseded bot images only", () => {
   const { removals } = run("apply");
-  expect(removals).toEqual(["rm c_old", "rmi -f sha256:old"]);
+  expect(removals).toEqual(["rm c_old", "rmi sha256:old"]);
+});
+
+test("invalid settings fall back to dry-run and remove nothing", () => {
+  const { out, removals } = run("aply", "seven");
+  expect(removals).toEqual([]);
+  expect(out).toContain("bot-janitor: invalid BOT_JANITOR_MODE; using dry-run");
+  expect(out).toContain("bot-janitor: invalid BOT_CONTAINER_RETENTION_DAYS; using 7 in dry-run");
+  expect(run("apply", "x7").removals).toEqual([]);
 });

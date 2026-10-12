@@ -27,6 +27,29 @@ test("a Vexa meeting mapped to several ptx meetings is deleted only if every one
   expect(retentionDecision(1, [row()], cutoff, { ...policy, keepVexaMeetingIds: new Set([1]) }).reason).toBe("keep_list");
 });
 
+test("an old published meeting never expires fresh artifacts under a reused Vexa id", () => {
+  expect(retentionDecision(1, [row()], new Date(cutoff.getTime() + 1), policy)).toEqual({ eligible: false, reason: "objects_recent" });
+});
+
+test("invalid ops settings warn and fall back instead of failing api/worker boot; retention never deletes on them", () => {
+  const load = (env: Record<string, string>) => {
+    const proc = Bun.spawnSync([process.execPath, "-e", 'const { config } = await import("./src/config.ts"); console.log("CONFIG " + JSON.stringify({ disk: config.disk.highWaterPercent, r: { ...config.artifactRetention, s3: undefined } }))'], {
+      cwd: new URL("../..", import.meta.url).pathname, env: { ...process.env, ...env }, stdout: "pipe", stderr: "pipe",
+    });
+    expect(proc.exitCode).toBe(0);
+    const out = proc.stdout.toString();
+    return { out, config: JSON.parse(out.slice(out.indexOf("CONFIG ") + 7)) };
+  };
+  const bad = load({ DISK_HIGH_WATER_PERCENT: "eighty", ARTIFACT_RETENTION_MODE: "aply", ARTIFACT_RETENTION_DAYS: "-1", ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS: "88,x", ARTIFACT_RETENTION_ORPHANS: "yes" });
+  expect(bad.config).toEqual({ disk: 80, r: { mode: "dry-run", days: 14, intervalMs: 21_600_000, orphans: false, keepVexaMeetingIds: [] } });
+  for (const name of ["DISK_HIGH_WATER_PERCENT", "ARTIFACT_RETENTION_MODE", "ARTIFACT_RETENTION_DAYS", "ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS", "ARTIFACT_RETENTION_ORPHANS"]) expect(bad.out).toContain(`"setting":"${name}"`);
+  // apply with any other invalid setting is downgraded, so a typo can never delete.
+  const forced = load({ ARTIFACT_RETENTION_MODE: "apply", ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS: "88;95" });
+  expect(forced.config.r.mode).toBe("dry-run");
+  expect(forced.out).toContain("artifact retention forced to dry-run");
+  expect(load({ ARTIFACT_RETENTION_MODE: "apply", ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS: "88,95" }).config.r).toMatchObject({ mode: "apply", keepVexaMeetingIds: [88, 95] });
+});
+
 test("retention config parsing rejects typos instead of silently changing behaviour", () => {
   expect(parseArtifactRetentionMode("dry-run")).toBe("dry-run");
   expect(() => parseArtifactRetentionMode("on")).toThrow("ARTIFACT_RETENTION_MODE");

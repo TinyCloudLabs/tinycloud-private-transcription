@@ -15,7 +15,7 @@ const old = new Date(now.getTime() - 30 * DAY);
 const recent = new Date(now.getTime() - 2 * DAY);
 // Unique per run: the integration DB is shared by every test file.
 const base = 800_000 + Math.floor(Math.random() * 100_000) * 10;
-const V = { expired: base + 1, recent: base + 2, failed: base + 3, reference: base + 4, evalRunning: base + 5, kept: base + 6, orphanOld: base + 7, orphanNew: base + 8 };
+const V = { expired: base + 1, recent: base + 2, failed: base + 3, reference: base + 4, evalRunning: base + 5, kept: base + 6, orphanOld: base + 7, orphanNew: base + 8, reused: base + 9 };
 
 class MemoryStore implements ArtifactStore {
   objects = new Map<string, ArtifactObject>();
@@ -44,6 +44,8 @@ beforeAll(async () => {
     meetingRow("reference", V.reference, "completed", old),
     meetingRow("eval", V.evalRunning, "completed", old),
     meetingRow("kept", V.kept, "completed", old),
+    // An old published meeting whose Vexa id was reused after a Vexa DB reset (fresh artifacts below).
+    meetingRow("reused", V.reused, "completed", old),
   ]);
   await h.ctx.db.insert(referenceTranscripts).values({ meetingId: `mtg_ret_${base}_reference`, source: "gemini", text: "reference" });
   await h.ctx.db.insert(transcriptEvals).values({ id: `eval_ret_${base}`, meetingId: `mtg_ret_${base}_eval`, provider: "tinfoil", model: "m", status: "running" });
@@ -53,7 +55,7 @@ afterAll(async () => h.stop());
 function fixture() {
   const store = new MemoryStore();
   for (const [name, id] of Object.entries(V)) {
-    const at = name === "orphanNew" ? recent : old;
+    const at = name === "orphanNew" || name === "reused" ? recent : old;
     store.put(`attributed-audio/1/${id}/sess/000000-abc.pcm`, at);
     store.put(`signal/1/${id}/sess/captured-signal.jsonl`, at, 1_000);
     store.put(`recordings/1/${id * 10}/sess/audio/000000.webm`, at, 500);
@@ -90,6 +92,7 @@ test("dry-run reports a plan with a reason per meeting and deletes nothing", asy
     [V.kept]: "keep_list",
     [V.orphanOld]: "orphan_retention_disabled",
     [V.orphanNew]: "orphan_retention_disabled",
+    [V.reused]: "objects_recent",
   });
   expect(plan.eligibleMeetings).toBe(1);
   expect(plan.eligibleBytes).toBe(1_600);

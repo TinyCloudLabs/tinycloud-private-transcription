@@ -1,5 +1,5 @@
 import type { AppContext } from "../context.ts";
-import { artifactStoreConfigured, runArtifactRetention, s3ArtifactStore, type ArtifactStore } from "../services/artifact-retention.ts";
+import { artifactStoreFromConfig, runArtifactRetention, type ArtifactStore } from "../services/artifact-retention.ts";
 import { diskUsedPercent } from "../uploads/storage.ts";
 
 const DISK_CHECK_INTERVAL_MS = 5 * 60_000;
@@ -21,25 +21,22 @@ export function startHousekeeping(ctx: AppContext, opts: { store?: ArtifactStore
 
   const retention = ctx.config.artifactRetention;
   if (retention.mode !== "off") {
-    const store = opts.store ?? (artifactStoreConfigured(retention.s3) ? s3ArtifactStore(retention.s3) : null);
-    if (!store) {
-      ctx.log.error("artifact retention is enabled but VEXA_MINIO_ENDPOINT/ACCESS_KEY/SECRET_KEY are not set; not running", { mode: retention.mode });
-    } else {
-      let sweeping = false;
-      const sweep = async () => {
-        if (sweeping) return;
-        sweeping = true;
-        try {
-          await runArtifactRetention(ctx, store, retention.mode);
-        } catch (error) {
-          ctx.log.error("artifact retention sweep failed", { mode: retention.mode, error: (error as Error).message });
-        } finally {
-          sweeping = false;
-        }
-      };
-      void sweep();
-      timers.push(setInterval(() => { void sweep(); }, retention.intervalMs));
-    }
+    let sweeping = false;
+    const sweep = async () => {
+      if (sweeping) return;
+      sweeping = true;
+      try {
+        const store = opts.store ?? artifactStoreFromConfig(retention.s3);
+        if (!store) ctx.log.error("artifact retention is enabled but its MinIO credentials are not available yet; skipping this sweep", { mode: retention.mode });
+        else await runArtifactRetention(ctx, store, retention.mode);
+      } catch (error) {
+        ctx.log.error("artifact retention sweep failed", { mode: retention.mode, error: (error as Error).message });
+      } finally {
+        sweeping = false;
+      }
+    };
+    void sweep();
+    timers.push(setInterval(() => { void sweep(); }, retention.intervalMs));
   }
   return { stop: () => timers.forEach(clearInterval) };
 }

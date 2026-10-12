@@ -234,6 +234,17 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(worker).toContain("ARTIFACT_RETENTION_MODE: ${ARTIFACT_RETENTION_MODE:-dry-run}");
     expect(worker).toContain("ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS: ${ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS:-88}");
     expect(worker).toContain("VEXA_MINIO_ENDPOINT: http://minio:9000");
+    // Least privilege: a provisioned list+delete-only user, never the MinIO root credentials.
+    expect(worker).toContain("VEXA_MINIO_ACCESS_KEY: ptx-retention");
+    expect(worker).toContain("VEXA_MINIO_SECRET_KEY_FILE: /run/minio-retention/secret-key");
+    expect(worker).not.toContain("MINIO_ROOT");
+    const init = compose.slice(compose.indexOf("\n  minio-init:\n"), compose.indexOf("\n  admin-api:\n"));
+    const policy = JSON.parse(init.match(/printf '%s' '(\{.*\})'/)![1]!);
+    expect(policy.Statement).toEqual([
+      { Effect: "Allow", Action: ["s3:ListBucket"], Resource: ["arn:aws:s3:::vexa"] },
+      { Effect: "Allow", Action: ["s3:DeleteObject"], Resource: ["arn:aws:s3:::vexa/recordings/*", "arn:aws:s3:::vexa/attributed-audio/*", "arn:aws:s3:::vexa/signal/*"] },
+    ]);
+    expect(init).toContain("- minio-retention:/run/minio-retention");
     const janitor = serviceEnv("bot-janitor");
     expect(janitor).toContain("BOT_JANITOR_MODE: ${BOT_JANITOR_MODE:-dry-run}");
     // Must name the same pinned bot image as the runtime, or it could treat the live pin as superseded.

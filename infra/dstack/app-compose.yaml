@@ -115,8 +115,9 @@ services:
       ARTIFACT_RETENTION_ORPHANS: ${ARTIFACT_RETENTION_ORPHANS:-false}
       ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS: ${ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS:-88}
       VEXA_MINIO_ENDPOINT: http://minio:9000
-      VEXA_MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
-      VEXA_MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      # Least-privilege user provisioned by minio-init (list + delete artifact prefixes only).
+      VEXA_MINIO_ACCESS_KEY: ptx-retention
+      VEXA_MINIO_SECRET_KEY_FILE: /run/minio-retention/secret-key
       VEXA_MINIO_BUCKET: vexa
       # Internal eval (TC-745): after publication, re-transcribe internal team meetings with these
       # models and keep the results in the ptx DB for comparison (`bun run cli eval report`).
@@ -132,6 +133,7 @@ services:
       - vexa-provision:/run/vexa:ro
       - signal-runtime:/run/signal-capability:ro
       - signal-control-1:/run/signal-control-1:ro
+      - minio-retention:/run/minio-retention:ro
     depends_on:
       api:
         condition: service_healthy
@@ -306,6 +308,19 @@ services:
       - |
         until mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"; do sleep 1; done
         mc mb -p local/vexa || true
+        # TC-904: least-privilege MinIO user for ptx artifact retention: list the vexa bucket and
+        # delete under its three artifact prefixes; no read or write. The secret is generated once
+        # into the minio-retention volume (never printed) and reapplied every boot. A failure here
+        # only leaves retention without credentials; it never fails this init or Vexa.
+        K=/run/minio-retention/secret-key
+        { [ -s "$$K" ] || { head -c 20 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$$K.tmp" && chmod 0400 "$$K.tmp" && mv "$$K.tmp" "$$K"; }; } &&
+          printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:ListBucket"],"Resource":["arn:aws:s3:::vexa"]},{"Effect":"Allow","Action":["s3:DeleteObject"],"Resource":["arn:aws:s3:::vexa/recordings/*","arn:aws:s3:::vexa/attributed-audio/*","arn:aws:s3:::vexa/signal/*"]}]}' > /tmp/ptx-retention.json &&
+          mc admin policy create local ptx-retention /tmp/ptx-retention.json >/dev/null &&
+          mc admin user add local ptx-retention "$$(cat "$$K")" >/dev/null &&
+          { mc admin policy attach local ptx-retention --user ptx-retention >/dev/null 2>&1 || mc admin policy entities local --user ptx-retention | grep -q ptx-retention; } &&
+          echo "ptx-retention MinIO user ready" || echo "ptx-retention MinIO user setup failed; artifact retention has no credentials"
+    volumes:
+      - minio-retention:/run/minio-retention
     depends_on:
       minio:
         condition: service_healthy
@@ -356,6 +371,10 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
+        # Invalid settings fall back to defaults and never remove anything.
+        case "$$BOT_JANITOR_MODE" in apply|dry-run) ;; *) echo "bot-janitor: invalid BOT_JANITOR_MODE; using dry-run"; BOT_JANITOR_MODE=dry-run;; esac
+        case "$$BOT_CONTAINER_RETENTION_DAYS" in ''|*[!0-9]*|0*) echo "bot-janitor: invalid BOT_CONTAINER_RETENTION_DAYS; using 7 in dry-run"; BOT_CONTAINER_RETENTION_DAYS=7; BOT_JANITOR_MODE=dry-run;; esac
+        case "$$BOT_JANITOR_INTERVAL_SECONDS" in ''|*[!0-9]*|0*) BOT_JANITOR_INTERVAL_SECONDS=21600;; esac
         log() { echo "bot-janitor [$$BOT_JANITOR_MODE] $$*"; }
         act() { if [ "$$BOT_JANITOR_MODE" = apply ]; then "$$@" >/dev/null || log "failed: $$*"; fi; }
         older() { awk -v a="$$1" -v b="$$2" 'BEGIN { exit !(a < b) }'; }
@@ -374,7 +393,7 @@ services:
               created=$$(docker image inspect -f '{{.Created}}' "$$img") || continue
               older "$$created" "$${pin#* }" || continue
               [ -z "$$(docker ps -aq --filter ancestor=$$img)" ] || continue
-              log "remove image $$img created $$created"; act docker rmi -f "$$img"
+              log "remove image $$img created $$created"; act docker rmi "$$img"
             done
         }
         while :; do sweep; sleep "$$BOT_JANITOR_INTERVAL_SECONDS"; done
@@ -555,6 +574,7 @@ volumes:
   vexa-postgres:
   vexa-redis:
   minio-data:
+  minio-retention:
   whisper-cache:
   vexa-provision:
   signal-profile:

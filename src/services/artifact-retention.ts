@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { and, eq, inArray } from "drizzle-orm";
 import type { AppContext } from "../context.ts";
 import type { ArtifactRetentionMode } from "../config.ts";
@@ -50,6 +51,9 @@ export function retentionDecision(vexaMeetingId: number, rows: PtxMeetingState[]
     if (row.status !== "completed" || !row.completedAt) return { eligible: false, reason: `status_${row.status}` };
     if (row.completedAt > policy.cutoff) return { eligible: false, reason: "completed_recently" };
   }
+  // Vexa meeting ids restart after a Vexa DB reset, so an old completed ptx row can share its id
+  // with a new meeting's artifacts. Those artifacts are recent; never delete them on the old row's age.
+  if (newestObject > policy.cutoff) return { eligible: false, reason: "objects_recent" };
   return { eligible: true, reason: "completed_expired" };
 }
 
@@ -93,8 +97,8 @@ export async function planArtifactRetention(ctx: AppContext, store: ArtifactStor
     keepVexaMeetingIds: new Set(cfg.keepVexaMeetingIds),
     orphans: cfg.orphans,
   };
-  // Recording keys carry Vexa's recording id, not its meeting id. A failed lookup aborts the sweep
-  // rather than treating every recording as unmapped and planning from partial data.
+  // Recording keys carry Vexa's recording id, not its meeting id; listRecordings reads every page.
+  // A failed lookup aborts the sweep rather than planning from partial data.
   const recordingMeetings = new Map((await ctx.vexa.listRecordings()).recordings.map((r) => [r.id, r.meeting_id] as const));
 
   const groups = new Map<number, { keys: string[]; bytes: number; bytesByKind: Partial<Record<ArtifactKind, number>>; newest: Date }>();
@@ -179,5 +183,15 @@ export function s3ArtifactStore(s3: { endpoint: string; accessKeyId: string; sec
   };
 }
 
-export const artifactStoreConfigured = (s3: { endpoint: string; accessKeyId: string; secretAccessKey: string }) =>
-  Boolean(s3.endpoint && s3.accessKeyId && s3.secretAccessKey);
+/**
+ * The configured store, or null while credentials are missing. The secret may come from a file the
+ * CVM provisions (minio-init); it is read on each call, so a sweep after provisioning succeeds.
+ */
+export function artifactStoreFromConfig(s3: { endpoint: string; accessKeyId: string; secretAccessKey: string; secretAccessKeyFile: string; bucket: string }): ArtifactStore | null {
+  let secretAccessKey = s3.secretAccessKey;
+  if (!secretAccessKey && s3.secretAccessKeyFile) {
+    try { secretAccessKey = readFileSync(s3.secretAccessKeyFile, "utf8").trim(); } catch { secretAccessKey = ""; }
+  }
+  if (!s3.endpoint || !s3.accessKeyId || !secretAccessKey) return null;
+  return s3ArtifactStore({ endpoint: s3.endpoint, accessKeyId: s3.accessKeyId, secretAccessKey, bucket: s3.bucket });
+}

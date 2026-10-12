@@ -98,12 +98,12 @@ switch (cmd) {
     process.exit(0);
   }
   case "artifact-retention": {
-    const { artifactStoreConfigured, planArtifactRetention, s3ArtifactStore } = await import("./services/artifact-retention.ts");
+    const { artifactStoreFromConfig, planArtifactRetention } = await import("./services/artifact-retention.ts");
     const ctx = createContext();
     if (rest.includes("--orphans")) ctx.config.artifactRetention.orphans = true;
-    const s3 = ctx.config.artifactRetention.s3;
-    if (!artifactStoreConfigured(s3)) fail("VEXA_MINIO_ENDPOINT, VEXA_MINIO_ACCESS_KEY and VEXA_MINIO_SECRET_KEY are required");
-    const plan = await planArtifactRetention(ctx, s3ArtifactStore(s3), new Date());
+    const store = artifactStoreFromConfig(ctx.config.artifactRetention.s3)
+      ?? fail("VEXA_MINIO_ENDPOINT, VEXA_MINIO_ACCESS_KEY and VEXA_MINIO_SECRET_KEY (or a readable VEXA_MINIO_SECRET_KEY_FILE) are required");
+    const plan = await planArtifactRetention(ctx, store, new Date());
     const mb = (bytes: number) => Math.round(bytes / 1e5) / 10;
     console.table(plan.meetings.map((m) => ({ vexa_meeting: m.vexaMeetingId, ptx_meeting: m.ptxMeetingIds.join(",") || "-", delete: m.eligible, reason: m.reason, objects: m.objects,
       mb: mb(m.bytes), recordings_mb: mb(m.bytesByKind.recordings ?? 0), attributed_mb: mb(m.bytesByKind["attributed-audio"] ?? 0), signal_mb: mb(m.bytesByKind.signal ?? 0) })));
