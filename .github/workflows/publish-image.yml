@@ -74,8 +74,8 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.description=TinyCloud Private Transcription api/worker
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=api
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=max,scope=api' || '' }}
 
       - name: Summary
         run: |
@@ -123,8 +123,8 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.description=TinyCloud Signal Desktop capture seat
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=signal-seat
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=max,scope=signal-seat' || '' }}
       - name: Summary
         run: |
           {
