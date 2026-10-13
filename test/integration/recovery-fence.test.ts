@@ -285,6 +285,9 @@ test("explicit recovery opens a fresh admission round over a terminal outcome", 
     expect(recovered.status).toBe(200);
     await waitStatus(meetingId, "completed");
     expect(paidCalls).toBe(2);
+    // settleRecordingRecovery writes `outcome` after the completion commit (meeting-job.ts:709-712).
+    await h.waitFor(async () => ((await recoveryRun(meetingId))?.outcome ?? null) !== null ? true : null,
+      { timeoutMs: 5_000, label: "recovery outcome settled" });
     expect(await recoveryRun(meetingId)).toMatchObject({ admissions: 1, outcome: "succeeded" });
   } finally {
     failNextStatus = null;
