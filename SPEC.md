@@ -46,7 +46,9 @@ States: `queued → joining → waiting_for_admission → in_progress → proces
 
 For every dispatched meeting, the worker sends Vexa `automatic_leave.max_time_left_alone` from `VEXA_MAX_TIME_LEFT_ALONE_MS` (default 300000 milliseconds). Vexa currently infers aloneness from the absence of remote participant audio, so five continuous silent minutes release the bot and continue normal finalization as `completed(left_alone)` on Jitsi or Google Meet; operators can tune the window when needed.
 
-`GET /v1/meetings/{id}` → status, platform, bot{name,joined_at}, transcript{status}, created/started/ended_at, metadata, error{type,code,message} on failure. Once completed it includes `transcript_provider: "vexa"`.
+`GET /v1/meetings/{id}` → status, platform, bot{name,joined_at}, transcript{status,version}, created/started/ended_at, metadata, error{type,code,message} on failure. Once completed it includes `transcript_provider: "vexa"`.
+
+`transcript.version`: integer, starts at 1, strictly increases each time the meeting's transcript is replaced (republish or rollback). Present when a transcript row exists. The transcript GET also includes `version` and `published_at` (ISO timestamp, falling back to `created_at` for legacy publications).
 
 `GET /v1/meetings/by-idempotency-key` with an `Idempotency-Key` header → `{meeting, request_hash}` for the authenticated project's existing create, or `404 meeting_not_found`. `meeting` has the same shape as the ID lookup; `request_hash` is SHA-256 of the canonical parsed create body (sorted object keys, omitted undefined fields, preserved array order; Signal URL fragments removed). This endpoint only reads: it never creates a meeting or enqueues work. Use it to recover uncertain creates even when sending another bot is no longer authorized. A lookup miss is not proof that a still-running request cannot commit later.
 `POST /v1/meetings/{id}/stop` → idempotent, returns `{id,status}`.
@@ -63,18 +65,19 @@ capture-provider record back to `processing` and retries Vexa-segment finalizati
 Speaker contract (TC-981): only segment `speaker_name` is nullable (`string | null`);
 `speaker_id` remains a non-null string. Unattributed speech has `speaker_name: null` and
 `attribution:"unknown"`, with an opaque ID of `participant:unresolved:<opaque>`.
-IDs are stable within a meeting and distinct per unresolved voice; they are not derived
-readably from provider data. Consumers must not parse them. Unresolved IDs use 1-based
-ordinals assigned by first appearance in the final time-ordered segment list, so rerunning
-the same input produces identical IDs. Speech without a capture key shares one unresolved
-ID, separate from keyed voices. Explicit `attribution:"overlap"` is retained for overlapping speech.
+Segment ids (`seg_…`), speaker ids (`speaker_…`) and unresolved speaker keys are stable only within one published version of a meeting's transcript. A republish (an increase in `transcript.version`) may renumber them, so consumers must key anything derived from them by (meeting id, `transcript.version`).
+They are not derived readably from provider data. Consumers must not parse them. Unresolved IDs use
+1-based ordinals assigned by first appearance in the final time-ordered segment list, so rerunning
+the same input produces identical IDs. Speech without a capture key shares one unresolved ID,
+separate from keyed voices. Explicit `attribution:"overlap"` is retained for overlapping speech.
 It creates no entry in `speakers[]`, and its plain-text line contains only the speech text,
 without a speaker label. Named speakers, including a participant actually named `Unknown`,
 keep their names and speaker entries. The existing attribution field remains optional for
 named segments. Gap `speaker_name` is also nullable when its speaker could not be resolved.
 This is an API contract change: consumers must accept null names. Deploy the separate
 tinychat consumer null-handling PR before deploying this PTX change. Existing stored
-transcripts are unchanged; any backfill is separate.
+transcripts are unchanged until `republish` (TC-989) publishes them in the null-name/opaque-id
+shape as a new transcript version.
 
 Attributed Google Meet transcripts (`provider:"tinfoil-attributed"`) are turn-level: each speaker
 stream is transcribed with a timestamped model (`TINFOIL_ATTRIBUTED_MODEL`, Whisper) and every segment

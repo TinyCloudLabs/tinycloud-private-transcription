@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { eq, sql } from "drizzle-orm";
-import { pgTable, text, timestamp } from "drizzle-orm/pg-core";
+import { jsonb, pgTable, real, text, timestamp } from "drizzle-orm/pg-core";
 import { migrate } from "drizzle-orm/bun-sql/migrator";
 import { createApp } from "../../src/api/app.ts";
 import { hashApiKey } from "../../src/api/auth.ts";
@@ -156,7 +156,7 @@ test("0004-0015 retain production retry, fallback, terminal delivery, and deleti
     expect(signalColumns).toEqual({ count: 2 });
 
     const [migrationCount] = await db.execute(sql`SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`);
-    expect(migrationCount).toEqual({ count: 24 });
+    expect(migrationCount).toEqual({ count: 25 });
 
     const [deletionAdmission] = await db.execute(sql`
       SELECT count(*)::int AS count
@@ -302,7 +302,7 @@ test("0016 keeps every pre-enforcement key working on meeting routes and grants 
   }
 }, 30_000);
 
-test("0017+ migrations are additive: every pre-existing column, row and meeting route is unchanged", async () => {
+test("0017-0024 migrations are additive: every pre-existing column, row and meeting route is unchanged", async () => {
   const databaseName = `ptx_batch_${crypto.randomUUID().replaceAll("-", "")}`;
   const databaseUrl = new URL(config.databaseUrl);
   databaseUrl.pathname = `/${databaseName}`;
@@ -337,6 +337,7 @@ test("0017+ migrations are additive: every pre-existing column, row and meeting 
     const schemaAfter = (await columns(db) as { table_name: string; column_name: string }[])
       .filter((c) => columnsBefore.has(`${c.table_name}.${c.column_name}`));
     expect(schemaAfter).toEqual(schemaBefore as never);
+    expect((await columns(db)).some((c) => c.table_name === "transcript_versions")).toBe(true);
     expect(await db.execute(sql`SELECT * FROM meetings`)).toEqual(rowsBefore);
     expect(await db.execute(sql`SELECT id, status, attempts, fetch_attempts FROM attributed_batches`))
       .toEqual([{ id: "mtg_upgrade:batch:0", status: "pending", attempts: 0, fetch_attempts: 0 }]);
@@ -349,6 +350,78 @@ test("0017+ migrations are additive: every pre-existing column, row and meeting 
     expect(res.status).toBe(404);
     // The meeting role never mounts the batch API.
     expect((await app.request("/v1/transcriptions", { headers: { Authorization: `Bearer ${key}` } })).status).toBe(404);
+  } finally {
+    await db?.$client.close();
+    await admin.unsafe(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`);
+    await admin.close();
+    await rm(fixture, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("0024 upgrades 0023 data additively and tolerates the old image after rollback", async () => {
+  const databaseName = `ptx_versions_${crypto.randomUUID().replaceAll("-", "")}`;
+  const databaseUrl = new URL(config.databaseUrl);
+  databaseUrl.pathname = `/${databaseName}`;
+  const adminUrl = new URL(config.databaseUrl);
+  adminUrl.pathname = "/postgres";
+  const admin = new SQL(adminUrl.toString());
+  const fixture = await productionMigrationsFixture(24);
+  let db: Db | undefined;
+  const oldTranscripts = pgTable("transcripts", {
+    meetingId: text("meeting_id").primaryKey(), language: text("language").notNull(),
+    durationSeconds: real("duration_seconds").notNull(), segmentsJson: jsonb("segments_json").notNull(),
+    provider: text("provider").notNull().default("vexa"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  });
+  try {
+    await admin.unsafe(`CREATE DATABASE "${databaseName}"`);
+    const before = createDb(databaseUrl.toString());
+    await migrate(before, { migrationsFolder: fixture });
+    await before.execute(sql`insert into projects (id, name, webhook_secret) values ('upgrade', 'fixture', 'fixture')`);
+    await before.execute(sql`insert into meetings (id, project_id, meeting_url, platform, status)
+      values ('mtg_v1', 'upgrade', 'https://meet.google.com/rep-ubli-sha', 'google_meet', 'completed'),
+      ('mtg_old_insert', 'upgrade', 'https://meet.google.com/rep-ubli-shb', 'google_meet', 'processing')`);
+    await before.execute(sql`insert into transcripts (meeting_id, language, duration_seconds, provider, segments_json)
+      values ('mtg_v1', 'en', 1, 'tinfoil-attributed', '{"speakers":[],"segments":[],"text":"fixture"}'::jsonb)`);
+    await before.execute(sql`insert into attributed_transcription_runs (meeting_id, status, manifest_json, coverage_json)
+      values ('mtg_v1', 'completed', '{"ranges":[]}'::jsonb, '{"batches":1}'::jsonb)`);
+    await before.execute(sql`insert into attributed_batches (id, meeting_id, ordinal, batch_json, status)
+      values ('mtg_v1:batch:0', 'mtg_v1', 0, '{}'::jsonb, 'completed')`);
+    await before.execute(sql`insert into attributed_attempts (id, batch_id, ordinal, status)
+      values ('attempt_v1', 'mtg_v1:batch:0', 0, 'succeeded')`);
+    const legacyRows = await before.select().from(oldTranscripts);
+    const legacyFingerprint = await before.execute(sql`select md5(t.segments_json::text) as content_hash,
+      md5(r.manifest_json::text) as manifest_hash, md5(r.coverage_json::text) as coverage_hash,
+      b.status as batch_status, a.status as attempt_status from transcripts t
+      join attributed_transcription_runs r on r.meeting_id = t.meeting_id
+      join attributed_batches b on b.meeting_id = t.meeting_id
+      join attributed_attempts a on a.batch_id = b.id`);
+    await before.$client.close();
+    db = await runMigrations(databaseUrl.toString());
+    expect(await db.execute(sql`select version, published_at from transcripts`)).toEqual([{ version: 1, published_at: null }]);
+    expect(await db.execute(sql`select count(*)::int as count from transcript_versions`)).toEqual([{ count: 0 }]);
+    expect(await db.execute(sql`select count(*)::int as count from information_schema.columns
+      where table_schema = 'public' and table_name = 'transcript_versions' and column_name = 'meeting_ended_at'`))
+      .toEqual([{ count: 1 }]);
+    // Named-column reads from the actual pre-0024 schema still work, and retain all content.
+    expect(JSON.stringify(await db.select().from(oldTranscripts)) === JSON.stringify(legacyRows)).toBe(true);
+    expect(await db.execute(sql`select md5(t.segments_json::text) as content_hash,
+      md5(r.manifest_json::text) as manifest_hash, md5(r.coverage_json::text) as coverage_hash,
+      b.status as batch_status, a.status as attempt_status from transcripts t
+      join attributed_transcription_runs r on r.meeting_id = t.meeting_id
+      join attributed_batches b on b.meeting_id = t.meeting_id
+      join attributed_attempts a on a.batch_id = b.id`)).toEqual(legacyFingerprint);
+    // The old migrator ignores the already-newer journal; it does not undo 0024 or check hashes.
+    await migrate(db, { migrationsFolder: fixture });
+    await db.insert(oldTranscripts).values({ meetingId: "mtg_old_insert", language: "en", durationSeconds: 0,
+      segmentsJson: sql`'{"speakers":[],"segments":[],"text":""}'::jsonb` });
+    expect(await db.execute(sql`select version, published_at from transcripts where meeting_id = 'mtg_old_insert'`))
+      .toEqual([{ version: 1, published_at: null }]);
+    expect(await db.execute(sql`select count(*)::int as count from drizzle.__drizzle_migrations`)).toEqual([{ count: 25 }]);
+    // Generated DDL must stay additive: rollback means retaining this schema, never dropping it.
+    const migration = await readFile(join(migrationsSource, "0024_transcript_versions.sql"), "utf8");
+    expect(/^\s*(drop|truncate|delete)\b/im.test(migration)).toBe(false);
+    expect(/\bALTER\s+TABLE\s+"transcripts"\s+ADD\s+COLUMN/i.test(migration)).toBe(true);
   } finally {
     await db?.$client.close();
     await admin.unsafe(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`);

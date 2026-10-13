@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { and, desc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import type { AppContext } from "../context.ts";
-import { attributedAttempts, attributedBatches as batchesTable, attributedRanges, attributedTranscriptionRuns, attributedWorkerReadiness, meetings, tinfoilDispatchSlots, transcripts, webhookDeliveries } from "../db/schema.ts";
+import type { Db } from "../db/client.ts";
+import { attributedAttempts, attributedBatches as batchesTable, attributedRanges, attributedTranscriptionRuns, attributedWorkerReadiness, meetings, tinfoilDispatchSlots, transcripts, transcriptVersions, webhookDeliveries } from "../db/schema.ts";
 import { attributedBatches, bySequence, readAttributedBatch, type AttributedBatch, type AttributedCapability, type AttributedManifest } from "../providers/transcription/attributed.ts";
 import { assembleRawPieces, attributedPieces, partsMs, type AttributedResult, type GapPart, type RawPiece } from "../providers/transcription/attributed-assembly.ts";
 import { recordingCuts, recordingLevels, type Pcm16 } from "../providers/transcription/audio.ts";
@@ -119,6 +120,10 @@ export async function markAttributedRecovery(ctx: AppContext, meetingId: string)
  * rather than re-verified: the ledger is authoritative once committed.
  */
 export type AttributedStageOutcome = "staged" | "resumed" | "ineligible";
+export async function insertPlannedBatches(tx: Parameters<Parameters<Db["transaction"]>[0]>[0], meetingId: string, specs: AttributedBatch[]): Promise<void> {
+  for (const [ordinal, batch] of specs.entries()) await tx.insert(batchesTable).values({ id: `${meetingId}:batch:${ordinal}`, meetingId, ordinal, batchJson: json(batch), status: "pending" });
+}
+
 export async function stageAttributedManifest(ctx: AppContext, meetingId: string, vexaMeetingId: number, fetched: AttributedManifest, capability: unknown): Promise<AttributedStageOutcome> {
   // Persist and compare in sequence order so a re-read in a different array order is not a conflict.
   const manifest = bySequence(fetched);
@@ -142,7 +147,7 @@ export async function stageAttributedManifest(ctx: AppContext, meetingId: string
     }
     await tx.insert(attributedTranscriptionRuns).values({ meetingId, status: "processing", manifestJson: json(manifest) });
     for (const range of manifest.ranges) await tx.insert(attributedRanges).values({ meetingId, sequence: range.sequence, rangeJson: json(range), status: range.state === "failed" ? "failed" : "pending" });
-    for (const [ordinal, batch] of specs.entries()) await tx.insert(batchesTable).values({ id: `${meetingId}:batch:${ordinal}`, meetingId, ordinal, batchJson: json(batch) });
+    await insertPlannedBatches(tx, meetingId, specs);
     return "staged" as const;
   });
   if (staged === "ineligible") return staged;
@@ -672,7 +677,7 @@ async function stageGapFill(ctx: AppContext, meetingId: string, rows: Array<type
 }
 
 /** `gaps` reports captured speech still untranscribed so the worker can alert after commit (TC-758). */
-type Publication = { meeting: typeof meetings.$inferSelect; webhook: boolean; deliveryId: string | null; gaps?: { count: number; gapMs: number }; unverifiedGapRows?: number } | null;
+type Publication = { meeting: typeof meetings.$inferSelect; version?: number; webhook: boolean; deliveryId: string | null; gaps?: { count: number; gapMs: number }; unverifiedGapRows?: number } | null;
 
 /** Per-meeting speech accounting stored beside the canonical transcript (TC-758). Milliseconds. */
 export interface AttributedCoverage {
@@ -682,6 +687,19 @@ export interface AttributedCoverage {
   gap_align: "none" | "completed" | "failed"; gap_chunks: number; gap_chunks_filled: number; gap_rows_unverified: number;
 }
 const rangeMs = (ranges: Array<{ start_ms: number; end_ms: number }>) => ranges.reduce((sum, range) => sum + Math.max(0, range.end_ms - range.start_ms), 0);
+
+/** Metadata-only publication guard: count words without ever logging or returning transcript content. */
+function transcriptWordCount(value: unknown): number {
+  if (typeof value === "string") {
+    try { return transcriptWordCount(JSON.parse(value)); } catch { return value.trim() ? value.trim().split(/\s+/u).length : 0; }
+  }
+  if (!value || typeof value !== "object") return 0;
+  const transcript = value as { text?: unknown; segments?: unknown };
+  if (typeof transcript.text === "string") return transcript.text.trim() ? transcript.text.trim().split(/\s+/u).length : 0;
+  return Array.isArray(transcript.segments)
+    ? transcript.segments.reduce((count, segment) => count + transcriptWordCount(segment), 0)
+    : 0;
+}
 
 /**
  * Publication is deliberately a second, complete verification pass.  Results fetched before this
@@ -696,8 +714,10 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
     const ledgerRows = await tx.select().from(batchesTable).where(eq(batchesTable.meetingId, meetingId)).orderBy(batchesTable.ordinal).for("update");
     const attempts = await tx.select().from(attributedAttempts).innerJoin(batchesTable, eq(attributedAttempts.batchId, batchesTable.id)).where(eq(batchesTable.meetingId, meetingId)).for("update");
     if (!meeting || meeting.status === "failed" || meeting.status === "cancelled" || meeting.dispatchBlocked || !run || run.status !== "processing" || !meeting.vexaMeetingId) return null;
-    const reject = async (gaps?: { count: number; gapMs: number }): Promise<Publication> => {
-      const [failed] = await tx.update(meetings).set({ status: "failed", errorCode: "transcription_failed", errorMessage: "Attributed evidence could not be verified for publication.", endedAt: new Date() })
+    const reject = async (gaps?: { count: number; gapMs: number }, code = "transcription_failed"): Promise<Publication> => {
+      const [failed] = await tx.update(meetings).set({ status: "failed", errorCode: code,
+        errorMessage: code === "republish_regressed" ? "Republished transcript did not meet the content regression floor." : "Attributed evidence could not be verified for publication.",
+        endedAt: sql`coalesce(${meetings.endedAt}, now())` })
         .where(and(eq(meetings.id, meetingId), eq(meetings.status, "processing"))).returning();
       if (failed) await tx.update(attributedTranscriptionRuns).set({ status: "partial", updatedAt: new Date() }).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
       return failed ? { meeting: failed, webhook: true, deliveryId: null, ...(gaps ? { gaps } : {}) } : null;
@@ -811,7 +831,7 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
     const existing = await tx.select().from(transcripts).where(eq(transcripts.meetingId, meetingId)).for("update");
     if (existing[0] && (existing[0].provider !== "tinfoil-attributed" || canonical(existing[0].segmentsJson) !== canonical(payload)
         || existing[0].language !== transcript.language || existing[0].durationSeconds !== transcript.duration_seconds)) {
-      const [failed] = await tx.update(meetings).set({ status: "failed", errorCode: "transcription_failed", errorMessage: "Attributed transcript conflicts with an existing transcript.", endedAt: new Date() })
+      const [failed] = await tx.update(meetings).set({ status: "failed", errorCode: "transcription_failed", errorMessage: "Attributed transcript conflicts with an existing transcript.", endedAt: sql`coalesce(${meetings.endedAt}, now())` })
         .where(and(eq(meetings.id, meetingId), eq(meetings.status, "processing"))).returning();
       if (failed) await tx.update(attributedTranscriptionRuns).set({ status: "partial", updatedAt: new Date() }).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
       return failed ? { meeting: failed, webhook: true, deliveryId: null } satisfies Publication : null;
@@ -822,19 +842,25 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
       return null;
     }
     if (meeting.status !== "processing") return null;
+    const [versionRow] = await tx.execute(sql`select coalesce(max(version), 0)::int + 1 as next
+      from transcript_versions where meeting_id = ${meetingId}`);
+    const version = Number(versionRow!.next);
+    if (version > 1) {
+      const [previous] = await tx.select({ segmentsJson: transcriptVersions.segmentsJson }).from(transcriptVersions)
+        .where(eq(transcriptVersions.meetingId, meetingId)).orderBy(desc(transcriptVersions.version)).limit(1);
+      if (previous && transcriptWordCount(payload) < transcriptWordCount(previous.segmentsJson) * 0.5) return reject(gapReport, "republish_regressed");
+    }
     const [completed] = await tx.update(meetings).set({ status: "completed", completedAt: new Date() }).where(and(eq(meetings.id, meetingId), eq(meetings.status, "processing"))).returning();
     if (!completed) return null;
-    await tx.insert(transcripts).values({ meetingId, language: transcript.language, durationSeconds: transcript.duration_seconds, segmentsJson: json(payload), provider: "tinfoil-attributed" });
+    const [stored] = await tx.insert(transcripts).values({ meetingId, language: transcript.language, durationSeconds: transcript.duration_seconds, segmentsJson: json(payload), provider: "tinfoil-attributed",
+      version, publishedAt: sql`now()` }).returning();
     await tx.update(attributedTranscriptionRuns).set({ status: "completed", coverageJson: json(coverage), updatedAt: new Date() }).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
     // Canonical transcript, terminal state, and completion-delivery intent commit together.
     // Redis is deliberately only a wakeup; a later reconciliation safely resumes this row.
-    const intent = webhookDeliveryValues(completed, "meeting.completed", {
-      meetingId, language: transcript.language, durationSeconds: transcript.duration_seconds,
-      segmentsJson: payload, provider: "tinfoil-attributed", createdAt: new Date(),
-    });
+    const intent = webhookDeliveryValues(completed, "meeting.completed", stored!);
     if (intent) await tx.insert(webhookDeliveries).values(intent)
       .onConflictDoNothing({ target: [webhookDeliveries.meetingId, webhookDeliveries.eventType] });
-    return { meeting: completed, webhook: true, deliveryId: intent?.id ?? null, ...(gapReport ? { gaps: gapReport } : {}), ...(unverified ? { unverifiedGapRows: unverified } : {}) } satisfies Publication;
+    return { meeting: completed, version: stored!.version, webhook: true, deliveryId: intent?.id ?? null, ...(gapReport ? { gaps: gapReport } : {}), ...(unverified ? { unverifiedGapRows: unverified } : {}) } satisfies Publication;
   });
   // The meeting is terminal: its recording cache is no longer needed.
   if (published) await removeRecordingCache(meetingId);
@@ -847,7 +873,7 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
     ctx.attributedWorkerHealthy = published.meeting.status === "completed";
     if (published.meeting.status === "completed") {
       await recordAttributedWorkerReadiness(ctx, true, "published");
-      await scheduleTranscriptEval(ctx, published.meeting);
+      if (published.version === 1) await scheduleTranscriptEval(ctx, published.meeting);
     }
     else await recordAttributedWorkerReadiness(ctx, false, "publication_failed");
     if (published.deliveryId) await wakeWebhookDelivery(ctx, published.deliveryId, new Date()).catch(() => {
