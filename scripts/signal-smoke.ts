@@ -8,7 +8,7 @@
  *   1. POST /v1/meetings with a Signal call link (+ Idempotency-Key) → 201 queued.
  *   2. GET  /v1/meetings/{id} until the lifecycle reaches in_progress.
  *   3. POST /v1/meetings/{id}/stop twice → identical body (idempotent).
- *   4. GET  /v1/meetings/{id}/transcript until completed, with `Unknown`/`unknown` segments.
+ *   4. GET  /v1/meetings/{id}/transcript until completed, with null speaker names and `unknown` attribution.
  *   5. meeting.completed webhook delivered to a local sink and HMAC-verified.
  *   6. The call fragment appears in no response body, webhook body, or process log.
  *
@@ -204,7 +204,7 @@ async function main() {
     save("signal-smoke-webhook.json", hook ? { type: hook.body.type, signature_valid: verifyWebhookSignature(webhookSecret, hook.rawBody, hook.headers["x-webhook-signature"]), body: hook.body } : null);
 
     const segments = transcript.body.segments ?? [];
-    const unknownSpeakers = segments.length > 0 && segments.every((s: any) => s.speaker_name === "Unknown" && s.attribution === "unknown");
+    const unknownSpeakers = segments.length > 0 && segments.every((s: any) => s.speaker_name === null && s.attribution === "unknown");
     const expectedPhraseMatched = healthBody.backend === "replay" || segments.some((s: any) => typeof s.text === "string" && s.text.toLowerCase().includes(expectedPhrase!.toLowerCase()));
     const stopIdempotent = !!stopped && !!stoppedAgain && stopped.http_status === 200 && stoppedAgain.http_status === 200 && JSON.stringify(stopped.body) === JSON.stringify(stoppedAgain.body);
     const leaked = [...bodies, ...(hook ? [hook.rawBody] : []), ...captureLog, ...serviceLog].some((t) => t.includes(CAPABILITY));

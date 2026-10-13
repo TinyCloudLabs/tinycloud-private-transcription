@@ -575,7 +575,7 @@ async function handleSignalPoll(ctx: AppContext, meeting: MeetingRow, continuePo
       if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
       return;
     }
-    const transcript = normalizeSegments((snapshot.segments ?? []).map((segment) => ({ ...segment, speaker: "Unknown", speakerKey: "unknown", attribution: "unknown" })), meeting.language);
+    const transcript = normalizeSegments((snapshot.segments ?? []).map((segment) => ({ ...segment, speaker: null, speakerKey: "unknown", attribution: "unknown" })), meeting.language);
     if (!transcript.text.trim()) throw new ApiError("transcription_failed", "Signal capture returned no words.");
     // A poll can observe only a terminal worker snapshot; preserve PTX's ordered lifecycle even
     // when Signal Desktop joined and left between polls.

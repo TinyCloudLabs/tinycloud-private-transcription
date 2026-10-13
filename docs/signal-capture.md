@@ -56,7 +56,8 @@ Coordination exception: no Linear issue was created for this slice because the w
 issue limit rejected creation; do not retry issue creation until capacity is available.
 
 The first slice maps worker states to the normal PTX lifecycle and normalizes every segment to the
-single `Unknown` speaker with `attribution: "unknown"`. Signal chat, reactions, camera, screen
+same non-null speaker ID with null speaker names and `attribution: "unknown"`, without a placeholder
+participant or speaker label. Signal chat, reactions, camera, screen
 share, autonomous speech, and true speaker attribution remain out of scope.
 
 ## Three-seat E2E plan

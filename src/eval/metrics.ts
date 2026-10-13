@@ -5,7 +5,7 @@ import { hallucinated } from "../domain/hallucination.ts";
  * words in published order, so a transcript whose turns are out of order scores worse even when
  * every word is present.
  */
-export interface TurnLike { speaker: string; text: string }
+export interface TurnLike { speaker: string | null; text: string }
 export interface TranscriptMetrics {
   hyp_words: number; ref_words: number;
   /** Word error rate in published order (substitutions + deletions + insertions) / reference words. */
@@ -32,10 +32,10 @@ export function words(text: string): string[] {
     .filter((word) => word && !FILLER.has(word));
 }
 
-const tagged = (turns: TurnLike[]) => turns.flatMap((turn) => words(turn.text).map((word) => ({ word, speaker: turn.speaker.trim().toLowerCase() })));
+const tagged = (turns: TurnLike[]) => turns.flatMap((turn) => words(turn.text).map((word) => ({ word, speaker: turn.speaker?.trim().toLowerCase() || null })));
 
 /** Levenshtein over words; full alignment (for speaker accuracy) only when it fits in memory. */
-function align(hyp: Array<{ word: string; speaker: string }>, ref: Array<{ word: string; speaker: string }>) {
+function align(hyp: Array<{ word: string; speaker: string | null }>, ref: Array<{ word: string; speaker: string | null }>) {
   const n = ref.length, m = hyp.length;
   if (!n) return { errors: m, matches: 0, speakerAgree: 0, deletions: 0, substitutions: 0 };
   if (n * m > ALIGN_CELL_LIMIT) {
@@ -90,10 +90,10 @@ const round = (value: number) => Math.round(value * 10_000) / 10_000;
 export function transcriptMetrics(hypothesis: TurnLike[], reference: TurnLike[] | null): TranscriptMetrics {
   const hyp = tagged(hypothesis);
   const turnWords = hypothesis.map((turn) => words(turn.text).length).sort((a, b) => a - b);
-  const unknownWords = hyp.filter((word) => word.speaker === "unknown").length;
+  const unknownWords = hyp.filter((word) => word.speaker === null || word.speaker === "unknown").length;
   const base = {
     hyp_words: hyp.length, ref_words: 0, wer: null, word_recall: null, trigram_recall: null, speaker_accuracy: null,
-    speakers: new Set(hypothesis.map((turn) => turn.speaker.trim().toLowerCase())).size,
+    speakers: new Set(hypothesis.map((turn) => turn.speaker?.trim().toLowerCase()).filter(Boolean)).size,
     unknown_word_share: hyp.length ? round(unknownWords / hyp.length) : 0,
     turns: hypothesis.length, median_turn_words: turnWords.length ? turnWords[Math.floor(turnWords.length / 2)]! : 0,
     hallucinated_turns: hypothesis.filter((turn) => hallucinated(turn.text)).length,

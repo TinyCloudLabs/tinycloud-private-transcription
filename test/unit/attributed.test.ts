@@ -63,7 +63,7 @@ test("open, failed, absolute, and oversized evidence are rejected before fetch",
 
 test("unresolved-speaker ranges batch and transcribe as an unknown speaker (TC-559)", async () => {
   // The unresolved range shares the named participant's speaker_key: publication must still give
-  // it a distinct speaker_id, never Alice's (M2). It is far enough from Alice's speech that no
+  // it a distinct unresolved speaker_id, never Alice's (M2). It is far enough from Alice's speech that no
   // neighbouring bound range names it (TC-742).
   const unresolved = (sequence: number, start_ms: number) => range(sequence, "a", "", start_ms, start_ms + 1_000, "unresolved");
   const named = range(0, "a", "Alice", 0, 1_000);
@@ -71,9 +71,11 @@ test("unresolved-speaker ranges batch and transcribe as an unknown speaker (TC-5
   const batches = attributedBatches(input, 1);
   expect(batches).toHaveLength(2);
   const transcript = await transcribeAttributedManifest(input, async (item) => bytesFor(item.start_ms, item.end_ms), async (_pcm, batch) => ({ text: batch.speaker_name || "mystery" }), "en", 1);
-  expect(transcript.segments.map((s) => [s.speaker_name, s.attribution])).toEqual([["Alice", "identified"], ["Unknown", "unknown"]]);
+  expect(transcript.segments.map((s) => [s.speaker_name, s.attribution])).toEqual([["Alice", "identified"], [null, "unknown"]]);
   expect(transcript.segments[1]!.speaker_id).not.toBe(transcript.segments[0]!.speaker_id);
-  expect(transcript.speakers).toHaveLength(2);
+  expect(transcript.speakers).toEqual([{ id: "speaker_0", name: "Alice" }]);
+  expect(transcript.segments[1]!.speaker_id).toBe("participant:unresolved:1");
+  expect(transcript.text).toBe("Alice: Alice\nmystery");
 });
 
 test("requires the exact numeric Vexa meeting identity even for empty evidence", () => {

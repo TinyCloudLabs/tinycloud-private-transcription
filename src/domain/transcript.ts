@@ -25,7 +25,7 @@ export interface Speaker {
 export interface Segment {
   id: string;
   speaker_id: string;
-  speaker_name: string;
+  speaker_name: string | null;
   start: number;
   end: number;
   text: string;
@@ -44,9 +44,7 @@ export interface NormalizedTranscript {
 }
 
 /** Captured speech that no path could transcribe, on the meeting clock (TC-758). Never silently dropped. */
-export interface TranscriptGap { start: number; end: number; speaker_name: string }
-
-const UNKNOWN = "Unknown";
+export interface TranscriptGap { start: number; end: number; speaker_name: string | null }
 
 /** Sort by start, drop empty text, assign stable per-meeting speaker ids in order of first appearance. */
 export function normalizeSegments(raw: RawSegment[], languageHint?: string | null): NormalizedTranscript {
@@ -54,15 +52,23 @@ export function normalizeSegments(raw: RawSegment[], languageHint?: string | nul
     .filter((s) => s.text && s.text.trim().length > 0)
     .sort((a, b) => a.start - b.start || a.end - b.end);
   const speakerIds = new Map<string, string>();
+  const unresolvedIds = new Map<string | null, string>();
   const speakers: Speaker[] = [];
   const segments: Segment[] = sorted.map((s, i) => {
-    const name = s.speaker && s.speaker.trim() ? s.speaker.trim() : UNKNOWN;
-    const key = s.speakerKey ? `participant:${s.speakerKey}` : `name:${name}`;
-    let id = speakerIds.get(key);
-    if (!id) {
-      id = `speaker_${speakers.length}`;
-      speakerIds.set(key, id);
-      speakers.push({ id, name });
+    const name = s.speaker?.trim() || null;
+    const attribution = name === null ? (s.attribution === "overlap" ? "overlap" : "unknown") : s.attribution;
+    let id: string;
+    if (name === null) {
+      const key = s.speakerKey || null;
+      id = unresolvedIds.get(key) ?? `participant:unresolved:${unresolvedIds.size + 1}`;
+      unresolvedIds.set(key, id);
+    } else {
+      const key = s.speakerKey ? `participant:${s.speakerKey}` : `name:${name}`;
+      id = speakerIds.get(key) ?? `speaker_${speakers.length}`;
+      if (!speakerIds.has(key)) {
+        speakerIds.set(key, id);
+        speakers.push({ id, name });
+      }
     }
     return {
       id: `seg_${String(i + 1).padStart(3, "0")}`,
@@ -71,7 +77,7 @@ export function normalizeSegments(raw: RawSegment[], languageHint?: string | nul
       start: s.start,
       end: s.end,
       text: s.text.trim(),
-      ...(s.attribution ? { attribution: s.attribution } : {}),
+      ...(attribution ? { attribution } : {}),
       ...(s.origin === "recording" || s.origin === "fallback" ? { source: s.origin } : {}),
     };
   });
@@ -82,6 +88,6 @@ export function normalizeSegments(raw: RawSegment[], languageHint?: string | nul
     duration_seconds: Math.round(duration * 1000) / 1000,
     speakers,
     segments,
-    text: segments.map((s) => `${s.speaker_name}: ${s.text}`).join("\n"),
+    text: segments.map((s) => s.speaker_name === null ? s.text : `${s.speaker_name}: ${s.text}`).join("\n"),
   };
 }

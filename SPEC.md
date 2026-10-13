@@ -60,12 +60,28 @@ capture-provider record back to `processing` and retries Vexa-segment finalizati
  "segments":[{"id":"seg_001","speaker_id":"speaker_0","speaker_name":"Alice","start":0.0,"end":3.2,"text":"…"}],
  "text":"Alice: …","created_at":"…"}
 ```
+Speaker contract (TC-981): only segment `speaker_name` is nullable (`string | null`);
+`speaker_id` remains a non-null string. Unattributed speech has `speaker_name: null` and
+`attribution:"unknown"`, with an opaque ID of `participant:unresolved:<opaque>`.
+IDs are stable within a meeting and distinct per unresolved voice; they are not derived
+readably from provider data. Consumers must not parse them. Unresolved IDs use 1-based
+ordinals assigned by first appearance in the final time-ordered segment list, so rerunning
+the same input produces identical IDs. Speech without a capture key shares one unresolved
+ID, separate from keyed voices. Explicit `attribution:"overlap"` is retained for overlapping speech.
+It creates no entry in `speakers[]`, and its plain-text line contains only the speech text,
+without a speaker label. Named speakers, including a participant actually named `Unknown`,
+keep their names and speaker entries. The existing attribution field remains optional for
+named segments. Gap `speaker_name` is also nullable when its speaker could not be resolved.
+This is an API contract change: consumers must accept null names. Deploy the separate
+tinychat consumer null-handling PR before deploying this PTX change. Existing stored
+transcripts are unchanged; any backfill is separate.
+
 Attributed Google Meet transcripts (`provider:"tinfoil-attributed"`) are turn-level: each speaker
 stream is transcribed with a timestamped model (`TINFOIL_ATTRIBUTED_MODEL`, Whisper) and every segment
 is placed on the meeting clock, so speakers interleave in spoken order. A participant has one
 `speaker_id` per display name. Audio whose speaker the capture could not bind takes the name of the
 bound speaker on the same audio channel within 3 s, with `attribution:"provisional"`; otherwise it
-publishes under `Unknown`. Model output that is not speech (chat-assistant replies, stock captions on
+publishes with `speaker_name: null` and `attribution:"unknown"`. Model output that is not speech (chat-assistant replies, stock captions on
 silence, repetition loops) is dropped. Audio below −65 dBFS never yields text (silent windows are not
 even sent); energy is measured over the captured audio within ±1 s of the text, never over pauses
 inserted between ranges. Speech-level audio (≥ −45 dBFS) keeps short phrases unless the model's
@@ -111,7 +127,7 @@ recording and prints the correlation peak (best offset, r, z, runner-up, prior) 
 measured energy, sending nothing to Tinfoil.
 Recovered text publishes with `source:"recording"` under the speaker of that speech with
 `attribution:"provisional"`; unresolved speech takes the same-channel inference (provisional) or
-`Unknown` with `attribution:"unknown"`. Anything still untranscribed — and any gap-fill result that
+`speaker_name: null` with `attribution:"unknown"`. Anything still untranscribed — and any gap-fill result that
 fails verification, which never fails the meeting — is listed as `gaps: [{start, end, speaker_name}]`
 (meeting seconds) with `partial: true`; a meeting with gaps but no text still completes with them
 listed. The worker logs `untranscribed_gap` with the gap total. Publication is typically minutes

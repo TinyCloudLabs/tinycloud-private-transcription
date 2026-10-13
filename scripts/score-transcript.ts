@@ -27,9 +27,9 @@ for (const input of inputs) {
     const { transcript, stats } = assembleAttributedTranscript(data.manifest, completed, "en");
     turns = transcript.segments.map((s) => ({ speaker: s.speaker_name, text: s.text }));
     extra = { model: data.model, calls: data.calls, failed_batches: data.batches.filter((b: { status: string }) => b.status === "failed").length, dropped: stats.dropped_hallucinations };
-    if (process.env.DUMP) await Bun.write(`${path}.transcript.txt`, transcript.segments.map((s) => `[${s.start.toFixed(1)}] ${s.speaker_name}: ${s.text}`).join("\n"));
+    if (process.env.DUMP) await Bun.write(`${path}.transcript.txt`, transcript.segments.map((s) => `[${s.start.toFixed(1)}] ${s.speaker_name === null ? "" : `${s.speaker_name}: `}${s.text}`).join("\n"));
   } else {
-    const segments = (data.segments ?? data) as Array<{ speaker_name: string; text: string }>;
+    const segments = (data.segments ?? data) as Array<{ speaker_name: string | null; text: string }>;
     turns = segments.map((s) => ({ speaker: s.speaker_name, text: s.text }));
   }
   rows.push({ input: path.split("/").at(-1), ...extra, ...transcriptMetrics(turns, reference) });

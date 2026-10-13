@@ -183,7 +183,7 @@ describe("recording gap fill (TC-758)", () => {
       ["Alice", "provisional", 0, 3_000, [0, 1]],
       ["Bob", "provisional", 2_500, 5_000, [3, 4]],
       ["Alice", "provisional", 9_000, 10_000, [2]],
-      ["Unknown", "unknown", 40_000, 41_000, [5]],
+      [null, "unknown", 40_000, 41_000, [5]],
     ]);
     // A sub-range of a completed batch is its own span.
     expect(gapSpec(input, [{ sequence: 2, start_ms: 9_200, end_ms: 9_700 }]).spans.map((span) => [span.start_ms, span.end_ms])).toEqual([[9_200, 9_700]]);
@@ -265,6 +265,20 @@ describe("recording gap fill (TC-758)", () => {
     // Unaligned (no chunks) or exhausted (no texts): every captured part is a gap.
     expect(gapOutcome(spec, [], new Map())).toMatchObject({ pieces: [], recording_ms: 0, gap_ms: 5_000 });
     expect(gapOutcome(spec, chunks, new Map())).toMatchObject({ pieces: [], recording_ms: 0, gap_ms: 5_000 });
+  });
+
+  test("unresolved recording gap fill emits null in pieces, transcript and remaining gaps (TC-981)", () => {
+    const input = manifest([range(0, "", 10_000, 11_000), range(1, "", 20_000, 21_000, { channel: 1 })]);
+    const spec = gapSpec(input, input.ranges.map(full));
+    expect(spec.spans.map((span) => [span.speaker_name, span.attribution])).toEqual([[null, "unknown"], [null, "unknown"]]);
+    const chunks = gapChunks(spec, { offset_ms: 0, score: 1, z: 9, duration_ms: 30_000, windows: [{ status: "voiced" }, { status: "voiced" }] });
+    const outcome = gapOutcome(spec, chunks, new Map([[0, { index: 0, status: "text", text: "Recovered words.", energy_dbfs: -20 }]]));
+    expect(outcome.pieces[0]).toMatchObject({ speaker: null, attribution: "unknown", origin: "recording" });
+    expect(outcome.gaps).toEqual([{ start: 20, end: 21, speaker_name: null }]);
+    const { transcript } = assembleAttributedTranscript(input, [], "en", outcome.pieces);
+    expect(transcript.speakers).toEqual([]);
+    expect(transcript.segments[0]).toMatchObject({ speaker_id: "participant:unresolved:1", speaker_name: null, attribution: "unknown", source: "recording" });
+    expect(transcript.text).toBe("Recovered words.");
   });
 
   test("recovered text never merges into the speaker's attributed turn", () => {
