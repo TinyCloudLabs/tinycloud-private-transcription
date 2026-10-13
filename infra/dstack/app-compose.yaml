@@ -113,7 +113,9 @@ services:
       ARTIFACT_RETENTION_MODE: ${ARTIFACT_RETENTION_MODE:-dry-run}
       ARTIFACT_RETENTION_DAYS: ${ARTIFACT_RETENTION_DAYS:-14}
       ARTIFACT_RETENTION_ORPHANS: ${ARTIFACT_RETENTION_ORPHANS:-false}
-      ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS: ${ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS:-88}
+      # 88 is the eval reference; 74, 84, 87 and 89 hold pre-TC-740/758 transcripts and stay until they are
+      # republished through the fixed pipeline or explicitly excluded (TC-989).
+      ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS: ${ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS:-74,84,87,88,89}
       VEXA_MINIO_ENDPOINT: http://minio:9000
       # Least-privilege user provisioned by minio-init (list + delete artifact prefixes only).
       VEXA_MINIO_ACCESS_KEY: ptx-retention

@@ -232,7 +232,7 @@ describe("infra/dstack/app-compose.yaml", () => {
   test("artifact retention and the bot janitor ship in dry-run (TC-904)", () => {
     const worker = serviceEnv("worker");
     expect(worker).toContain("ARTIFACT_RETENTION_MODE: ${ARTIFACT_RETENTION_MODE:-dry-run}");
-    expect(worker).toContain("ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS: ${ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS:-88}");
+    expect(worker).toContain("ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS: ${ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS:-74,84,87,88,89}");
     expect(worker).toContain("VEXA_MINIO_ENDPOINT: http://minio:9000");
     // Least privilege: a provisioned list+delete-only user, never the MinIO root credentials.
     expect(worker).toContain("VEXA_MINIO_ACCESS_KEY: ptx-retention");
