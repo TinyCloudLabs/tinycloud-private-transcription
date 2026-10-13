@@ -128,6 +128,35 @@ describe("single-slot arbiter", () => {
   });
 });
 
+describe("VAD coverage (TC-1045)", () => {
+  const sentSeconds = (body: { segments: { start: number; end: number }[] }) => body.segments.reduce((sum, s) => sum + s.end - s.start, 0);
+
+  test("narration over a steady noise floor reaches the model whole, and the result records the VAD coverage", async () => {
+    const id = await h.submit(await audio("narration_mp3"));
+    await h.work();
+    const body = await (await result(id)).json();
+    expect(body.status).toBe("completed");
+    const { stats } = body;
+    expect([stats.vad_fallback, typeof stats.voiced_seconds, typeof stats.dropped_above_floor_pct]).toEqual([false, "number", "number"]);
+    expect(stats.voiced_seconds / body.duration_seconds).toBeGreaterThanOrEqual(0.9);
+    expect(stats.dropped_above_floor_pct).toBeLessThanOrEqual(10);
+    expect(stats.tinfoil_audio_seconds).toBeCloseTo(stats.voiced_seconds, 3);
+    expect(sentSeconds(body)).toBeCloseTo(stats.voiced_seconds, 3);
+    expect(await h.row(id)).toMatchObject({ vadFallback: false, vadDroppedAboveFloorPct: stats.dropped_above_floor_pct });
+  });
+
+  test("a quiet recording trips the coverage guard: the VAD falls back to the floor and still sends all of it", async () => {
+    const id = await h.submit(await audio("quiet_narration_mp3"));
+    await h.work();
+    const body = await (await result(id)).json();
+    expect(body.status).toBe("completed");
+    expect(body.stats.vad_fallback).toBe(true);
+    expect(body.stats.voiced_seconds / body.duration_seconds).toBeGreaterThanOrEqual(0.9);
+    expect(body.stats.dropped_above_floor_pct).toBeLessThanOrEqual(10);
+    expect(sentSeconds(body)).toBeCloseTo(body.stats.voiced_seconds, 3);
+  });
+});
+
 describe("region insert", () => {
   // Postgres binds at most 65,535 parameters per statement; ~12,000 regions is the 2 h stereo worst case.
   const many = Array.from({ length: 12_345 }, (_, i) => ({ channel: i % 2, startMs: i * 600, endMs: i * 600 + 400 }));

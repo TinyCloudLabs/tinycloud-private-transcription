@@ -203,7 +203,10 @@ not_received|stored|deletion_pending|deleted, audio_deleted_at, transcript_expir
 error:{type,code,message}|null, created_at, upload_deadline_at, uploaded_at, processing_started_at, finished_at}`.
 Completed result: `{id, status, language, duration_seconds, provider:"tinfoil", model, channels, diarized, speakers:[{id,
 name, channel}], segments:[{id, speaker_id, channel, start, end, text}], text, stats:{tinfoil_calls,
-tinfoil_audio_seconds}}`. Without `diarize`, `diarized` is false, speakers are `channel_N` (named by `channel_labels`) and
+tinfoil_audio_seconds, voiced_seconds, dropped_above_floor_pct, vad_fallback}}`. `voiced_seconds` is the audio the VAD (or
+diarizer) selected to send; `dropped_above_floor_pct` is the share of the recording at or above −50 dBFS that was not
+sent; `vad_fallback` is true when the coverage guard (below) replaced the VAD threshold. The last two are null for a job
+whose regions were detected before TC-1045. Without `diarize`, `diarized` is false, speakers are `channel_N` (named by `channel_labels`) and
 timestamps are region-level (VAD regions, below). With `diarize`, `diarized` is true, `channels` is 1, speakers are
 `{id:"speaker_N", name:"Speaker N+1", channel:0}` (N 0–31, numbered by first appearance; only speakers with text are
 listed) and every segment is one speaker turn on channel 0, in time order. Results stored before `diarized` existed
@@ -273,9 +276,14 @@ replay); anything else → the upload was accepted or the job ended.
 ### Processing
 One job end-to-end at a time, service-wide. Per channel (`separate` + 2 channels; otherwise a mono downmix), ffmpeg
 decodes to 16 kHz PCM on disk, stopping at 7,200 s of PCM (counted in bytes, whatever the timestamps say); an energy VAD
-(100 ms frames; voiced ≥ max(−50 dBFS, p10 + 12 dB); gaps ≤ 1 s merged;
+(100 ms frames; voiced ≥ max(−50 dBFS, min(−40 dBFS, p10 + 12 dB)); gaps ≤ 1 s merged;
 ±0.25 s padding; regions > 30 s split at the quietest frame in their last 10 s) produces regions; each region is one
-Tinfoil request. No speech → `no_speech`.
+Tinfoil request. No speech → `no_speech`. The −40 dBFS cap keeps continuous speech over a steady noise floor, where the
+10th percentile lies inside the speech (TC-1045); a background louder than −40 dBFS is therefore sent with the speech.
+**Coverage guard:** if the regions leave more than 10% of the recording at or above −50 dBFS unsent, the channel's
+regions are recomputed with −50 dBFS as the threshold (every non-silent stretch, merged, padded and cut at 30 s) and the
+job records `vad_fallback`; if even those leave more than 10% unsent, the job fails `processing_failed` rather than
+completing with part of the recording.
 
 **Diarization** (`diarize: true`; [docs/diarization-benchmark.md](./docs/diarization-benchmark.md)). After the mono
 decode, speech is labelled with speakers in equal windows of at most 10 min that overlap by 60 s, one window at a time,

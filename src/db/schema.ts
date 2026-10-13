@@ -240,6 +240,10 @@ export const transcriptions = pgTable(
     claimCount: integer("claim_count").notNull().default(0),
     tinfoilCalls: integer("tinfoil_calls").notNull().default(0),
     tinfoilAudioSeconds: real("tinfoil_audio_seconds").notNull().default(0),
+    /** Share of the recording (%) at or above the VAD's -50 dBFS floor that the regions leave unsent; set with the regions (TC-1045). */
+    vadDroppedAboveFloorPct: real("vad_dropped_above_floor_pct"),
+    /** The VAD coverage guard replaced the relative threshold with the floor (TC-1045). Null for jobs whose regions predate it. */
+    vadFallback: boolean("vad_fallback"),
     errorCode: text("error_code"),
     errorMessage: text("error_message"),
     /** Deletion ledger: pending is committed with (or before) the terminal state, before any unlink. */

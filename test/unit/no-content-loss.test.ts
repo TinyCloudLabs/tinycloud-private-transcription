@@ -219,6 +219,15 @@ describe("recording gap fill (TC-758)", () => {
     expect(alignRecording(manifest([range(0, "Alice", 0, 1_000)]), voiced, null)).toBeNull();
   });
 
+  test("alignment still verifies over loud room tone (the mask is not capped like the batch VAD, TC-1045)", () => {
+    // The same bursts over -38 dBFS room tone. A threshold capped at -40 dBFS would mark every frame voiced: a constant
+    // mask that fits every offset, so the alignment would be rejected and the speech left as listed gaps.
+    const ranges = [0, 4_000, 9_000, 15_000, 22_000, 30_000].map((start, i) => range(i, "Alice", start, start + 1_500));
+    const samples = new Int16Array(45 * PCM_RATE).fill(412);
+    for (const r of ranges) samples.fill(8_000, Math.round((r.start_ms + 7_300) * 16), Math.round((r.end_ms + 7_300) * 16));
+    expect(alignRecording(manifest(ranges), voicedFrames(frameLevels(samples, PCM_RATE)), null)).toMatchObject({ offset_ms: 7_300, score: 1 });
+  });
+
   test("the prior offset is the clock origin relative to Vexa's start time, when plausible", () => {
     const start = "2026-10-06T10:00:00.000Z";
     expect(priorOffsetMs(Date.parse(start) + 12_500, start)).toBe(12_500);

@@ -176,6 +176,13 @@
       "when": 1791889984837,
       "tag": "0024_transcript_versions",
       "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1791914239823,
+      "tag": "0025_vad_coverage",
+      "breakpoints": true
     }
   ]
 }

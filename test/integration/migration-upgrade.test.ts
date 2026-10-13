@@ -156,7 +156,7 @@ test("0004-0015 retain production retry, fallback, terminal delivery, and deleti
     expect(signalColumns).toEqual({ count: 2 });
 
     const [migrationCount] = await db.execute(sql`SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`);
-    expect(migrationCount).toEqual({ count: 25 });
+    expect(migrationCount).toEqual({ count: 26 });
 
     const [deletionAdmission] = await db.execute(sql`
       SELECT count(*)::int AS count
@@ -417,7 +417,7 @@ test("0024 upgrades 0023 data additively and tolerates the old image after rollb
       segmentsJson: sql`'{"speakers":[],"segments":[],"text":""}'::jsonb` });
     expect(await db.execute(sql`select version, published_at from transcripts where meeting_id = 'mtg_old_insert'`))
       .toEqual([{ version: 1, published_at: null }]);
-    expect(await db.execute(sql`select count(*)::int as count from drizzle.__drizzle_migrations`)).toEqual([{ count: 25 }]);
+    expect(await db.execute(sql`select count(*)::int as count from drizzle.__drizzle_migrations`)).toEqual([{ count: 26 }]);
     // Generated DDL must stay additive: rollback means retaining this schema, never dropping it.
     const migration = await readFile(join(migrationsSource, "0024_transcript_versions.sql"), "utf8");
     expect(/^\s*(drop|truncate|delete)\b/im.test(migration)).toBe(false);

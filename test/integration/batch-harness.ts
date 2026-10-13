@@ -187,7 +187,11 @@ export async function startBatchHarness(opts: { config?: DeepPartial<BatchConfig
 const fixtureCache = new Map<string, Uint8Array>();
 
 type Fixture = "stereo" | "mono_wav" | "silent_wav" | "three_channel_wav" | "over_cap_mp3" | "stereo_dense"
-  | "stereo_m4a" | "stereo_webm" | "stereo_webm_no_duration" | "stereo_webm_offset" | "stereo_flac" | "stereo_mp4_with_video";
+  | "stereo_m4a" | "stereo_webm" | "stereo_webm_no_duration" | "stereo_webm_offset" | "stereo_flac" | "stereo_mp4_with_video"
+  | "narration_mp3" | "quiet_narration_mp3";
+
+/** 30 s of public-domain LibriVox narration over a steady noise floor (TC-1045). */
+const NARRATION = join(import.meta.dir, "../../fixtures/librivox-art-of-war-30s.flac");
 
 // ch0 speaks 0.5–2.5 s, ch1 speaks 3.5–5.5 s; 7 s stereo. Re-encoded per container below. Inputs and graph only:
 // `-map` is an output option, so it has to follow any further input.
@@ -222,6 +226,9 @@ export async function audio(kind: Fixture): Promise<Uint8Array> {
     silent_wav: ["-f", "lavfi", "-i", "anullsrc=r=16000:cl=stereo", "-t", "3", "-c:a", "pcm_s16le"],
     three_channel_wav: ["-f", "lavfi", "-i", "sine=f=440:d=1", "-ac", "3", "-ar", "16000", "-c:a", "pcm_s16le"],
     over_cap_mp3: ["-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono", "-t", "7201", "-c:a", "libmp3lame", "-b:a", "8k"],
+    narration_mp3: ["-i", NARRATION, "-ac", "1", "-ar", "44100", "-c:a", "libmp3lame", "-b:a", "64k"],
+    // The same narration 12 dB quieter: every frame above the -50 dBFS floor, most of them below the -40 dBFS cap.
+    quiet_narration_mp3: ["-i", NARRATION, "-af", "volume=-12dB", "-ac", "1", "-ar", "44100", "-c:a", "libmp3lame", "-b:a", "64k"],
   };
   const proc = Bun.spawn(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", ...args[kind], out], { stdout: "ignore", stderr: "pipe" });
   const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
