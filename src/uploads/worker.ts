@@ -13,7 +13,7 @@ import { fenceGuard, holdFence, LostFence, type DbOrTx, type Fence } from "./fen
 import { cleanupJobFiles, recoverStaleClaims, releaseDeadSlot, runSweep, terminalize, workerLive } from "./ledger.ts";
 import type { ProviderOutcome } from "./provider.ts";
 import { ensureStorageRoot, jobDir, removeJobEntry, workDirName } from "./storage.ts";
-import { detectRegions, frameEnergies } from "./vad.ts";
+import { aboveFloorFrames, detectSpeech, droppedAboveFloorFrames, frameEnergies, type Region } from "./vad.ts";
 
 export interface Claim {
   job: TranscriptionRow;
@@ -134,23 +134,22 @@ async function runPipeline(ctx: BatchContext, job: TranscriptionRow, fence: Fenc
   await ctx.faults.hit("worker.after_rename", { id: job.id });
   await holdFence(ctx.db, fence);
 
-  // 2. VAD regions (speaker turns for a diarized job), inserted in one fenced transaction (kept across re-claims).
+  // 2. VAD regions (speaker turns for a diarized job), inserted in one fenced transaction (kept across re-claims) with
+  //    the coverage they leave: the share of non-silent audio that is not sent, and whether the VAD fell back.
   let regions = await ctx.db.select().from(transcriptionRegions).where(eq(transcriptionRegions.transcriptionId, job.id))
     .orderBy(asc(transcriptionRegions.startMs), asc(transcriptionRegions.channel));
   if (regions.length === 0) {
-    const detected = job.diarize
-      ? await diarizeTurns(ctx, job, fence, pcm[0]!, signal)
-      : (await Promise.all(pcm.map(async (path, channel) => (await detectRegions(path)).map((region) => ({ ...region, channel, speaker: null })))))
-        .flat().sort((a, b) => a.startMs - b.startMs || a.channel - b.channel);
+    const detected = job.diarize ? await diarizeTurns(ctx, job, fence, pcm[0]!, signal) : await vadRegions(ctx, job, fence, pcm);
     if (detected === null) return;
-    if (detected.length === 0) {
+    if (detected.regions.length === 0) {
       if (await failClaim(ctx, ctx.db, fence, "no_speech", "No speech was detected in the recording")) await cleanupJobFiles(ctx, job.id);
       else throw new LostFence(job.id);
       return;
     }
     await ctx.db.transaction(async (tx) => {
       await holdFence(tx, fence);
-      await insertRegions(tx, fence, detected);
+      await insertRegions(tx, fence, detected.regions);
+      await tx.update(transcriptions).set({ vadDroppedAboveFloorPct: detected.droppedAboveFloorPct, vadFallback: detected.fallback }).where(fenceGuard(fence));
     });
     regions = await ctx.db.select().from(transcriptionRegions).where(eq(transcriptionRegions.transcriptionId, job.id))
       .orderBy(asc(transcriptionRegions.startMs), asc(transcriptionRegions.channel));
@@ -190,11 +189,46 @@ export async function insertRegions(tx: DbOrTx, fence: Fence, detected: { channe
   }
 }
 
+interface DetectedRegions {
+  regions: (Region & { channel: number; speaker: number | null })[];
+  droppedAboveFloorPct: number;
+  fallback: boolean;
+}
+
+const percent = (part: number, whole: number) => whole === 0 ? 0 : Math.round((part / whole) * 1000) / 10;
+
+/**
+ * VAD regions of every channel through the coverage guard (`detectSpeech`). A channel whose relative threshold leaves
+ * too much non-silent audio unsent falls back to the floor, logged. If even that leaves too much unsent, the job fails
+ * processing_failed, fenced, and this returns null: a partial transcript is never completed.
+ */
+async function vadRegions(ctx: BatchContext, job: TranscriptionRow, fence: Fence, pcm: string[]): Promise<DetectedRegions | null> {
+  const detections = await Promise.all(pcm.map(async (path) => detectSpeech(await frameEnergies(path))));
+  const dropped = detections.reduce((sum, d) => sum + d.droppedFrames, 0);
+  const aboveFloor = detections.reduce((sum, d) => sum + d.aboveFloorFrames, 0);
+  const fallback = detections.some((d) => d.fallback);
+  if (fallback) {
+    ctx.log.warn("batch VAD fell back to the floor threshold", {
+      transcriptionId: job.id, stage: "vad", primaryDroppedAboveFloorPct: Math.max(...detections.map((d) => percent(d.primaryDroppedShare, 1))),
+    });
+  }
+  if (detections.some((d) => !d.covered)) {
+    ctx.log.error("batch VAD could not cover the recording", { transcriptionId: job.id, stage: "vad", droppedAboveFloorPct: percent(dropped, aboveFloor), alert: true });
+    if (await failClaim(ctx, ctx.db, fence, "processing_failed", "Speech detection could not cover the recording")) await cleanupJobFiles(ctx, job.id);
+    else throw new LostFence(job.id);
+    return null;
+  }
+  const regions = detections.flatMap((d, channel) => d.regions.map((region) => ({ ...region, channel, speaker: null })))
+    .sort((a, b) => a.startMs - b.startMs || a.channel - b.channel);
+  return { regions, droppedAboveFloorPct: percent(dropped, aboveFloor), fallback };
+}
+
 /**
  * Speaker turns of the mono mix (channel 0). A job whose diarization cannot run (the stage failed, or was switched off
- * after the job was accepted) fails processing_failed, fenced, and this returns null.
+ * after the job was accepted) fails processing_failed, fenced, and this returns null. The diarizer, not the VAD
+ * threshold, decides what is speech, so there is no fallback; the unsent non-silent share is still recorded.
  */
-async function diarizeTurns(ctx: BatchContext, job: TranscriptionRow, fence: Fence, pcmPath: string, signal: AbortSignal) {
+async function diarizeTurns(ctx: BatchContext, job: TranscriptionRow, fence: Fence, pcmPath: string, signal: AbortSignal): Promise<DetectedRegions | null> {
   let segments: SpeakerSegment[];
   try {
     if (!ctx.diarizer) throw new Error("diarization is not available");
@@ -208,7 +242,13 @@ async function diarizeTurns(ctx: BatchContext, job: TranscriptionRow, fence: Fen
     else throw new LostFence(job.id);
     return null;
   }
-  return speakerTurns(segments, await frameEnergies(pcmPath)).map((turn) => ({ ...turn, channel: 0 }));
+  const energies = await frameEnergies(pcmPath);
+  const turns = speakerTurns(segments, energies);
+  return {
+    regions: turns.map((turn) => ({ ...turn, channel: 0 })),
+    droppedAboveFloorPct: percent(droppedAboveFloorFrames(energies, turns), aboveFloorFrames(energies)),
+    fallback: false,
+  };
 }
 
 type Admission = { kind: "admitted"; attemptId: string } | { kind: "capacity" } | { kind: "settled" };
@@ -393,7 +433,9 @@ async function assemble(ctx: BatchContext, job: TranscriptionRow, fence: Fence) 
     if (segments.length === 0) {
       return terminalize(tx, job.id, fenceGuard(fence), "failed", { code: "no_speech", message: "No speech was recognized in the recording" });
     }
-    const [stats] = await tx.select({ calls: transcriptions.tinfoilCalls, seconds: transcriptions.tinfoilAudioSeconds }).from(transcriptions).where(eq(transcriptions.id, job.id));
+    const [stats] = await tx.select({ calls: transcriptions.tinfoilCalls, seconds: transcriptions.tinfoilAudioSeconds, dropped: transcriptions.vadDroppedAboveFloorPct, fallback: transcriptions.vadFallback })
+      .from(transcriptions).where(eq(transcriptions.id, job.id));
+    const voicedMs = regions.reduce((sum, region) => sum + region.endMs - region.startMs, 0);
     const name = new Map(speakers.map((speaker) => [speaker.id, speaker.name]));
     await tx.insert(transcriptionResults).values({
       transcriptionId: job.id,
@@ -407,7 +449,14 @@ async function assemble(ctx: BatchContext, job: TranscriptionRow, fence: Fence) 
         speakers,
         segments,
         text: segments.map((segment) => `${name.get(segment.speaker_id)}: ${segment.text}`).join("\n"),
-        stats: { tinfoil_calls: stats!.calls, tinfoil_audio_seconds: Math.round(stats!.seconds * 1000) / 1000 },
+        stats: {
+          tinfoil_calls: stats!.calls,
+          tinfoil_audio_seconds: Math.round(stats!.seconds * 1000) / 1000,
+          // VAD coverage (TC-1045). The last two are null for a job whose regions were detected before they were recorded.
+          voiced_seconds: voicedMs / 1000,
+          dropped_above_floor_pct: stats!.dropped,
+          vad_fallback: stats!.fallback,
+        },
       },
     });
     return terminalize(tx, job.id, fenceGuard(fence), "completed", null, {

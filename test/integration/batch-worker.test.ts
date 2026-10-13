@@ -7,6 +7,7 @@ import { runSweep, retentionLagSeconds } from "../../src/uploads/ledger.ts";
 import type { FaultPoint } from "../../src/uploads/faults.ts";
 import { jobDir, jobsRoot } from "../../src/uploads/storage.ts";
 import { claimNext, insertRegions, processClaim, recordWorkerHeartbeat, REGION_INSERT_CHUNK, startBatchWorker } from "../../src/uploads/worker.ts";
+import { VAD } from "../../src/uploads/vad.ts";
 import { holdFence } from "../../src/uploads/fence.ts";
 import { audio, exists, startBatchHarness, TENANT_A, TENANT_B, tenant, type BatchHarness } from "./batch-harness.ts";
 
@@ -125,6 +126,84 @@ describe("single-slot arbiter", () => {
     await h.work();
     expect(await h.row(id)).toMatchObject({ status: "failed", errorCode: "no_speech", deletionState: "files_deleted" });
     expect(h.tinfoil.calls.length).toBe(0);
+  });
+});
+
+describe("VAD coverage (TC-1045)", () => {
+  const sentSeconds = (body: { segments: { start: number; end: number }[] }) => body.segments.reduce((sum, s) => sum + s.end - s.start, 0);
+
+  test("narration over a steady noise floor reaches the model whole, and the result records the VAD coverage", async () => {
+    const id = await h.submit(await audio("narration_mp3"));
+    await h.work();
+    const body = await (await result(id)).json();
+    expect(body.status).toBe("completed");
+    const { stats } = body;
+    expect([stats.vad_fallback, typeof stats.voiced_seconds, typeof stats.dropped_above_floor_pct]).toEqual([false, "number", "number"]);
+    expect(stats.voiced_seconds / body.duration_seconds).toBeGreaterThanOrEqual(0.9);
+    expect(stats.dropped_above_floor_pct).toBeLessThanOrEqual(10);
+    expect(stats.tinfoil_audio_seconds).toBeCloseTo(stats.voiced_seconds, 3);
+    expect(sentSeconds(body)).toBeCloseTo(stats.voiced_seconds, 3);
+    expect(await h.row(id)).toMatchObject({ vadFallback: false, vadDroppedAboveFloorPct: stats.dropped_above_floor_pct });
+  });
+
+  test("a quiet recording trips the coverage guard: the VAD falls back to the floor and still sends all of it", async () => {
+    const id = await h.submit(await audio("quiet_narration_mp3"));
+    await h.work();
+    const body = await (await result(id)).json();
+    expect(body.status).toBe("completed");
+    expect(body.stats.vad_fallback).toBe(true);
+    expect(body.stats.voiced_seconds / body.duration_seconds).toBeGreaterThanOrEqual(0.9);
+    expect(body.stats.dropped_above_floor_pct).toBeLessThanOrEqual(10);
+    expect(sentSeconds(body)).toBeCloseTo(body.stats.voiced_seconds, 3);
+  });
+
+  test("a recording shorter than one region fails no_speech, not processing_failed", async () => {
+    const id = await h.submit(await audio("short_wav"), { contentType: "audio/wav" });
+    await h.work();
+    expect(await h.row(id)).toMatchObject({ status: "failed", errorCode: "no_speech" });
+    expect(h.tinfoil.calls.length).toBe(0);
+  });
+
+  test("when even the floor fallback leaves speech unsent, the job fails processing_failed before any call", async () => {
+    const id = await h.submit(await audio("clicks_wav"), { contentType: "audio/wav" });
+    // Unpadded, each 0.2 s click is shorter than a region at any threshold; the leading 2 s tone still forms one.
+    const padMs = VAD.padMs;
+    VAD.padMs = 0;
+    try {
+      await h.work();
+    } finally {
+      VAD.padMs = padMs;
+    }
+    expect(await h.row(id)).toMatchObject({ status: "failed", errorCode: "processing_failed", deletionState: "files_deleted" });
+    expect(h.tinfoil.calls.length).toBe(0);
+    expect(await regions(id)).toEqual([]);
+    expect(await h.ctx.db.select().from(transcriptionResults).where(eq(transcriptionResults.transcriptionId, id))).toEqual([]);
+  });
+
+  test("regions kept across a re-claim keep their coverage stats; regions detected before TC-1045 complete with null stats", async () => {
+    // Re-claim: the first claim detects and stores regions, then crashes before any dispatch.
+    const resumed = await h.submit(await audio("narration_mp3"));
+    h.faults.once("worker.after_regions", "crash");
+    await expect(h.work()).rejects.toThrow("simulated crash");
+    const stored = await h.row(resumed);
+    expect([stored.vadFallback, typeof stored.vadDroppedAboveFloorPct]).toEqual([false, "number"]);
+    // Sentinels: a resumed claim that re-ran detection would overwrite them.
+    await h.ctx.db.update(transcriptions).set({ vadFallback: true, vadDroppedAboveFloorPct: 7.5, claimHeartbeatAt: new Date(Date.now() - 120_000) })
+      .where(eq(transcriptions.id, resumed));
+    expect(await h.work()).toBe(true);
+    const body = await (await result(resumed)).json();
+    expect([body.status, body.stats.vad_fallback, body.stats.dropped_above_floor_pct]).toEqual(["completed", true, 7.5]);
+
+    // Legacy: regions inserted the way the previous image did, without the coverage columns.
+    const legacy = await h.submit(await audio("stereo"));
+    const claim = (await claimNext(h.ctx))!;
+    await h.ctx.db.transaction(async (tx) => {
+      await holdFence(tx, claim.fence);
+      await insertRegions(tx, claim.fence, [{ channel: 0, startMs: 250, endMs: 2_750 }, { channel: 1, startMs: 3_250, endMs: 5_750 }]);
+    });
+    await processClaim(h.ctx, claim);
+    const old = await (await result(legacy)).json();
+    expect([old.status, old.stats.voiced_seconds, old.stats.dropped_above_floor_pct, old.stats.vad_fallback]).toEqual(["completed", 5, null, null]);
   });
 });
 

@@ -120,7 +120,10 @@ export function frameLevels(samples: Int16Array, sampleRate: number): Float64Arr
   return levels;
 }
 
-/** Voiced 100 ms frames: level ≥ max(−50 dB, 10th percentile + 12 dB). */
+/**
+ * Voiced 100 ms frames: level ≥ max(−50 dB, 10th percentile + 12 dB). Deliberately uncapped, unlike the batch VAD
+ * (src/uploads/vad.ts, TC-1045): this mask only aligns the recording, which needs discrimination over a loud room, not recall.
+ */
 export function voicedFrames(levels: Float64Array): Uint8Array {
   const sorted = Float64Array.from(levels).sort();
   const threshold = Math.max(-50, (sorted[Math.floor(sorted.length * 0.1)] ?? -120) + 12);
