@@ -154,7 +154,7 @@ describe("happy path: create -> joined -> completed -> transcript + webhook", ()
     const body = await waitStatus(id, "completed");
     expect(body.ended_at).toBeTruthy();
     expect(body.completed_at).toBeTruthy();
-    expect(body.transcript).toEqual({ status: "completed" });
+    expect(body.transcript).toEqual({ status: "completed", version: 1 });
     expect(body.transcript_provider).toBe("vexa");
     expect(body.error).toBeUndefined();
 

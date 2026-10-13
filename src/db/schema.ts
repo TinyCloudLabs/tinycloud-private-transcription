@@ -68,6 +68,8 @@ export const meetings = pgTable(
 
 export const transcripts = pgTable("transcripts", {
   meetingId: text("meeting_id").primaryKey().references(() => meetings.id, { onDelete: "cascade" }),
+  version: integer("version").notNull().default(1),
+  publishedAt: timestamp("published_at", { withTimezone: true }),
   language: text("language").notNull(),
   durationSeconds: real("duration_seconds").notNull(),
   segmentsJson: jsonb("segments_json").notNull(),
@@ -346,6 +348,22 @@ export type MeetingRow = typeof meetings.$inferSelect;
 export type TranscriptRow = typeof transcripts.$inferSelect;
 export type WebhookDeliveryRow = typeof webhookDeliveries.$inferSelect;
 export type ProjectRow = typeof projects.$inferSelect;
+
+/** Previous published content, retained across republish and rollback (TC-989). */
+export const transcriptVersions = pgTable("transcript_versions", {
+  id: text("id").primaryKey(),
+  meetingId: text("meeting_id").notNull().references(() => meetings.id, { onDelete: "cascade" }),
+  version: integer("version").notNull(),
+  language: text("language"),
+  durationSeconds: real("duration_seconds"),
+  provider: text("provider"),
+  segmentsJson: jsonb("segments_json").notNull(),
+  transcriptCreatedAt: timestamp("transcript_created_at", { withTimezone: true }).notNull(),
+  meetingCompletedAt: timestamp("meeting_completed_at", { withTimezone: true }),
+  coverageJson: jsonb("coverage_json"),
+  reason: text("reason").notNull(),
+  archivedAt: timestamp("archived_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [uniqueIndex("transcript_versions_meeting_version_idx").on(t.meetingId, t.version)]);
 
 /**
  * Internal transcript evaluation (TC-745). A reference transcript (e.g. a Google Meet / Gemini

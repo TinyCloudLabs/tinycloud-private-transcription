@@ -323,14 +323,12 @@ export async function completeMeetingWithTranscript(
     if (!current || current.status !== "processing") return { meeting: current ?? null, changed: false, deliveryId: null };
     const payload = { speakers: t.speakers, segments: t.segments, text: t.text, ...(t.partial ? { partial: true } : {}) };
     const segmentsJson = sql`${JSON.stringify(payload)}::text::jsonb`;
-    await tx.insert(transcripts).values({ meetingId, language: t.language, durationSeconds: t.duration_seconds, segmentsJson, provider })
-      .onConflictDoUpdate({ target: transcripts.meetingId, set: { language: t.language, durationSeconds: t.duration_seconds, segmentsJson, provider } });
+    const [stored] = await tx.insert(transcripts).values({ meetingId, language: t.language, durationSeconds: t.duration_seconds, segmentsJson, provider, publishedAt: sql`now()` })
+      .onConflictDoUpdate({ target: transcripts.meetingId, set: { language: t.language, durationSeconds: t.duration_seconds, segmentsJson, provider, publishedAt: sql`now()` } }).returning();
     const [completed] = await tx.update(meetings).set({ status: "completed", completedAt: new Date(), ...extra })
       .where(and(eq(meetings.id, meetingId), eq(meetings.status, "processing"))).returning();
     if (!completed) return { meeting: null, changed: false, deliveryId: null };
-    const intent = webhookDeliveryValues(completed, "meeting.completed", {
-      meetingId, language: t.language, durationSeconds: t.duration_seconds, segmentsJson: payload, provider, createdAt: new Date(),
-    });
+    const intent = webhookDeliveryValues(completed, "meeting.completed", stored!);
     if (intent) await tx.execute(sql`
       INSERT INTO webhook_deliveries (id, meeting_id, event_id, event_type, endpoint, payload, attempt, status, next_attempt_at)
       VALUES (${intent.id}, ${intent.meetingId}, ${intent.eventId}, ${intent.eventType}, ${intent.endpoint}, ${intent.payload}, 0, 'pending', ${intent.nextAttemptAt})
@@ -573,7 +571,7 @@ export function serializeMeeting(m: MeetingRow, transcript: TranscriptRow | null
     platform: m.platform as Platform,
     meeting_url: m.meetingUrl,
     bot: { name: m.botName, joined_at: m.startedAt?.toISOString() ?? null },
-    transcript: { status: transcriptStatus(status, !!transcript) },
+    transcript: { status: transcriptStatus(status, !!transcript), ...(transcript ? { version: transcript.version } : {}) },
     created_at: m.createdAt.toISOString(),
     started_at: m.startedAt?.toISOString() ?? null,
     ended_at: m.endedAt?.toISOString() ?? null,
@@ -616,6 +614,8 @@ export function serializeTranscript(m: MeetingRow, t: TranscriptRow) {
   return {
     meeting_id: m.id,
     status: "completed",
+    version: t.version,
+    published_at: (t.publishedAt ?? t.createdAt).toISOString(),
     language: t.language,
     duration_seconds: t.durationSeconds,
     provider: t.provider,

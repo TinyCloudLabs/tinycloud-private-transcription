@@ -25,6 +25,7 @@ export interface ReceivedWebhook {
 
 export interface Harness {
   ctx: AppContext;
+  worker: WorkerHandle;
   vexa: ReturnType<typeof startMockVexa>;
   apiKey: string;
   webhookSecret: string;
@@ -142,6 +143,7 @@ export async function startHarness(
 
   return {
     ctx,
+    worker,
     vexa,
     apiKey: key,
     webhookSecret,

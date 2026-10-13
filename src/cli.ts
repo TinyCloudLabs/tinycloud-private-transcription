@@ -8,7 +8,9 @@ const flag = (name: string) => {
   const i = rest.indexOf(`--${name}`);
   return i >= 0 ? rest[i + 1] : undefined;
 };
-const USAGE = `usage: bun run cli <create-key --project <name> [--scopes <scope>[,<scope>...]] | migrate | eval ...>
+export const USAGE = `usage: bun run cli <create-key --project <name> [--scopes <scope>[,<scope>...]] | migrate | eval ... | republish ...>
+  republish --meeting <ptx id | vexa id> [--dry-run | --apply]   default --dry-run (TC-989)
+  republish --rollback --meeting <id> [--version N] [--dry-run | --apply]
   eval run --meeting <id> [--models <m>[,<m>...]]     re-transcribe retained audio with each model (TC-745)
   eval reference --meeting <id> --source <name> < file   store a reference transcript (e.g. Gemini) and re-score
   eval report --meeting <id>                          coverage (captured vs transcribed speech) and metrics for the published transcript and every eval
@@ -26,7 +28,55 @@ const fail = (message: string): never => {
   process.exit(1);
 };
 
-switch (cmd) {
+export function parseRepublishFlags(args: string[]) {
+  let meeting: string | undefined, version: number | undefined;
+  const seen = new Set<string>();
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (!["--meeting", "--version", "--rollback", "--dry-run", "--apply"].includes(arg)) throw new Error("unknown republish flag");
+    if (seen.has(arg)) throw new Error("duplicate republish flag");
+    seen.add(arg);
+    if (arg === "--meeting" || arg === "--version") {
+      const value = args[++i];
+      if (!value || value.startsWith("--")) throw new Error(`${arg} needs a value`);
+      if (arg === "--meeting") meeting = value;
+      else {
+        version = /^\d+$/.test(value) ? Number(value) : NaN;
+        if (!Number.isSafeInteger(version) || version < 1) throw new Error("--version must be a positive integer");
+      }
+    }
+  }
+  if (!meeting) throw new Error("--meeting is required");
+  if (seen.has("--apply") && seen.has("--dry-run")) throw new Error("--apply and --dry-run are mutually exclusive");
+  if (version !== undefined && !seen.has("--rollback")) throw new Error("--version requires --rollback");
+  return { meeting, version, rollback: seen.has("--rollback"), apply: seen.has("--apply") };
+}
+
+if (import.meta.main) switch (cmd) {
+  case "republish": {
+    const options = (() => {
+      try { return parseRepublishFlags(rest); } catch (error) { return fail((error as Error).message); }
+    })();
+    const { planRepublish, applyRepublish, rollbackTranscript } = await import("./services/republish.ts");
+    try {
+      await runMigrations();
+      const ctx = createContext();
+      const plan = options.rollback
+        ? await rollbackTranscript(ctx, options.meeting, options.version, options.apply)
+        : await (options.apply ? applyRepublish : planRepublish)(ctx, options.meeting);
+      console.log(JSON.stringify(plan));
+      if (!plan.preconditions.ok) process.exit(1);
+      if (options.apply) console.log(options.rollback
+        ? `applied: meeting ${plan.meetingId} completed; version ${plan.nextVersion}`
+        : `applied: meeting ${plan.meetingId} processing; queued ${"plannedBatches" in plan ? plan.plannedBatches : 0} batches`);
+      process.exit(0);
+    } catch (error) {
+      // Driver errors may embed SQL parameters. Keep CLI failure output metadata-only.
+      console.error(error instanceof Error && ["transcript_version_already_archived", "meeting_status_race"].includes(error.message)
+        ? error.message : "republish_failed");
+      process.exit(1);
+    }
+  }
   case "create-key": {
     const project = flag("project") ?? "demo";
     const scopesArg = flag("scopes");
