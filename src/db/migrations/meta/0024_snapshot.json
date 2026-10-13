@@ -1,5 +1,5 @@
 {
-  "id": "2666e532-be84-44d4-9126-4a94d4e3c18f",
+  "id": "d0140aee-44cf-4a82-bd4c-167daad3d4b5",
   "prevId": "294c2e2e-2463-4ebf-bd56-6700b55564e4",
   "version": "7",
   "dialect": "postgresql",
@@ -1192,6 +1192,12 @@
         },
         "meeting_completed_at": {
           "name": "meeting_completed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "meeting_ended_at": {
+          "name": "meeting_ended_at",
           "type": "timestamp with time zone",
           "primaryKey": false,
           "notNull": false

@@ -72,7 +72,7 @@ if (import.meta.main) switch (cmd) {
       process.exit(0);
     } catch (error) {
       // Driver errors may embed SQL parameters. Keep CLI failure output metadata-only.
-      console.error(error instanceof Error && ["transcript_version_already_archived", "meeting_status_race"].includes(error.message)
+      console.error(error instanceof Error && ["apply requires a ptx meeting id", "meeting_status_race"].includes(error.message)
         ? error.message : "republish_failed");
       process.exit(1);
     }

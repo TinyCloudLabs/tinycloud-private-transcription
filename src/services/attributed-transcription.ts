@@ -688,6 +688,19 @@ export interface AttributedCoverage {
 }
 const rangeMs = (ranges: Array<{ start_ms: number; end_ms: number }>) => ranges.reduce((sum, range) => sum + Math.max(0, range.end_ms - range.start_ms), 0);
 
+/** Metadata-only publication guard: count words without ever logging or returning transcript content. */
+function transcriptWordCount(value: unknown): number {
+  if (typeof value === "string") {
+    try { return transcriptWordCount(JSON.parse(value)); } catch { return value.trim() ? value.trim().split(/\s+/u).length : 0; }
+  }
+  if (!value || typeof value !== "object") return 0;
+  const transcript = value as { text?: unknown; segments?: unknown };
+  if (typeof transcript.text === "string") return transcript.text.trim() ? transcript.text.trim().split(/\s+/u).length : 0;
+  return Array.isArray(transcript.segments)
+    ? transcript.segments.reduce((count, segment) => count + transcriptWordCount(segment), 0)
+    : 0;
+}
+
 /**
  * Publication is deliberately a second, complete verification pass.  Results fetched before this
  * transaction are merely hints: only locked ledger rows and the immutable closed manifest may
@@ -701,8 +714,10 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
     const ledgerRows = await tx.select().from(batchesTable).where(eq(batchesTable.meetingId, meetingId)).orderBy(batchesTable.ordinal).for("update");
     const attempts = await tx.select().from(attributedAttempts).innerJoin(batchesTable, eq(attributedAttempts.batchId, batchesTable.id)).where(eq(batchesTable.meetingId, meetingId)).for("update");
     if (!meeting || meeting.status === "failed" || meeting.status === "cancelled" || meeting.dispatchBlocked || !run || run.status !== "processing" || !meeting.vexaMeetingId) return null;
-    const reject = async (gaps?: { count: number; gapMs: number }): Promise<Publication> => {
-      const [failed] = await tx.update(meetings).set({ status: "failed", errorCode: "transcription_failed", errorMessage: "Attributed evidence could not be verified for publication.", endedAt: new Date() })
+    const reject = async (gaps?: { count: number; gapMs: number }, code = "transcription_failed"): Promise<Publication> => {
+      const [failed] = await tx.update(meetings).set({ status: "failed", errorCode: code,
+        errorMessage: code === "republish_regressed" ? "Republished transcript did not meet the content regression floor." : "Attributed evidence could not be verified for publication.",
+        endedAt: sql`coalesce(${meetings.endedAt}, now())` })
         .where(and(eq(meetings.id, meetingId), eq(meetings.status, "processing"))).returning();
       if (failed) await tx.update(attributedTranscriptionRuns).set({ status: "partial", updatedAt: new Date() }).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
       return failed ? { meeting: failed, webhook: true, deliveryId: null, ...(gaps ? { gaps } : {}) } : null;
@@ -816,7 +831,7 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
     const existing = await tx.select().from(transcripts).where(eq(transcripts.meetingId, meetingId)).for("update");
     if (existing[0] && (existing[0].provider !== "tinfoil-attributed" || canonical(existing[0].segmentsJson) !== canonical(payload)
         || existing[0].language !== transcript.language || existing[0].durationSeconds !== transcript.duration_seconds)) {
-      const [failed] = await tx.update(meetings).set({ status: "failed", errorCode: "transcription_failed", errorMessage: "Attributed transcript conflicts with an existing transcript.", endedAt: new Date() })
+      const [failed] = await tx.update(meetings).set({ status: "failed", errorCode: "transcription_failed", errorMessage: "Attributed transcript conflicts with an existing transcript.", endedAt: sql`coalesce(${meetings.endedAt}, now())` })
         .where(and(eq(meetings.id, meetingId), eq(meetings.status, "processing"))).returning();
       if (failed) await tx.update(attributedTranscriptionRuns).set({ status: "partial", updatedAt: new Date() }).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
       return failed ? { meeting: failed, webhook: true, deliveryId: null } satisfies Publication : null;
@@ -827,10 +842,18 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
       return null;
     }
     if (meeting.status !== "processing") return null;
+    const [versionRow] = await tx.execute(sql`select coalesce(max(version), 0)::int + 1 as next
+      from transcript_versions where meeting_id = ${meetingId}`);
+    const version = Number(versionRow!.next);
+    if (version > 1) {
+      const [previous] = await tx.select({ segmentsJson: transcriptVersions.segmentsJson }).from(transcriptVersions)
+        .where(eq(transcriptVersions.meetingId, meetingId)).orderBy(desc(transcriptVersions.version)).limit(1);
+      if (previous && transcriptWordCount(payload) < transcriptWordCount(previous.segmentsJson) * 0.5) return reject(gapReport, "republish_regressed");
+    }
     const [completed] = await tx.update(meetings).set({ status: "completed", completedAt: new Date() }).where(and(eq(meetings.id, meetingId), eq(meetings.status, "processing"))).returning();
     if (!completed) return null;
     const [stored] = await tx.insert(transcripts).values({ meetingId, language: transcript.language, durationSeconds: transcript.duration_seconds, segmentsJson: json(payload), provider: "tinfoil-attributed",
-      version: sql`coalesce((select max(${transcriptVersions.version}) from ${transcriptVersions} where ${transcriptVersions.meetingId} = ${meetingId}), 0) + 1`, publishedAt: sql`now()` }).returning();
+      version, publishedAt: sql`now()` }).returning();
     await tx.update(attributedTranscriptionRuns).set({ status: "completed", coverageJson: json(coverage), updatedAt: new Date() }).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
     // Canonical transcript, terminal state, and completion-delivery intent commit together.
     // Redis is deliberately only a wakeup; a later reconciliation safely resumes this row.

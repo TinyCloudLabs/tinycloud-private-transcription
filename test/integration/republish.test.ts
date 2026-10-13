@@ -11,6 +11,9 @@ import { processJob } from "../../src/worker/index.ts";
 import { startHarness, type Harness } from "./harness.ts";
 
 let h: Harness;
+let s3: ReturnType<typeof Bun.serve>;
+let artifactKeys: Set<string>;
+let artifactListFails = false;
 const pcm = new Uint8Array(new Float32Array(16_000).fill(.1).buffer);
 const sha256 = createHash("sha256").update(pcm).digest("hex");
 const marker = { speakers: [], segments: [], text: "synthetic stale marker" };
@@ -26,10 +29,26 @@ const fetchMock = (async (_url: string, init: RequestInit) => {
 
 beforeEach(async () => {
   calls = 0;
+  artifactKeys = new Set();
+  artifactListFails = false;
+  s3 = Bun.serve({ port: 0, fetch(req) {
+    const url = new URL(req.url);
+    const prefix = url.searchParams.get("prefix") ?? "";
+    if (artifactListFails && prefix === "attributed-audio/") return new Response("unavailable", { status: 500 });
+    const keys = [...artifactKeys].filter((key) => key.startsWith(prefix));
+    const contents = keys.map((key) => `<Contents><Key>${key}</Key><LastModified>2026-10-13T00:00:00.000Z</LastModified><Size>1</Size></Contents>`).join("");
+    return new Response(`<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>vexa</Name><Prefix>${prefix}</Prefix><KeyCount>${keys.length}</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>${contents}</ListBucketResult>`,
+      { headers: { "content-type": "application/xml" } });
+  } });
   const tinfoil = new TinfoilTranscriptionProvider({ baseUrl: "http://tinfoil.invalid", apiKey: "test", model: "test", fetch: fetchMock });
   h = await startHarness({ attributedTranscriptionEnabled: true, enabledPlatforms: ["google_meet"], transcriptRecovery: tinfoil });
+  h.ctx.config.artifactRetention = {
+    ...h.ctx.config.artifactRetention,
+    keepVexaMeetingIds: [1, 2, 3, 4, 5],
+    s3: { endpoint: `http://127.0.0.1:${s3.port}`, accessKeyId: "test", secretAccessKey: "test", secretAccessKeyFile: "", bucket: "vexa" },
+  };
 });
-afterEach(async () => { await h?.stop(); });
+afterEach(async () => { await h?.stop(); s3?.stop(true); });
 
 /** Same authenticated PCM and closed-manifest fixture as attributed-transcription.test.ts. */
 async function attributedMeeting() {
@@ -53,6 +72,7 @@ async function attributedMeeting() {
       clock_origin: "first_admitted_capture_epoch_ms", clock_origin_ms: 0, ranges },
     attributed_audio_base64: Object.fromEntries(ranges.map((r) => [r.path, Buffer.from(pcm).toString("base64")])),
   });
+  for (const range of ranges) artifactKeys.add(`attributed-audio/test/${bot.id}/session/${String(range.sequence).padStart(6, "0")}-${range.sha256}.pcm`);
   await h.waitFor(async () => {
     const view = await (await h.api(`/v1/meetings/${id}`)).json();
     return view.status === "completed" ? true : null;
@@ -103,7 +123,12 @@ async function setMarker(id: string) {
 }
 async function cli(args: string[]) {
   const proc = Bun.spawn([process.execPath, "--no-env-file", "run", "src/cli.ts", "republish", ...args], {
-    env: { PATH: process.env.PATH!, DATABASE_URL: h.ctx.config.databaseUrl, REDIS_URL: h.ctx.config.redisUrl },
+    env: {
+      PATH: process.env.PATH!, DATABASE_URL: h.ctx.config.databaseUrl, REDIS_URL: h.ctx.config.redisUrl,
+      VEXA_BASE_URL: h.ctx.config.vexa.baseUrl, VEXA_API_KEY: h.ctx.config.vexa.apiKey,
+      VEXA_MINIO_ENDPOINT: h.ctx.config.artifactRetention.s3.endpoint, VEXA_MINIO_ACCESS_KEY: "test",
+      VEXA_MINIO_SECRET_KEY: "test", VEXA_MINIO_BUCKET: "vexa", ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS: "1,2,3,4,5",
+    },
     stdout: "pipe", stderr: "pipe",
   });
   const output = await new Response(proc.stdout).text();
@@ -116,7 +141,9 @@ test("dry-run writes nothing", async () => {
   const { id, vexaId } = await attributedMeeting();
   const before = await rowCounts(), state = await fingerprints();
   const plan = await planRepublish(h.ctx, String(vexaId));
-  expect(plan).toMatchObject({ meetingId: id, currentVersion: 1, nextVersion: 2, preconditions: { ok: true, failures: [] } });
+  expect(plan).toMatchObject({ meetingId: id, currentVersion: 1, nextVersion: 2,
+    audio: { ranges_expected: 2, ranges_present: 2, ranges_missing: 0, recordings: 0 },
+    preconditions: { ok: true, failures: [] } });
   const result = await cli(["--meeting", id, "--dry-run"]);
   expect(result.exit).toBe(0);
   expect(result.lines.length).toBe(1);
@@ -126,12 +153,60 @@ test("dry-run writes nothing", async () => {
   expect(await h.ctx.queue.size()).toEqual({ ready: 0, delayed: 0 });
 }, 30_000);
 
+test("numeric dry-run resolves uniquely, ambiguity lists ids, and numeric apply is refused", async () => {
+  const { id, vexaId } = await attributedMeeting();
+  expect((await planRepublish(h.ctx, String(vexaId))).meetingId).toBe(id);
+  let refusal = "";
+  try { await applyRepublish(h.ctx, String(vexaId)); } catch (error) { refusal = (error as Error).message; }
+  expect(refusal).toBe("apply requires a ptx meeting id");
+  const cliApply = await cli(["--meeting", String(vexaId), "--apply"]);
+  expect(cliApply.exit).toBe(1);
+  await h.ctx.db.execute(sql`insert into meetings
+    (id, project_id, meeting_url, platform, status, metadata, vexa_bot_id)
+    select 'mtg_ambiguous_fixture', project_id, meeting_url, platform, status, '{}'::jsonb, ${`mtg-${vexaId}-legacy`}
+    from meetings where id = ${id}`);
+  const ambiguous = await planRepublish(h.ctx, String(vexaId));
+  expect(ambiguous.preconditions.failures).toContain("vexa_meeting_id_ambiguous");
+  expect(ambiguous.candidateMeetingIds).toEqual([id, "mtg_ambiguous_fixture"].sort());
+}, 30_000);
+
+test("apply fails closed on keep-list and retained attributed-audio probes", async () => {
+  const { id, vexaId } = await attributedMeeting();
+  const before = await fingerprints();
+  h.ctx.config.artifactRetention.keepVexaMeetingIds = [];
+  const scoped = await planRepublish(h.ctx, id);
+  expect(scoped.meetingId).toBe(id);
+  expect(scoped.preconditions.failures).toContain("not_on_keep_list");
+  expect((await applyRepublish(h.ctx, id)).preconditions.failures).toContain("not_on_keep_list");
+  expect(await fingerprints()).toEqual(before);
+
+  h.ctx.config.artifactRetention.keepVexaMeetingIds = [vexaId];
+  const missingKey = [...artifactKeys][0]!;
+  artifactKeys.delete(missingKey);
+  const missing = await applyRepublish(h.ctx, id);
+  expect(missing.preconditions.failures).toContain("audio_missing");
+  expect(missing.audio).toMatchObject({ ranges_expected: 2, ranges_present: 1, ranges_missing: 1 });
+  expect(await fingerprints()).toEqual(before);
+
+  artifactKeys.add(missingKey);
+  artifactListFails = true;
+  const failed = await applyRepublish(h.ctx, id);
+  expect(failed.preconditions.failures).toContain("audio_probe_failed");
+  expect(failed.audio.warnings).toContain("audio_probe_failed");
+  expect(await fingerprints()).toEqual(before);
+
+  artifactListFails = false;
+  const ready = await planRepublish(h.ctx, id);
+  expect(ready.preconditions.ok).toBe(true);
+  expect(ready.audio).toMatchObject({ ranges_expected: 2, ranges_present: 2, ranges_missing: 0 });
+}, 30_000);
+
 test("apply republishes as version 2 through the current pipeline", async () => {
   const { id, vexaId, manifest } = await attributedMeeting();
   await setMarker(id);
   await h.ctx.db.delete(batchesTable).where(eq(batchesTable.id, `${id}:batch:0`));
   const beforeCalls = calls;
-  const plan = await applyRepublish(h.ctx, String(vexaId));
+  const plan = await applyRepublish(h.ctx, id);
   expect(plan.preconditions.ok).toBe(true);
   expect(plan.existingBatches).toBeLessThan(plan.plannedBatches);
   expect((await h.api(`/v1/meetings/${id}/transcript`)).status).toBe(202);
@@ -219,6 +294,9 @@ test("refuses unsafe states", async () => {
   }
   await h.ctx.db.update(meetings).set({ platform: "jitsi" }).where(eq(meetings.id, id));
   await refuses("platform_not_google_meet");
+  await h.ctx.db.update(meetings).set({ platform: "google_meet" }).where(eq(meetings.id, id));
+  await h.ctx.db.delete(transcripts).where(eq(transcripts.meetingId, id));
+  await refuses("transcript_missing");
   expect((await cli(["--meeting", id, "--dry-run"])).exit).toBe(1);
 }, 30_000);
 
@@ -233,20 +311,18 @@ test("concurrent apply", async () => {
   expect((await current(id)).version).toBe(2);
 }, 30_000);
 
-test("duplicate archive aborts republish without resetting the ledger", async () => {
+test("old-image version collision is renumbered before archive", async () => {
   const { id } = await attributedMeeting();
   await h.ctx.db.execute(sql`insert into transcript_versions
-    (id, meeting_id, version, language, duration_seconds, provider, segments_json, transcript_created_at, reason)
-    select 'tv_conflict', meeting_id, version, language, duration_seconds, provider, segments_json, created_at, 'republish'
-    from transcripts where meeting_id = ${id}`);
-  const before = await fingerprints();
-  let rejected = false;
-  try { await applyRepublish(h.ctx, id); } catch (error) {
-    rejected = error instanceof Error && error.message === "transcript_version_already_archived";
-  }
-  expect(rejected).toBe(true);
-  expect(await fingerprints()).toEqual(before);
-  expect(await h.ctx.queue.size()).toEqual({ ready: 0, delayed: 0 });
+    (id, meeting_id, version, language, duration_seconds, provider, segments_json, transcript_created_at, meeting_completed_at, reason)
+    select 'tv_conflict', t.meeting_id, t.version, t.language, t.duration_seconds, t.provider, t.segments_json, t.created_at, m.completed_at, 'republish'
+    from transcripts t join meetings m on m.id = t.meeting_id where t.meeting_id = ${id}`);
+  const plan = await applyRepublish(h.ctx, id);
+  expect(plan.preconditions.ok).toBe(true);
+  expect(plan.nextVersion).toBe(3);
+  expect((await snapshots(id)).map((row) => row.version)).toEqual([1, 2]);
+  await drain();
+  expect((await current(id)).version).toBe(3);
 }, 30_000);
 
 test("rollback refuses missing snapshots and in-flight batches without writes", async () => {
@@ -263,10 +339,23 @@ test("rollback refuses missing snapshots and in-flight batches without writes", 
     expect(plan.preconditions.failures).toContain("batch_in_flight");
     expect(await fingerprints()).toEqual(state);
   }
+  await h.ctx.db.update(batchesTable).set({ status: "pending", dispatchToken: null }).where(eq(batchesTable.id, `${id}:batch:0`));
+  for (const [patch, failure] of [
+    [{ dispatchBlocked: true }, "dispatch_blocked"],
+    [{ dispatchBlocked: false, deletionToken: "deletion-fixture" }, "deletion_in_progress"],
+    [{ dispatchBlocked: false, deletionToken: null, status: "cancelled" }, "meeting_not_rollbackable"],
+  ] as const) {
+    await h.ctx.db.update(meetings).set(patch).where(eq(meetings.id, id));
+    const state = await fingerprints();
+    const plan = await rollbackTranscript(h.ctx, id, 1, true);
+    expect(plan.preconditions.failures).toContain(failure);
+    expect(await fingerprints()).toEqual(state);
+  }
 }, 30_000);
 
 test("rollback restores the snapshot as a newer version", async () => {
   const { id } = await attributedMeeting();
+  const originalMeeting = (await h.ctx.db.select().from(meetings).where(eq(meetings.id, id)))[0]!;
   await setMarker(id);
   await applyRepublish(h.ctx, id);
   await drain();
@@ -277,6 +366,9 @@ test("rollback restores the snapshot as a newer version", async () => {
   expect(cliPreview.exit).toBe(0);
   expect(JSON.parse(cliPreview.lines[0]!).targetVersion).toBe(1);
   expect(await fingerprints()).toEqual(before);
+  const forcedEndedAt = new Date("2026-10-13T12:00:00.000Z");
+  const forcedCompletedAt = new Date("2026-10-13T12:01:00.000Z");
+  await h.ctx.db.update(meetings).set({ endedAt: forcedEndedAt, completedAt: forcedCompletedAt }).where(eq(meetings.id, id));
   const plan = await rollbackTranscript(h.ctx, id, undefined, true);
   expect(plan.targetVersion).toBe(1);
   expect((await current(id)).version).toBe(3);
@@ -284,7 +376,10 @@ test("rollback restores the snapshot as a newer version", async () => {
   expect((await snapshots(id)).map((s) => [s.version, s.reason])).toEqual([[1, "republish"], [2, "rollback"]]);
   expect((await h.ctx.db.select().from(batchesTable)).length).toBe(0);
   expect((await h.ctx.db.select().from(attributedTranscriptionRuns))[0]!.status).toBe("completed");
-  expect((await h.ctx.db.select().from(meetings))[0]!.status).toBe("completed");
+  const restoredMeeting = (await h.ctx.db.select().from(meetings))[0]!;
+  expect(restoredMeeting.status).toBe("completed");
+  expect(restoredMeeting.completedAt).toEqual(originalMeeting.completedAt);
+  expect(restoredMeeting.endedAt).toEqual(originalMeeting.endedAt);
   expect(h.webhook.received.length).toBe(1);
   // Default target is selected before archiving v3: repeated rollback restores the v2 content.
   expect((await rollbackTranscript(h.ctx, id, undefined, true)).targetVersion).toBe(2);
@@ -299,14 +394,51 @@ test("rollback restores the snapshot as a newer version", async () => {
   expect(await h.ctx.queue.size()).toEqual({ ready: 0, delayed: 0 });
 }, 30_000);
 
+test("two concurrent rollbacks serialize and only one commits", async () => {
+  const { id } = await attributedMeeting();
+  await applyRepublish(h.ctx, id);
+  await drain();
+  const plans = await Promise.all([
+    rollbackTranscript(h.ctx, id, 1, true),
+    rollbackTranscript(h.ctx, id, 1, true),
+  ]);
+  expect(plans.filter((plan) => plan.preconditions.ok).length).toBe(1);
+  expect(plans.find((plan) => !plan.preconditions.ok)!.preconditions.failures).toContain("rollback_lost_race");
+  expect((await current(id)).version).toBe(3);
+  expect((await snapshots(id)).map((row) => row.version)).toEqual([1, 2]);
+}, 30_000);
+
+test("republish regression floor rejects short output and rollback restores timestamps", async () => {
+  const { id } = await attributedMeeting();
+  const beforeMeeting = (await h.ctx.db.select().from(meetings).where(eq(meetings.id, id)))[0]!;
+  const old = { speakers: [], segments: [], text: Array.from({ length: 100 }, (_, i) => `synthetic${i}`).join(" ") };
+  await h.ctx.db.update(transcripts).set({ segmentsJson: json(old) }).where(eq(transcripts.meetingId, id));
+  expect((await applyRepublish(h.ctx, id)).preconditions.ok).toBe(true);
+  await drain();
+  const failed = (await h.ctx.db.select().from(meetings).where(eq(meetings.id, id)))[0]!;
+  expect(failed.status).toBe("failed");
+  expect(failed.errorCode).toBe("republish_regressed");
+  expect(failed.endedAt).toEqual(beforeMeeting.endedAt);
+  expect(await current(id)).toBeUndefined();
+  const rollback = await rollbackTranscript(h.ctx, id, 1, true);
+  expect(rollback.preconditions.ok).toBe(true);
+  expect((await current(id)).version).toBe(2);
+  expect(sameContent((await current(id)).segmentsJson, old)).toBe(true);
+  const restored = (await h.ctx.db.select().from(meetings).where(eq(meetings.id, id)))[0]!;
+  expect(restored.endedAt).toEqual(beforeMeeting.endedAt);
+  expect(restored.completedAt).toEqual(beforeMeeting.completedAt);
+}, 30_000);
+
 test("rollback after a rejected republish", async () => {
   const { id, manifest } = await attributedMeeting();
+  const endedAt = (await h.ctx.db.select().from(meetings).where(eq(meetings.id, id)))[0]!.endedAt;
   await setMarker(id);
   await applyRepublish(h.ctx, id);
   await h.ctx.db.update(attributedRanges).set({ rangeJson: json({ ...manifest.ranges[0], sequence: 99 }) })
     .where(and(eq(attributedRanges.meetingId, id), eq(attributedRanges.sequence, 0)));
   await drain();
   expect((await h.ctx.db.select().from(meetings))[0]!.status).toBe("failed");
+  expect((await h.ctx.db.select().from(meetings))[0]!.endedAt).toEqual(endedAt);
   expect((await h.ctx.db.select().from(webhookDeliveries)).filter((w) => w.eventType === "meeting.failed").length).toBe(1);
   expect((await current(id))).toBeUndefined();
   expect((await rollbackTranscript(h.ctx, id, 1, true)).nextVersion).toBe(2);

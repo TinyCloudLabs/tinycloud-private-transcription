@@ -360,6 +360,7 @@ export const transcriptVersions = pgTable("transcript_versions", {
   segmentsJson: jsonb("segments_json").notNull(),
   transcriptCreatedAt: timestamp("transcript_created_at", { withTimezone: true }).notNull(),
   meetingCompletedAt: timestamp("meeting_completed_at", { withTimezone: true }),
+  meetingEndedAt: timestamp("meeting_ended_at", { withTimezone: true }),
   coverageJson: jsonb("coverage_json"),
   reason: text("reason").notNull(),
   archivedAt: timestamp("archived_at", { withTimezone: true }).notNull().defaultNow(),

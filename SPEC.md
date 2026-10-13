@@ -65,18 +65,19 @@ capture-provider record back to `processing` and retries Vexa-segment finalizati
 Speaker contract (TC-981): only segment `speaker_name` is nullable (`string | null`);
 `speaker_id` remains a non-null string. Unattributed speech has `speaker_name: null` and
 `attribution:"unknown"`, with an opaque ID of `participant:unresolved:<opaque>`.
-IDs are stable within a meeting and distinct per unresolved voice; they are not derived
-readably from provider data. Consumers must not parse them. Unresolved IDs use 1-based
-ordinals assigned by first appearance in the final time-ordered segment list, so rerunning
-the same input produces identical IDs. Speech without a capture key shares one unresolved
-ID, separate from keyed voices. Explicit `attribution:"overlap"` is retained for overlapping speech.
+Segment ids (`seg_…`), speaker ids (`speaker_…`) and unresolved speaker keys are stable only within one published version of a meeting's transcript. A republish (an increase in `transcript.version`) may renumber them, so consumers must key anything derived from them by (meeting id, `transcript.version`).
+They are not derived readably from provider data. Consumers must not parse them. Unresolved IDs use
+1-based ordinals assigned by first appearance in the final time-ordered segment list, so rerunning
+the same input produces identical IDs. Speech without a capture key shares one unresolved ID,
+separate from keyed voices. Explicit `attribution:"overlap"` is retained for overlapping speech.
 It creates no entry in `speakers[]`, and its plain-text line contains only the speech text,
 without a speaker label. Named speakers, including a participant actually named `Unknown`,
 keep their names and speaker entries. The existing attribution field remains optional for
 named segments. Gap `speaker_name` is also nullable when its speaker could not be resolved.
 This is an API contract change: consumers must accept null names. Deploy the separate
 tinychat consumer null-handling PR before deploying this PTX change. Existing stored
-transcripts are unchanged; any backfill is separate.
+transcripts are unchanged until `republish` (TC-989) publishes them in the null-name/opaque-id
+shape as a new transcript version.
 
 Attributed Google Meet transcripts (`provider:"tinfoil-attributed"`) are turn-level: each speaker
 stream is transcribed with a timestamped model (`TINFOIL_ATTRIBUTED_MODEL`, Whisper) and every segment

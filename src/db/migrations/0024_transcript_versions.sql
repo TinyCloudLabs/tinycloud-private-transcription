@@ -8,6 +8,7 @@ CREATE TABLE "transcript_versions" (
 	"segments_json" jsonb NOT NULL,
 	"transcript_created_at" timestamp with time zone NOT NULL,
 	"meeting_completed_at" timestamp with time zone,
+	"meeting_ended_at" timestamp with time zone,
 	"coverage_json" jsonb,
 	"reason" text NOT NULL,
 	"archived_at" timestamp with time zone DEFAULT now() NOT NULL

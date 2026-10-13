@@ -400,6 +400,9 @@ test("0024 upgrades 0023 data additively and tolerates the old image after rollb
     db = await runMigrations(databaseUrl.toString());
     expect(await db.execute(sql`select version, published_at from transcripts`)).toEqual([{ version: 1, published_at: null }]);
     expect(await db.execute(sql`select count(*)::int as count from transcript_versions`)).toEqual([{ count: 0 }]);
+    expect(await db.execute(sql`select count(*)::int as count from information_schema.columns
+      where table_schema = 'public' and table_name = 'transcript_versions' and column_name = 'meeting_ended_at'`))
+      .toEqual([{ count: 1 }]);
     // Named-column reads from the actual pre-0024 schema still work, and retain all content.
     expect(JSON.stringify(await db.select().from(oldTranscripts)) === JSON.stringify(legacyRows)).toBe(true);
     expect(await db.execute(sql`select md5(t.segments_json::text) as content_hash,
