@@ -51,8 +51,8 @@ describe("assembly (TC-741/742/743)", () => {
     expect(unknown).toBe(true);
     expect(transcript.speakers).toEqual([]);
     expect(transcript.segments.map((segment) => [segment.speaker_name, segment.speaker_id, segment.attribution])).toEqual([
-      [null, "participant:unresolved:gmeet:channel:0", "unknown"],
-      [null, "participant:unresolved:gmeet:channel:1", "unknown"],
+      [null, "participant:unresolved:1", "unknown"],
+      [null, "participant:unresolved:2", "unknown"],
     ]);
     expect(transcript.text).toBe("Speech 0\nSpeech 1");
   });

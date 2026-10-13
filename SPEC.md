@@ -62,10 +62,12 @@ capture-provider record back to `processing` and retries Vexa-segment finalizati
 ```
 Speaker contract (TC-981): only segment `speaker_name` is nullable (`string | null`);
 `speaker_id` remains a non-null string. Unattributed speech has `speaker_name: null` and
-`attribution:"unknown"`, with a stable per-meeting ID of `participant:unresolved:<key>` for
-each unresolved speaker key. An existing `unresolved:` prefix is retained rather than repeated;
-speech without a capture key uses `participant:unresolved:unknown`. Distinct unresolved keys
-keep distinct IDs. Explicit `attribution:"overlap"` is retained for overlapping speech.
+`attribution:"unknown"`, with an opaque ID of `participant:unresolved:<opaque>`.
+IDs are stable within a meeting and distinct per unresolved voice; they are not derived
+readably from provider data. Consumers must not parse them. Unresolved IDs use 1-based
+ordinals assigned by first appearance in the final time-ordered segment list, so rerunning
+the same input produces identical IDs. Speech without a capture key shares one unresolved
+ID, separate from keyed voices. Explicit `attribution:"overlap"` is retained for overlapping speech.
 It creates no entry in `speakers[]`, and its plain-text line contains only the speech text,
 without a speaker label. Named speakers, including a participant actually named `Unknown`,
 keep their names and speaker entries. The existing attribution field remains optional for

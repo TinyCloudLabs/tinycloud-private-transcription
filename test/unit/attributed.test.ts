@@ -74,7 +74,7 @@ test("unresolved-speaker ranges batch and transcribe as an unknown speaker (TC-5
   expect(transcript.segments.map((s) => [s.speaker_name, s.attribution])).toEqual([["Alice", "identified"], [null, "unknown"]]);
   expect(transcript.segments[1]!.speaker_id).not.toBe(transcript.segments[0]!.speaker_id);
   expect(transcript.speakers).toEqual([{ id: "speaker_0", name: "Alice" }]);
-  expect(transcript.segments[1]!.speaker_id).toBe("participant:unresolved:a");
+  expect(transcript.segments[1]!.speaker_id).toBe("participant:unresolved:1");
   expect(transcript.text).toBe("Alice: Alice\nmystery");
 });
 

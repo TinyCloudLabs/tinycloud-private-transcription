@@ -277,7 +277,7 @@ describe("recording gap fill (TC-758)", () => {
     expect(outcome.gaps).toEqual([{ start: 20, end: 21, speaker_name: null }]);
     const { transcript } = assembleAttributedTranscript(input, [], "en", outcome.pieces);
     expect(transcript.speakers).toEqual([]);
-    expect(transcript.segments[0]).toMatchObject({ speaker_id: "participant:unresolved:gmeet:channel:0", speaker_name: null, attribution: "unknown", source: "recording" });
+    expect(transcript.segments[0]).toMatchObject({ speaker_id: "participant:unresolved:1", speaker_name: null, attribution: "unknown", source: "recording" });
     expect(transcript.text).toBe("Recovered words.");
   });
 

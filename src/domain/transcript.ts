@@ -52,14 +52,16 @@ export function normalizeSegments(raw: RawSegment[], languageHint?: string | nul
     .filter((s) => s.text && s.text.trim().length > 0)
     .sort((a, b) => a.start - b.start || a.end - b.end);
   const speakerIds = new Map<string, string>();
+  const unresolvedIds = new Map<string | null, string>();
   const speakers: Speaker[] = [];
   const segments: Segment[] = sorted.map((s, i) => {
     const name = s.speaker?.trim() || null;
     const attribution = name === null ? (s.attribution === "overlap" ? "overlap" : "unknown") : s.attribution;
     let id: string;
     if (name === null) {
-      const key = s.speakerKey || "unknown";
-      id = `participant:${key.startsWith("unresolved:") ? key : `unresolved:${key}`}`;
+      const key = s.speakerKey || null;
+      id = unresolvedIds.get(key) ?? `participant:unresolved:${unresolvedIds.size + 1}`;
+      unresolvedIds.set(key, id);
     } else {
       const key = s.speakerKey ? `participant:${s.speakerKey}` : `name:${name}`;
       id = speakerIds.get(key) ?? `speaker_${speakers.length}`;
