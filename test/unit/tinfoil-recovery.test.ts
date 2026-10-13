@@ -51,7 +51,7 @@ describe("whole-recording Tinfoil recovery", () => {
     expect(maxActive).toBe(2);
     expect(transcript.segments.map((segment) => segment.text)).toEqual(names.map((name) => `text ${name}`));
     expect(transcript.speakers).toEqual([]);
-    expect(transcript.segments.every((segment) => segment.speaker_name === null && segment.speaker_id === null && segment.attribution === "unknown")).toBe(true);
+    expect(transcript.segments.every((segment) => segment.speaker_name === null && segment.speaker_id === "participant:unresolved:unknown" && segment.attribution === "unknown")).toBe(true);
     expect(transcript.text).toBe(names.map((name) => `text ${name}`).join("\n"));
     expect(transcript.duration_seconds).toBe(12);
   });

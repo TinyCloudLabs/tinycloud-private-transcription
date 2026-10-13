@@ -24,7 +24,7 @@ export interface Speaker {
 }
 export interface Segment {
   id: string;
-  speaker_id: string | null;
+  speaker_id: string;
   speaker_name: string | null;
   start: number;
   end: number;
@@ -56,12 +56,14 @@ export function normalizeSegments(raw: RawSegment[], languageHint?: string | nul
   const segments: Segment[] = sorted.map((s, i) => {
     const name = s.speaker?.trim() || null;
     const attribution = name === null ? (s.attribution === "overlap" ? "overlap" : "unknown") : s.attribution;
-    let id: string | null = null;
-    if (name !== null) {
+    let id: string;
+    if (name === null) {
+      const key = s.speakerKey || "unknown";
+      id = `participant:${key.startsWith("unresolved:") ? key : `unresolved:${key}`}`;
+    } else {
       const key = s.speakerKey ? `participant:${s.speakerKey}` : `name:${name}`;
-      id = speakerIds.get(key) ?? null;
-      if (id === null) {
-        id = `speaker_${speakers.length}`;
+      id = speakerIds.get(key) ?? `speaker_${speakers.length}`;
+      if (!speakerIds.has(key)) {
         speakerIds.set(key, id);
         speakers.push({ id, name });
       }

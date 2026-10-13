@@ -51,7 +51,7 @@ describe("Signal call transcription", () => {
       const body = await r.json();
       return body.status === "completed" ? body : null;
     });
-    expect(transcript.segments[0]).toMatchObject({ speaker_id: null, speaker_name: null, attribution: "unknown", text: "hello from signal" });
+    expect(transcript.segments[0]).toMatchObject({ speaker_id: "participant:unresolved:unknown", speaker_name: null, attribution: "unknown", text: "hello from signal" });
     expect(transcript.speakers).toEqual([]);
     expect(transcript.text).toBe("hello from signal");
     expect(JSON.stringify(transcript)).not.toContain(capability);

@@ -8,7 +8,7 @@
  *   1. POST /v1/meetings with a Signal call link (+ Idempotency-Key) → 201 queued.
  *   2. GET  /v1/meetings/{id} until the lifecycle reaches in_progress.
  *   3. POST /v1/meetings/{id}/stop twice → identical body (idempotent).
- *   4. GET  /v1/meetings/{id}/transcript until completed, with `Unknown`/`unknown` segments.
+ *   4. GET  /v1/meetings/{id}/transcript until completed, with null speaker names and `unknown` attribution.
  *   5. meeting.completed webhook delivered to a local sink and HMAC-verified.
  *   6. The call fragment appears in no response body, webhook body, or process log.
  *

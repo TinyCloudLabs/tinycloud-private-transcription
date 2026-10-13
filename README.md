@@ -260,7 +260,8 @@ Every meeting requests live Vexa transcription. When Tinfoil recovery is configu
 retained mixed recording. On completion, TinyCloud validates, de-duplicates, rebases, normalizes, and stores
 a complete Vexa speaker-attributed timeline unchanged. If terminal timestamps show that Vexa lost a material
 tail, TinyCloud transcribes the retained recording through Tinfoil's text-STT endpoint. Tinfoil does no
-diarization: recovered segments use `Unknown` speakers. `POST /v1/meetings/{id}/recover` remains tenant-scoped;
+diarization: recovered segments have null speaker names and `attribution: "unknown"`, with a stable,
+non-null speaker ID and no placeholder participant or speaker label. `POST /v1/meetings/{id}/recover` remains tenant-scoped;
 transcript storage is an upsert and only the winning terminal transition emits a webhook.
 
 ### Known gaps / risks

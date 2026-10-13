@@ -218,7 +218,7 @@ test("unresolved-speaker ranges publish as unknown without vetoing the meeting (
   expect(transcript.segments).toHaveLength(2);
   expect(transcript.segments[1].speaker_id).not.toBe(transcript.segments[0].speaker_id);
   expect(transcript.segments[0]).toMatchObject({ speaker_name: "Alice", attribution: "identified" });
-  expect(transcript.segments[1]).toMatchObject({ speaker_id: null, speaker_name: null, attribution: "unknown" });
+  expect(transcript.segments[1]).toMatchObject({ speaker_id: "participant:unresolved:alice", speaker_name: null, attribution: "unknown" });
   expect(transcript.speakers).toEqual([{ id: "speaker_0", name: "Alice" }]);
   expect(transcript.text).toBe("Alice: sealed words\nsealed words");
   const [rangeRow] = await h.ctx.db.execute<{ failed: number; completed: number }>(sql`
@@ -285,7 +285,7 @@ test("unresolved-only ranges publish as unknown with the partial marker (TC-559)
   const transcript = await (await h.api(`/v1/meetings/${id}/transcript`)).json();
   expect(transcript).toMatchObject({ provider: "tinfoil-attributed", text: "sealed words" });
   expect(transcript.partial).toBe(true);
-  expect(transcript.segments[0]).toMatchObject({ speaker_id: null, speaker_name: null, attribution: "unknown" });
+  expect(transcript.segments[0]).toMatchObject({ speaker_id: "participant:unresolved:unresolved:1", speaker_name: null, attribution: "unknown" });
   expect(transcript.speakers).toEqual([]);
 });
 

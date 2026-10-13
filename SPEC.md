@@ -60,14 +60,17 @@ capture-provider record back to `processing` and retries Vexa-segment finalizati
  "segments":[{"id":"seg_001","speaker_id":"speaker_0","speaker_name":"Alice","start":0.0,"end":3.2,"text":"…"}],
  "text":"Alice: …","created_at":"…"}
 ```
-Speaker contract (TC-981): segment `speaker_name` and `speaker_id` are now nullable
-(`string | null`). Unattributed speech has both fields set to `null` and
-`attribution:"unknown"`; explicit `attribution:"overlap"` is retained for overlapping speech.
+Speaker contract (TC-981): only segment `speaker_name` is nullable (`string | null`);
+`speaker_id` remains a non-null string. Unattributed speech has `speaker_name: null` and
+`attribution:"unknown"`, with a stable per-meeting ID of `participant:unresolved:<key>` for
+each unresolved speaker key. An existing `unresolved:` prefix is retained rather than repeated;
+speech without a capture key uses `participant:unresolved:unknown`. Distinct unresolved keys
+keep distinct IDs. Explicit `attribution:"overlap"` is retained for overlapping speech.
 It creates no entry in `speakers[]`, and its plain-text line contains only the speech text,
 without a speaker label. Named speakers, including a participant actually named `Unknown`,
 keep their names and speaker entries. The existing attribution field remains optional for
 named segments. Gap `speaker_name` is also nullable when its speaker could not be resolved.
-This is an API contract change: consumers must accept null names and IDs. Deploy the separate
+This is an API contract change: consumers must accept null names. Deploy the separate
 tinychat consumer null-handling PR before deploying this PTX change. Existing stored
 transcripts are unchanged; any backfill is separate.
 

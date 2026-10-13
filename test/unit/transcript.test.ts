@@ -26,7 +26,7 @@ test("normalizeSegments builds stable speaker ids, text, duration", () => {
     end: 2.5,
     text: "Hello there.",
   });
-  expect(t.segments[2]).toMatchObject({ speaker_id: null, speaker_name: null, attribution: "unknown" });
+  expect(t.segments[2]).toMatchObject({ speaker_id: "participant:unresolved:unknown", speaker_name: null, attribution: "unknown" });
   expect(t.text).toBe("Sam: Hello there.\nBob: Second.\nUnknown voice");
 });
 
@@ -37,7 +37,7 @@ test("capture identities survive duplicate display names and name changes; uncer
     { start: 2, end: 3, text: "Renamed", speaker: "Samuel", speakerKey: "a", attribution: "identified" },
     { start: 3, end: 4, text: "Both", speaker: null, attribution: "overlap" },
   ]);
-  expect(t.segments.map(s => s.speaker_id)).toEqual(["speaker_0", "speaker_1", "speaker_0", null]);
+  expect(t.segments.map(s => s.speaker_id)).toEqual(["speaker_0", "speaker_1", "speaker_0", "participant:unresolved:unknown"]);
   expect(t.segments[2]?.speaker_name).toBe("Samuel");
   expect(t.segments[3]).toMatchObject({ speaker_name: null, attribution: "overlap" });
 });
@@ -51,9 +51,29 @@ test("missing, null and blank names create no participant, even with distinct un
   ]);
   expect(t.speakers).toEqual([{ id: "speaker_0", name: "Alice" }]);
   for (const segment of t.segments.slice(0, 3)) {
-    expect(segment).toMatchObject({ speaker_id: null, speaker_name: null, attribution: "unknown" });
+    expect(segment).toMatchObject({ speaker_name: null, attribution: "unknown" });
   }
+  expect(t.segments.map(s => s.speaker_id)).toEqual([
+    "participant:unresolved:unknown", "participant:unresolved:a", "participant:unresolved:b", "speaker_0",
+  ]);
   expect(t.text).toBe("First\nSecond\nThird\nAlice: Named");
+});
+
+test("unresolved speaker ids stay distinct and stable across turns and input order (TC-981)", () => {
+  const raw = [
+    { start: 0, end: 1, text: "First voice", speaker: null, speakerKey: "unresolved:a" },
+    { start: 2, end: 3, text: "Second voice", speaker: null, speakerKey: "unresolved:b" },
+    { start: 4, end: 5, text: "First voice again", speaker: null, speakerKey: "unresolved:a" },
+  ];
+  const t = normalizeSegments(raw);
+  expect(t.segments.map(s => s.speaker_id)).toEqual([
+    "participant:unresolved:a", "participant:unresolved:b", "participant:unresolved:a",
+  ]);
+  expect(normalizeSegments([...raw].reverse()).segments).toEqual(t.segments);
+  expect(normalizeSegments([raw[2]!]).segments[0]!.speaker_id).toBe(t.segments[0]!.speaker_id);
+  expect(t.segments.every(s => s.speaker_name === null && s.attribution === "unknown")).toBe(true);
+  expect(t.speakers).toEqual([]);
+  expect(t.text).toBe("First voice\nSecond voice\nFirst voice again");
 });
 
 test("a participant actually named Unknown keeps their name (TC-981)", () => {
