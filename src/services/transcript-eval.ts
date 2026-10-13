@@ -86,7 +86,7 @@ async function referenceTurns(ctx: AppContext, meetingId: string): Promise<TurnL
   return reference ? parseReferenceTranscript(reference.text) : null;
 }
 
-const turnsOf = (segments: Array<{ speaker_name: string; text: string }>): TurnLike[] => segments.map((s) => ({ speaker: s.speaker_name, text: s.text }));
+const turnsOf = (segments: Array<{ speaker_name: string | null; text: string }>): TurnLike[] => segments.map((s) => ({ speaker: s.speaker_name, text: s.text }));
 
 /** Re-transcribes one meeting with each model. Runs inline (CLI) or in the worker's background. */
 export async function runTranscriptEval(ctx: AppContext, meetingId: string, models: string[], log: (line: string) => void = () => {}): Promise<string[]> {
@@ -137,7 +137,7 @@ export async function setReferenceTranscript(ctx: AppContext, meetingId: string,
     .onConflictDoUpdate({ target: referenceTranscripts.meetingId, set: { source, text, createdAt: new Date() } });
   const evals = await ctx.db.select().from(transcriptEvals).where(and(eq(transcriptEvals.meetingId, meetingId), eq(transcriptEvals.status, "completed")));
   for (const row of evals) {
-    const transcript = object<{ segments: Array<{ speaker_name: string; text: string }> }>(row.transcriptJson);
+    const transcript = object<{ segments: Array<{ speaker_name: string | null; text: string }> }>(row.transcriptJson);
     const previous = object<Record<string, unknown>>(row.metricsJson ?? {});
     await ctx.db.update(transcriptEvals).set({ metricsJson: { ...previous, ...transcriptMetrics(turnsOf(transcript.segments), turns) } }).where(eq(transcriptEvals.id, row.id));
   }
@@ -153,7 +153,7 @@ export async function transcriptEvalReport(ctx: AppContext, meetingId: string): 
   const rows: EvalReportRow[] = [];
   const [canonical] = await ctx.db.select().from(transcripts).where(eq(transcripts.meetingId, meetingId));
   if (canonical) {
-    const payload = object<{ segments?: Array<{ speaker_name: string; text: string }> }>(canonical.segmentsJson);
+    const payload = object<{ segments?: Array<{ speaker_name: string | null; text: string }> }>(canonical.segmentsJson);
     rows.push({ source: `published:${canonical.provider}`, status: "completed", created_at: canonical.createdAt.toISOString(), calls: null, metrics: transcriptMetrics(turnsOf(payload.segments ?? []), turns) });
   }
   for (const row of await ctx.db.select().from(transcriptEvals).where(eq(transcriptEvals.meetingId, meetingId)).orderBy(desc(transcriptEvals.createdAt))) {
@@ -165,7 +165,7 @@ export async function transcriptEvalReport(ctx: AppContext, meetingId: string): 
 
 /** Plain-text view of an eval's (or the canonical) transcript for operator review on the server. */
 export async function transcriptEvalText(ctx: AppContext, meetingId: string, evalId?: string): Promise<string> {
-  let segments: Array<{ speaker_name: string; text: string; start: number }> = [];
+  let segments: Array<{ speaker_name: string | null; text: string; start: number }> = [];
   if (evalId) {
     const [row] = await ctx.db.select().from(transcriptEvals).where(and(eq(transcriptEvals.id, evalId), eq(transcriptEvals.meetingId, meetingId)));
     segments = object<{ segments?: typeof segments }>(row?.transcriptJson ?? {}).segments ?? [];
@@ -174,5 +174,5 @@ export async function transcriptEvalText(ctx: AppContext, meetingId: string, eva
     segments = object<{ segments?: typeof segments }>(row?.segmentsJson ?? {}).segments ?? [];
   }
   const clock = (seconds: number) => new Date(seconds * 1000).toISOString().slice(11, 19);
-  return segments.map((s) => `[${clock(s.start)}] ${s.speaker_name}: ${s.text}`).join("\n");
+  return segments.map((s) => `[${clock(s.start)}] ${s.speaker_name === null ? "" : `${s.speaker_name}: `}${s.text}`).join("\n");
 }

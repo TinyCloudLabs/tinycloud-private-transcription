@@ -168,7 +168,7 @@ export function inferUnresolvedSpeakers(manifest: AttributedManifest, windowMs =
  * `origin` marks text that did not come from the primary model on the speaker's own stream (TC-758):
  * `recording` was re-read from the retained mixed recording, `fallback` came from the fallback model.
  */
-export type RawPiece = { start: number; end: number; text: string; speaker: string; speakerKey: string; attribution: SpeakerAttribution; language: string | null; origin?: "recording" | "fallback" };
+export type RawPiece = { start: number; end: number; text: string; speaker: string | null; speakerKey: string; attribution: SpeakerAttribution; language: string | null; origin?: "recording" | "fallback" };
 
 /** One published identity per display name: the capture channel is not a person. */
 export const nameKey = (name: string) => `name:${name.normalize("NFC").trim().toLowerCase()}`;
@@ -184,7 +184,7 @@ function speakerFor(batch: AttributedBatch, ranges: AttributedRange[], inferred:
     // The provider's speaker_key can collide with a named participant's key, so unresolved
     // ranges keep their own namespace unless a neighbouring bound range names them.
     return guess ? { speaker: guess.name, speakerKey: nameKey(guess.name), attribution: "provisional" }
-      : { speaker: "Unknown", speakerKey: `unresolved:${batch.speaker_key}`, attribution: "unknown" };
+      : { speaker: null, speakerKey: `unresolved:${batch.speaker_key}`, attribution: "unknown" };
   }
   return { speaker: batch.speaker_name, speakerKey: nameKey(batch.speaker_name),
     attribution: batch.attribution.source === "glow-bound" && batch.attribution.confidence > 0 ? "identified" : "provisional" };

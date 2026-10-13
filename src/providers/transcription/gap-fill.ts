@@ -61,7 +61,7 @@ const SILENT_DB = -60, MAX_WINDOWS = 20_000;
 /** Text bounds, enforced when a result is accepted and again at publication. */
 export const MAX_WINDOW_TEXT = 8_000;
 
-export interface GapSpan { start_ms: number; end_ms: number; speaker_name: string; speaker_key: string; attribution: "provisional" | "unknown"; parts: GapPart[] }
+export interface GapSpan { start_ms: number; end_ms: number; speaker_name: string | null; speaker_key: string; attribution: "provisional" | "unknown"; parts: GapPart[] }
 export interface GapSpec { kind: "gap_fill"; spans: GapSpan[] }
 export interface GapWindow { span: number; start_ms: number; end_ms: number }
 export type AlignWindowStatus = "voiced" | "silent" | "missing";
@@ -74,12 +74,12 @@ export interface GapChunkSpec { kind: "gap_chunk"; windows: GapChunkWindow[] }
 export interface GapWindowText { index: number; status: "text" | "empty" | "mismatch"; text?: string; language?: string; segments?: TimedPiece[]; energy_dbfs?: number }
 export interface GapChunkResult { model?: string; fallback?: boolean; windows: GapWindowText[] }
 
-/** Named ranges keep their speaker; unresolved ones take the same-channel inference or Unknown. */
+/** Named ranges keep their speaker; unresolved ones take the same-channel inference or null. */
 function speakerOf(range: AttributedRange, inferred: ReturnType<typeof inferUnresolvedSpeakers>): Pick<GapSpan, "speaker_name" | "speaker_key" | "attribution"> {
   if (range.attribution.source !== "unresolved" && range.speaker_name.trim()) return { speaker_name: range.speaker_name, speaker_key: nameKey(range.speaker_name), attribution: "provisional" };
   const guess = inferred.get(range.sequence);
   return guess ? { speaker_name: guess.name, speaker_key: nameKey(guess.name), attribution: "provisional" }
-    : { speaker_name: "Unknown", speaker_key: `unresolved:${range.speaker_key}`, attribution: "unknown" };
+    : { speaker_name: null, speaker_key: `unresolved:${range.speaker_key}`, attribution: "unknown" };
 }
 
 /** Deterministic spans over the untranscribed parts, merged per speaker. */

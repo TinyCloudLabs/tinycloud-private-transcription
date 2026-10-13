@@ -85,7 +85,7 @@ describe("recording recovery and transcript JSON compatibility", () => {
     await waitStatus(id, "completed");
     const response = await h.api(`/v1/meetings/${id}/transcript`);
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ provider: "tinfoil", speakers: [{ name: "Unknown" }], text: "Unknown: Recovered final remarks." });
+    expect(await response.json()).toMatchObject({ provider: "tinfoil", speakers: [], text: "Recovered final remarks." });
     expect(tinfoilCalls.at(-1)).toMatchObject({ fields: ["model", "response_format", "file"] });
     expect(tinfoilCalls.at(-1)!.fileSize).toBeGreaterThan(PCM_RATE * 2);
   });
@@ -150,7 +150,7 @@ describe("recording recovery and transcript JSON compatibility", () => {
     expect(names.length).toBeGreaterThan(1);
     expect(transcript.provider).toBe("tinfoil");
     expect(transcript.segments.map((segment: { text: string }) => segment.text)).toEqual(names);
-    expect(transcript.segments.every((segment: { speaker_name: string }) => segment.speaker_name === "Unknown")).toBe(true);
+    expect(transcript.segments.every((segment: { speaker_name: string | null }) => segment.speaker_name === null)).toBe(true);
     expect(transcript.duration_seconds).toBe(3);
   });
 
@@ -168,7 +168,7 @@ describe("recording recovery and transcript JSON compatibility", () => {
     await waitStatus(id, "completed");
     expect(await (await h.api(`/v1/meetings/${id}/transcript`)).json()).toMatchObject({
       provider: "tinfoil",
-      speakers: [{ name: "Unknown" }],
+      speakers: [],
     });
   });
 

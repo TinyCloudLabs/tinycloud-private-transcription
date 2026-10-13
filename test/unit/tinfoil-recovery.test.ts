@@ -26,7 +26,7 @@ describe("whole-recording Tinfoil recovery", () => {
     expect(chunks.every((chunk, index) => chunk.to - chunk.from <= 600 && (index === 0 || chunk.from === chunks[index - 1]!.to))).toBe(true);
   });
 
-  test("sends scaled long audio as ordered chunks and exposes only Unknown attribution", async () => {
+  test("sends scaled long audio as ordered chunks and exposes null speakers with unknown attribution", async () => {
     const names: string[] = [];
     let active = 0;
     let maxActive = 0;
@@ -50,8 +50,9 @@ describe("whole-recording Tinfoil recovery", () => {
     expect(names.length).toBeLessThanOrEqual(7);
     expect(maxActive).toBe(2);
     expect(transcript.segments.map((segment) => segment.text)).toEqual(names.map((name) => `text ${name}`));
-    expect(transcript.speakers).toEqual([{ id: "speaker_0", name: "Unknown" }]);
-    expect(transcript.segments.every((segment) => segment.speaker_name === "Unknown" && segment.attribution === "unknown")).toBe(true);
+    expect(transcript.speakers).toEqual([]);
+    expect(transcript.segments.every((segment) => segment.speaker_name === null && segment.speaker_id === null && segment.attribution === "unknown")).toBe(true);
+    expect(transcript.text).toBe(names.map((name) => `text ${name}`).join("\n"));
     expect(transcript.duration_seconds).toBe(12);
   });
 
@@ -114,7 +115,7 @@ describe("whole-recording Tinfoil recovery", () => {
       retryDelayMs: 0,
       fetch: (async () => ++calls === 1 ? fail() : Response.json({ text: "Recovered" })) as unknown as typeof fetch,
     });
-    expect((await provider.transcribe(input(toneWav(1)))).text).toBe("Unknown: Recovered");
+    expect((await provider.transcribe(input(toneWav(1)))).text).toBe("Recovered");
     expect(calls).toBe(2);
   });
 });

@@ -106,7 +106,7 @@ const awaitStatus = (id: string, want: string[], timeoutMs = 15_000) =>
   h.waitFor(async () => (want.includes(await statusOf(id)) ? await statusOf(id) : null), { timeoutMs, label: `${id} → ${want.join("|")}` });
 
 describe("Signal three-seat capacity", () => {
-  test("runs three isolated seats concurrently, queues a fourth, and attributes every segment to Unknown", async () => {
+  test("runs three isolated seats concurrently, queues a fourth, and leaves every segment unattributed", async () => {
     const order = shuffled(["alice", "bob", "carol"]);
     const ids: Record<string, string> = {};
     for (const who of order) {
@@ -137,8 +137,8 @@ describe("Signal three-seat capacity", () => {
       const body = await (await h.api(`/v1/meetings/${ids[who]}/transcript`)).json();
       expect(body.status).toBe("completed");
       expect(body.segments.map((s: any) => s.text)).toEqual([PHRASES[who]]);
-      expect(body.segments.every((s: any) => s.speaker_name === "Unknown" && s.attribution === "unknown")).toBe(true);
-      expect(body.speakers).toEqual([{ id: "speaker_0", name: "Unknown" }]);
+      expect(body.segments.every((s: any) => s.speaker_name === null && s.attribution === "unknown")).toBe(true);
+      expect(body.speakers).toEqual([]);
       expect(JSON.stringify(body)).not.toContain(capabilityFor(who));
     }
 

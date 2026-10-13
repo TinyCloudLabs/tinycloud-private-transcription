@@ -291,7 +291,7 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
         start: chunks[index]!.from,
         end: chunks[index]!.to,
         text: body.text,
-        speaker: "Unknown",
+        speaker: null,
         speakerKey: "unknown",
         attribution: "unknown" as const,
         language: body.language,

@@ -218,16 +218,16 @@ test("unresolved-speaker ranges publish as unknown without vetoing the meeting (
   expect(transcript.segments).toHaveLength(2);
   expect(transcript.segments[1].speaker_id).not.toBe(transcript.segments[0].speaker_id);
   expect(transcript.segments[0]).toMatchObject({ speaker_name: "Alice", attribution: "identified" });
-  expect(transcript.segments[1]).toMatchObject({ speaker_name: "Unknown", attribution: "unknown" });
-  expect(transcript.text).toContain("Alice: sealed words");
-  expect(transcript.text).toContain("Unknown: sealed words");
+  expect(transcript.segments[1]).toMatchObject({ speaker_id: null, speaker_name: null, attribution: "unknown" });
+  expect(transcript.speakers).toEqual([{ id: "speaker_0", name: "Alice" }]);
+  expect(transcript.text).toBe("Alice: sealed words\nsealed words");
   const [rangeRow] = await h.ctx.db.execute<{ failed: number; completed: number }>(sql`
     select count(*) filter (where status = 'failed')::int as failed,
            count(*) filter (where status = 'completed')::int as completed
     from attributed_ranges where meeting_id = ${id}`);
   expect(rangeRow).toEqual({ failed: 1, completed: 2 });
   // The producer-failed range has no retained recording here, so it is listed rather than dropped (TC-758).
-  expect(transcript.gaps).toEqual([{ start: 12, end: 13, speaker_name: "Unknown" }]);
+  expect(transcript.gaps).toEqual([{ start: 12, end: 13, speaker_name: null }]);
 }, 30_000);
 
 test("an open manifest degrades to the mixed recording instead of failing (TC-559)", async () => {
@@ -248,7 +248,7 @@ test("an open manifest degrades to the mixed recording instead of failing (TC-55
   }, { timeoutMs: 30_000 });
   expect(meeting).toMatchObject({ transcript_provider: "tinfoil", transcript_partial: true });
   const transcript = await (await h.api(`/v1/meetings/${id}/transcript`)).json();
-  expect(transcript).toMatchObject({ provider: "tinfoil", partial: true, text: "Unknown: sealed words" });
+  expect(transcript).toMatchObject({ provider: "tinfoil", partial: true, text: "sealed words" });
   expect(h.vexa.requests.map((request) => request.path)).toContain(`/meetings/${bot.id}/attributed-audio`);
   expect(h.vexa.requests.map((request) => request.path).some((path) => path.startsWith("/recordings"))).toBe(true);
   // The fallback marker is durable: reconciler/worker restarts keep polling to complete the
@@ -283,9 +283,10 @@ test("unresolved-only ranges publish as unknown with the partial marker (TC-559)
   // Unresolved speech is published but degraded: the meeting and transcript carry the marker.
   expect(meeting).toMatchObject({ transcript_provider: "tinfoil-attributed", transcript_partial: true });
   const transcript = await (await h.api(`/v1/meetings/${id}/transcript`)).json();
-  expect(transcript).toMatchObject({ provider: "tinfoil-attributed", text: "Unknown: sealed words" });
+  expect(transcript).toMatchObject({ provider: "tinfoil-attributed", text: "sealed words" });
   expect(transcript.partial).toBe(true);
-  expect(transcript.segments[0]).toMatchObject({ speaker_name: "Unknown", attribution: "unknown" });
+  expect(transcript.segments[0]).toMatchObject({ speaker_id: null, speaker_name: null, attribution: "unknown" });
+  expect(transcript.speakers).toEqual([]);
 });
 
 test("a transient manifest fetch failure retries instead of falling back (TC-559)", async () => {

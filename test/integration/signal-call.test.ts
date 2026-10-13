@@ -51,7 +51,9 @@ describe("Signal call transcription", () => {
       const body = await r.json();
       return body.status === "completed" ? body : null;
     });
-    expect(transcript.segments[0]).toMatchObject({ speaker_name: "Unknown", attribution: "unknown", text: "hello from signal" });
+    expect(transcript.segments[0]).toMatchObject({ speaker_id: null, speaker_name: null, attribution: "unknown", text: "hello from signal" });
+    expect(transcript.speakers).toEqual([]);
+    expect(transcript.text).toBe("hello from signal");
     expect(JSON.stringify(transcript)).not.toContain(capability);
     const finished = await h.api(`/v1/meetings/${meeting.id}`);
     expect(JSON.stringify(await finished.json())).not.toContain(capability);
@@ -78,7 +80,7 @@ describe("Signal call transcription", () => {
       const body = await (await h.api(`/v1/meetings/${meeting.id}/transcript`)).json();
       return body.status === "completed" ? body : null;
     });
-    expect(transcript.segments[0]).toMatchObject({ speaker_name: "Unknown", attribution: "unknown" });
+    expect(transcript.segments[0]).toMatchObject({ speaker_name: null, attribution: "unknown" });
     expect(signal.leaves).toBe(before + 1);
     expect((await h.api(`/v1/meetings/${meeting.id}/stop`, { method: "POST" })).status).toBe(200);
     expect(signal.leaves).toBe(before + 1);

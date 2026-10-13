@@ -889,7 +889,7 @@ export async function reconcileAttributedRuns(ctx: AppContext): Promise<void> {
   }
 }
 
-export interface GapFillCheckWindow { index: number; speaker_name: string; start: number; end: number; from: number; to: number; planned_db: number; measured_db: number; diff_db: number; r: number | null; match: boolean }
+export interface GapFillCheckWindow { index: number; speaker_name: string | null; start: number; end: number; from: number; to: number; planned_db: number; measured_db: number; diff_db: number; r: number | null; match: boolean }
 export interface GapFillCheckReport {
   meetingId: string; vexaMeetingId: number; spans_from: "untranscribed" | "all_ranges"; spans: number; windows: number; voiced_windows: number;
   recording_sec: number; prior_offset_ms: number | null; alignment: { offset_ms: number; score: number; z: number } | null;

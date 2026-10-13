@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { attributedBatches, type AttributedManifest, type AttributedRange } from "../../src/providers/transcription/attributed.ts";
-import { assembleAttributedTranscript, batchTimeline, inferUnresolvedSpeakers, meetingSeconds, paddedBatchPcm, type AttributedResult } from "../../src/providers/transcription/attributed-assembly.ts";
+import { assembleAttributedTranscript, attributedPieces, batchTimeline, inferUnresolvedSpeakers, meetingSeconds, paddedBatchPcm, type AttributedResult } from "../../src/providers/transcription/attributed-assembly.ts";
 import { TinfoilTranscriptionProvider, timedWindows } from "../../src/providers/transcription/tinfoil.ts";
 import { hallucinated } from "../../src/domain/hallucination.ts";
 
@@ -39,6 +39,21 @@ describe("batch timeline (TC-741)", () => {
 });
 
 describe("assembly (TC-741/742/743)", () => {
+  test.each([false, true])("unresolved batches emit null without participant entries, timed=%s (TC-981)", (timed) => {
+    const input = manifest([range(0, "", 0, 1_000), range(1, "", 10_000, 11_000, { channel: 1 })]);
+    const completed = attributedBatches(input, 1).map((spec, i) => ({ spec, result: {
+      text: `Speech ${i}`, ...(timed ? { segments: [{ start: 0, end: 0.9, text: `Speech ${i}` }] } : {}),
+    } }));
+    const { raw } = attributedPieces(input, completed);
+    expect(raw.map((piece) => [piece.speaker, piece.attribution])).toEqual([[null, "unknown"], [null, "unknown"]]);
+    expect(new Set(raw.map((piece) => piece.speakerKey)).size).toBe(2);
+    const { transcript, unknown } = assembleAttributedTranscript(input, completed, "en");
+    expect(unknown).toBe(true);
+    expect(transcript.speakers).toEqual([]);
+    expect(transcript.segments.map((segment) => [segment.speaker_name, segment.speaker_id, segment.attribution])).toEqual([[null, null, "unknown"], [null, null, "unknown"]]);
+    expect(transcript.text).toBe("Speech 0\nSpeech 1");
+  });
+
   test("timed segments interleave speakers in meeting order and merge each speaker's turns", () => {
     const input = manifest([range(0, "Alice", 0, 2_000), range(1, "Bob", 2_500, 4_000, { channel: 1 }), range(2, "Alice", 4_500, 6_000)]);
     const batches = attributedBatches(input, 1);
@@ -67,8 +82,8 @@ describe("assembly (TC-741/742/743)", () => {
     const { transcript, unknown } = assembleAttributedTranscript(input, batches.map((spec) => ({ spec, result: { text: "words", segments: spec.ranges.map((_, i) => ({ start: i * 1.8, end: i * 1.8 + 0.9, text: `w${spec.ranges[i]!.sequence}` })) } })), "en");
     const bySequenceText = Object.fromEntries(transcript.segments.flatMap((s) => s.text.split(" ").map((w) => [w, [s.speaker_name, s.attribution]])));
     expect(bySequenceText.w1).toEqual(["Kenny", "provisional"]);
-    expect(bySequenceText.w2).toEqual(["Unknown", "unknown"]);
-    expect(bySequenceText.w3).toEqual(["Unknown", "unknown"]);
+    expect(bySequenceText.w2).toEqual([null, "unknown"]);
+    expect(bySequenceText.w3).toEqual([null, "unknown"]);
     expect(unknown).toBe(true);
   });
 
@@ -168,6 +183,6 @@ describe("review fixes (PR #71)", () => {
     const unresolved = attributedBatches(input, 1).find((spec) => spec.attribution.source === "unresolved")!;
     expect(unresolved.ranges.map((r) => r.sequence)).toEqual([1, 3]);
     const { transcript } = assembleAttributedTranscript(input, [{ spec: unresolved, result: { text: "a long stretch of mixed speech from two people on one channel" } }], "en");
-    expect(transcript.segments.map((s) => [s.speaker_name, s.attribution])).toEqual([["Unknown", "unknown"]]);
+    expect(transcript.segments.map((s) => [s.speaker_name, s.attribution])).toEqual([[null, "unknown"]]);
   });
 });

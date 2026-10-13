@@ -34,3 +34,12 @@ test("metrics penalize out-of-order turns, unknown speakers, and hallucinations"
   expect(transcriptMetrics([{ speaker: "A", text: "Hello! How can I assist you today?" }], null).hallucinated_turns).toBe(1);
   expect(words("Um, it's TinyCloud—private!")).toEqual(["its", "tinycloud", "private"]);
 });
+
+test("metrics accept null speakers and count their words as unattributed (TC-981)", () => {
+  const hypothesis = [{ speaker: null, text: "First words" }, { speaker: "Alice", text: "Second words" }];
+  const reference = [{ speaker: "Bob", text: "First words" }, hypothesis[1]!];
+  expect(transcriptMetrics(hypothesis, reference)).toMatchObject({
+    wer: 0, word_recall: 1, speaker_accuracy: 0.5, speakers: 1, unknown_word_share: 0.5,
+  });
+  expect(transcriptMetrics([hypothesis[0]!], null)).toMatchObject({ speakers: 0, unknown_word_share: 1 });
+});
