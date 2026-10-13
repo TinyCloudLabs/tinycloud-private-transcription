@@ -430,6 +430,48 @@ test("0024 upgrades 0023 data additively and tolerates the old image after rollb
   }
 }, 30_000);
 
+test("0025 adds the VAD coverage columns without touching existing jobs, and the old image keeps working after rollback", async () => {
+  const databaseName = `ptx_vad_${crypto.randomUUID().replaceAll("-", "")}`;
+  const databaseUrl = new URL(config.databaseUrl);
+  databaseUrl.pathname = `/${databaseName}`;
+  const adminUrl = new URL(config.databaseUrl);
+  adminUrl.pathname = "/postgres";
+  const admin = new SQL(adminUrl.toString());
+  const fixture = await productionMigrationsFixture(25);
+  let db: Db | undefined;
+  // The previous image's named-column insert of a job (no coverage columns).
+  const insertJob = (target: Db, id: string) => target.execute(sql`insert into transcriptions (id, project_id, tenant_ref, status,
+    idempotency_key, request_hash, content_type, byte_size, sha256, channel_mode, channel_labels, upload_deadline_at, tinfoil_audio_seconds)
+    values (${id}, 'upgrade', 'tenant', 'completed', ${id}, 'hash', 'audio/mpeg', 1, 'sha', 'mixed', '[]'::jsonb, now(), 12.5)`);
+  try {
+    await admin.unsafe(`CREATE DATABASE "${databaseName}"`);
+    const before = createDb(databaseUrl.toString());
+    await migrate(before, { migrationsFolder: fixture });
+    await before.execute(sql`insert into projects (id, name, webhook_secret) values ('upgrade', 'fixture', 'fixture')`);
+    await insertJob(before, "trn_before");
+    const [rowBefore] = await before.execute(sql`select to_jsonb(t) as row from transcriptions t`);
+    await before.$client.close();
+
+    db = await runMigrations(databaseUrl.toString());
+    const [rowAfter] = await db.execute(sql`select to_jsonb(t) - 'vad_dropped_above_floor_pct' - 'vad_fallback' as row,
+      vad_dropped_above_floor_pct, vad_fallback from transcriptions t`);
+    expect(rowAfter).toEqual({ ...(rowBefore as object), vad_dropped_above_floor_pct: null, vad_fallback: null });
+    // The old migrator ignores the newer journal; the old image's insert still works and leaves the columns null.
+    await migrate(db, { migrationsFolder: fixture });
+    await insertJob(db, "trn_old_image");
+    expect(await db.execute(sql`select vad_dropped_above_floor_pct, vad_fallback from transcriptions where id = 'trn_old_image'`))
+      .toEqual([{ vad_dropped_above_floor_pct: null, vad_fallback: null }]);
+    const migration = await readFile(join(migrationsSource, "0025_vad_coverage.sql"), "utf8");
+    expect(/^\s*(drop|truncate|delete|update)\b/im.test(migration)).toBe(false);
+    expect(/\b(default|not null)\b/i.test(migration)).toBe(false);
+  } finally {
+    await db?.$client.close();
+    await admin.unsafe(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`);
+    await admin.close();
+    await rm(fixture, { recursive: true, force: true });
+  }
+}, 30_000);
+
 test("0018: a fresh install starts with admission closed; an existing deployment keeps its admission mode", async () => {
   const adminUrl = new URL(config.databaseUrl);
   adminUrl.pathname = "/postgres";

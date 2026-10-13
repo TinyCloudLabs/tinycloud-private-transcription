@@ -200,7 +200,7 @@ describe("VAD coverage guard (TC-1045)", () => {
 
   test("real pauses are skipped without tripping the guard", () => {
     const detection = detectSpeech(speechWithPauses());
-    expect(detection).toMatchObject({ fallback: false, covered: true, droppedFrames: 0, totalFrames: 500 });
+    expect(detection).toMatchObject({ fallback: false, covered: true, droppedFrames: 0, aboveFloorFrames: 400 });
     expect(detection.regions).toHaveLength(5);
     expect(detection.regions[0]).toEqual({ startMs: 0, endMs: 8_250 });
   });
@@ -216,16 +216,55 @@ describe("VAD coverage guard (TC-1045)", () => {
     expect(detection.regions.at(-1)!.endMs).toBe(60_000);
   });
 
+  test("a quiet talker in a quiet room is not lost because they speak for only a small part of the recording", () => {
+    // 100 s in a -55 dBFS room; a -45 dBFS talker speaks for 8 s. The threshold (p10 + 12 = -43) drops all of it: 8% of
+    // the recording but 100% of its non-silent audio, so the guard measures against the non-silent audio.
+    const e = new Float64Array(1_000).fill(-55);
+    e.fill(-45, 500, 580);
+    const detection = detectSpeech(e);
+    expect(detection).toMatchObject({ primaryDroppedShare: 1, fallback: true, covered: true, droppedFrames: 0 });
+    expect(detection.regions).toEqual([{ startMs: 49_750, endMs: 58_250 }]);
+  });
+
+  test("the fallback trips only above 10% of the non-silent audio", () => {
+    // A -60 dBFS room (threshold -48): 9 s of speech, then k frames at -49 dBFS far from it, dropped by the threshold.
+    const withDropped = (k: number) => {
+      const e = new Float64Array(1_000).fill(-60);
+      e.fill(-25, 0, 90);
+      e.fill(-49, 500, 500 + k);
+      return detectSpeech(e);
+    };
+    expect(withDropped(10)).toMatchObject({ aboveFloorFrames: 100, droppedFrames: 10, fallback: false });
+    expect(withDropped(11)).toMatchObject({ aboveFloorFrames: 101, fallback: true, droppedFrames: 0 });
+  });
+
+  test("sub-second recordings and edge clicks are the VAD's resolution, not lost speech: no fallback, no failure", () => {
+    const clip = (frames: number, loud: number[]) => {
+      const e = new Float64Array(frames).fill(-120);
+      for (const f of loud) e[f] = -25;
+      return detectSpeech(e);
+    };
+    // 0.1 s of speech: too short to send, so the worker fails it no_speech, as before.
+    expect(clip(1, [0])).toMatchObject({ regions: [], fallback: false, covered: true });
+    expect(clip(3, [0, 1, 2])).toMatchObject({ fallback: false, covered: true });
+    for (const [frames, loud] of [[5, [4]], [9, [0]], [9, [8]]] as const) {
+      expect({ frames, loud, ...clip(frames, [...loud]) }).toMatchObject({ frames, loud, covered: true });
+    }
+  });
+
   test("a pathological threshold falls back to the floor instead of dropping the speech", () => {
     const detection = detectSpeech(speechWithPauses(), { ...VAD, capDbfs: 0, aboveP10Db: 200 });
-    expect(detection.primaryDroppedShare).toBe(0.8);
+    expect(detection.primaryDroppedShare).toBe(1);
     expect(detection).toMatchObject({ fallback: true, covered: true, droppedFrames: 0 });
     expect(detection.regions).toEqual(detectSpeech(speechWithPauses()).regions);
   });
 
   test("when even the floor cannot cover the recording, the detection says so (the worker fails the job)", () => {
-    const detection = detectSpeech(speechWithPauses(), { ...VAD, capDbfs: 0, aboveP10Db: 200, minMs: 60_000 });
-    expect(detection).toMatchObject({ fallback: true, covered: false, regions: [], droppedFrames: 400 });
+    // Unpadded, 0.2 s bursts 2 s apart are each shorter than a region, at any threshold.
+    const e = new Float64Array(1_000).fill(-120);
+    for (let f = 0; f < 1_000; f += 20) e.fill(-25, f, f + 2);
+    const detection = detectSpeech(e, { ...VAD, padMs: 0 });
+    expect(detection).toMatchObject({ fallback: true, covered: false, regions: [], droppedFrames: 100, aboveFloorFrames: 100 });
   });
 });
 

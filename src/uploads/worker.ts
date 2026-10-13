@@ -13,7 +13,7 @@ import { fenceGuard, holdFence, LostFence, type DbOrTx, type Fence } from "./fen
 import { cleanupJobFiles, recoverStaleClaims, releaseDeadSlot, runSweep, terminalize, workerLive } from "./ledger.ts";
 import type { ProviderOutcome } from "./provider.ts";
 import { ensureStorageRoot, jobDir, removeJobEntry, workDirName } from "./storage.ts";
-import { detectSpeech, droppedAboveFloorFrames, frameEnergies, type Region } from "./vad.ts";
+import { aboveFloorFrames, detectSpeech, droppedAboveFloorFrames, frameEnergies, type Region } from "./vad.ts";
 
 export interface Claim {
   job: TranscriptionRow;
@@ -205,7 +205,7 @@ const percent = (part: number, whole: number) => whole === 0 ? 0 : Math.round((p
 async function vadRegions(ctx: BatchContext, job: TranscriptionRow, fence: Fence, pcm: string[]): Promise<DetectedRegions | null> {
   const detections = await Promise.all(pcm.map(async (path) => detectSpeech(await frameEnergies(path))));
   const dropped = detections.reduce((sum, d) => sum + d.droppedFrames, 0);
-  const total = detections.reduce((sum, d) => sum + d.totalFrames, 0);
+  const aboveFloor = detections.reduce((sum, d) => sum + d.aboveFloorFrames, 0);
   const fallback = detections.some((d) => d.fallback);
   if (fallback) {
     ctx.log.warn("batch VAD fell back to the floor threshold", {
@@ -213,14 +213,14 @@ async function vadRegions(ctx: BatchContext, job: TranscriptionRow, fence: Fence
     });
   }
   if (detections.some((d) => !d.covered)) {
-    ctx.log.error("batch VAD could not cover the recording", { transcriptionId: job.id, stage: "vad", droppedAboveFloorPct: percent(dropped, total), alert: true });
+    ctx.log.error("batch VAD could not cover the recording", { transcriptionId: job.id, stage: "vad", droppedAboveFloorPct: percent(dropped, aboveFloor), alert: true });
     if (await failClaim(ctx, ctx.db, fence, "processing_failed", "Speech detection could not cover the recording")) await cleanupJobFiles(ctx, job.id);
     else throw new LostFence(job.id);
     return null;
   }
   const regions = detections.flatMap((d, channel) => d.regions.map((region) => ({ ...region, channel, speaker: null })))
     .sort((a, b) => a.startMs - b.startMs || a.channel - b.channel);
-  return { regions, droppedAboveFloorPct: percent(dropped, total), fallback };
+  return { regions, droppedAboveFloorPct: percent(dropped, aboveFloor), fallback };
 }
 
 /**
@@ -246,7 +246,7 @@ async function diarizeTurns(ctx: BatchContext, job: TranscriptionRow, fence: Fen
   const turns = speakerTurns(segments, energies);
   return {
     regions: turns.map((turn) => ({ ...turn, channel: 0 })),
-    droppedAboveFloorPct: percent(droppedAboveFloorFrames(energies, turns), energies.length),
+    droppedAboveFloorPct: percent(droppedAboveFloorFrames(energies, turns), aboveFloorFrames(energies)),
     fallback: false,
   };
 }

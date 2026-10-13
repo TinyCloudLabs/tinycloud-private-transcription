@@ -188,7 +188,7 @@ const fixtureCache = new Map<string, Uint8Array>();
 
 type Fixture = "stereo" | "mono_wav" | "silent_wav" | "three_channel_wav" | "over_cap_mp3" | "stereo_dense"
   | "stereo_m4a" | "stereo_webm" | "stereo_webm_no_duration" | "stereo_webm_offset" | "stereo_flac" | "stereo_mp4_with_video"
-  | "narration_mp3" | "quiet_narration_mp3";
+  | "narration_mp3" | "quiet_narration_mp3" | "short_wav" | "clicks_wav";
 
 /** 30 s of public-domain LibriVox narration over a steady noise floor (TC-1045). */
 const NARRATION = join(import.meta.dir, "../../fixtures/librivox-art-of-war-30s.flac");
@@ -229,6 +229,10 @@ export async function audio(kind: Fixture): Promise<Uint8Array> {
     narration_mp3: ["-i", NARRATION, "-ac", "1", "-ar", "44100", "-c:a", "libmp3lame", "-b:a", "64k"],
     // The same narration 12 dB quieter: every frame above the -50 dBFS floor, most of them below the -40 dBFS cap.
     quiet_narration_mp3: ["-i", NARRATION, "-af", "volume=-12dB", "-ac", "1", "-ar", "44100", "-c:a", "libmp3lame", "-b:a", "64k"],
+    // 0.3 s of tone: shorter than the VAD's 0.4 s minimum region.
+    short_wav: ["-f", "lavfi", "-i", "sine=f=440:d=0.3", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le"],
+    // 2 s of tone, then a 0.2 s click every 2 s until 20 s, over digital silence.
+    clicks_wav: ["-f", "lavfi", "-i", "sine=f=1000:d=20", "-af", "volume='if(lt(t,2)+lt(mod(t,2),0.2),1,0)':eval=frame", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le"],
   };
   const proc = Bun.spawn(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", ...args[kind], out], { stdout: "ignore", stderr: "pipe" });
   const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);

@@ -12,7 +12,7 @@ import { PCM_BYTES_PER_SECOND } from "./audio.ts";
  */
 export const VAD = {
   frameMs: 100, floorDbfs: -50, aboveP10Db: 12, capDbfs: -40, mergeGapMs: 1_000, padMs: 250, minMs: 400, maxMs: 30_000, splitSearchMs: 10_000,
-  /** Coverage guard: at most this share of the recording may be above the floor yet unsent before the VAD falls back. */
+  /** Coverage guard: at most this share of the non-silent audio (frames ≥ floorDbfs) may go unsent before the VAD falls back. */
   maxDroppedAboveFloor: 0.1,
 };
 
@@ -83,24 +83,31 @@ export function regionsFromEnergies(energies: Float64Array, threshold = vadThres
     if (last && region.startMs <= last.endMs) last.endMs = Math.max(last.endMs, region.endMs);
     else coalesced.push({ ...region });
   }
-  return coalesced.flatMap((region) => splitLong(region, energies));
+  return coalesced.flatMap((region) => splitLong(region, energies, vad));
 }
 
 /** Cuts a region longer than VAD.maxMs at the quietest frame in the last VAD.splitSearchMs of every VAD.maxMs window. */
-export function splitLong(region: Region, energies: Float64Array): Region[] {
+export function splitLong(region: Region, energies: Float64Array, vad: VadParams = VAD): Region[] {
   const out: Region[] = [];
   let from = region.startMs;
-  while (region.endMs - from > VAD.maxMs) {
-    const searchFrom = Math.floor((from + VAD.maxMs - VAD.splitSearchMs) / VAD.frameMs);
-    const searchTo = Math.floor((from + VAD.maxMs) / VAD.frameMs);
+  while (region.endMs - from > vad.maxMs) {
+    const searchFrom = Math.floor((from + vad.maxMs - vad.splitSearchMs) / vad.frameMs);
+    const searchTo = Math.floor((from + vad.maxMs) / vad.frameMs);
     let best = searchTo - 1;
     for (let f = searchFrom; f < searchTo; f++) if (energies[f]! <= energies[best]!) best = f;
-    const cut = best * VAD.frameMs + VAD.frameMs / 2;
+    const cut = best * vad.frameMs + vad.frameMs / 2;
     out.push({ startMs: from, endMs: cut });
     from = cut;
   }
   out.push({ startMs: from, endMs: region.endMs });
   return out;
+}
+
+/** Frames at or above the absolute floor: audio that is not silence. */
+export function aboveFloorFrames(energies: Float64Array, vad: VadParams = VAD): number {
+  let count = 0;
+  for (const energy of energies) if (energy >= vad.floorDbfs) count++;
+  return count;
 }
 
 /**
@@ -122,10 +129,11 @@ export interface Detection {
   regions: Region[];
   /** Frames above the floor that the returned regions leave unsent. */
   droppedFrames: number;
-  totalFrames: number;
+  /** Frames above the floor: the guard's denominator. */
+  aboveFloorFrames: number;
   /** The relative threshold left too much audio above the floor unsent, so the regions use the floor alone. */
   fallback: boolean;
-  /** Share of the recording above the floor that the relative threshold would have left unsent (what tripped the fallback). */
+  /** Share of the audio above the floor that the relative threshold would have left unsent (what tripped the fallback). */
   primaryDroppedShare: number;
   /** false: even the floor-only regions leave more than the bound unsent. The job must fail, never complete. */
   covered: boolean;
@@ -133,17 +141,21 @@ export interface Detection {
 
 /**
  * VAD regions with a fail-closed coverage guard. If the relative threshold leaves more than `maxDroppedAboveFloor` of
- * the recording above the floor unsent, the regions are recomputed with the floor as the threshold (every stretch of
- * non-silent audio, still merged, padded and cut at 30 s). A pause in a quiet room is below the floor and never trips it.
+ * the non-silent audio (frames at or above the floor) unsent, the regions are recomputed with the floor as the threshold:
+ * every stretch of non-silent audio, still merged, padded and cut at 30 s. A pause in a quiet room is below the floor and
+ * never counts. The bound is never below one minimum region (`minMs`): the VAD never sends a stretch shorter than that
+ * on its own, so a sub-second recording or a lone click at either end is the VAD's resolution, not lost speech.
  */
 export function detectSpeech(energies: Float64Array, vad: VadParams = VAD): Detection {
-  const totalFrames = energies.length;
-  const bound = vad.maxDroppedAboveFloor * totalFrames;
+  const aboveFloor = aboveFloorFrames(energies, vad);
+  const bound = Math.max(vad.maxDroppedAboveFloor * aboveFloor, vad.minMs / vad.frameMs);
   const primary = regionsFromEnergies(energies, vadThreshold(energies, vad), vad);
   const primaryDropped = droppedAboveFloorFrames(energies, primary, vad);
-  const primaryDroppedShare = totalFrames === 0 ? 0 : primaryDropped / totalFrames;
-  if (primaryDropped <= bound) return { regions: primary, droppedFrames: primaryDropped, totalFrames, fallback: false, primaryDroppedShare, covered: true };
+  const primaryDroppedShare = aboveFloor === 0 ? 0 : primaryDropped / aboveFloor;
+  if (primaryDropped <= bound) {
+    return { regions: primary, droppedFrames: primaryDropped, aboveFloorFrames: aboveFloor, fallback: false, primaryDroppedShare, covered: true };
+  }
   const regions = regionsFromEnergies(energies, vad.floorDbfs, vad);
   const droppedFrames = droppedAboveFloorFrames(energies, regions, vad);
-  return { regions, droppedFrames, totalFrames, fallback: true, primaryDroppedShare, covered: droppedFrames <= bound };
+  return { regions, droppedFrames, aboveFloorFrames: aboveFloor, fallback: true, primaryDroppedShare, covered: droppedFrames <= bound };
 }
