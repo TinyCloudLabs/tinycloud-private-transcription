@@ -413,6 +413,9 @@ test("a delayed heartbeat acknowledgement cannot authorize a wave after takeover
   // Admission 1 paid for exactly one wave; the re-admitted owner paid for its own fresh-heartbeat
   // waves. Neither call overlapped another.
   expect(maxInflight).toBe(1);
+  // settleRecordingRecovery writes `outcome` after the completion commit (meeting-job.ts:709-712).
+  await h.waitFor(async () => ((await recoveryRun(meetingId))?.outcome ?? null) !== null ? true : null,
+    { timeoutMs: 5_000, label: "recovery outcome settled" });
   expect(await recoveryRun(meetingId)).toMatchObject({ admissions: 2, outcome: "succeeded" });
 }, 30_000);
 
@@ -443,6 +446,9 @@ test("a live-but-late first heartbeat frees its admission without spending the r
   // and the outcome is a clean success — not the exhaustion a held-until-stale admission costs.
   expect(paidCalls).toBe(3);
   expect(maxInflight).toBe(1);
+  // settleRecordingRecovery writes `outcome` after the completion commit (meeting-job.ts:709-712).
+  await h.waitFor(async () => ((await recoveryRun(meetingId))?.outcome ?? null) !== null ? true : null,
+    { timeoutMs: 5_000, label: "recovery outcome settled" });
   expect(await recoveryRun(meetingId)).toMatchObject({ admissions: 1, outcome: "succeeded" });
 }, 30_000);
 
