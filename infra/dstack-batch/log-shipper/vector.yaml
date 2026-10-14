@@ -1,12 +1,73 @@
 data_dir: /var/lib/vector
-secret:
-  bs: { type: directory, path: /run/vector-secrets, remove_trailing_whitespace: true }
 sources:
-  docker_fluent: { type: fluent, mode: tcp, address: 0.0.0.0:24224 }
+  docker_files:
+    type: file
+    include: [/host/containers/*/*-json.log*]
+    read_from: end
+    max_line_bytes: 65536
 transforms:
+  raw_label_gate:
+    type: remap
+    inputs: [docker_files]
+    drop_on_abort: true
+    drop_on_error: true
+    source: |
+      message = string!(.message)
+      if contains(message, "\"attrs\":{\"tc.logship\":\"ptx-batch-api\"}") {
+        .gate_status = "accepted"
+      } else if contains(message, "\"attrs\":{\"tc.logship\":\"ptx-batch-worker\"}") {
+        .gate_status = "accepted"
+      } else if contains(message, "\"attrs\":{\"tc.logship\":\"") {
+        . = {"gate_status": "unexpected", "reason": "unexpected_label", "count": 1}
+      } else {
+        . = {"gate_status": "dropped", "reason": "unlabelled", "count": 1}
+      }
+  gate_routes:
+    type: route
+    inputs: [raw_label_gate]
+    route:
+      accepted: .gate_status == "accepted"
+      dropped: .gate_status == "dropped"
+      unexpected: .gate_status == "unexpected"
+  gate_unmatched:
+    type: remap
+    inputs: [gate_routes._unmatched]
+    drop_on_error: true
+    source: |
+      . = {"reason": "route_unmatched", "count": 1}
+  parse_docker_envelope:
+    type: remap
+    inputs: [gate_routes.accepted]
+    drop_on_abort: true
+    drop_on_error: true
+    source: |
+      envelope, parse_err = parse_json(.message)
+      if parse_err != null || !is_object(envelope) { abort }
+      if !is_object(envelope.attrs) { abort }
+      label = envelope.attrs."tc.logship"
+      tag = if label == "ptx-batch-api" { "ptx-batch.api" } else if label == "ptx-batch-worker" { "ptx-batch.worker" } else { abort }
+      if !is_string(envelope.log) { abort }
+      . = {"tag": tag, "log": envelope.log}
+  gate_unexpected_event:
+    type: remap
+    inputs: [gate_routes.unexpected]
+    drop_on_error: true
+    source: |
+      . = {"event": "logship_unexpected_label", "reason": "unapproved_label"}
+  gate_counters:
+    type: log_to_metric
+    inputs: [gate_routes.dropped, gate_routes.unexpected, gate_unmatched]
+    metrics:
+      - type: counter
+        field: count
+        name: gate_dropped_total
+        namespace: logship
+        increment_by_value: true
+        tags:
+          reason: "{{reason}}"
   allowlist:
     type: remap
-    inputs: [docker_fluent]
+    inputs: [parse_docker_envelope]
     drop_on_abort: true
     drop_on_error: true
     source: |
@@ -218,11 +279,16 @@ transforms:
 sinks:
   betterstack:
     type: http
-    inputs: [allowlist]
+    inputs: [allowlist, gate_unexpected_event]
     method: post
     uri: "https://s2795436.us-west-2a.betterstackdata.com/"
     encoding: { codec: json }
     compression: gzip
-    auth: { strategy: bearer, token: "SECRET[bs.bs_token]" }
+    auth: { strategy: bearer, token: "${BETTERSTACK_SOURCE_TOKEN}" }
     batch: { max_bytes: 4000000, timeout_secs: 5 }
     buffer: { type: memory, max_events: 1000, when_full: drop_newest }
+  gate_metrics:
+    type: prometheus_exporter
+    inputs: [gate_counters]
+    address: 127.0.0.1:9598
+    flush_period_secs: 5

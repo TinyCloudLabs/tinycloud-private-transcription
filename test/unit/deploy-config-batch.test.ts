@@ -26,10 +26,15 @@ const API_IMAGE = /^ghcr\.io\/tinycloudlabs\/tinycloud-private-transcription\/ap
 const POSTGRES = "postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685";
 
 type Service = {
-  image: string; build?: unknown; command?: string[]; environment: Record<string, string>; volumes?: { source?: string; target: string }[]; ports?: unknown[];
+  image: string; build?: unknown; command?: string[]; environment: Record<string, string>;
+  volumes?: { type?: string; source?: string; target: string; read_only?: boolean; bind?: { create_host_path?: boolean } }[];
+  configs?: { source: string; target: string }[]; labels?: Record<string, string>; ports?: unknown[];
   mem_limit?: string; memswap_limit?: string; mem_reservation?: string; cpuset?: string; cpus?: number;
+  read_only?: boolean; user?: string; cap_drop?: string[]; security_opt?: string[];
   logging?: { driver?: string; options?: Record<string, string> };
 };
+const vectorConfigText = read("infra/dstack-batch/log-shipper/vector.yaml");
+const vectorConfig = Bun.YAML.parse(vectorConfigText);
 
 function render(quietMode?: string): Record<string, Service> {
   const rendered = Bun.spawnSync(
@@ -51,15 +56,15 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(services.api!.image).toMatch(API_IMAGE);
     expect(services["upload-worker"]!.image).toBe(services.api!.image);
     expect(services.postgres!.image).toBe(POSTGRES);
-    expect(services["log-shipper"]!.ports).toEqual([{ mode: "ingress", host_ip: "127.0.0.1", target: 24224, published: "24224", protocol: "tcp" }]);
+    expect(services["log-shipper"]!.ports ?? []).toEqual([]);
     expect(services["log-shipper"]!.cpus).toBe(0.25);
     expect(Number(services["log-shipper"]!.mem_limit)).toBe(64 * 1024 * 1024);
     expect(composeText).not.toMatch(/^\s+(build|context|dockerfile):/m);
     expect(composeText).not.toMatch(/image: \$\{/);
   });
 
-  test("renders the embedded Vector config byte-identically after Compose dollar unescaping", () => {
-    expect(render()["log-shipper"]!.environment.VECTOR_CONFIG_YAML.replaceAll("$$", "$")).toBe(read("infra/dstack-batch/log-shipper/vector.yaml"));
+  test("mounts Vector's canonical config through a Compose config", () => {
+    expect(render()["log-shipper"]!.configs).toEqual([{ source: "vector-config", target: "/etc/vector/vector.yaml" }]);
   });
 
   test("runs the batch role with no meeting workload, docker socket, or fault injection", () => {
@@ -90,15 +95,40 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(render("false")["upload-worker"]!.environment.BATCH_VAD_QUIET_MODE).toBe("false");
   });
 
-  test("only api and worker ship logs, asynchronously, to the local loopback sidecar", () => {
+  test("api and worker alone expose their Docker label through capped json-file logs", () => {
     const services = render();
-    for (const [name, tag] of [["api", "ptx-batch.api"], ["upload-worker", "ptx-batch.worker"]] as const) {
-      expect(services[name]!.logging).toEqual({ driver: "fluentd", options: {
-        "fluentd-address": "127.0.0.1:24224", "fluentd-async": "true", "fluentd-buffer-limit": "7000",
-        tag, "cache-max-size": "20m", "cache-max-file": "5",
+    for (const [name, label] of [["api", "ptx-batch-api"], ["upload-worker", "ptx-batch-worker"]] as const) {
+      expect(services[name]!.labels?.["tc.logship"]).toBe(label);
+      expect(services[name]!.logging).toEqual({ driver: "json-file", options: {
+        "max-size": "10m", "max-file": "3", labels: "tc.logship",
       } });
     }
+    expect(services.postgres!.labels?.["tc.logship"]).toBeUndefined();
+    expect(services["log-shipper"]!.labels?.["tc.logship"]).toBeUndefined();
     expect(services.postgres!.logging?.driver).toBe("json-file");
+    expect(composeConfig).not.toMatch(/driver:\s*fluentd|fluentd-address|24224/);
+  });
+
+  test("Vector gates raw Docker labels first and reads only the host log tree read-only", () => {
+    const services = render();
+    const shipper = services["log-shipper"]!;
+    expect(Object.keys(vectorConfig.transforms!)[0]).toBe("raw_label_gate");
+    expect(vectorConfig.sources!.docker_files).toEqual({
+      type: "file", include: ["/host/containers/*/*-json.log*"], read_from: "end", max_line_bytes: 65536,
+    });
+    expect(vectorConfig.transforms!.raw_label_gate!.inputs).toEqual(["docker_files"]);
+    expect(shipper.user).toBe("0:0");
+    expect(shipper.read_only).toBe(true);
+    expect(shipper.cap_drop).toEqual(["ALL"]);
+    expect(shipper.security_opt).toContain("no-new-privileges:true");
+    expect(shipper.ports ?? []).toEqual([]);
+    expect(shipper.volumes?.find((volume) => volume.target === "/host/containers")).toMatchObject({
+      type: "bind", source: "/var/lib/docker/containers", read_only: true, bind: { create_host_path: false },
+    });
+    expect(shipper.volumes?.find((volume) => volume.target === "/var/lib/vector")).toMatchObject({
+      type: "volume", source: "ptx-batch-vector-data",
+    });
+    expect(shipper.environment.VECTOR_CONFIG_YAML).toBeUndefined();
   });
 
   test("fits tdx.small: service budgets total 896 MiB and retain at least 1 GB guest headroom", () => {
@@ -115,8 +145,8 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     const total = Object.values(services).reduce((sum, service) => sum + Number(service.mem_limit), 0);
     expect(total).toBe(896 * 1024 * 1024);
     expect(1_942_806_528 - total).toBeGreaterThanOrEqual(1_000_000_000);
-    for (const name of ["postgres", "log-shipper"]) {
-      expect(services[name]!.logging).toEqual({ driver: "json-file", options: { "max-size": "10m", "max-file": "3" } });
+    for (const name of ["api", "upload-worker", "postgres", "log-shipper"]) {
+      expect(services[name]!.logging).toEqual({ driver: "json-file", options: { "max-size": "10m", "max-file": "3", ...(name === "api" || name === "upload-worker" ? { labels: "tc.logship" } : {}) } });
     }
     expect(services.postgres!.command).toEqual(["postgres", "-c", "max_connections=40", "-c", "shared_buffers=32MB", "-c", "work_mem=2MB",
       "-c", "maintenance_work_mem=16MB", "-c", "max_wal_size=256MB"]);

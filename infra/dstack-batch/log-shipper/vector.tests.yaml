@@ -433,3 +433,100 @@ tests:
           tag: "ptx-batch.api"
           log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"meeting https://meet.google.com/abc-defg-hij\"}"
     no_outputs_from: [allowlist]
+  - name: "Docker raw-label gate admits API only after matching the envelope attribute"
+    inputs:
+      - insert_at: raw_label_gate
+        type: log
+        log_fields:
+          message: '{"log":"{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch transcription create\",\"stage\":\"create\",\"created\":true}\n","stream":"stdout","time":"2026-10-14T10:00:00.000000000Z","attrs":{"tc.logship":"ptx-batch-api"}}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.svc, "api")
+              assert_eq!(.event, "batch_transcription_create")
+              assert_eq!(.created, true)
+  - name: "Docker raw-label gate admits upload worker events"
+    inputs:
+      - insert_at: raw_label_gate
+        type: log
+        log_fields:
+          message: '{"log":"{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch worker started\"}\n","stream":"stdout","time":"2026-10-14T10:00:00.000000000Z","attrs":{"tc.logship":"ptx-batch-worker"}}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.svc, "worker")
+              assert_eq!(.event, "batch_worker_started")
+  - name: "TC-961: unlabelled Postgres canaries stop at the first gate"
+    inputs:
+      - insert_at: raw_label_gate
+        type: log
+        log_fields:
+          message: '{"log":"password=TC961_DB_PASSWORD_CANARY token=TC961_TOKEN_CANARY sql_value=TC961_SQL_VALUE_CANARY\n","stream":"stderr","time":"2026-10-14T10:00:00.000000000Z","attrs":{}}'
+    outputs:
+      - extract_from: gate_counters
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.namespace, "logship")
+              assert_eq!(.name, "gate_dropped_total")
+              assert_eq!(.tags.reason, "unlabelled")
+              assert!(!contains(encode_json(.), "TC961_"))
+    no_outputs_from: [allowlist, gate_unexpected_event]
+  - name: "TC-961: unlabelled app canaries stop at the first gate"
+    inputs:
+      - insert_at: raw_label_gate
+        type: log
+        log_fields:
+          message: '{"log":"{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"error\",\"msg\":\"password=TC961_DB_PASSWORD_CANARY token=TC961_TOKEN_CANARY sql_value=TC961_SQL_VALUE_CANARY\"}\n","stream":"stdout","time":"2026-10-14T10:00:00.000000000Z","attrs":{}}'
+    outputs:
+      - extract_from: gate_counters
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.name, "gate_dropped_total")
+              assert_eq!(.tags.reason, "unlabelled")
+              assert!(!contains(encode_json(.), "TC961_"))
+    no_outputs_from: [allowlist, gate_unexpected_event]
+  - name: "An attribute-looking string inside app content cannot satisfy the raw-label gate"
+    inputs:
+      - insert_at: raw_label_gate
+        type: log
+        log_fields:
+          message: '{"log":"forged {\"attrs\":{\"tc.logship\":\"ptx-batch-api\"}} TC961_TOKEN_CANARY\n","stream":"stdout","time":"2026-10-14T10:00:00.000000000Z","attrs":{}}'
+    outputs:
+      - extract_from: gate_counters
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.name, "gate_dropped_total")
+              assert_eq!(.tags.reason, "unlabelled")
+              assert!(!contains(encode_json(.), "TC961_TOKEN_CANARY"))
+    no_outputs_from: [allowlist, gate_unexpected_event]
+  - name: "Unexpected Docker label emits a fixed event and increments the labeled counter"
+    inputs:
+      - insert_at: raw_label_gate
+        type: log
+        log_fields:
+          message: '{"log":"password=TC961_DB_PASSWORD_CANARY token=TC961_TOKEN_CANARY\n","stream":"stdout","time":"2026-10-14T10:00:00.000000000Z","attrs":{"tc.logship":"ptx-batch-postgres"}}'
+    outputs:
+      - extract_from: gate_unexpected_event
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "logship_unexpected_label")
+              assert_eq!(.reason, "unapproved_label")
+              assert_eq!(length(keys(.)), 2)
+              assert!(!contains(encode_json(.), "TC961_"))
+      - extract_from: gate_counters
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.namespace, "logship")
+              assert_eq!(.name, "gate_dropped_total")
+              assert_eq!(.tags.reason, "unexpected_label")
+              assert!(!contains(encode_json(.), "TC961_"))
+    no_outputs_from: [allowlist]

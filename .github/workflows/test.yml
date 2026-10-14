@@ -44,15 +44,11 @@ jobs:
       - name: Test Vector allowlist
         run: |
           set -euo pipefail
-          secrets_dir="$(mktemp -d)"
-          trap 'rm -rf "$secrets_dir"' EXIT
-          printf '%s' "test-token" > "$secrets_dir/bs_token"
           sudo docker run --rm \
+            -e BETTERSTACK_SOURCE_TOKEN=vector-test-token \
             -v "$PWD/infra/dstack-batch/log-shipper:/vector-config:ro" \
-            -v "$secrets_dir:/run/vector-secrets:ro" \
             timberio/vector:0.59.0-alpine@sha256:0e36bc2a290039e9b6a5e92f04bd2f133223506f72d09682c1df16c015172b7a \
-            test /vector-config/vector.yaml /vector-config/vector.tests.yaml
-
+            test --dangerously-allow-env-var-interpolation /vector-config/vector.yaml /vector-config/vector.tests.yaml
       - name: Build Signal seat image
         run: docker build --file infra/signal-seat/Dockerfile --tag ptx-signal-seat:test .
 
