@@ -223,9 +223,11 @@ Without `diarize`, `diarized` is false, speakers are `channel_N` (named by `chan
 timestamps are region-level (VAD regions, below). With `diarize`, `diarized` is true, `channels` is 1, speakers are
 `{id:"speaker_N", name:"Speaker N+1", channel:0}` (N 0–31, numbered by first appearance; only speakers with text are
 listed) and every segment is one speaker turn on channel 0, in time order. Recovered audio without speaker evidence
-uses an ordinary `speaker_N` id named `Unknown speaker`. Recovered intervals shorter than 0.4 s that touch a turn
+uses the next available `speaker_N` id named `Unknown speaker`, after numbering known speakers by their own first
+appearance. Unknown does not shift known speakers' ids or names. Recovered intervals shorter than 0.4 s that touch a turn
 are absorbed into its nearest speaker (ties to the earlier turn). At the 32-speaker limit, added audio is attributed
-to the nearest existing turn instead of adding an unknown speaker. The exact union has no duplicate audio; requests
+to the nearest existing turn instead of adding an unknown speaker; a midpoint split that would create a piece shorter
+than 0.4 s stays whole with the touching side (otherwise the nearest side). The exact union has no duplicate audio; requests
 stay at most 30 s, including when a recovered sliver extends a capped turn. Results stored before `diarized` existed
 are returned with `diarized: false`.
 

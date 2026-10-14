@@ -355,7 +355,7 @@ describe("diarization", () => {
     await h.work();
     const body = await (await result(id)).json();
     expect(body).toMatchObject({ status: "completed", diarized: true, channels: 1,
-      speakers: [{ id: "speaker_0", name: "Unknown speaker", channel: 0 }, { id: "speaker_1", name: "Speaker 2", channel: 0 }, { id: "speaker_2", name: "Speaker 3", channel: 0 }],
+      speakers: [{ id: "speaker_0", name: "Speaker 1", channel: 0 }, { id: "speaker_1", name: "Speaker 2", channel: 0 }, { id: "speaker_2", name: "Unknown speaker", channel: 0 }],
       stats: { vad_mode: "quiet", vad_fallback: false, tinfoil_calls: 5, tinfoil_audio_seconds: 23, voiced_seconds: 23,
         dropped_above_floor_pct: 0, dropped_above_noise_pct: 0 },
     });
@@ -369,6 +369,13 @@ describe("diarization", () => {
     expect(h.tinfoil.calls.map((call) => call.filename)).toEqual(saved.map((r) => `${id}-${r.ordinal}.wav`));
     expect(body.segments.every((s: { speaker_id: string }) => body.speakers.some((p: { id: string }) => p.id === s.speaker_id))).toBe(true);
     expect(body.text).toStartWith("Unknown speaker: words 1");
+    expect(body.segments.map((s: { speaker_id: string }) => s.speaker_id)).toEqual(["speaker_2", "speaker_0", "speaker_2", "speaker_2", "speaker_1"]);
+    // The same known speakers have the same ids and names with quiet coverage disabled.
+    h.ctx.config.vad.quietMode = false;
+    const normalId = await h.submit(audio.bytes, { contentType: "audio/wav", body: { diarize: true } });
+    await h.work();
+    const normal = await (await result(normalId)).json();
+    expect(body.speakers.filter((s: { name: string }) => s.name !== "Unknown speaker")).toEqual(normal.speakers);
   });
 
   test("an empty diarizer result recovers gated speech with one valid unknown speaker", async () => {

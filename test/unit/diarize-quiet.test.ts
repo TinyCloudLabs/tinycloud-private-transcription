@@ -111,6 +111,29 @@ test("an empty diarizer result still sends gated quiet speech with one unknown s
   expect(result.stats).toMatchObject({ vad_mode: "quiet", dropped_above_noise_pct: 0 });
 });
 
+test("at the speaker cap, partial midpoint gaps never create tiny distant-speaker requests", () => {
+  const original = Array.from({ length: 32 }, (_, speaker) => ({ startMs: speaker * 4_000 + 1_000, endMs: speaker * 4_000 + 2_000, speaker }));
+  const energies = new Float64Array(1_300).fill(-58);
+  // The midpoint is 3.5 s. Recovered coverage barely crosses it from either touching side.
+  for (const tail of [50, 100, 200, 350]) {
+    for (const [region, index, expected] of [
+      [{ startMs: 2_000, endMs: 3_500 + tail }, 0, { startMs: 1_000, endMs: 3_500 + tail, speaker: 0 }],
+      [{ startMs: 3_500 - tail, endMs: 5_000 }, 1, { startMs: 3_500 - tail, endMs: 6_000, speaker: 1 }],
+    ] as const) {
+      const result = unionQuietTurns(original, [region], energies);
+      expect(result.length).toBe(original.length);
+      expect(result[index]).toEqual(expected);
+      expect(result.every((r) => r.endMs - r.startMs >= 400)).toBe(true);
+      includes(result, original); includes(result, [region]); disjointAndCapped(result);
+    }
+  }
+  // A complete 600 ms gap has two short midpoint pieces: absorb it whole into the earlier touching turn.
+  const close = original.map((r, i) => i === 1 ? { ...r, startMs: 2_600 } : r);
+  const joined = unionQuietTurns(close, [{ startMs: 2_000, endMs: 2_600 }], energies);
+  expect(joined[0]).toEqual({ startMs: 1_000, endMs: 2_600, speaker: 0 });
+  expect(joined[1]).toEqual(close[1]);
+});
+
 test("flag-off and every gate-failing signal are byte-identical to the old speaker-turn path", () => {
   const segments = [{ startMs: 1_000, endMs: 2_000, speaker: 7 }, { startMs: 4_000, endMs: 4_500, speaker: 3 }];
   const ninePeaks = new Float64Array(1_000).fill(-62); ninePeaks.fill(-41, 200, 209);

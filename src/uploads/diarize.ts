@@ -435,7 +435,14 @@ export function unionQuietTurns(turns: readonly Turn[], regions: readonly Region
       added.push({ startMs, endMs, speaker: UNKNOWN_SPEAKER });
     } else {
       // A 33rd public speaker would violate the relay contract. Use the nearest existing turn instead.
-      const boundary = before && after ? Math.floor((before.endMs + after.startMs) / 2) : before ? endMs : startMs;
+      let boundary = before && after ? Math.floor((before.endMs + after.startMs) / 2) : before ? endMs : startMs;
+      if (boundary > startMs && boundary < endMs && Math.min(boundary - startMs, endMs - boundary) < DIARIZATION.minTurnMs) {
+        // A partial gap can straddle the midpoint by only 50 ms. Keep it with the touching side, avoiding a tiny
+        // standalone request for the distant speaker. Without a touching side, keep the whole nearest-side interval.
+        const centre = (startMs + endMs) / 2;
+        const useBefore = before?.endMs === startMs || (after?.startMs !== endMs && before && (!after || centre - before.endMs <= after.startMs - centre));
+        boundary = useBefore ? endMs : startMs;
+      }
       if (before && startMs < boundary) added.push({ startMs, endMs: Math.min(endMs, boundary), speaker: before.speaker });
       if (after && endMs > boundary) added.push({ startMs: Math.max(startMs, boundary), endMs, speaker: after.speaker });
     }

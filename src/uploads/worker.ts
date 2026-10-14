@@ -426,9 +426,12 @@ async function assemble(ctx: BatchContext, job: TranscriptionRow, fence: Fence) 
     if (regions.some((region) => region.status !== "completed")) throw new Error("assembly with unsettled regions");
     const channels = job.channelMode === "separate" && job.channels === 2 ? [0, 1] : [0];
     const spoken = regions.filter((region) => (region.text ?? "").trim() !== "");
-    // A diarized job's speakers are numbered by first appearance among the turns with text: speaker_0, speaker_1, …
+    // Known speakers keep their first-appearance ids and names; Unknown takes the next available id.
     const order = new Map<number, number>();
-    if (job.diarize) for (const region of spoken) if (!order.has(region.speaker!)) order.set(region.speaker!, order.size);
+    if (job.diarize) {
+      for (const region of spoken) if (region.speaker !== UNKNOWN_SPEAKER && !order.has(region.speaker!)) order.set(region.speaker!, order.size);
+      if (spoken.some((region) => region.speaker === UNKNOWN_SPEAKER)) order.set(UNKNOWN_SPEAKER, order.size);
+    }
     const speakers = job.diarize
       ? [...order].map(([speaker, n]) => ({ id: `speaker_${n}`, name: speaker === UNKNOWN_SPEAKER ? "Unknown speaker" : `Speaker ${n + 1}`, channel: 0 }))
       : channels.map((channel) => ({ id: `channel_${channel}`, name: job.channelLabels[channel] ?? `Speaker ${channel + 1}`, channel }));
