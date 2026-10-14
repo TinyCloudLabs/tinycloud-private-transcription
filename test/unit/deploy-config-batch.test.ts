@@ -357,7 +357,7 @@ sed -n "$((n + 1))p" "${dir}/gets"
       for (const mode of ["true", "false"]) {
         const capture = join(captureDir, `sealed-${mode}.txt`);
         const run = runStep("Validate the sealed environment", {
-          BATCH_POSTGRES_PASSWORD: password, BATCH_TINFOIL_API_KEY: providerKey, PTX_BOOTSTRAP_KEYS: env,
+          BATCH_POSTGRES_PASSWORD: password, BATCH_TINFOIL_API_KEY: providerKey, PTX_BOOTSTRAP_KEYS: env, BETTERSTACK_SOURCE_TOKEN: "test-token",
           PTX_BATCH_ADMIN_KEY: keys[1]!.key, BATCH_VAD_QUIET_MODE: mode, SEALED_CAPTURE: capture,
         }, { docker: `while [ "$#" -gt 0 ]; do
   if [ "$1" = "--env-file" ]; then cp -- "$2" "$SEALED_CAPTURE"; exit; fi
@@ -368,11 +368,12 @@ exit 1` });
         // runStep has removed its temp directory; this copy contains only generated test values.
         const lines = readFileSync(capture, "utf8").trimEnd().split("\n");
         expect(lines.map((line) => line.slice(0, line.indexOf("="))).sort())
-          .toEqual(["BATCH_TINFOIL_API_KEY", "BATCH_VAD_QUIET_MODE", "POSTGRES_PASSWORD", "PTX_BOOTSTRAP_KEYS"]);
+          .toEqual(["BATCH_TINFOIL_API_KEY", "BATCH_VAD_QUIET_MODE", "BETTERSTACK_SOURCE_TOKEN", "POSTGRES_PASSWORD", "PTX_BOOTSTRAP_KEYS"]);
         expect(lines).toContain(`BATCH_VAD_QUIET_MODE=${mode}`);
         expect(lines).toContain(`POSTGRES_PASSWORD=${password}`);
         expect(lines).toContain(`BATCH_TINFOIL_API_KEY=${providerKey}`);
         expect(lines).toContain(`PTX_BOOTSTRAP_KEYS=${env}`);
+        expect(lines).toContain("BETTERSTACK_SOURCE_TOKEN=test-token");
         expect(render(mode)["upload-worker"]!.environment.BATCH_VAD_QUIET_MODE).toBe(mode);
       }
       expect(workflowText).toContain("${{ vars.BATCH_VAD_QUIET_MODE || 'true' }}");
