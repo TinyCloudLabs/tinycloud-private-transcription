@@ -1,0 +1,191 @@
+tests:
+  - name: batch completion keeps only approved metrics
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: ptx-batch.worker
+          log: '{"ts":"2026-10-14T10:00:00Z","level":"info","msg":"batch job finished","job_id":"trn_01J9ABCDEF0123456789ABCDEF","status":"completed","code":null,"stage":"assemble","outcome":"completed","duration_seconds":6.5,"tinfoil_calls":2,"tinfoil_audio_seconds":5,"voiced_seconds":4.5,"dropped_above_floor_pct":2,"vad_fallback":false,"segments":2,"content_type":"audio/mpeg","text":"secret transcript","ownerId":"secret-owner"}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "batch job finished")
+              assert_eq!(.job_id, "trn_01J9ABCDEF0123456789ABCDEF")
+              assert_eq!(.status, "completed")
+              assert_eq!(.code, null)
+              assert_eq!(.stage, "assemble")
+              assert_eq!(.outcome, "completed")
+              assert_eq!(.duration_seconds, 6.5)
+              assert_eq!(.tinfoil_calls, 2)
+              assert_eq!(.tinfoil_audio_seconds, 5)
+              assert_eq!(.voiced_seconds, 4.5)
+              assert_eq!(.dropped_above_floor_pct, 2)
+              assert_eq!(.vad_fallback, false)
+              assert_eq!(.segments, 2)
+              assert_eq!(.content_type, "audio/mpeg")
+              assert!(!exists(.text))
+              assert!(!exists(.ownerId))
+              assert_eq!(length(keys(.)), 16)
+  - name: no speech completion preserves known and null metrics
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: ptx-batch.worker
+          log: '{"level":"info","msg":"batch job finished","job_id":"trn_01J9ABCDEF0123456789ABCDEF","status":"failed","code":"no_speech","stage":"vad","outcome":"no_speech","duration_seconds":7,"tinfoil_calls":null,"tinfoil_audio_seconds":null,"voiced_seconds":null,"dropped_above_floor_pct":null,"vad_fallback":null,"segments":0,"content_type":"audio/wav"}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.job_id, "trn_01J9ABCDEF0123456789ABCDEF")
+              assert_eq!(.status, "failed")
+              assert_eq!(.code, "no_speech")
+              assert_eq!(.stage, "vad")
+              assert_eq!(.outcome, "no_speech")
+              assert_eq!(.duration_seconds, 7)
+              assert_eq!(.tinfoil_calls, null)
+              assert_eq!(.tinfoil_audio_seconds, null)
+              assert_eq!(.voiced_seconds, null)
+              assert_eq!(.dropped_above_floor_pct, null)
+              assert_eq!(.vad_fallback, null)
+              assert_eq!(.segments, 0)
+              assert_eq!(.content_type, "audio/wav")
+              assert_eq!(length(keys(.)), 16)
+  - name: batch request event excludes all unapproved fields
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: ptx-batch.api
+          log: '{"level":"info","msg":"batch transcription create","stage":"create","transcriptionId":"01J9ABCDEF0123456789ABCDEF","correlationId":"01J9ABCDEF0123456789ABCDEF","created":true,"owner":"secret","address":"person@example.com"}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "batch transcription create")
+              assert!(!exists(.created))
+              assert!(!exists(.owner))
+              assert!(!contains(encode_json(.), "person@example.com"))
+  - name: correlation and job identifiers require expected opaque formats
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: ptx-batch.api
+          log: '{"level":"info","msg":"batch transcription create","transcriptionId":"trn_01J9ABCDEF0123456789ABCDEF","correlationId":"did:pkh:eip155:1:0xd559CCd9EB87c530A9a349262669386dE93cf412"}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.transcriptionId, "trn_01J9ABCDEF0123456789ABCDEF")
+              assert!(!exists(.correlationId))
+              assert!(!contains(encode_json(.), "d559"))
+              assert_eq!(length(keys(.)), 4)
+  - name: non-JSON system line is redacted and capped
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: ptx-batch.api
+          log: 'client 198.51.100.22 contacted user@example.com; bearer abc.def-123'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert!(!contains(encode_json(.), "198.51.100.22"))
+              assert!(!contains(encode_json(.), "user@example.com"))
+              assert!(length(string!(.event)) <= 300)
+  - name: unknown tag is dropped
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: unknown.container
+          log: '{"level":"info","msg":"ignored"}'
+    no_outputs_from: [allowlist]
+  - name: signed kv ticket URL is redacted
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: ptx-batch.api
+          log: '{"level":"info","msg":"request /signed/kv/secret-ticket-123"}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert!(!contains(string!(.event), "secret-ticket-123"))
+  - name: authorization bearer header is redacted
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: ptx-batch.api
+          log: '{"level":"warn","msg":"Authorization: Bearer supersecret-token"}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert!(!contains(encode_json(.), "supersecret-token"))
+  - name: jwt and api key are redacted
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: ptx-batch.api
+          log: '{"level":"error","msg":"token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.signature api_key=sk_live_12345678901234567890"}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert!(!contains(encode_json(.), "eyJhbGci"))
+              assert!(!contains(encode_json(.), "sk_live_"))
+  - name: transcript text never ships from logger message
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: ptx-batch.worker
+          log: '{"level":"info","msg":"transcript: the secret phrase spoken in the meeting"}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert!(!contains(encode_json(.), "secret phrase"))
+  - name: SQL with literal values never ships
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: ptx-batch.api
+          log: '{"level":"error","msg":"SELECT * FROM users WHERE email = ''person@example.com''"}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert!(!contains(encode_json(.), "SELECT"))
+              assert!(!contains(encode_json(.), "person@example.com"))
+  - name: meeting URL is redacted
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: ptx-batch.api
+          log: '{"level":"info","msg":"meeting https://meet.google.com/abc-defg-hij"}'
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert!(!contains(encode_json(.), "abc-defg-hij"))

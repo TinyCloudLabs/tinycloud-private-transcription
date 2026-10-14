@@ -27,7 +27,7 @@ const POSTGRES = "postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b
 
 type Service = {
   image: string; build?: unknown; command?: string[]; environment: Record<string, string>; volumes?: { source?: string; target: string }[]; ports?: unknown[];
-  mem_limit?: string; memswap_limit?: string; mem_reservation?: string; cpuset?: string;
+  mem_limit?: string; memswap_limit?: string; mem_reservation?: string; cpuset?: string; cpus?: number;
   logging?: { driver?: string; options?: Record<string, string> };
 };
 
@@ -41,9 +41,9 @@ function render(quietMode?: string): Record<string, Service> {
 }
 
 describe("infra/dstack-batch/app-compose.yaml", () => {
-  test("is api + upload-worker + postgres only, image-only, every image digest-pinned", () => {
+  test("adds a digest-pinned Vector sidecar to api, worker and postgres", () => {
     const services = render();
-    expect(Object.keys(services).sort()).toEqual(["api", "postgres", "upload-worker"]);
+    expect(Object.keys(services).sort()).toEqual(["api", "log-shipper", "postgres", "upload-worker"]);
     for (const service of Object.values(services)) {
       expect(service.build).toBeUndefined();
       expect(service.image).toMatch(/@sha256:[0-9a-f]{64}$/);
@@ -51,9 +51,15 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(services.api!.image).toMatch(API_IMAGE);
     expect(services["upload-worker"]!.image).toBe(services.api!.image);
     expect(services.postgres!.image).toBe(POSTGRES);
+    expect(services["log-shipper"]!.ports).toEqual([{ mode: "ingress", host_ip: "127.0.0.1", target: 24224, published: "24224", protocol: "tcp" }]);
+    expect(services["log-shipper"]!.cpus).toBe(0.25);
+    expect(Number(services["log-shipper"]!.mem_limit)).toBe(64 * 1024 * 1024);
     expect(composeText).not.toMatch(/^\s+(build|context|dockerfile):/m);
-    // The image cannot be overridden from the sealed env.
     expect(composeText).not.toMatch(/image: \$\{/);
+  });
+
+  test("renders the embedded Vector config byte-identically to its canonical file", () => {
+    expect(render()["log-shipper"]!.environment.VECTOR_CONFIG_YAML).toBe(read("infra/dstack-batch/log-shipper/vector.yaml"));
   });
 
   test("runs the batch role with no meeting workload, docker socket, or fault injection", () => {
@@ -73,9 +79,9 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(workflowText).toContain("PTX_FAULT_INJECT must never appear");
   });
 
-  test("takes only the three existing sealed keys and the optional quiet-mode rollback flag", () => {
+  test("takes only the expected sealed values and optional quiet-mode rollback flag", () => {
     const sealed = [...new Set([...composeConfig.matchAll(/\$\{([A-Z0-9_]+)/g)].map((m) => m[1]))].sort();
-    expect(sealed).toEqual(["BATCH_TINFOIL_API_KEY", "BATCH_VAD_QUIET_MODE", "POSTGRES_PASSWORD", "PTX_BOOTSTRAP_KEYS"]);
+    expect(sealed).toEqual(["BATCH_TINFOIL_API_KEY", "BATCH_VAD_QUIET_MODE", "BETTERSTACK_SOURCE_TOKEN", "POSTGRES_PASSWORD", "PTX_BOOTSTRAP_KEYS"]);
     expect([...(envExample.match(/^[A-Z0-9_]+(?==)/gm) ?? [])].sort()).toEqual(sealed.filter((key) => key !== "BATCH_VAD_QUIET_MODE"));
     const services = render();
     expect(services.api!.environment.PTX_BOOTSTRAP_KEYS).toBe("");
@@ -84,7 +90,18 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(render("false")["upload-worker"]!.environment.BATCH_VAD_QUIET_MODE).toBe("false");
   });
 
-  test("fits tdx.small: every service has a memory limit, no swap, and a reservation; ~1 GiB stays with the guest", () => {
+  test("only api and worker ship logs, asynchronously, to the local loopback sidecar", () => {
+    const services = render();
+    for (const [name, tag] of [["api", "ptx-batch.api"], ["upload-worker", "ptx-batch.worker"]] as const) {
+      expect(services[name]!.logging).toEqual({ driver: "fluentd", options: {
+        "fluentd-address": "127.0.0.1:24224", "fluentd-async": "true", "fluentd-buffer-limit": "4194304",
+        tag, "cache-max-size": "20m", "cache-max-file": "5",
+      } });
+    }
+    expect(services.postgres!.logging?.driver).toBe("json-file");
+  });
+
+  test("fits tdx.small: service budgets total 928 MiB and shipper logs remain bounded", () => {
     const services = render();
     const limits = { api: 320, "upload-worker": 320, postgres: 192 } as const;
     for (const [name, mib] of Object.entries(limits)) {
@@ -94,11 +111,12 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
       expect(Number(service.mem_reservation)).toBeGreaterThan(0);
       expect(Number(service.mem_reservation)).toBeLessThan(Number(service.mem_limit));
     }
-    // The guest of a live tdx.small reports 1,942,806,528 bytes; leave at least 1 GB of it to the OS, dstack and dockerd.
+    expect(Number(services["log-shipper"]!.mem_limit)).toBe(64 * 1024 * 1024);
     const total = Object.values(services).reduce((sum, service) => sum + Number(service.mem_limit), 0);
+    expect(total).toBe(896 * 1024 * 1024);
     expect(1_942_806_528 - total).toBeGreaterThanOrEqual(1_000_000_000);
-    for (const [name, service] of Object.entries(services)) {
-      expect({ name, logging: service.logging }).toEqual({ name, logging: { driver: "json-file", options: { "max-size": "10m", "max-file": "3" } } });
+    for (const name of ["postgres", "log-shipper"]) {
+      expect(services[name]!.logging).toEqual({ driver: "json-file", options: { "max-size": "10m", "max-file": "3" } });
     }
     expect(services.postgres!.command).toEqual(["postgres", "-c", "max_connections=40", "-c", "shared_buffers=32MB", "-c", "work_mem=2MB",
       "-c", "maintenance_work_mem=16MB", "-c", "max_wal_size=256MB"]);
@@ -302,6 +320,7 @@ sed -n "$((n + 1))p" "${dir}/gets"
     const validate = (admin: string, bootstrap = env, quietMode = "true") => runStep("Validate the sealed environment", {
       BATCH_POSTGRES_PASSWORD: "a".repeat(64), BATCH_TINFOIL_API_KEY: "tinfoil", PTX_BOOTSTRAP_KEYS: bootstrap, PTX_BATCH_ADMIN_KEY: admin,
       BATCH_VAD_QUIET_MODE: quietMode,
+      BETTERSTACK_SOURCE_TOKEN: "test-token",
     }, { docker: "exit 0" });
 
     const ok = validate(adminKey);
@@ -391,7 +410,8 @@ exit 1` });
 esac`;
     const guard = (has0018: string) => runStep("Guard inputs, secrets and the image pin", {
       CONFIRM: "ptx-batch", CVM_NAME: "ptx-batch", GITHUB_REF: "refs/heads/main", DRAIN_TIMEOUT_MINUTES: "130", IMAGE_REPO: workflow.env.IMAGE_REPO!,
-      PHALA_CLOUD_API_KEY: "p", BATCH_POSTGRES_PASSWORD: "b", BATCH_TINFOIL_API_KEY: "t", PTX_BOOTSTRAP_KEYS: "[]", PTX_BATCH_ADMIN_KEY: "a", HAS_0018: has0018,
+      PHALA_CLOUD_API_KEY: "p", BATCH_POSTGRES_PASSWORD: "b", BATCH_TINFOIL_API_KEY: "t", PTX_BOOTSTRAP_KEYS: "[]", PTX_BATCH_ADMIN_KEY: "a",
+      BETTERSTACK_SOURCE_TOKEN: "test-token", HAS_0018: has0018,
     }, { git, docker: `printf '{"digest":"%s"}' '${digest}'` });
     expect(guard("1")).toMatchObject({ exitCode: 0 });
     const old = guard("0");
@@ -411,8 +431,15 @@ esac`;
     expect(open(counts(0, 0, 0, "closed")).exitCode).toBe(1);
   });
 
-  test("never prints a secret", () => {
-    for (const name of ["BATCH_TINFOIL_API_KEY", "BATCH_POSTGRES_PASSWORD", "PTX_BOOTSTRAP_KEYS", "PTX_BATCH_ADMIN_KEY", "PHALA_CLOUD_API_KEY"]) {
+  test("the Better Stack token is guarded, written to the env file, and never printed", () => {
+    const guard = steps[index("Guard inputs, secrets and the image pin")]!;
+    const validate = steps[index("Validate the sealed environment")]!;
+    expect(guard.env!.BETTERSTACK_SOURCE_TOKEN).toBe("${{ secrets.BETTERSTACK_SOURCE_TOKEN }}");
+    expect(guard.run).toContain("BETTERSTACK_SOURCE_TOKEN");
+    expect(validate.env!.BETTERSTACK_SOURCE_TOKEN).toBe("${{ secrets.BETTERSTACK_SOURCE_TOKEN }}");
+    expect(validate.run).toContain("BETTERSTACK_SOURCE_TOKEN=$BETTERSTACK_SOURCE_TOKEN");
+    expect(steps[index("Sync allowed_envs")]!.run).toContain("node .github/scripts/phala-sync-allowed-envs.mjs");
+    for (const name of ["BATCH_TINFOIL_API_KEY", "BATCH_POSTGRES_PASSWORD", "PTX_BOOTSTRAP_KEYS", "PTX_BATCH_ADMIN_KEY", "PHALA_CLOUD_API_KEY", "BETTERSTACK_SOURCE_TOKEN"]) {
       expect(workflowText).not.toMatch(new RegExp(`echo[^\\n]*\\$\\{?${name}`));
     }
   });

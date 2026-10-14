@@ -1,0 +1,48 @@
+data_dir: /var/lib/vector
+secret:
+  bs: { type: directory, path: /run/vector-secrets, remove_trailing_whitespace: true }
+sources:
+  docker_fluent: { type: fluent, mode: tcp, address: 0.0.0.0:24224 }
+transforms:
+  allowlist:
+    type: remap
+    inputs: [docker_fluent]
+    drop_on_abort: true
+    source: |
+      svc = string(.tag) ?? ""
+      line = string(.log) ?? ""
+      if svc != "ptx-batch.api" && svc != "ptx-batch.worker" { abort }
+      j, err = parse_json(line)
+      if err != null || !is_object(j) {
+        . = {"svc": svc, "event": redact(truncate(line, 300), filters: [r'\b(?:\d{1,3}\.){3}\d{1,3}\b', r'\b(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}\b', r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}', r'0x[0-9a-fA-F]{8,}', r'did:[a-z0-9]+:[A-Za-z0-9.:%_\-]+', r'tinycloud:[A-Za-z0-9.:%_\-]+', r'(?i)bearer\s+[A-Za-z0-9._\-]+', r'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.?[A-Za-z0-9_\-]*', r'/signed/kv/\S+', r'(?i)authorization\s*:\s*bearer\s+\S+', r'(?i)api[_-]?key\s*[:=]\s*\S+', r'(?i)\bsk_(?:live|test)_[A-Za-z0-9]+\b', r'(?i)\b(select|insert|update|delete)\b.*', r'(?i)transcript(?:ion)?(?: text)?\s*[:=].*', r'(?i)https?://meet\.google\.com/\S+'])}
+      } else {
+        out = {"svc": svc}
+        level = string(j.level) ?? ""
+        if level == "debug" || level == "info" || level == "warn" || level == "error" { out.level = level }
+        if j.msg != null {
+          msg = redact(string(j.msg) ?? "", filters: [r'\b(?:\d{1,3}\.){3}\d{1,3}\b', r'\b(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}\b', r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}', r'0x[0-9a-fA-F]{8,}', r'did:[a-z0-9]+:[A-Za-z0-9.:%_\-]+', r'tinycloud:[A-Za-z0-9.:%_\-]+', r'(?i)bearer\s+[A-Za-z0-9._\-]+', r'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.?[A-Za-z0-9_\-]*', r'/signed/kv/\S+', r'(?i)authorization\s*:\s*bearer\s+\S+', r'(?i)api[_-]?key\s*[:=]\s*\S+', r'(?i)\bsk_(?:live|test)_[A-Za-z0-9]+\b', r'(?i)\b(select|insert|update|delete)\b.*', r'(?i)transcript(?:ion)?(?: text)?\s*[:=].*', r'(?i)https?://meet\.google\.com/\S+'])
+          out.event = truncate(msg, 300)
+        }
+        jkeys, keys_err = keys(j)
+        for_each(["stage", "code", "status", "alert", "outcome", "tinfoil_calls", "tinfoil_audio_seconds", "voiced_seconds", "dropped_above_floor_pct", "vad_fallback", "segments", "duration_seconds", "content_type"]) -> |_i, key| {
+          if keys_err == null && includes(jkeys, key) { out = set!(out, [key], get(j, [key]) ?? null) }
+        }
+        correlation_id = string(j.correlationId) ?? ""
+        if length(correlation_id) == 36 && match(correlation_id, r'^[A-Fa-f0-9-]{36}') { out.correlationId = correlation_id }
+        for_each(["transcriptionId", "job_id"]) -> |_i, key| {
+          id = string(get(j, [key]) ?? "") ?? ""
+          if length(id) == 30 && match(id, r'^trn_[0-9A-HJKMNP-TV-Z]{26}') { out = set!(out, [key], id) }
+        }
+        . = out
+      }
+sinks:
+  betterstack:
+    type: http
+    inputs: [allowlist]
+    method: post
+    uri: "https://s2795436.us-west-2a.betterstackdata.com/"
+    encoding: { codec: json }
+    compression: gzip
+    auth: { strategy: bearer, token: "SECRET[bs.bs_token]" }
+    batch: { max_bytes: 4000000, timeout_secs: 5 }
+    buffer: { type: memory, max_events: 1000, when_full: drop_newest }

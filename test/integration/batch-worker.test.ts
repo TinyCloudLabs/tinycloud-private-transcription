@@ -131,6 +131,26 @@ describe("single-slot arbiter", () => {
     expect(await h.row(id)).toMatchObject({ status: "failed", errorCode: "no_speech", deletionState: "files_deleted" });
     expect(h.tinfoil.calls.length).toBe(0);
   });
+
+  test("completion log has the exact safe key set for completed and no_speech jobs", async () => {
+    const events: { message: string; fields: Record<string, unknown> }[] = [];
+    const original = h.ctx.log;
+    h.ctx.log = { debug() {}, warn() {}, error() {}, info: (message, fields) => events.push({ message, fields: fields ?? {} }) };
+    try {
+      const completedId = await h.submit(await audio("mono_wav"), { contentType: "audio/wav" });
+      await h.work();
+      const noSpeechId = await h.submit(await audio("silent_wav"), { contentType: "audio/wav" });
+      await h.work();
+      const completion = events.filter((event) => event.message === "batch job finished");
+      expect(completion).toHaveLength(2);
+      const expectedKeys = ["code", "content_type", "dropped_above_floor_pct", "duration_seconds", "job_id", "outcome", "segments", "stage", "status", "tinfoil_audio_seconds", "tinfoil_calls", "vad_fallback", "voiced_seconds"].sort();
+      for (const event of completion) expect(Object.keys(event.fields).sort()).toEqual(expectedKeys);
+      expect(completion[0]!.fields).toMatchObject({ job_id: completedId, outcome: "completed", status: "completed", stage: "assemble", content_type: "audio/wav", segments: 1 });
+      expect(completion[1]!.fields).toMatchObject({ job_id: noSpeechId, outcome: "no_speech", status: "failed", code: "no_speech", stage: "vad", content_type: "audio/wav", segments: 0, duration_seconds: 3, tinfoil_calls: 0, tinfoil_audio_seconds: 0, voiced_seconds: 0, dropped_above_floor_pct: 0, vad_fallback: false });
+    } finally {
+      h.ctx.log = original;
+    }
+  });
 });
 
 describe("VAD coverage (TC-1045)", () => {

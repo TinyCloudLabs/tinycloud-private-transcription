@@ -80,24 +80,36 @@ PTX upload origin (P7) and TinyChat's `PRIVATE_CLOUD_TRANSCRIPTION_API_URL`.
 ## Sizing (tdx.small)
 
 The owner chose tdx.small for cost. Batch runs one job at a time and transcription is remote (Tinfoil), so the CVM
-only runs api + upload-worker + Postgres, and ffmpeg/VAD for the job in hand. The instance type and disk apply at
-creation only; the update path never resizes.
+runs api + upload-worker + Postgres plus the bounded Vector log sidecar; ffmpeg/VAD handle the job in hand. The instance
+type and disk apply at creation only; the update path never resizes.
 
 **Memory.** The guest of a tdx.small reports 1,853 MiB (1,942,806,528 B). A live tdx.small (dstack 0.5.5) running two
-small containers reports ~1.27 GB used, so about 1 GiB stays with the guest OS, dstack and dockerd. The compose caps the
-three services at 832 MiB together, with no swap (`memswap_limit` = `mem_limit`):
+small containers reports ~1.27 GB used, so the compose must leave at least 1,000,000,000 B to the guest OS, dstack and
+dockerd. The four service caps total 896 MiB (api 320m + worker 320m + Postgres 192m + Vector 64m):
 
 | service | `mem_limit` | `mem_reservation` | what lives there |
 |---|---|---|---|
-| api | 320m | 96m | Bun + Hono; PUT bodies stream to disk, hashed in flight; ffprobe; the healthcheck's `bun -e` |
-| upload-worker | 320m | 96m | Bun; ffmpeg (child process) decodes one channel at a time to PCM on disk |
-| postgres | 192m | 64m | `max_connections=40`, `shared_buffers=32MB`, `work_mem=2MB`, `maintenance_work_mem=16MB`, `max_wal_size=256MB` |
+| api | 320m | 96m | Bun + Hono; PUT bodies stream to disk; ffprobe; healthcheck |
+| upload-worker | 320m | 96m | Bun; ffmpeg decodes one channel at a time to PCM on disk |
+| postgres | 192m | 64m | tuned Postgres; unshipped |
+| log-shipper | 64m, 0.25 CPU | — | Vector allowlist and Better Stack HTTP sink; memory buffer capped at 1,000 events |
+
+The four limits leave 1,003,282,432 B to the guest. The sidecar stays capped at 64 MiB and a quarter CPU; the local
+burst rehearsal measures its peak RSS before approval. Api and worker use Docker's asynchronous fluentd driver; if
+Vector is down, logging can be lost once Docker's bounded buffer fills, but the applications continue. Postgres remains
+on local json-file logs.
 
 `max_connections=40` covers the Bun.SQL pools (10 each: api, its boot migrator, worker) and the 3 superuser slots. A cgroup
 limit also counts page cache, which the kernel reclaims first, so a container sitting near its limit while it writes
-PCM is normal. An OOM kill happens when what the kernel cannot reclaim fills the limit: anonymous memory, shmem
-(Postgres `shared_buffers`), kernel memory such as socket buffers, and dirty page cache that writeback has not yet
-flushed. The kill stays inside that container. The envelope therefore reports anon + shmem, not anon alone.
+PCM is normal. An OOM kill stays inside that container.
+
+**Private logs.** [`log-shipper/vector.yaml`](./log-shipper/vector.yaml) is the canonical Vector allowlist embedded in
+the compose. Docker forwards api and worker logs asynchronously to the sidecar on loopback; unknown tags are dropped,
+non-JSON system lines are redacted and capped at 300 characters, and structured lines are rebuilt from explicit safe
+fields. Postgres stays local and unshipped. The source token is supplied only by the `BETTERSTACK_SOURCE_TOKEN`
+secret in GitHub Environment `ptx-batch`; Vector writes it mode 0600 to its directory secrets backend and unsets the
+environment variable before starting. The sidecar is capped at 64 MiB and 0.25 CPU, with a bounded 1,000-event sink
+buffer. If it is unavailable, fluentd-async avoids blocking the applications; buffered log loss is possible.
 
 The decode path never holds a recording in memory: ffmpeg writes 16 kHz s16le PCM to disk per channel, the VAD reads
 it in 60 s slices (a 2 h channel is 72,000 frame energies, 576 KB), and each dispatch reads one region of at most
@@ -113,13 +125,16 @@ for 15 s while it decoded, 4,305 GETs, all 200):
 | upload-worker | 320 MiB | 86 MiB (bun) | 47 MiB (32 MiB) | ffmpeg 46 MiB | 0 / 0 |
 | postgres | 192 MiB | 20 MiB | 71 MiB (61 MiB) | | 0 / 0 |
 
+This phase adds the capped Vector sidecar to the runtime; rerun the two-hour `batch-envelope.yml` memory proof with the
+new four-service compose before deployment. The local sidecar burst rehearsal does not replace that CVM-envelope proof.
+
 **Disk (20 GB).** The data disk holds Docker images, Postgres and the upload volume; a live tdx.small shows an
 18.87 GiB filesystem. Worst case for a 2 h recording (16 kHz s16le = 32,000 B/s per channel):
 
 | item | bound |
 |---|---|
 | images (api ~0.25 GB, postgres ~0.27 GB, one update overlap; dstack prunes after `compose up`), dstack data | ≤ 2.4 GB (a live tdx.small uses 1.77 GB) |
-| container logs: json-file, `max-size: 10m`, `max-file: "3"` on each of the 3 services | ≤ 90 MB |
+| container logs: api and worker fluentd caches (20m × 5 each), Postgres and shipper json-file (10m × 3 each) | ≤ 260 MB |
 | Postgres data + WAL (`max_wal_size=256MB`) | ≤ 0.5 GB |
 | accepted audio + in-flight `.part` files (`BATCH_MAX_RESERVED_BYTES`) | ≤ 1.21 GB |
 | PCM of the one processing job: 2 ch × 7,200 s × 32,000 B/s = 0.46 GB; ×2 while a crashed claim's work dir awaits the sweeper | ≤ 0.92 GB |

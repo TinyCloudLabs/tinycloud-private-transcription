@@ -6,16 +6,17 @@
 #   POSTGRES_PASSWORD      internal Postgres password
 #   BATCH_TINFOIL_API_KEY  the owner's dedicated batch Tinfoil key (never the meeting service's key)
 #   PTX_BOOTSTRAP_KEYS     hashed API keys: tinychat (transcriptions:*) and owner-admin (admin:*)
+#   BETTERSTACK_SOURCE_TOKEN  ingest-only token, written to Vector's directory secrets backend
 #
 # The api/worker image is an immutable pin that only a PR changes; it cannot be overridden from the sealed env.
 # Until the first batch image exists (P2 merged → publish-image.yml), it is the placeholder below, which
 # .github/workflows/deploy-batch.yml refuses to deploy.
 #
 # Sized for Phala tdx.small (1 vCPU, 2048 MB; the guest sees 1,853 MiB). A live tdx.small with two small containers
-# reports ~1.27 GB used, so ~1 GiB is left to the guest OS, dstack and dockerd. The three services are capped at
-# 832 MiB together (api 320m + upload-worker 320m + postgres 192m), with no swap, so a runaway process is OOM-killed
-# inside its own container instead of taking the guest down. The cgroup limit also counts page cache, which the kernel
-# reclaims first. Container logs are json-file, capped at 3 x 10 MB per service. .github/workflows/batch-envelope.yml proves these limits with a 2-hour stereo recording on one CPU.
+# reports ~1.27 GB used. The four services are capped at 896 MiB together (api 320m + worker 320m + postgres 192m +
+# log-shipper 64m), leaving 1,003,282,432 B for the guest OS, dstack and dockerd. The shipper is limited to 0.25 CPU.
+# Api and worker have asynchronous fluentd logging with a bounded local cache; postgres remains json-file and unshipped.
+# The batch-envelope.yml 2-hour stereo proof should be rerun against this compose before deployment.
 services:
   api:
     image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:508cb0be60a27e6b2bb4eefd888ad7c98954c3e5@sha256:72568fe357e87aefb13a4430b0124b16a4c5e98395281e80e9ee09471c9aaf4d
@@ -40,9 +41,7 @@ services:
       BATCH_TENANT_DAILY_BYTES: "362880000"
       BATCH_UPLOAD_MAX_PUT_SECONDS: "1800"
       BATCH_UPLOAD_MIN_BYTES_PER_SECOND: "32768"
-      # Browser and app origins allowed to PUT /uploads/{id} directly (Exo web, Pages previews, desktop, mobile).
       BATCH_CORS_ORIGINS: "https://tinycloud.chat,https://tinychat-4jq.pages.dev,https://*.tinychat-4jq.pages.dev,tauri://localhost,http://tauri.localhost,capacitor://localhost,https://localhost"
-      # Speaker diarization (create diarize: true); set on both api (capabilities) and upload-worker (runs it).
       BATCH_DIARIZATION_ENABLED: "true"
       LOG_LEVEL: info
     ports:
@@ -55,22 +54,24 @@ services:
       timeout: 5s
       retries: 30
       start_period: 20s
-    # Bun + Hono + streamed uploads (to disk, hashed in flight) + ffprobe; the healthcheck's bun runs in this cgroup.
     mem_limit: 320m
     memswap_limit: 320m
     mem_reservation: 96m
     logging:
-      driver: json-file
+      driver: fluentd
       options:
-        max-size: 10m
-        max-file: "3"
+        fluentd-address: "127.0.0.1:24224"
+        fluentd-async: "true"
+        fluentd-buffer-limit: "4194304"
+        tag: ptx-batch.api
+        cache-max-size: "20m"
+        cache-max-file: "5"
 
   upload-worker:
     image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:508cb0be60a27e6b2bb4eefd888ad7c98954c3e5@sha256:72568fe357e87aefb13a4430b0124b16a4c5e98395281e80e9ee09471c9aaf4d
     restart: unless-stopped
     command: ["bun", "run", "src/uploads/worker.ts"]
     depends_on:
-      # The api applies migrations before it reports live.
       api:
         condition: service_healthy
     environment:
@@ -86,23 +87,22 @@ services:
       LOG_LEVEL: info
     volumes:
       - ptx-batch-uploads:/var/lib/ptx-batch/uploads
-    # One job at a time: ffmpeg (a child, same cgroup) decodes each channel to PCM on disk; the VAD reads it in 60 s
-    # slices and each dispatch reads one region (<= 30 s, ~1 MB). Nothing holds a whole channel in memory. A diarized
-    # job runs one sherpa-onnx process per 10-minute window, one at a time (docs/diarization-benchmark.md).
     mem_limit: 320m
     memswap_limit: 320m
     mem_reservation: 96m
     logging:
-      driver: json-file
+      driver: fluentd
       options:
-        max-size: 10m
-        max-file: "3"
+        fluentd-address: "127.0.0.1:24224"
+        fluentd-async: "true"
+        fluentd-buffer-limit: "4194304"
+        tag: ptx-batch.worker
+        cache-max-size: "20m"
+        cache-max-file: "5"
 
   postgres:
     image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     restart: unless-stopped
-    # Tiny-box tuning. max_connections 40 covers the Bun.SQL pools (10 each: api, its boot migrator, worker) plus the
-    # 3 superuser slots; max_wal_size bounds WAL on disk (see the disk budget in the runbook).
     command: ["postgres", "-c", "max_connections=40", "-c", "shared_buffers=32MB", "-c", "work_mem=2MB",
       "-c", "maintenance_work_mem=16MB", "-c", "max_wal_size=256MB"]
     mem_limit: 192m
@@ -125,6 +125,81 @@ services:
       timeout: 5s
       retries: 30
 
+  log-shipper:
+    image: timberio/vector:0.59.0-alpine@sha256:0e36bc2a290039e9b6a5e92f04bd2f133223506f72d09682c1df16c015172b7a
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:24224:24224"
+    mem_limit: 64m
+    memswap_limit: 64m
+    cpus: 0.25
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    environment:
+      BETTERSTACK_SOURCE_TOKEN: ${BETTERSTACK_SOURCE_TOKEN:-}
+      VECTOR_CONFIG_YAML: |
+        data_dir: /var/lib/vector
+        secret:
+          bs: { type: directory, path: /run/vector-secrets, remove_trailing_whitespace: true }
+        sources:
+          docker_fluent: { type: fluent, mode: tcp, address: 0.0.0.0:24224 }
+        transforms:
+          allowlist:
+            type: remap
+            inputs: [docker_fluent]
+            drop_on_abort: true
+            source: |
+              svc = string(.tag) ?? ""
+              line = string(.log) ?? ""
+              if svc != "ptx-batch.api" && svc != "ptx-batch.worker" { abort }
+              j, err = parse_json(line)
+              if err != null || !is_object(j) {
+                . = {"svc": svc, "event": redact(truncate(line, 300), filters: [r'\b(?:\d{1,3}\.){3}\d{1,3}\b', r'\b(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}\b', r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}', r'0x[0-9a-fA-F]{8,}', r'did:[a-z0-9]+:[A-Za-z0-9.:%_\-]+', r'tinycloud:[A-Za-z0-9.:%_\-]+', r'(?i)bearer\s+[A-Za-z0-9._\-]+', r'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.?[A-Za-z0-9_\-]*', r'/signed/kv/\S+', r'(?i)authorization\s*:\s*bearer\s+\S+', r'(?i)api[_-]?key\s*[:=]\s*\S+', r'(?i)\bsk_(?:live|test)_[A-Za-z0-9]+\b', r'(?i)\b(select|insert|update|delete)\b.*', r'(?i)transcript(?:ion)?(?: text)?\s*[:=].*', r'(?i)https?://meet\.google\.com/\S+'])}
+              } else {
+                out = {"svc": svc}
+                level = string(j.level) ?? ""
+                if level == "debug" || level == "info" || level == "warn" || level == "error" { out.level = level }
+                if j.msg != null {
+                  msg = redact(string(j.msg) ?? "", filters: [r'\b(?:\d{1,3}\.){3}\d{1,3}\b', r'\b(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}\b', r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}', r'0x[0-9a-fA-F]{8,}', r'did:[a-z0-9]+:[A-Za-z0-9.:%_\-]+', r'tinycloud:[A-Za-z0-9.:%_\-]+', r'(?i)bearer\s+[A-Za-z0-9._\-]+', r'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.?[A-Za-z0-9_\-]*', r'/signed/kv/\S+', r'(?i)authorization\s*:\s*bearer\s+\S+', r'(?i)api[_-]?key\s*[:=]\s*\S+', r'(?i)\bsk_(?:live|test)_[A-Za-z0-9]+\b', r'(?i)\b(select|insert|update|delete)\b.*', r'(?i)transcript(?:ion)?(?: text)?\s*[:=].*', r'(?i)https?://meet\.google\.com/\S+'])
+                  out.event = truncate(msg, 300)
+                }
+                jkeys, keys_err = keys(j)
+                for_each(["stage", "code", "status", "alert", "outcome", "tinfoil_calls", "tinfoil_audio_seconds", "voiced_seconds", "dropped_above_floor_pct", "vad_fallback", "segments", "duration_seconds", "content_type"]) -> |_i, key| {
+                  if keys_err == null && includes(jkeys, key) { out = set!(out, [key], get(j, [key]) ?? null) }
+                }
+                correlation_id = string(j.correlationId) ?? ""
+                if length(correlation_id) == 36 && match(correlation_id, r'^[A-Fa-f0-9-]{36}') { out.correlationId = correlation_id }
+                for_each(["transcriptionId", "job_id"]) -> |_i, key| {
+                  id = string(get(j, [key]) ?? "") ?? ""
+                  if length(id) == 30 && match(id, r'^trn_[0-9A-HJKMNP-TV-Z]{26}') { out = set!(out, [key], id) }
+                }
+                . = out
+              }
+        sinks:
+          betterstack:
+            type: http
+            inputs: [allowlist]
+            method: post
+            uri: "https://s2795436.us-west-2a.betterstackdata.com/"
+            encoding: { codec: json }
+            compression: gzip
+            auth: { strategy: bearer, token: "SECRET[bs.bs_token]" }
+            batch: { max_bytes: 4000000, timeout_secs: 5 }
+            buffer: { type: memory, max_events: 1000, when_full: drop_newest }
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        umask 077
+        mkdir -p /run/vector-secrets /etc/vector /var/lib/vector
+        printf '%s' "$$BETTERSTACK_SOURCE_TOKEN" > /run/vector-secrets/bs_token
+        printf '%s\n' "$$VECTOR_CONFIG_YAML" > /etc/vector/vector.yaml
+        unset BETTERSTACK_SOURCE_TOKEN VECTOR_CONFIG_YAML
+        exec vector --config /etc/vector/vector.yaml
+
 volumes:
   ptx-batch-data: {}
   ptx-batch-uploads: {}
+

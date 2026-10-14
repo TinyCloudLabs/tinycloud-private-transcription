@@ -64,8 +64,55 @@ const sleepUnless = (ms: number, signal: AbortSignal) => new Promise<void>((reso
 });
 
 /** Fenced terminal failure; returns false (and changes nothing) when the fence was already lost. */
-async function failClaim(ctx: BatchContext, db: DbOrTx, fence: Fence, code: JobErrorCode, message: string): Promise<boolean> {
-  return !!(await terminalize(db, fence.id, fenceGuard(fence), "failed", { code, message }));
+async function failClaim(
+  ctx: BatchContext,
+  db: DbOrTx,
+  fence: Fence,
+  code: JobErrorCode,
+  message: string,
+  completion: { stage?: string; metrics?: Partial<FinishedMetrics>; segments?: number | null } = {},
+): Promise<boolean> {
+  const row = await terminalize(db, fence.id, fenceGuard(fence), "failed", { code, message });
+  if (!row) return false;
+  logJobFinished(ctx, row, "failed", code, completion.stage ?? "pipeline", {
+    tinfoil_calls: row.tinfoilCalls ?? null,
+    tinfoil_audio_seconds: row.tinfoilAudioSeconds === null ? null : Math.round(row.tinfoilAudioSeconds * 1000) / 1000,
+    voiced_seconds: null,
+    dropped_above_floor_pct: row.vadDroppedAboveFloorPct ?? null,
+    vad_fallback: row.vadFallback ?? null,
+    ...completion.metrics,
+  }, completion.segments ?? null);
+  return true;
+}
+
+type FinishedMetrics = {
+  tinfoil_calls: number | null;
+  tinfoil_audio_seconds: number | null;
+  voiced_seconds: number | null;
+  dropped_above_floor_pct: number | null;
+  vad_fallback: boolean | null;
+};
+
+function logJobFinished(
+  ctx: BatchContext,
+  job: TranscriptionRow,
+  status: "completed" | "failed",
+  code: string | null,
+  stage: string,
+  metrics: FinishedMetrics,
+  segments: number | null,
+) {
+  ctx.log.info("batch job finished", {
+    job_id: job.id,
+    outcome: status === "completed" ? "completed" : code === "no_speech" ? "no_speech" : "failed",
+    status,
+    code,
+    stage,
+    duration_seconds: job.durationSeconds,
+    ...metrics,
+    segments,
+    content_type: job.contentType,
+  });
 }
 
 /**
@@ -142,7 +189,14 @@ async function runPipeline(ctx: BatchContext, job: TranscriptionRow, fence: Fenc
     const detected = job.diarize ? await diarizeTurns(ctx, job, fence, pcm[0]!, signal) : await vadRegions(ctx, job, fence, pcm);
     if (detected === null) return;
     if (detected.regions.length === 0) {
-      if (await failClaim(ctx, ctx.db, fence, "no_speech", "No speech was detected in the recording")) await cleanupJobFiles(ctx, job.id);
+      if (await failClaim(ctx, ctx.db, fence, "no_speech", "No speech was detected in the recording", {
+        stage: "vad",
+        metrics: {
+          tinfoil_calls: 0, tinfoil_audio_seconds: 0, voiced_seconds: 0,
+          dropped_above_floor_pct: detected.droppedAboveFloorPct, vad_fallback: detected.fallback,
+        },
+        segments: 0,
+      })) await cleanupJobFiles(ctx, job.id);
       else throw new LostFence(job.id);
       return;
     }
@@ -432,6 +486,9 @@ async function assemble(ctx: BatchContext, job: TranscriptionRow, fence: Fence) 
     const regions = await tx.select().from(transcriptionRegions).where(eq(transcriptionRegions.transcriptionId, job.id))
       .orderBy(asc(transcriptionRegions.startMs), asc(transcriptionRegions.channel));
     if (regions.some((region) => region.status !== "completed")) throw new Error("assembly with unsettled regions");
+    const [stats] = await tx.select({ calls: transcriptions.tinfoilCalls, seconds: transcriptions.tinfoilAudioSeconds, dropped: transcriptions.vadDroppedAboveFloorPct, fallback: transcriptions.vadFallback, vad: transcriptions.vadStats })
+      .from(transcriptions).where(eq(transcriptions.id, job.id));
+    const voicedMs = regions.reduce((sum, region) => sum + region.endMs - region.startMs, 0);
     const channels = job.channelMode === "separate" && job.channels === 2 ? [0, 1] : [0];
     const spoken = regions.filter((region) => (region.text ?? "").trim() !== "");
     // Known speakers keep their first-appearance ids and names; Unknown takes the next available id.
@@ -451,12 +508,21 @@ async function assemble(ctx: BatchContext, job: TranscriptionRow, fence: Fence) 
       end: region.endMs / 1000,
       text: region.text!.trim(),
     }));
+    const metrics = {
+      tinfoil_calls: stats?.calls ?? null,
+      tinfoil_audio_seconds: stats?.seconds === null || stats?.seconds === undefined ? null : Math.round(stats.seconds * 1000) / 1000,
+      voiced_seconds: voicedMs / 1000,
+      dropped_above_floor_pct: stats?.dropped ?? null,
+      vad_fallback: stats?.fallback ?? null,
+    };
     if (segments.length === 0) {
-      return terminalize(tx, job.id, fenceGuard(fence), "failed", { code: "no_speech", message: "No speech was recognized in the recording" });
+      return {
+        row: await terminalize(tx, job.id, fenceGuard(fence), "failed", { code: "no_speech", message: "No speech was recognized in the recording" }),
+        segments: 0,
+        metrics,
+      };
     }
-    const [stats] = await tx.select({ calls: transcriptions.tinfoilCalls, seconds: transcriptions.tinfoilAudioSeconds, dropped: transcriptions.vadDroppedAboveFloorPct, fallback: transcriptions.vadFallback, vad: transcriptions.vadStats })
-      .from(transcriptions).where(eq(transcriptions.id, job.id));
-    const voicedMs = regions.reduce((sum, region) => sum + region.endMs - region.startMs, 0);
+
     const name = new Map(speakers.map((speaker) => [speaker.id, speaker.name]));
     await tx.insert(transcriptionResults).values({
       transcriptionId: job.id,
@@ -482,12 +548,16 @@ async function assemble(ctx: BatchContext, job: TranscriptionRow, fence: Fence) 
         },
       },
     });
-    return terminalize(tx, job.id, fenceGuard(fence), "completed", null, {
-      transcriptExpiresAt: new Date(Date.now() + ctx.config.retention.transcriptTtlSeconds * 1000),
-    });
+    return {
+      row: await terminalize(tx, job.id, fenceGuard(fence), "completed", null, {
+        transcriptExpiresAt: new Date(Date.now() + ctx.config.retention.transcriptTtlSeconds * 1000),
+      }),
+      segments: segments.length,
+      metrics,
+    };
   });
-  if (!committed) throw new LostFence(job.id);
-  ctx.log.info("batch job finished", { transcriptionId: job.id, status: committed.status, code: committed.errorCode, stage: "assemble" });
+  if (!committed.row) throw new LostFence(job.id);
+  logJobFinished(ctx, job, committed.row.status === "completed" ? "completed" : "failed", committed.row.errorCode, "assemble", committed.metrics, committed.segments);
 }
 
 export async function recordWorkerHeartbeat(ctx: BatchContext, observedAt = new Date()) {
