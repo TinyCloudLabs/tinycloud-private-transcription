@@ -69,8 +69,8 @@ test("retention config parsing rejects typos instead of silently changing behavi
 
 test("the worker warns while disk usage is at or above the high-water mark", async () => {
   const warnings: Array<[string, Record<string, unknown> | undefined]> = [];
-  const ctx = (highWaterPercent: number) => ({
-    config: { disk: { path: "/", highWaterPercent } },
+  const ctx = (highWaterPercent: number, path = "/") => ({
+    config: { disk: { path, highWaterPercent } },
     log: { debug() {}, info() {}, error() {}, warn: (msg: string, data?: Record<string, unknown>) => warnings.push([msg, data]) },
   }) as unknown as AppContext;
   const used = await checkDisk(ctx(100));
@@ -78,16 +78,23 @@ test("the worker warns while disk usage is at or above the high-water mark", asy
   expect(warnings.length).toBe(used! >= 100 ? 1 : 0);
   warnings.length = 0;
   await checkDisk(ctx(1));
-  expect(warnings).toEqual([["disk usage above high-water mark", { path: "/", used_percent: expect.any(Number), high_water_percent: 1 }]]);
+  expect(warnings).toEqual([["disk usage above high-water mark", { used_percent: expect.any(Number), high_water_percent: 1 }]]);
+  warnings.length = 0;
+  await checkDisk(ctx(100, "/tmp/TC965_DISK_PATH_CANARY"));
+  expect(warnings).toEqual([["disk usage check failed", undefined]]);
+  expect(JSON.stringify(warnings)).not.toContain("TC965_DISK_PATH_CANARY");
 });
-test("retention sweep logs only an error code when artifact storage fails", async () => {
+
+test("retention sweep logs a fixed code for storage failures and reaches the storage path", async () => {
   const { promise, resolve } = Promise.withResolvers<void>();
   const errors: Array<[string, Record<string, unknown> | undefined]> = [];
+  let listCalls = 0;
   const ctx = {
     config: {
       disk: { path: "/", highWaterPercent: 100 },
       artifactRetention: { mode: "dry-run", intervalMs: 60_000, days: 14, orphans: false, keepVexaMeetingIds: [], s3: {} },
     },
+    vexa: { listRecordings: async () => ({ recordings: [] }) },
     log: {
       debug() {},
       info() {},
@@ -96,16 +103,58 @@ test("retention sweep logs only an error code when artifact storage fails", asyn
     },
   } as unknown as AppContext;
   const store = {
-    list: async function* () { throw Object.assign(new Error("s3://TC965_KEY_CANARY/private-object?token=TC965_TOKEN_CANARY"), { code: "AccessDenied" }); },
+    list: async function* () {
+      listCalls++;
+      throw Object.assign(new Error("s3://TC965_KEY_CANARY/private-object?token=TC965_TOKEN_CANARY"), { code: "TC965_SYNTHETIC_TOKEN" });
+    },
     delete: async () => {},
   };
   const housekeeping = startHousekeeping(ctx, { store });
   await promise;
   housekeeping.stop();
-  expect(errors).toEqual([["artifact retention sweep failed", { mode: "dry-run", error_code: "unknown" }]]);
+  expect(listCalls).toBeGreaterThan(0);
+  expect(errors).toEqual([["artifact retention sweep failed", { mode: "dry-run", error_code: "sweep_failed" }]]);
   const output = JSON.stringify(errors);
   expect(output).not.toContain("TC965_KEY_CANARY");
   expect(output).not.toContain("TC965_TOKEN_CANARY");
+  expect(output).not.toContain("TC965_SYNTHETIC_TOKEN");
+});
+
+test("retention sweep does not log database messages or parameters", async () => {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  const errors: Array<[string, Record<string, unknown> | undefined]> = [];
+  let listCalls = 0;
+  const ctx = {
+    config: {
+      disk: { path: "/", highWaterPercent: 100 },
+      artifactRetention: { mode: "dry-run", intervalMs: 60_000, days: 14, orphans: false, keepVexaMeetingIds: [], s3: {} },
+    },
+    vexa: { listRecordings: async () => ({ recordings: [{ id: 123, meeting_id: 88, media_files: [] }] }) },
+    db: { select: () => { throw new Error("query failed: SELECT ... params: TC965_DB_PARAM_CANARY"); } },
+    log: {
+      debug() {},
+      info() {},
+      warn() {},
+      error: (msg: string, data?: Record<string, unknown>) => { errors.push([msg, data]); resolve(); },
+    },
+  } as unknown as AppContext;
+  const store = {
+    list: async function* (prefix: string) {
+      listCalls++;
+      if (prefix === "recordings/") yield {
+        key: "recordings/1/123/session/audio/000000.webm",
+        size: 1,
+        lastModified: new Date("2026-09-01T00:00:00Z"),
+      };
+    },
+    delete: async () => {},
+  };
+  const housekeeping = startHousekeeping(ctx, { store });
+  await promise;
+  housekeeping.stop();
+  expect(listCalls).toBeGreaterThan(0);
+  expect(errors).toEqual([["artifact retention sweep failed", { mode: "dry-run", error_code: "sweep_failed" }]]);
+  expect(JSON.stringify(errors)).not.toContain("TC965_DB_PARAM_CANARY");
 });
 
 test("a ptx meeting links to Vexa by vexa_meeting_id or by the id in vexa_bot_id", () => {
