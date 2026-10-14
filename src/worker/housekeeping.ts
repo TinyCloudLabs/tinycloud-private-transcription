@@ -8,8 +8,8 @@ const DISK_CHECK_INTERVAL_MS = 5 * 60_000;
 export async function checkDisk(ctx: AppContext): Promise<number | null> {
   const { path, highWaterPercent } = ctx.config.disk;
   const used = await diskUsedPercent(path).catch(() => null);
-  if (used === null) ctx.log.warn("disk usage check failed", { path });
-  else if (used >= highWaterPercent) ctx.log.warn("disk usage above high-water mark", { path, used_percent: used, high_water_percent: highWaterPercent });
+  if (used === null) ctx.log.warn("disk usage check failed");
+  else if (used >= highWaterPercent) ctx.log.warn("disk usage above high-water mark", { used_percent: used, high_water_percent: highWaterPercent });
   return used;
 }
 
@@ -30,7 +30,7 @@ export function startHousekeeping(ctx: AppContext, opts: { store?: ArtifactStore
         if (!store) ctx.log.error("artifact retention is enabled but its MinIO credentials are not available yet; skipping this sweep", { mode: retention.mode });
         else await runArtifactRetention(ctx, store, retention.mode);
       } catch (error) {
-        ctx.log.error("artifact retention sweep failed", { mode: retention.mode, error: (error as Error).message });
+        ctx.log.error("artifact retention sweep failed", { mode: retention.mode, error_code: "sweep_failed" });
       } finally {
         sweeping = false;
       }
