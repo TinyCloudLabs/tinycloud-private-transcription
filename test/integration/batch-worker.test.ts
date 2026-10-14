@@ -163,7 +163,8 @@ describe("single-slot arbiter", () => {
       const completion = events.filter((event) => event.message === "batch job finished");
       expect(completion).toHaveLength(1);
       expect(Object.keys(completion[0]!.fields).sort()).toEqual(["code", "content_type", "dropped_above_floor_pct", "duration_seconds", "job_id", "outcome", "segments", "tinfoil_audio_seconds", "tinfoil_calls", "vad_fallback", "voiced_seconds"].sort());
-      expect(completion[0]!.fields).toMatchObject({ job_id: id, outcome: "failed", code: "transcription_failed", content_type: "audio/wav", tinfoil_calls: 1, tinfoil_audio_seconds: null });
+      // tinfoil_audio_seconds counts audio the provider completed (worker.ts adds it per completed region): a rejected first call is a measured 0.
+      expect(completion[0]!.fields).toMatchObject({ job_id: id, outcome: "failed", code: "transcription_failed", content_type: "audio/wav", tinfoil_calls: 1, tinfoil_audio_seconds: 0 });
     } finally {
       h.ctx.log = original;
     }
