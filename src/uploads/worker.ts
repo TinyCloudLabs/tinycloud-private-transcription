@@ -13,7 +13,7 @@ import { fenceGuard, holdFence, LostFence, type DbOrTx, type Fence } from "./fen
 import { cleanupJobFiles, recoverStaleClaims, releaseDeadSlot, runSweep, terminalize, workerLive } from "./ledger.ts";
 import type { ProviderOutcome } from "./provider.ts";
 import { ensureStorageRoot, jobDir, removeJobEntry, workDirName } from "./storage.ts";
-import { aboveFloorFrames, detectSpeech, droppedAboveFloorFrames, frameEnergies, summarizeVad, VAD, type Region, type VadStats } from "./vad.ts";
+import { detectSpeech, frameEnergies, summarizeVad, VAD, type Detection, type Region, type VadStats } from "./vad.ts";
 
 export interface Claim {
   job: TranscriptionRow;
@@ -201,6 +201,23 @@ interface DetectedRegions {
 
 const percent = (part: number, whole: number) => whole === 0 ? 0 : Math.round((part / whole) * 1000) / 10;
 
+/** Both paths guard the final sent coverage before persisting regions or dispatching any audio. */
+async function guardCoverage(ctx: BatchContext, job: TranscriptionRow, fence: Fence,
+  detections: readonly Pick<Detection, "fallback" | "primaryDroppedShare" | "covered" | "droppedFrames" | "aboveFloorFrames">[]): Promise<boolean> {
+  if (detections.some((d) => d.fallback)) {
+    ctx.log.warn("batch VAD fell back to the floor threshold", {
+      transcriptionId: job.id, stage: "vad", primaryDroppedAboveFloorPct: Math.max(...detections.map((d) => percent(d.primaryDroppedShare, 1))),
+    });
+  }
+  if (detections.every((d) => d.covered)) return true;
+  const dropped = detections.reduce((sum, d) => sum + d.droppedFrames, 0);
+  const aboveFloor = detections.reduce((sum, d) => sum + d.aboveFloorFrames, 0);
+  ctx.log.error("batch VAD could not cover the recording", { transcriptionId: job.id, stage: "vad", droppedAboveFloorPct: percent(dropped, aboveFloor), alert: true });
+  if (await failClaim(ctx, ctx.db, fence, "processing_failed", "Speech detection could not cover the recording")) await cleanupJobFiles(ctx, job.id);
+  else throw new LostFence(job.id);
+  return false;
+}
+
 /**
  * VAD regions of every channel through the coverage guard (`detectSpeech`). A channel whose relative threshold leaves
  * too much non-silent audio unsent falls back to the floor, logged. If even that leaves too much unsent, the job fails
@@ -213,17 +230,7 @@ async function vadRegions(ctx: BatchContext, job: TranscriptionRow, fence: Fence
   const dropped = detections.reduce((sum, d) => sum + d.droppedFrames, 0);
   const aboveFloor = detections.reduce((sum, d) => sum + d.aboveFloorFrames, 0);
   const fallback = detections.some((d) => d.fallback);
-  if (fallback) {
-    ctx.log.warn("batch VAD fell back to the floor threshold", {
-      transcriptionId: job.id, stage: "vad", primaryDroppedAboveFloorPct: Math.max(...detections.map((d) => percent(d.primaryDroppedShare, 1))),
-    });
-  }
-  if (detections.some((d) => !d.covered)) {
-    ctx.log.error("batch VAD could not cover the recording", { transcriptionId: job.id, stage: "vad", droppedAboveFloorPct: percent(dropped, aboveFloor), alert: true });
-    if (await failClaim(ctx, ctx.db, fence, "processing_failed", "Speech detection could not cover the recording")) await cleanupJobFiles(ctx, job.id);
-    else throw new LostFence(job.id);
-    return null;
-  }
+  if (!await guardCoverage(ctx, job, fence, detections)) return null;
   const regions = detections.flatMap((d, channel) => d.regions.map((region) => ({ ...region, channel, speaker: null })))
     .sort((a, b) => a.startMs - b.startMs || a.channel - b.channel);
   const stats = detections.length === 1 ? detections[0]!.stats
@@ -232,9 +239,9 @@ async function vadRegions(ctx: BatchContext, job: TranscriptionRow, fence: Fence
 }
 
 /**
- * Speaker turns of the mono mix (channel 0), extended by quiet VAD coverage when enabled and its gate passes.
- * A job whose diarization cannot run (the stage failed, or was switched off after acceptance) fails processing_failed,
- * fenced, and this returns null. The fallback flag stays false; coverage stats describe the final sent regions.
+ * Speaker turns of the mono mix (channel 0), extended by the ordinary VAD's selected coverage when needed.
+ * Diarization failure or insufficient final coverage fails processing_failed before any dispatch.
+ * The fallback flag and coverage stats describe the selected mode and final sent turns.
  */
 async function diarizeTurns(ctx: BatchContext, job: TranscriptionRow, fence: Fence, pcmPath: string, signal: AbortSignal): Promise<DetectedRegions | null> {
   let segments: SpeakerSegment[];
@@ -252,12 +259,13 @@ async function diarizeTurns(ctx: BatchContext, job: TranscriptionRow, fence: Fen
   }
   const energies = await frameEnergies(pcmPath);
   const vad = { ...VAD, quiet: { ...VAD.quiet, enabled: ctx.config.vad.quietMode } };
-  const { turns, stats } = detectDiarizedSpeech(segments, energies, vad);
+  const detection = detectDiarizedSpeech(segments, energies, vad);
+  if (!await guardCoverage(ctx, job, fence, [detection])) return null;
   return {
-    regions: turns.map((turn) => ({ ...turn, channel: 0 })),
-    droppedAboveFloorPct: percent(droppedAboveFloorFrames(energies, turns), aboveFloorFrames(energies)),
-    fallback: false,
-    stats,
+    regions: detection.turns.map((turn) => ({ ...turn, channel: 0 })),
+    droppedAboveFloorPct: percent(detection.droppedFrames, detection.aboveFloorFrames),
+    fallback: detection.fallback,
+    stats: detection.stats,
   };
 }
 

@@ -347,6 +347,54 @@ describe("diarization", () => {
     return { bytes: pcmToWav(pcm, PCM_RATE), energies };
   }
 
+  test("TC-1093: short quiet diarized PCM retains selected fallback when the peak gate misses", async () => {
+    // Repo-generated single-mic envelope, not a production replay: 40 s, quiet median, just 200 ms of peaks.
+    const levels = new Float64Array(400).fill(-53);
+    levels.fill(-49, 50, 150); levels.fill(-49, 250, 350); levels.fill(-31, 100, 102);
+    const audio = await synthetic(levels), selected = detectSpeech(audio.energies);
+    expect(selected).toMatchObject({ fallback: true, covered: true, stats: { vad_mode: "fallback", speech_peak_s: 0.2 } });
+    const segments = [{ startMs: 10_000, endMs: 14_000, speaker: 7 }];
+    h.ctx.diarizer = { diarize: async () => segments };
+    for (const enabled of [true, false]) {
+      h.ctx.config.vad.quietMode = enabled;
+      const id = await h.submit(audio.bytes, { contentType: "audio/wav", body: { diarize: true } });
+      await h.work();
+      const body = await (await result(id)).json();
+      expect(body).toMatchObject({ status: "completed", diarized: true,
+        stats: { vad_mode: "fallback", vad_fallback: true, speech_peak_s: 0.2, voiced_seconds: 40,
+          tinfoil_audio_seconds: 40, dropped_above_floor_pct: 0, dropped_above_noise_pct: 0 },
+      });
+      expect(await h.row(id)).toMatchObject({ status: "completed", errorCode: null, vadFallback: true, vadDroppedAboveFloorPct: 0 });
+      const saved = (await regions(id)).sort((a, b) => a.startMs - b.startMs);
+      expect(saved.filter((r) => r.speaker === 7).map(({ startMs, endMs, speaker }) => ({ startMs, endMs, speaker })))
+        .toEqual(speakerTurns(segments, audio.energies));
+      for (const [i, r] of saved.entries()) {
+        expect(r.endMs - r.startMs).toBeLessThanOrEqual(30_000);
+        if (i) expect(r.startMs).toBe(saved[i - 1]!.endMs);
+      }
+      expect(saved[0]!.startMs).toBe(0);
+      expect(saved.at(-1)!.endMs).toBe(40_000);
+      expect(saved.filter((r) => r.speaker !== 7).every((r) => r.speaker === UNKNOWN_SPEAKER)).toBe(true);
+    }
+  });
+
+  test("TC-1093: diarized final coverage fails closed before dispatch when selected fallback still drops speech", async () => {
+    h.ctx.diarizer = { diarize: async () => [{ startMs: 0, endMs: 2_000, speaker: 7 }] };
+    const id = await h.submit(await audio("clicks_wav"), { contentType: "audio/wav", body: { diarize: true } });
+    const padMs = VAD.padMs;
+    VAD.padMs = 0;
+    try {
+      await h.work();
+    } finally {
+      VAD.padMs = padMs;
+    }
+    expect(await h.row(id)).toMatchObject({ status: "failed", errorCode: "processing_failed",
+      errorMessage: "Speech detection could not cover the recording", deletionState: "files_deleted" });
+    expect(h.tinfoil.calls).toEqual([]);
+    expect(await regions(id)).toEqual([]);
+    expect(await h.ctx.db.select().from(transcriptionResults).where(eq(transcriptionResults.transcriptionId, id))).toEqual([]);
+  });
+
   test("diarized quiet speech adds missed audio once, exposes quiet stats and gives unknown a valid result id", async () => {
     const audio = await synthetic();
     const segments = [{ startMs: 12_000, endMs: 13_000, speaker: 7 }, { startMs: 70_000, endMs: 70_500, speaker: 3 }];
@@ -375,7 +423,8 @@ describe("diarization", () => {
     const normalId = await h.submit(audio.bytes, { contentType: "audio/wav", body: { diarize: true } });
     await h.work();
     const normal = await (await result(normalId)).json();
-    expect(body.speakers.filter((s: { name: string }) => s.name !== "Unknown speaker")).toEqual(normal.speakers);
+    expect(body.speakers.filter((s: { name: string }) => s.name !== "Unknown speaker"))
+      .toEqual(normal.speakers.filter((s: { name: string }) => s.name !== "Unknown speaker"));
   });
 
   test("an empty diarizer result recovers gated speech with one valid unknown speaker", async () => {
@@ -390,22 +439,6 @@ describe("diarization", () => {
     });
   });
 
-  test("flag-off and gate-failing diarized jobs keep the exact old intervals, attribution and stats", async () => {
-    const segments = [{ startMs: 12_000, endMs: 13_000, speaker: 7 }];
-    h.ctx.diarizer = { diarize: async () => segments };
-    for (const [enabled, levels] of [[false, quietSpeechLevels()], [true, new Float64Array(1_000).fill(-25)]] as const) {
-      const audio = await synthetic(levels);
-      h.ctx.config.vad.quietMode = enabled;
-      const id = await h.submit(audio.bytes, { contentType: "audio/wav", body: { diarize: true } });
-      await h.work();
-      const body = await (await result(id)).json(), expected = speakerTurns(segments, audio.energies);
-      expect(body.segments.map((s: { start: number; end: number; speaker_id: string }) => [s.start * 1000, s.end * 1000, s.speaker_id]))
-        .toEqual(expected.map((r) => [r.startMs, r.endMs, "speaker_0"]));
-      expect((await regions(id)).map(({ startMs, endMs, speaker }) => ({ startMs, endMs, speaker }))).toEqual(expected);
-      expect(body.stats).toMatchObject(summarizeVad([{ energies: audio.energies, regions: expected, mode: "primary" }]));
-      expect(body.speakers).toEqual([{ id: "speaker_0", name: "Speaker 1", channel: 0 }]);
-    }
-  });
 
   test("a non-diarized quiet job retains #99 intervals and stats and never calls the diarizer", async () => {
     const audio = await synthetic();
