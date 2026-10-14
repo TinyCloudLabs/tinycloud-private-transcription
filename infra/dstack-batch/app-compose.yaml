@@ -18,7 +18,7 @@
 # reclaims first. Container logs are json-file, capped at 3 x 10 MB per service. .github/workflows/batch-envelope.yml proves these limits with a 2-hour stereo recording on one CPU.
 services:
   api:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:7e54bcd2f8531485e78913e0d70d316cf3318d4b@sha256:6fb61c804c965522516454929eba9472ae22f3b2dcfedc870c2ce05480c7bb37
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:6ce28cf297efae98507a746692d6011bd5d27f78@sha256:2366f0c72126eb735c29d594130005e9907b0a91bd3c39c4af32965da7f0ec2a
     restart: unless-stopped
     depends_on:
       postgres:
@@ -66,7 +66,7 @@ services:
         max-file: "3"
 
   upload-worker:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:7e54bcd2f8531485e78913e0d70d316cf3318d4b@sha256:6fb61c804c965522516454929eba9472ae22f3b2dcfedc870c2ce05480c7bb37
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:6ce28cf297efae98507a746692d6011bd5d27f78@sha256:2366f0c72126eb735c29d594130005e9907b0a91bd3c39c4af32965da7f0ec2a
     restart: unless-stopped
     command: ["bun", "run", "src/uploads/worker.ts"]
     depends_on:
