@@ -13,7 +13,7 @@ import { fenceGuard, holdFence, LostFence, type DbOrTx, type Fence } from "./fen
 import { cleanupJobFiles, recoverStaleClaims, releaseDeadSlot, runSweep, terminalize, workerLive } from "./ledger.ts";
 import type { ProviderOutcome } from "./provider.ts";
 import { ensureStorageRoot, jobDir, removeJobEntry, workDirName } from "./storage.ts";
-import { aboveFloorFrames, detectSpeech, droppedAboveFloorFrames, frameEnergies, type Region } from "./vad.ts";
+import { aboveFloorFrames, detectSpeech, droppedAboveFloorFrames, frameEnergies, summarizeVad, VAD, type Region, type VadStats } from "./vad.ts";
 
 export interface Claim {
   job: TranscriptionRow;
@@ -149,7 +149,9 @@ async function runPipeline(ctx: BatchContext, job: TranscriptionRow, fence: Fenc
     await ctx.db.transaction(async (tx) => {
       await holdFence(tx, fence);
       await insertRegions(tx, fence, detected.regions);
-      await tx.update(transcriptions).set({ vadDroppedAboveFloorPct: detected.droppedAboveFloorPct, vadFallback: detected.fallback }).where(fenceGuard(fence));
+      // Bind JSON as text before casting: Bun.SQL otherwise re-encodes Drizzle's JSON string as a JSONB string.
+      await tx.update(transcriptions).set({ vadDroppedAboveFloorPct: detected.droppedAboveFloorPct, vadFallback: detected.fallback,
+        vadStats: sql`${JSON.stringify(detected.stats)}::text::jsonb` }).where(fenceGuard(fence));
     });
     regions = await ctx.db.select().from(transcriptionRegions).where(eq(transcriptionRegions.transcriptionId, job.id))
       .orderBy(asc(transcriptionRegions.startMs), asc(transcriptionRegions.channel));
@@ -193,6 +195,7 @@ interface DetectedRegions {
   regions: (Region & { channel: number; speaker: number | null })[];
   droppedAboveFloorPct: number;
   fallback: boolean;
+  stats: VadStats;
 }
 
 const percent = (part: number, whole: number) => whole === 0 ? 0 : Math.round((part / whole) * 1000) / 10;
@@ -203,7 +206,9 @@ const percent = (part: number, whole: number) => whole === 0 ? 0 : Math.round((p
  * processing_failed, fenced, and this returns null: a partial transcript is never completed.
  */
 async function vadRegions(ctx: BatchContext, job: TranscriptionRow, fence: Fence, pcm: string[]): Promise<DetectedRegions | null> {
-  const detections = await Promise.all(pcm.map(async (path) => detectSpeech(await frameEnergies(path))));
+  const energies = await Promise.all(pcm.map((path) => frameEnergies(path)));
+  const vad = { ...VAD, quiet: { ...VAD.quiet, enabled: ctx.config.vad.quietMode } };
+  const detections = energies.map((e) => detectSpeech(e, vad));
   const dropped = detections.reduce((sum, d) => sum + d.droppedFrames, 0);
   const aboveFloor = detections.reduce((sum, d) => sum + d.aboveFloorFrames, 0);
   const fallback = detections.some((d) => d.fallback);
@@ -220,7 +225,9 @@ async function vadRegions(ctx: BatchContext, job: TranscriptionRow, fence: Fence
   }
   const regions = detections.flatMap((d, channel) => d.regions.map((region) => ({ ...region, channel, speaker: null })))
     .sort((a, b) => a.startMs - b.startMs || a.channel - b.channel);
-  return { regions, droppedAboveFloorPct: percent(dropped, aboveFloor), fallback };
+  const stats = detections.length === 1 ? detections[0]!.stats
+    : summarizeVad(detections.map((d, channel) => ({ energies: energies[channel]!, regions: d.regions, mode: d.stats.vad_mode })), vad);
+  return { regions, droppedAboveFloorPct: percent(dropped, aboveFloor), fallback, stats };
 }
 
 /**
@@ -248,6 +255,7 @@ async function diarizeTurns(ctx: BatchContext, job: TranscriptionRow, fence: Fen
     regions: turns.map((turn) => ({ ...turn, channel: 0 })),
     droppedAboveFloorPct: percent(droppedAboveFloorFrames(energies, turns), aboveFloorFrames(energies)),
     fallback: false,
+    stats: summarizeVad([{ energies, regions: turns, mode: "primary" }]),
   };
 }
 
@@ -433,7 +441,7 @@ async function assemble(ctx: BatchContext, job: TranscriptionRow, fence: Fence) 
     if (segments.length === 0) {
       return terminalize(tx, job.id, fenceGuard(fence), "failed", { code: "no_speech", message: "No speech was recognized in the recording" });
     }
-    const [stats] = await tx.select({ calls: transcriptions.tinfoilCalls, seconds: transcriptions.tinfoilAudioSeconds, dropped: transcriptions.vadDroppedAboveFloorPct, fallback: transcriptions.vadFallback })
+    const [stats] = await tx.select({ calls: transcriptions.tinfoilCalls, seconds: transcriptions.tinfoilAudioSeconds, dropped: transcriptions.vadDroppedAboveFloorPct, fallback: transcriptions.vadFallback, vad: transcriptions.vadStats })
       .from(transcriptions).where(eq(transcriptions.id, job.id));
     const voicedMs = regions.reduce((sum, region) => sum + region.endMs - region.startMs, 0);
     const name = new Map(speakers.map((speaker) => [speaker.id, speaker.name]));
@@ -456,6 +464,8 @@ async function assemble(ctx: BatchContext, job: TranscriptionRow, fence: Fence) 
           voiced_seconds: voicedMs / 1000,
           dropped_above_floor_pct: stats!.dropped,
           vad_fallback: stats!.fallback,
+          // Old jobs lack these measurements; do not invent a mode or diagnostics for saved regions.
+          ...(stats!.vad ?? {}),
         },
       },
     });

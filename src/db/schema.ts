@@ -1,4 +1,5 @@
 import type { CaptureDiagnostics } from "../domain/capture.ts";
+import type { VadStats } from "../uploads/vad.ts";
 import { sql } from "drizzle-orm";
 import { pgTable, text, timestamp, integer, bigint, jsonb, real, boolean, index, uniqueIndex, primaryKey } from "drizzle-orm/pg-core";
 
@@ -244,6 +245,8 @@ export const transcriptions = pgTable(
     vadDroppedAboveFloorPct: real("vad_dropped_above_floor_pct"),
     /** The VAD coverage guard replaced the relative threshold with the floor (TC-1045). Null for jobs whose regions predate it. */
     vadFallback: boolean("vad_fallback"),
+    /** Quiet-mode diagnostics, committed with regions and retained across worker re-claims. Null for older jobs. */
+    vadStats: jsonb("vad_stats").$type<VadStats>(),
     errorCode: text("error_code"),
     errorMessage: text("error_message"),
     /** Deletion ledger: pending is committed with (or before) the terminal state, before any unlink. */

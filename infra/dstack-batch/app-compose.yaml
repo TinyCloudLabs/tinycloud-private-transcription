@@ -81,6 +81,8 @@ services:
       BATCH_TINFOIL_API_KEY: ${BATCH_TINFOIL_API_KEY:-}
       BATCH_TINFOIL_MODEL: voxtral-small-24b
       BATCH_DIARIZATION_ENABLED: "true"
+      # Runtime rollback for newly detected jobs; the sealed deploy env can override this one flag.
+      BATCH_VAD_QUIET_MODE: "${BATCH_VAD_QUIET_MODE:-true}"
       LOG_LEVEL: info
     volumes:
       - ptx-batch-uploads:/var/lib/ptx-batch/uploads

@@ -31,3 +31,12 @@ export function sentFrames(energies: Float64Array, regions: readonly Region[]) {
     return regions.some((r) => r.startMs <= centre && centre < r.endMs);
   });
 }
+
+/** Quiet far-field speech with a full second of peaks; attenuation is applied before PCM quantization. */
+export function quietSpeechLevels(gainDb = 0) {
+  const levels = new Float64Array(1_000).fill(-58 + gainDb);
+  levels.fill(-54 + gainDb, 100, 200);
+  levels.fill(-52 + gainDb, 400, 500);
+  levels.fill(-36 + gainDb, 150, 160);
+  return levels;
+}

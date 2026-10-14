@@ -183,6 +183,13 @@
       "when": 1791914239823,
       "tag": "0025_vad_coverage",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1791949981616,
+      "tag": "0026_vad_quiet_stats",
+      "breakpoints": true
     }
   ]
 }

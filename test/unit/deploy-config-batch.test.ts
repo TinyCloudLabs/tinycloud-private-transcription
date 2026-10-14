@@ -31,10 +31,10 @@ type Service = {
   logging?: { driver?: string; options?: Record<string, string> };
 };
 
-function render(): Record<string, Service> {
+function render(quietMode?: string): Record<string, Service> {
   const rendered = Bun.spawnSync(
     ["docker", "compose", "-f", "infra/dstack-batch/app-compose.yaml", "--env-file", "infra/dstack-batch/.env.example", "config", "--format", "json"],
-    { cwd: repo, stdout: "pipe", stderr: "pipe" },
+    { cwd: repo, stdout: "pipe", stderr: "pipe", env: { ...process.env, ...(quietMode === undefined ? {} : { BATCH_VAD_QUIET_MODE: quietMode }) } },
   );
   expect(rendered.exitCode).toBe(0);
   return JSON.parse(rendered.stdout.toString()).services;
@@ -73,13 +73,15 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(workflowText).toContain("PTX_FAULT_INJECT must never appear");
   });
 
-  test("takes only POSTGRES_PASSWORD, BATCH_TINFOIL_API_KEY and PTX_BOOTSTRAP_KEYS from the sealed env", () => {
+  test("takes only the three existing sealed keys and the optional quiet-mode rollback flag", () => {
     const sealed = [...new Set([...composeConfig.matchAll(/\$\{([A-Z0-9_]+)/g)].map((m) => m[1]))].sort();
-    expect(sealed).toEqual(["BATCH_TINFOIL_API_KEY", "POSTGRES_PASSWORD", "PTX_BOOTSTRAP_KEYS"]);
-    expect([...(envExample.match(/^[A-Z0-9_]+(?==)/gm) ?? [])].sort()).toEqual(sealed as string[]);
+    expect(sealed).toEqual(["BATCH_TINFOIL_API_KEY", "BATCH_VAD_QUIET_MODE", "POSTGRES_PASSWORD", "PTX_BOOTSTRAP_KEYS"]);
+    expect([...(envExample.match(/^[A-Z0-9_]+(?==)/gm) ?? [])].sort()).toEqual(sealed.filter((key) => key !== "BATCH_VAD_QUIET_MODE"));
     const services = render();
     expect(services.api!.environment.PTX_BOOTSTRAP_KEYS).toBe("");
     expect(services["upload-worker"]!.environment.PTX_BOOTSTRAP_KEYS).toBeUndefined();
+    expect(services["upload-worker"]!.environment.BATCH_VAD_QUIET_MODE).toBe("true");
+    expect(render("false")["upload-worker"]!.environment.BATCH_VAD_QUIET_MODE).toBe("false");
   });
 
   test("fits tdx.small: every service has a memory limit, no swap, and a reservation; ~1 GiB stays with the guest", () => {
@@ -297,13 +299,18 @@ sed -n "$((n + 1))p" "${dir}/gets"
       { id: "owner-admin", project: "ops", scopes: ["admin:*"] },
     ]);
     const [tinychatKey, adminKey] = [keys[0]!.key, keys[1]!.key];
-    const validate = (admin: string, bootstrap = env) => runStep("Validate the sealed environment", {
+    const validate = (admin: string, bootstrap = env, quietMode = "true") => runStep("Validate the sealed environment", {
       BATCH_POSTGRES_PASSWORD: "a".repeat(64), BATCH_TINFOIL_API_KEY: "tinfoil", PTX_BOOTSTRAP_KEYS: bootstrap, PTX_BATCH_ADMIN_KEY: admin,
+      BATCH_VAD_QUIET_MODE: quietMode,
     }, { docker: "exit 0" });
 
     const ok = validate(adminKey);
     expect({ exitCode: ok.exitCode, out: ok.out }).toMatchObject({ exitCode: 0 });
     expect(ok.out).toContain("bootstrap keys: tinychat-batch(transcriptions:*) owner-admin(admin:*)");
+    expect(validate(adminKey, env, "false").exitCode).toBe(0);
+    const invalidMode = validate(adminKey, env, "invalid");
+    expect(invalidMode.exitCode).toBe(1);
+    expect(invalidMode.out).toContain("BATCH_VAD_QUIET_MODE must be true or false");
     for (const [admin, error] of [
       ["tc_live_not_a_minted_key", "PTX_BATCH_ADMIN_KEY does not hash to any PTX_BOOTSTRAP_KEYS entry"],
       [tinychatKey, "PTX_BATCH_ADMIN_KEY hashes to tinychat-batch, which does not hold admin:*"],

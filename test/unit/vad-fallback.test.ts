@@ -58,6 +58,7 @@ test("every non-fallback detection is byte-identical to cf3cb40", async () => {
     const energies = await frameEnergies(path);
     const old = baselineDetection(energies);
     expect(old.fallback).toBe(false);
-    expect(JSON.stringify(detectSpeech(energies))).toBe(JSON.stringify(old));
+    const { stats, ...legacy } = detectSpeech(energies);
+    expect(JSON.stringify(legacy)).toBe(JSON.stringify(old));
   }
 });

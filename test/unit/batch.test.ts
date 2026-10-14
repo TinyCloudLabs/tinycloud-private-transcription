@@ -155,6 +155,20 @@ describe("provider outcome classification", () => {
 });
 
 describe("VAD regions", () => {
+  test("quiet detection is enabled by default and has one batch config rollback flag", () => {
+    const old = process.env.BATCH_VAD_QUIET_MODE;
+    try {
+      delete process.env.BATCH_VAD_QUIET_MODE;
+      expect(batchConfigFromEnv().vad.quietMode).toBe(true);
+      process.env.BATCH_VAD_QUIET_MODE = "false";
+      expect(batchConfigFromEnv().vad.quietMode).toBe(false);
+      process.env.BATCH_VAD_QUIET_MODE = "true";
+      expect(batchConfigFromEnv().vad.quietMode).toBe(true);
+    } finally {
+      if (old === undefined) delete process.env.BATCH_VAD_QUIET_MODE;
+      else process.env.BATCH_VAD_QUIET_MODE = old;
+    }
+  });
   const frames = (spec: [number, number][], total: number) => {
     // spec: [startFrame, endFrame) voiced at -20 dBFS; everything else digital silence (-120).
     const e = new Float64Array(total).fill(-120);
