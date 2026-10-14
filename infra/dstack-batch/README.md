@@ -71,6 +71,8 @@ gh workflow run deploy-batch.yml -R $R --ref main -f confirm=ptx-batch
   `120 + (awaiting_upload + queued + processing) × 240` minutes; the run prints it at drain start and warns when the
   timeout is below it. Check the queue first (`GET /v1/admin/admission`) and size to what you see; with a deep queue,
   drain ahead of time (`PUT … {"mode":"drain"}`) and dispatch once `active` is 0.
+  With TC-922 long recordings, ten serial jobs can exceed even the maximum 300-minute drain window: pause admission
+  and drain to zero **before** the release window, then dispatch the update. The 4 h worker ceiling is unchanged.
 - A failure after the drain leaves admission in **drain**. Investigate, then reopen deliberately:
   `curl -X PUT $URL/v1/admin/admission -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d '{"mode":"open"}'`.
 
@@ -100,7 +102,7 @@ PCM is normal. An OOM kill happens when what the kernel cannot reclaim fills the
 flushed. The kill stays inside that container. The envelope therefore reports anon + shmem, not anon alone.
 
 The decode path never holds a recording in memory: ffmpeg writes 16 kHz s16le PCM to disk per channel, the VAD reads
-it in 60 s slices (a 2 h channel is 72,000 frame energies, 576 KB), and each dispatch reads one region of at most
+it in 60 s slices (an 11,101 s channel is 111,010 frame energies, about 888 KB), and each dispatch reads one region of at most
 30 s (~0.96 MB WAV). [`batch-envelope.yml`](../../.github/workflows/batch-envelope.yml) proves the envelope on every
 change to the batch runtime: it runs this compose (limits unchanged) on one CPU with Tinfoil mocked, uploads a
 synthetic 2-hour stereo 128 kbps MP3 three times at once, and fails on any OOM kill or restart.
@@ -114,20 +116,24 @@ for 15 s while it decoded, 4,305 GETs, all 200):
 | postgres | 192 MiB | 20 MiB | 71 MiB (61 MiB) | | 0 / 0 |
 
 **Disk (20 GB).** The data disk holds Docker images, Postgres and the upload volume; a live tdx.small shows an
-18.87 GiB filesystem. Worst case for a 2 h recording (16 kHz s16le = 32,000 B/s per channel):
+18.87 GiB filesystem. Bounds at the accepted 11,101 s ceiling (16 kHz s16le = 32,000 B/s per channel):
 
 | item | bound |
 |---|---|
 | images (api ~0.25 GB, postgres ~0.27 GB, one update overlap; dstack prunes after `compose up`), dstack data | ≤ 2.4 GB (a live tdx.small uses 1.77 GB) |
 | container logs: json-file, `max-size: 10m`, `max-file: "3"` on each of the 3 services | ≤ 90 MB |
 | Postgres data + WAL (`max_wal_size=256MB`) | ≤ 0.5 GB |
-| accepted audio + in-flight `.part` files (`BATCH_MAX_RESERVED_BYTES`) | ≤ 1.21 GB |
-| PCM of the one processing job: 2 ch × 7,200 s × 32,000 B/s = 0.46 GB; ×2 while a crashed claim's work dir awaits the sweeper | ≤ 0.92 GB |
-| **total** | **≤ 5.1 GB ≈ 26% of 20 GB** |
+| accepted audio + in-flight `.part` files (`BATCH_MAX_RESERVED_BYTES`) | ≤ 1.865 GB |
+| PCM of the one processing job: 2 ch × 11,101 s × 32,000 B/s = 0.711 GB; ×2 while a crashed claim's work dir awaits the sweeper | ≈ 1.421 GB |
+| **total** | **≈ 6.3 GB ≈ 32% of 20 GB** |
 
-Bounded use never reaches the 80% high-water (`BATCH_DISK_HIGH_WATER_PERCENT`, unchanged), which stays fail-closed for
-leaks: at 80%, creates and PUTs are refused, and what can still be written after that point (3 in-flight PUTs, 0.36 GB;
-one job's PCM, ≤ 0.92 GB; WAL, ~0.25 GB; ≈ 1.5 GB) fits in the remaining 4 GB with 2.6× margin.
+These sizing estimates remain below the unchanged 80% high-water (`BATCH_DISK_HIGH_WATER_PERCENT`), which stays
+fail-closed for leaks. At 80%, creates and PUTs are refused; the conservative remaining writes (3 in-flight PUTs,
+0.56 GB; duplicated PCM, about 1.421 GB; WAL, about 0.25 GB; about 2.24 GB total) fit in the remaining 4 GB.
+PCM arithmetic is a sizing estimate; ffmpeg's byte stop can overshoot by an output packet. Disk-full and stale-claim
+duplicate-PCM pressure were not measured in the TC-922 envelope. Its six mock-provider MP3 jobs had no OOM/restarts
+under API/worker 320 MiB limits, but sampled `memory.current` including cache reached those caps; kernel
+`memory.peak` was unavailable. See [validation and limitations](../../docs/tc-922-validation.md).
 
 ## Browser uploads (CORS)
 

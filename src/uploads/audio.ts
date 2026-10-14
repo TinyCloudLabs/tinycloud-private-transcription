@@ -95,7 +95,7 @@ async function scanDuration(path: string, ffprobePath: string, maxDurationSecond
 export async function probeAudio(
   path: string,
   contentType: UploadContentType,
-  limits: { maxDurationSeconds: number; maxChannels: number; durationScanSeconds: number },
+  limits: { acceptedMaxDurationSeconds: number; maxChannels: number; durationScanSeconds: number },
   ffprobePath = "ffprobe",
   signal?: AbortSignal,
 ): Promise<ProbeOutcome> {
@@ -123,14 +123,15 @@ export async function probeAudio(
   }
   let duration = Number(parsed.format?.duration);
   if (!Number.isFinite(duration) || duration <= 0) {
-    const scan = await scanDuration(path, ffprobePath, limits.maxDurationSeconds, limits.durationScanSeconds * 1000, signal);
+    const scan = await scanDuration(path, ffprobePath, limits.acceptedMaxDurationSeconds, limits.durationScanSeconds * 1000, signal);
     if (!scan.ok) return scan;
     // Packet timestamps can start anywhere (`format.duration`, when present, already excludes the start).
     const start = Number(parsed.format?.start_time);
     duration = scan.end - (Number.isFinite(start) ? start : 0);
   }
   if (!Number.isFinite(duration) || duration <= 0) return unreadable;
-  if (duration > limits.maxDurationSeconds) return tooLong(limits.maxDurationSeconds);
+  // Compare raw duration before rounding: even one sample above the accepted ceiling must fail.
+  if (duration > limits.acceptedMaxDurationSeconds) return tooLong(limits.acceptedMaxDurationSeconds);
   return { ok: true, probe: { durationSeconds: Math.round(duration * 1000) / 1000, channels } };
 }
 
