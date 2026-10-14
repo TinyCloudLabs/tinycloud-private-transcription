@@ -406,10 +406,10 @@ its existing `POST /v1/meetings` proxy accepts Signal URLs once production enabl
 ```bash
 phala status                                                    # confirm the intended workspace
 sudo docker compose -f infra/dstack/app-compose.yaml --env-file infra/dstack/.env config -q   # compose sanity
-phala deploy -n ptx-dev -c infra/dstack/app-compose.yaml -e infra/dstack/.env -t tdx.large --disk-size 40G --no-public-logs --wait
+phala deploy -n ptx-dev -c infra/dstack/app-compose.yaml -e infra/dstack/.env -t tdx.large --disk-size 40G --no-public-logs --no-public-sysinfo --wait
 phala cvms get ptx-dev --json | jq '{status, app_id, gateway}'
 # update in place (new image tag / env / compose):
-phala deploy --cvm-id ptx-dev -c infra/dstack/app-compose.yaml -e infra/dstack/.env --no-public-logs --wait
+phala deploy --cvm-id ptx-dev -c infra/dstack/app-compose.yaml -e infra/dstack/.env --no-public-logs --no-public-sysinfo --wait
 ```
 
 `tdx.large` (4 vCPU / 7.5 GB usable, ~$0.24/h incl. 40 GB disk) fits the control plane, one Signal seat, an

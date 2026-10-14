@@ -58,7 +58,7 @@ gh workflow run deploy-batch.yml -R $R --ref main -f confirm=ptx-batch
   disabled before any secret is in scope. Bump the CLI by editing that `package.json` and regenerating the lockfile
   (`npm install --package-lock-only --ignore-scripts`).
 - **First creation** (`PTX_BATCH_CVM_ID` unset): `phala deploy -n ptx-batch -t tdx.small --disk-size 20G
-  --no-dev-os --no-public-logs --wait`, then a health gate, then an admission gate: a fresh install starts with
+  --no-dev-os --no-public-logs --no-public-sysinfo --wait`, then a health gate, then an admission gate: a fresh install starts with
   admission `closed` (migration 0018) and must report `closed` to the admin key before `{"mode":"open"}`. A failed
   create leaves admission closed. Record the CVM id it prints:
   `gh variable set PTX_BATCH_CVM_ID --env ptx-batch -R $R --body <id>`.
