@@ -11,7 +11,7 @@ import { PCM_BYTES_PER_SECOND } from "./audio.ts";
  * whose background is louder than -40 dBFS is sent whole: no speech is lost, at the cost of sending the background.
  */
 export const VAD = {
-  frameMs: 100, floorDbfs: -50, aboveP10Db: 12, capDbfs: -40, mergeGapMs: 1_000, padMs: 250, minMs: 400, maxMs: 30_000, splitSearchMs: 10_000,
+  frameMs: 100, floorDbfs: -50, fallbackDbfs: -57, aboveP10Db: 12, capDbfs: -40, mergeGapMs: 1_000, padMs: 250, minMs: 400, maxMs: 30_000, splitSearchMs: 10_000,
   /** Coverage guard: at most this share of the non-silent audio (frames ≥ floorDbfs) may go unsent before the VAD falls back. */
   maxDroppedAboveFloor: 0.1,
 };
@@ -131,7 +131,7 @@ export interface Detection {
   droppedFrames: number;
   /** Frames above the floor: the guard's denominator. */
   aboveFloorFrames: number;
-  /** The relative threshold left too much audio above the floor unsent, so the regions use the floor alone. */
+  /** The relative threshold left too much audio above the floor unsent, so the regions use fallbackDbfs. */
   fallback: boolean;
   /** Share of the audio above the floor that the relative threshold would have left unsent (what tripped the fallback). */
   primaryDroppedShare: number;
@@ -141,7 +141,7 @@ export interface Detection {
 
 /**
  * VAD regions with a fail-closed coverage guard. If the relative threshold leaves more than `maxDroppedAboveFloor` of
- * the non-silent audio (frames at or above the floor) unsent, the regions are recomputed with the floor as the threshold:
+ * the non-silent audio (frames at or above the floor) unsent, the regions are recomputed with `fallbackDbfs` as the threshold:
  * every stretch of non-silent audio, still merged, padded and cut at 30 s. A pause in a quiet room is below the floor and
  * never counts. The bound is never below one minimum region (`minMs`): the VAD never sends a stretch shorter than that
  * on its own, so a sub-second recording or a lone click at either end is the VAD's resolution, not lost speech.
@@ -155,7 +155,7 @@ export function detectSpeech(energies: Float64Array, vad: VadParams = VAD): Dete
   if (primaryDropped <= bound) {
     return { regions: primary, droppedFrames: primaryDropped, aboveFloorFrames: aboveFloor, fallback: false, primaryDroppedShare, covered: true };
   }
-  const regions = regionsFromEnergies(energies, vad.floorDbfs, vad);
+  const regions = regionsFromEnergies(energies, vad.fallbackDbfs, vad);
   const droppedFrames = droppedAboveFloorFrames(energies, regions, vad);
   return { regions, droppedFrames, aboveFloorFrames: aboveFloor, fallback: true, primaryDroppedShare, covered: droppedFrames <= bound };
 }

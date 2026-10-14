@@ -217,10 +217,10 @@ describe("VAD coverage guard (TC-1045)", () => {
   });
 
   test("a quiet talker in a quiet room is not lost because they speak for only a small part of the recording", () => {
-    // 100 s in a -55 dBFS room; a -45 dBFS talker speaks for 8 s. The threshold (p10 + 12 = -43) drops all of it: 8% of
+    // 100 s in a -60 dBFS room; a -49 dBFS talker speaks for 8 s. The threshold (p10 + 12 = -48) drops all of it: 8% of
     // the recording but 100% of its non-silent audio, so the guard measures against the non-silent audio.
-    const e = new Float64Array(1_000).fill(-55);
-    e.fill(-45, 500, 580);
+    const e = new Float64Array(1_000).fill(-60);
+    e.fill(-49, 500, 580);
     const detection = detectSpeech(e);
     expect(detection).toMatchObject({ primaryDroppedShare: 1, fallback: true, covered: true, droppedFrames: 0 });
     expect(detection.regions).toEqual([{ startMs: 49_750, endMs: 58_250 }]);
