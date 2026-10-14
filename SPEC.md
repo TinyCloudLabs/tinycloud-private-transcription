@@ -214,9 +214,10 @@ detected before TC-1045. TC-1093 adds `vad_mode: "primary" | "fallback" | "quiet
 an empty input has p10/p50/p99 = −120 and zero counts. Percentiles use floor-index order statistics.
 For separate stereo, scalar diagnostics pool the channel frames; `speech_peak_s` sums channel-frame duration and
 can exceed wall-clock duration. The gate runs per channel; the job mode is quiet if any channel is quiet, otherwise
-fallback if any falls back, otherwise primary. Diarized jobs keep the diarizer's regions; when quiet mode is enabled
-and its gate passes, they add the exact quiet-VAD coverage outside those turns and report quiet. Otherwise they
-report primary. Both drop metrics describe the final regions; `vad_fallback` stays false for diarized jobs.
+fallback if any falls back, otherwise primary. Diarized jobs retain known speaker turns and add the ordinary VAD's
+selected quiet/fallback coverage, including fallback when the quiet gate misses or is disabled. Primary coverage
+also repairs above-floor holes that exceed the guard. Mode/fallback match the ordinary selection; both drop metrics
+describe the final sent turns, which must satisfy the same coverage bound before any provider dispatch.
 These six additions are persisted with the regions and retained
 across re-claims; they are absent for jobs detected before TC-1093. Existing saved results are returned unchanged.
 Without `diarize`, `diarized` is false, speakers are `channel_N` (named by `channel_labels`) and
@@ -324,10 +325,12 @@ each speaker takes one local speaker per window unless the score is ≥ 0.8; oth
 duration-weighted means of the linked embeddings. After the last window, speakers never heard in the same window merge
 while their centroids' similarity is ≥ 0.7, and past 32 speakers the one with the least speech joins its most similar
 speaker. Each window keeps only its segments up to the middle of each overlap, so overlapped speech is attributed once.
-The segments become speaker turns instead of VAD regions: every 100 ms frame of speech gets one speaker (the current speaker keeps overlapped
+The segments become speaker turns: every 100 ms frame of speech gets one speaker (the current speaker keeps overlapped
 speech); runs of one speaker < 1 s apart merge; turns < 0.4 s fold into the nearer neighbour < 1 s away; turns are
-padded ≤ 0.25 s into silence, never into a neighbour; turns > 30 s split at their quietest frame. Each turn is one
-Tinfoil request through the same arbiter. Non-speech is never sent. A diarizer that fails (or is no longer installed
+padded ≤ 0.25 s into silence, never into a neighbour; turns > 30 s split at their quietest frame. Selected VAD coverage
+is added without replacing known attribution or duplicating audio (unknown/sliver rules above). Each final turn is
+one Tinfoil request through the same arbiter. If final coverage still exceeds the floor bound, the job fails
+`processing_failed` before any provider call. A diarizer that fails (or is no longer installed
 when the job is claimed) fails the job `processing_failed` before any provider call; the stage is enabled with
 `BATCH_DIARIZATION_ENABLED=true` and offered only when its install under `BATCH_DIARIZATION_DIR` is complete.
 

@@ -3,7 +3,7 @@ import { availableParallelism } from "node:os";
 import { join } from "node:path";
 import { PCM_BYTES_PER_SECOND, PCM_RATE } from "./audio.ts";
 import type { BatchConfig } from "./config.ts";
-import { detectSpeech, splitLong, summarizeVad, VAD, type Region, type VadParams, type VadStats } from "./vad.ts";
+import { detectSpeech, droppedAboveFloorFrames, splitLong, summarizeVad, VAD, type Detection, type Region, type VadParams } from "./vad.ts";
 
 /**
  * Speaker diarization for `diarize: true` jobs: sherpa-onnx (pyannote segmentation-3.0 + NeMo TitaNet-S embeddings,
@@ -404,13 +404,18 @@ export function speakerTurns(segments: readonly SpeakerSegment[], energies: Floa
     .flatMap((turn) => splitLong(turn, energies).map((region) => ({ ...region, speaker: turn.speaker })));
 }
 
-/** Keep the exact old diarized path unless the existing quiet detector selects quiet coverage. */
-export function detectDiarizedSpeech(segments: readonly SpeakerSegment[], energies: Float64Array, vad: VadParams = VAD): { turns: Turn[]; stats: VadStats } {
+/** Retain known turns; add selected quiet/fallback coverage or repair an above-floor hole, then guard the final union. */
+export function detectDiarizedSpeech(segments: readonly SpeakerSegment[], energies: Float64Array, vad: VadParams = VAD): Omit<Detection, "regions"> & { turns: Turn[] } {
   const original = speakerTurns(segments, energies);
-  const detection = vad.quiet.enabled ? detectSpeech(energies, vad) : null;
-  const quiet = detection?.stats.vad_mode === "quiet";
-  const turns = quiet ? unionQuietTurns(original, detection.regions, energies, vad) : original;
-  return { turns, stats: summarizeVad([{ energies, regions: turns, mode: quiet ? "quiet" : "primary" }], vad) };
+  const detection = detectSpeech(energies, vad);
+  const bound = Math.max(vad.maxDroppedAboveFloor * detection.aboveFloorFrames, vad.minMs / vad.frameMs);
+  const originalDropped = droppedAboveFloorFrames(energies, original, vad);
+  const extend = detection.stats.vad_mode !== "primary" || originalDropped > bound;
+  const turns = extend ? unionQuietTurns(original, detection.regions, energies, vad) : original;
+  const droppedFrames = extend ? droppedAboveFloorFrames(energies, turns, vad) : originalDropped;
+  return { turns, droppedFrames, aboveFloorFrames: detection.aboveFloorFrames, fallback: detection.fallback,
+    primaryDroppedShare: detection.primaryDroppedShare, covered: droppedFrames <= bound,
+    stats: summarizeVad([{ energies, regions: turns, mode: detection.stats.vad_mode }], vad) };
 }
 
 /** Exact coverage union. Existing attribution wins; only uncovered audio needs a speaker. Inputs are sorted and disjoint. */

@@ -134,17 +134,49 @@ test("at the speaker cap, partial midpoint gaps never create tiny distant-speake
   expect(joined[1]).toEqual(close[1]);
 });
 
-test("flag-off and every gate-failing signal are byte-identical to the old speaker-turn path", () => {
-  const segments = [{ startMs: 1_000, endMs: 2_000, speaker: 7 }, { startMs: 4_000, endMs: 4_500, speaker: 3 }];
-  const ninePeaks = new Float64Array(1_000).fill(-62); ninePeaks.fill(-41, 200, 209);
-  const loudPeaks = new Float64Array(1_000).fill(-60); loudPeaks.fill(-23, 400, 500);
-  const cases = [new Float64Array(), new Float64Array(600).fill(-120), new Float64Array(1).fill(-20),
-    new Float64Array(1_000).fill(-50), new Float64Array(1_000).fill(-55), ninePeaks, loudPeaks,
-    Float64Array.from({ length: 1_000 }, (_, f) => -60 + 4 * Math.sin(f * .11))];
-  for (const enabled of [false, true]) for (const energies of enabled ? cases : [...cases, quietPcm]) {
-    const vad = { ...VAD, quiet: { ...VAD.quiet, enabled } };
-    const turns = speakerTurns(segments, energies);
-    const expected = { turns, stats: summarizeVad([{ energies, regions: turns, mode: "primary" }], vad) };
-    expect(JSON.stringify(detectDiarizedSpeech(segments, energies, vad))).toBe(JSON.stringify(expected));
+test("ordinary fully covered speaker turns keep their intervals and attribution", () => {
+  const energies = new Float64Array(400).fill(-25);
+  const segments = [{ startMs: 0, endMs: 20_000, speaker: 7 }, { startMs: 20_000, endMs: 40_000, speaker: 3 }];
+  const original = speakerTurns(segments, energies), result = detectDiarizedSpeech(segments, energies);
+  expect(result.turns).toEqual(original);
+  expect(result).toMatchObject({ covered: true, fallback: false, droppedFrames: 0, stats: { vad_mode: "primary" } });
+});
+
+test("the final union, not VAD alone, decides fail-closed coverage", () => {
+  const energies = new Float64Array(200).fill(-120);
+  energies.fill(-25, 0, 20);
+  for (let f = 40; f < 200; f += 20) energies.fill(-25, f, f + 2);
+  const vad = { ...VAD, padMs: 0 };
+  expect(detectSpeech(energies, vad).covered).toBe(false);
+  const missed = detectDiarizedSpeech([{ startMs: 0, endMs: 2_000, speaker: 7 }], energies, vad);
+  expect(missed).toMatchObject({ covered: false, fallback: true, stats: { vad_mode: "fallback" } });
+  const retained = detectDiarizedSpeech([{ startMs: 0, endMs: 20_000, speaker: 7 }], energies, vad);
+  expect(retained).toMatchObject({ covered: true, fallback: true, droppedFrames: 0 });
+  expect(sentMs(retained.turns)).toBe(20_000);
+});
+
+test("primary detection repairs above-floor holes in otherwise ordinary diarized audio", () => {
+  const energies = new Float64Array(400).fill(-25);
+  const segments = [{ startMs: 10_000, endMs: 14_000, speaker: 7 }];
+  expect(detectSpeech(energies).fallback).toBe(false);
+  const result = detectDiarizedSpeech(segments, energies);
+  expect(result).toMatchObject({ covered: true, fallback: false, droppedFrames: 0, stats: { vad_mode: "primary" } });
+  includes(result.turns, speakerTurns(segments, energies));
+  expect(sentMs(result.turns)).toBe(40_000);
+  disjointAndCapped(result.turns);
+});
+
+test("long quiet coverage remains complete across request cuts without relabelling known speakers", () => {
+  const energies = new Float64Array(7_200).fill(-53);
+  energies.fill(-49, 1_000, 2_000); energies.fill(-31, 1_500, 1_520);
+  const segments = [{ startMs: 120_000, endMs: 150_000, speaker: 7 }, { startMs: 500_000, endMs: 515_000, speaker: 3 }];
+  const result = detectDiarizedSpeech(segments, energies);
+  expect(result.stats).toMatchObject({ vad_mode: "quiet", dropped_above_noise_pct: 0 });
+  expect(sentMs(result.turns)).toBe(720_000);
+  includes(result.turns, speakerTurns(segments, energies));
+  disjointAndCapped(result.turns);
+  for (const speaker of [7, 3]) {
+    expect(sentMs(result.turns.filter((r) => r.speaker === speaker))).toBe(sentMs(speakerTurns(segments, energies).filter((r) => r.speaker === speaker)));
   }
 });
+
