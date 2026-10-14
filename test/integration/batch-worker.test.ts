@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { mkdir, readdir } from "node:fs/promises";
+import { mkdir, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { eq, sql } from "drizzle-orm";
 import { providerDispatchSlots, transcriptionAttempts, transcriptionRegions, transcriptionResults, transcriptions, transcriptionWorkers } from "../../src/db/schema.ts";
@@ -7,7 +7,8 @@ import { runSweep, retentionLagSeconds } from "../../src/uploads/ledger.ts";
 import type { FaultPoint } from "../../src/uploads/faults.ts";
 import { jobDir, jobsRoot } from "../../src/uploads/storage.ts";
 import { claimNext, insertRegions, processClaim, recordWorkerHeartbeat, REGION_INSERT_CHUNK, startBatchWorker } from "../../src/uploads/worker.ts";
-import { detectSpeech, VAD } from "../../src/uploads/vad.ts";
+import { detectSpeech, frameEnergies, summarizeVad, VAD } from "../../src/uploads/vad.ts";
+import { speakerTurns, UNKNOWN_SPEAKER } from "../../src/uploads/diarize.ts";
 import { PCM_RATE } from "../../src/uploads/audio.ts";
 import { pcmToWav } from "../../src/providers/transcription/audio.ts";
 import { pcmFromLevels, quietSpeechLevels } from "../support/vad-fixtures.ts";
@@ -335,6 +336,105 @@ describe("diarization", () => {
   const alternating = [0, 2, 4, 6, 8, 10, 12, 14].map((s, i) => ({ startMs: s * 1000, endMs: s * 1000 + 1_500, speaker: i % 2 ? 3 : 7 }));
   afterEach(() => {
     h.ctx.diarizer = null;
+    h.ctx.config.vad.quietMode = true;
+  });
+
+  async function synthetic(levels = quietSpeechLevels()) {
+    const pcm = pcmFromLevels(levels), path = join(h.uploadDir, "expected.pcm");
+    await Bun.write(path, pcm);
+    const energies = await frameEnergies(path);
+    await rm(path);
+    return { bytes: pcmToWav(pcm, PCM_RATE), energies };
+  }
+
+  test("diarized quiet speech adds missed audio once, exposes quiet stats and gives unknown a valid result id", async () => {
+    const audio = await synthetic();
+    const segments = [{ startMs: 12_000, endMs: 13_000, speaker: 7 }, { startMs: 70_000, endMs: 70_500, speaker: 3 }];
+    h.ctx.diarizer = { diarize: async () => segments };
+    const id = await h.submit(audio.bytes, { contentType: "audio/wav", body: { diarize: true } });
+    await h.work();
+    const body = await (await result(id)).json();
+    expect(body).toMatchObject({ status: "completed", diarized: true, channels: 1,
+      speakers: [{ id: "speaker_0", name: "Unknown speaker", channel: 0 }, { id: "speaker_1", name: "Speaker 2", channel: 0 }, { id: "speaker_2", name: "Speaker 3", channel: 0 }],
+      stats: { vad_mode: "quiet", vad_fallback: false, tinfoil_calls: 5, tinfoil_audio_seconds: 23, voiced_seconds: 23,
+        dropped_above_floor_pct: 0, dropped_above_noise_pct: 0 },
+    });
+    const saved = (await regions(id)).sort((a, b) => a.startMs - b.startMs);
+    expect(saved.some((r) => r.speaker === UNKNOWN_SPEAKER)).toBe(true);
+    expect(body.stats).toMatchObject(summarizeVad([{ energies: audio.energies, regions: saved, mode: "quiet" }]));
+    for (const [i, r] of saved.entries()) {
+      expect(r.endMs - r.startMs).toBeLessThanOrEqual(30_000);
+      if (i) expect(r.startMs).toBeGreaterThanOrEqual(saved[i - 1]!.endMs);
+    }
+    expect(h.tinfoil.calls.map((call) => call.filename)).toEqual(saved.map((r) => `${id}-${r.ordinal}.wav`));
+    expect(body.segments.every((s: { speaker_id: string }) => body.speakers.some((p: { id: string }) => p.id === s.speaker_id))).toBe(true);
+    expect(body.text).toStartWith("Unknown speaker: words 1");
+  });
+
+  test("an empty diarizer result recovers gated speech with one valid unknown speaker", async () => {
+    const audio = await synthetic();
+    h.ctx.diarizer = { diarize: async () => [] };
+    const id = await h.submit(audio.bytes, { contentType: "audio/wav", body: { diarize: true } });
+    await h.work();
+    const body = await (await result(id)).json();
+    expect(body).toMatchObject({ status: "completed", diarized: true,
+      speakers: [{ id: "speaker_0", name: "Unknown speaker", channel: 0 }],
+      stats: { voiced_seconds: 22, vad_mode: "quiet", dropped_above_noise_pct: 0 },
+    });
+  });
+
+  test("flag-off and gate-failing diarized jobs keep the exact old intervals, attribution and stats", async () => {
+    const segments = [{ startMs: 12_000, endMs: 13_000, speaker: 7 }];
+    h.ctx.diarizer = { diarize: async () => segments };
+    for (const [enabled, levels] of [[false, quietSpeechLevels()], [true, new Float64Array(1_000).fill(-25)]] as const) {
+      const audio = await synthetic(levels);
+      h.ctx.config.vad.quietMode = enabled;
+      const id = await h.submit(audio.bytes, { contentType: "audio/wav", body: { diarize: true } });
+      await h.work();
+      const body = await (await result(id)).json(), expected = speakerTurns(segments, audio.energies);
+      expect(body.segments.map((s: { start: number; end: number; speaker_id: string }) => [s.start * 1000, s.end * 1000, s.speaker_id]))
+        .toEqual(expected.map((r) => [r.startMs, r.endMs, "speaker_0"]));
+      expect((await regions(id)).map(({ startMs, endMs, speaker }) => ({ startMs, endMs, speaker }))).toEqual(expected);
+      expect(body.stats).toMatchObject(summarizeVad([{ energies: audio.energies, regions: expected, mode: "primary" }]));
+      expect(body.speakers).toEqual([{ id: "speaker_0", name: "Speaker 1", channel: 0 }]);
+    }
+  });
+
+  test("a non-diarized quiet job retains #99 intervals and stats and never calls the diarizer", async () => {
+    const audio = await synthetic();
+    h.ctx.diarizer = { diarize: async () => { throw new Error("non-diarized job called diarizer"); } };
+    const id = await h.submit(audio.bytes, { contentType: "audio/wav", body: { channel_mode: "mixed", diarize: false } });
+    await h.work();
+    const body = await (await result(id)).json(), expected = detectSpeech(audio.energies);
+    expect((await regions(id)).map(({ startMs, endMs }) => ({ startMs, endMs }))).toEqual(expected.regions);
+    expect(body.stats).toMatchObject(expected.stats);
+    expect(body).toMatchObject({ status: "completed", diarized: false, speakers: [{ id: "channel_0", name: "Speaker 1", channel: 0 }],
+      stats: { tinfoil_calls: 2, tinfoil_audio_seconds: 22, voiced_seconds: 22, vad_fallback: false },
+    });
+  });
+
+  test("diarized quiet coverage and stats roll back together and survive a flag change on re-claim", async () => {
+    const audio = await synthetic();
+    h.ctx.diarizer = { diarize: async () => [{ startMs: 12_000, endMs: 13_000, speaker: 7 }] };
+    const id = await h.submit(audio.bytes, { contentType: "audio/wav", body: { diarize: true } });
+    h.faults.once("worker.regions_inserted", "crash");
+    await expect(h.work()).rejects.toThrow("simulated crash");
+    expect(await regions(id)).toEqual([]);
+    expect((await h.row(id)).vadStats).toBeNull();
+    await h.ctx.db.update(transcriptions).set({ claimHeartbeatAt: new Date(Date.now() - 120_000) }).where(eq(transcriptions.id, id));
+    h.faults.once("worker.after_regions", "crash");
+    await expect(h.work()).rejects.toThrow("simulated crash");
+    const saved = await regions(id), stats = (await h.row(id)).vadStats;
+    expect(stats?.vad_mode).toBe("quiet");
+    h.ctx.config.vad.quietMode = false;
+    h.ctx.diarizer = { diarize: async () => { throw new Error("saved regions must not be redetected"); } };
+    await h.ctx.db.update(transcriptions).set({ claimHeartbeatAt: new Date(Date.now() - 120_000) }).where(eq(transcriptions.id, id));
+    await h.work();
+    expect((await regions(id)).map(({ startMs, endMs, speaker }) => ({ startMs, endMs, speaker })))
+      .toEqual(saved.map(({ startMs, endMs, speaker }) => ({ startMs, endMs, speaker })));
+    const body = await (await result(id)).json();
+    expect(body.status).toBe("completed");
+    expect(body.stats).toMatchObject(stats!);
   });
 
   test("diarize: true sends each speaker turn of the mono mix once and labels speakers by first appearance", async () => {

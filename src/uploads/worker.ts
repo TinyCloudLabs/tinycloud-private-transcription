@@ -6,7 +6,7 @@ import { providerDispatchSlots, transcriptionAdmission, transcriptionAttempts, t
 import { pcmToWav } from "../providers/transcription/audio.ts";
 import { decodeChannelToPcm, PCM_RATE, readPcmRange } from "./audio.ts";
 import type { BatchContext } from "./context.ts";
-import { speakerTurns, type SpeakerSegment } from "./diarize.ts";
+import { detectDiarizedSpeech, UNKNOWN_SPEAKER, type SpeakerSegment } from "./diarize.ts";
 import type { JobErrorCode } from "./errors.ts";
 import { isSimulatedCrash } from "./faults.ts";
 import { fenceGuard, holdFence, LostFence, type DbOrTx, type Fence } from "./fence.ts";
@@ -232,9 +232,9 @@ async function vadRegions(ctx: BatchContext, job: TranscriptionRow, fence: Fence
 }
 
 /**
- * Speaker turns of the mono mix (channel 0). A job whose diarization cannot run (the stage failed, or was switched off
- * after the job was accepted) fails processing_failed, fenced, and this returns null. The diarizer, not the VAD
- * threshold, decides what is speech, so there is no fallback; the unsent non-silent share is still recorded.
+ * Speaker turns of the mono mix (channel 0), extended by quiet VAD coverage when enabled and its gate passes.
+ * A job whose diarization cannot run (the stage failed, or was switched off after acceptance) fails processing_failed,
+ * fenced, and this returns null. The fallback flag stays false; coverage stats describe the final sent regions.
  */
 async function diarizeTurns(ctx: BatchContext, job: TranscriptionRow, fence: Fence, pcmPath: string, signal: AbortSignal): Promise<DetectedRegions | null> {
   let segments: SpeakerSegment[];
@@ -251,12 +251,13 @@ async function diarizeTurns(ctx: BatchContext, job: TranscriptionRow, fence: Fen
     return null;
   }
   const energies = await frameEnergies(pcmPath);
-  const turns = speakerTurns(segments, energies);
+  const vad = { ...VAD, quiet: { ...VAD.quiet, enabled: ctx.config.vad.quietMode } };
+  const { turns, stats } = detectDiarizedSpeech(segments, energies, vad);
   return {
     regions: turns.map((turn) => ({ ...turn, channel: 0 })),
     droppedAboveFloorPct: percent(droppedAboveFloorFrames(energies, turns), aboveFloorFrames(energies)),
     fallback: false,
-    stats: summarizeVad([{ energies, regions: turns, mode: "primary" }]),
+    stats,
   };
 }
 
@@ -429,7 +430,7 @@ async function assemble(ctx: BatchContext, job: TranscriptionRow, fence: Fence) 
     const order = new Map<number, number>();
     if (job.diarize) for (const region of spoken) if (!order.has(region.speaker!)) order.set(region.speaker!, order.size);
     const speakers = job.diarize
-      ? [...order.values()].map((n) => ({ id: `speaker_${n}`, name: `Speaker ${n + 1}`, channel: 0 }))
+      ? [...order].map(([speaker, n]) => ({ id: `speaker_${n}`, name: speaker === UNKNOWN_SPEAKER ? "Unknown speaker" : `Speaker ${n + 1}`, channel: 0 }))
       : channels.map((channel) => ({ id: `channel_${channel}`, name: job.channelLabels[channel] ?? `Speaker ${channel + 1}`, channel }));
     const segments = spoken.map((region, index) => ({
       id: `seg_${String(index + 1).padStart(4, "0")}`,

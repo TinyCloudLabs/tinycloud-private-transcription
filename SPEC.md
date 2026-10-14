@@ -214,13 +214,19 @@ detected before TC-1045. TC-1093 adds `vad_mode: "primary" | "fallback" | "quiet
 an empty input has p10/p50/p99 = −120 and zero counts. Percentiles use floor-index order statistics.
 For separate stereo, scalar diagnostics pool the channel frames; `speech_peak_s` sums channel-frame duration and
 can exceed wall-clock duration. The gate runs per channel; the job mode is quiet if any channel is quiet, otherwise
-fallback if any falls back, otherwise primary. Diarized jobs keep the diarizer's regions and report primary with
-diagnostics measured against those actual regions. These six additions are persisted with the regions and retained
+fallback if any falls back, otherwise primary. Diarized jobs keep the diarizer's regions; when quiet mode is enabled
+and its gate passes, they add the exact quiet-VAD coverage outside those turns and report quiet. Otherwise they
+report primary. Both drop metrics describe the final regions; `vad_fallback` stays false for diarized jobs.
+These six additions are persisted with the regions and retained
 across re-claims; they are absent for jobs detected before TC-1093. Existing saved results are returned unchanged.
 Without `diarize`, `diarized` is false, speakers are `channel_N` (named by `channel_labels`) and
 timestamps are region-level (VAD regions, below). With `diarize`, `diarized` is true, `channels` is 1, speakers are
 `{id:"speaker_N", name:"Speaker N+1", channel:0}` (N 0–31, numbered by first appearance; only speakers with text are
-listed) and every segment is one speaker turn on channel 0, in time order. Results stored before `diarized` existed
+listed) and every segment is one speaker turn on channel 0, in time order. Recovered audio without speaker evidence
+uses an ordinary `speaker_N` id named `Unknown speaker`. Recovered intervals shorter than 0.4 s that touch a turn
+are absorbed into its nearest speaker (ties to the earlier turn). At the 32-speaker limit, added audio is attributed
+to the nearest existing turn instead of adding an unknown speaker. The exact union has no duplicate audio; requests
+stay at most 30 s, including when a recovered sliver extends a capped turn. Results stored before `diarized` existed
 are returned with `diarized: false`.
 
 `content_type` → container: `audio/mpeg` mp3, `audio/wav` WAV, `audio/ogg` Ogg (Vorbis/Opus/FLAC), `audio/mp4`
