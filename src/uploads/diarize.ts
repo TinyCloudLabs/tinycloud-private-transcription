@@ -3,7 +3,7 @@ import { availableParallelism } from "node:os";
 import { join } from "node:path";
 import { PCM_BYTES_PER_SECOND, PCM_RATE } from "./audio.ts";
 import type { BatchConfig } from "./config.ts";
-import { splitLong, VAD, type Region } from "./vad.ts";
+import { detectSpeech, splitLong, summarizeVad, VAD, type Region, type VadParams, type VadStats } from "./vad.ts";
 
 /**
  * Speaker diarization for `diarize: true` jobs: sherpa-onnx (pyannote segmentation-3.0 + NeMo TitaNet-S embeddings,
@@ -57,6 +57,9 @@ export interface SpeakerSegment {
 export interface Turn extends Region {
   speaker: number;
 }
+
+/** Internal only: assembly gives this an ordinary speaker_<n> id named "Unknown speaker". */
+export const UNKNOWN_SPEAKER = -1;
 
 export interface Diarizer {
   /** Speaker segments of a 16 kHz mono s16le PCM file. `signal` kills the diarizer process. */
@@ -399,6 +402,81 @@ export function speakerTurns(segments: readonly SpeakerSegment[], energies: Floa
       endMs: Math.min(turn.endMs + DIARIZATION.padMs, i + 1 < turns.length ? Math.floor((turn.endMs + turns[i + 1]!.startMs) / 2) : totalMs),
     }))
     .flatMap((turn) => splitLong(turn, energies).map((region) => ({ ...region, speaker: turn.speaker })));
+}
+
+/** Keep the exact old diarized path unless the existing quiet detector selects quiet coverage. */
+export function detectDiarizedSpeech(segments: readonly SpeakerSegment[], energies: Float64Array, vad: VadParams = VAD): { turns: Turn[]; stats: VadStats } {
+  const original = speakerTurns(segments, energies);
+  const detection = vad.quiet.enabled ? detectSpeech(energies, vad) : null;
+  const quiet = detection?.stats.vad_mode === "quiet";
+  const turns = quiet ? unionQuietTurns(original, detection.regions, energies, vad) : original;
+  return { turns, stats: summarizeVad([{ energies, regions: turns, mode: quiet ? "quiet" : "primary" }], vad) };
+}
+
+/** Exact coverage union. Existing attribution wins; only uncovered audio needs a speaker. Inputs are sorted and disjoint. */
+export function unionQuietTurns(turns: readonly Turn[], regions: readonly Region[], energies: Float64Array, vad: VadParams = VAD): Turn[] {
+  // Undo VAD request cuts before subtraction: a cut is not an attribution boundary or a short recovered gap.
+  const coverage: Region[] = [];
+  for (const region of regions) {
+    const last = coverage.at(-1);
+    if (last && region.startMs <= last.endMs) last.endMs = Math.max(last.endMs, region.endMs);
+    else coverage.push({ ...region });
+  }
+  const added: Turn[] = [];
+  const unknownFits = new Set(turns.map((turn) => turn.speaker)).size < DIARIZATION.maxSpeakers;
+  const add = (startMs: number, endMs: number, before: Turn | undefined, after: Turn | undefined) => {
+    const touches = before?.endMs === startMs || after?.startMs === endMs;
+    if (endMs - startMs < DIARIZATION.minTurnMs && touches) {
+      // Absorb a recovered sliver into the nearest touching turn; ties go to the earlier speaker.
+      const centre = (startMs + endMs) / 2;
+      const speaker = before && (!after || centre - before.endMs <= after.startMs - centre) ? before.speaker : after!.speaker;
+      added.push({ startMs, endMs, speaker });
+    } else if (unknownFits) {
+      added.push({ startMs, endMs, speaker: UNKNOWN_SPEAKER });
+    } else {
+      // A 33rd public speaker would violate the relay contract. Use the nearest existing turn instead.
+      let boundary = before && after ? Math.floor((before.endMs + after.startMs) / 2) : before ? endMs : startMs;
+      if (boundary > startMs && boundary < endMs && Math.min(boundary - startMs, endMs - boundary) < DIARIZATION.minTurnMs) {
+        // A partial gap can straddle the midpoint by only 50 ms. Keep it with the touching side, avoiding a tiny
+        // standalone request for the distant speaker. Without a touching side, keep the whole nearest-side interval.
+        const centre = (startMs + endMs) / 2;
+        const useBefore = before?.endMs === startMs || (after?.startMs !== endMs && before && (!after || centre - before.endMs <= after.startMs - centre));
+        boundary = useBefore ? endMs : startMs;
+      }
+      if (before && startMs < boundary) added.push({ startMs, endMs: Math.min(endMs, boundary), speaker: before.speaker });
+      if (after && endMs > boundary) added.push({ startMs: Math.max(startMs, boundary), endMs, speaker: after.speaker });
+    }
+  };
+  let next = 0;
+  for (const region of coverage) {
+    let cursor = region.startMs;
+    while (next < turns.length && turns[next]!.endMs <= cursor) next++;
+    while (cursor < region.endMs) {
+      const turn = turns[next];
+      if (!turn || turn.startMs >= region.endMs) {
+        add(cursor, region.endMs, turns[next - 1], turn);
+        break;
+      }
+      if (turn.startMs > cursor) add(cursor, turn.startMs, turns[next - 1], turn);
+      cursor = Math.max(cursor, turn.endMs);
+      if (turn.endMs <= region.endMs) next++;
+    }
+  }
+  const combined: Turn[] = [];
+  for (const turn of [...turns, ...added].sort((a, b) => a.startMs - b.startMs)) {
+    const last = combined.at(-1);
+    if (last && last.speaker === turn.speaker && last.endMs === turn.startMs) last.endMs = turn.endMs;
+    else combined.push({ ...turn });
+  }
+  return combined.flatMap((turn) => {
+    const cuts = splitLong(turn, energies, vad);
+    const last = cuts.at(-1), previous = cuts.at(-2);
+    if (last && previous && last.endMs - last.startMs < DIARIZATION.minTurnMs) {
+      // Extending a capped turn by 50 ms must not create a new 50 ms request: rebalance the final cut.
+      previous.endMs = last.startMs = last.endMs - DIARIZATION.minTurnMs;
+    }
+    return cuts.map((region) => ({ ...region, speaker: turn.speaker }));
+  });
 }
 
 function mergeSameSpeaker(turns: Turn[]): Turn[] {

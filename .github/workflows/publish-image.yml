@@ -65,8 +65,11 @@ jobs:
       - name: Build and push
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        env:
+          BUILDX_METADATA_PROVENANCE: disabled
         with:
           context: .
+          provenance: false
           platforms: linux/amd64
           push: true
           tags: ${{ steps.tags.outputs.tags }}
@@ -113,8 +116,11 @@ jobs:
       - name: Build and push Signal seat
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        env:
+          BUILDX_METADATA_PROVENANCE: disabled
         with:
           context: .
+          provenance: false
           file: infra/signal-seat/Dockerfile
           platforms: linux/amd64
           push: true
