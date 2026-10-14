@@ -1,8 +1,8 @@
 # ptx-batch runbook
 
 `ptx-batch` is the dedicated batch-transcription CVM (`PTX_ROLE=batch`; contract in [SPEC.md](../../SPEC.md#batch-transcription-ptx_rolebatch)).
-It runs `api`, `upload-worker` and Postgres from [`app-compose.yaml`](./app-compose.yaml): no Vexa, Redis, Signal,
-Whisper or docker.sock. It is a separate CVM with its own Tinfoil credential; **ptx-dev (the live meeting service) is
+It runs `api`, `upload-worker`, Postgres and the `log-shipper` sidecar from [`app-compose.yaml`](./app-compose.yaml): no
+Vexa, Redis, Signal, Whisper or docker.sock. It is a separate CVM with its own Tinfoil credential; **ptx-dev (the live meeting service) is
 never touched by anything here.**
 
 Deploys run only through the manual workflow [`deploy-batch.yml`](../../.github/workflows/deploy-batch.yml). Merging
@@ -44,8 +44,9 @@ that run's summary and open a PR that sets both `image:` lines to `api:<sha>@sha
 
 The first creation needs an image that contains migration 0018 (a fresh install starts with admission `closed`); the
 workflow refuses a pin whose commit lacks `src/db/migrations/0018_batch_admission_closed.sql`, because an older image
-seeds admission `open`. The order is: merge the change to `main` → `publish-image.yml` publishes that commit's image →
-re-pin PR (both `image:` lines) merged → dispatch the create.
+seeds admission `open`. For this logging change, the current API image pin predates the completion fields and shipper; after
+merge, publish the new image and open the required re-pin PR before deployment. The order remains:
+merge → `publish-image.yml` publishes → re-pin PR merged → dispatch.
 
 ## Deploy
 
@@ -94,19 +95,25 @@ dockerd. The four service caps total 896 MiB (api 320m + worker 320m + Postgres 
 | postgres | 192m | 64m | tuned Postgres; unshipped |
 | log-shipper | 64m, 0.25 CPU | — | Vector allowlist and Better Stack HTTP sink; memory buffer capped at 1,000 events |
 
-The four limits leave 1,003,282,432 B to the guest. The sidecar stays capped at 64 MiB and a quarter CPU; the local
-burst rehearsal measures its peak RSS before approval. Api and worker use Docker's asynchronous fluentd driver; if
-Vector is down, logging can be lost once Docker's bounded buffer fills, but the applications continue. Postgres remains
-on local json-file logs.
+The four limits leave 1,003,282,432 B to the guest. The 8,192-event Docker queues are each budgeted at 4 KiB per line:
+`4 KiB × 8,192 × 2 producers = 67,108,864 B` worst-case payload. This memory is in dockerd, outside service cgroups
+but inside the guest headroom; if both queues are full, 936,173,568 B remains for guest OS, dstack and dockerd work.
+An 8,192-event burst with the stub sink stopped measured a sampled Vector container-memory peak of 16.83 MiB, below
+the 48 MiB review threshold. The sidecar stays capped at 64 MiB and a quarter CPU. Api and worker use Docker's
+driver; if Vector is down, logging can be lost once Docker's bounded buffer fills, but the applications continue.
+Postgres remains on local json-file logs.
 
 `max_connections=40` covers the Bun.SQL pools (10 each: api, its boot migrator, worker) and the 3 superuser slots. A cgroup
 limit also counts page cache, which the kernel reclaims first, so a container sitting near its limit while it writes
 PCM is normal. An OOM kill stays inside that container.
 
 **Private logs.** [`log-shipper/vector.yaml`](./log-shipper/vector.yaml) is the canonical Vector allowlist embedded in
-the compose. Docker forwards api and worker logs asynchronously to the sidecar on loopback; unknown tags are dropped,
-non-JSON system lines are redacted and capped at 300 characters, and structured lines are rebuilt from explicit safe
-fields. Postgres stays local and unshipped. The source token is supplied only by the `BETTERSTACK_SOURCE_TOKEN`
+the compose; the vendored `fields.json` is the field/event contract checked against the generated VRL. Docker forwards
+api and worker logs asynchronously to the sidecar on loopback. The transform drops unknown tags/events, non-JSON,
+non-object and partial records, rebuilding accepted JSON events from fresh, schema-bounded scalar fields only; dropped
+records increment Vector's `component_discarded_events_total` metric. Postgres stays local and unshipped because its
+diagnostic output can contain SQL/error context; Vector stays local and unshipped to avoid feeding its own logs back
+through Fluentd. Both use capped json-file logging. The source token is supplied only by the `BETTERSTACK_SOURCE_TOKEN`
 secret in GitHub Environment `ptx-batch`; Vector writes it mode 0600 to its directory secrets backend and unsets the
 environment variable before starting. The sidecar is capped at 64 MiB and 0.25 CPU, with a bounded 1,000-event sink
 buffer. If it is unavailable, fluentd-async avoids blocking the applications; buffered log loss is possible.
@@ -211,3 +218,28 @@ boot (the sweeper retries pending deletions and removes unauthorized files).
   80%, or `retention_lag_seconds` exceeds 300. Logs are content-free JSON; `alert: true` marks operator faults (provider
   401/403/404, failed unlink, artifact reappearing after verified deletion, disk high-water, retention lag).
 - Logs are not public (`--no-public-logs`): `phala logs ptx-batch -f`, `phala logs ptx-batch --serial --tail 200`.
+
+## Logging sidecar
+
+The `log-shipper` accepts only `ptx-batch.api` and `ptx-batch.worker` Fluent events. It parses JSON objects, maps exact
+application messages to the closed snake_case event IDs, validates every retained field, and constructs a fresh output
+record; unknown messages, malformed/non-object JSON, partial Docker records, and unknown tags are dropped. Vector's
+`component_discarded_events_total` is the internal drop counter. The canonical shared field contract is vendored at
+[`log-shipper/fields.json`](./log-shipper/fields.json) and is tested against the VRL allowlist in CI.
+
+Postgres remains on capped `json-file` because database diagnostics can carry SQL and error context; it is intentionally
+not routed to Better Stack. Vector also remains on capped `json-file`: shipping its own Fluent source logs would create
+a feedback loop. Neither service is attached to the shipper's input, so neither reaches the telemetry sink.
+
+The API and worker use `fluentd-async: true` with `fluentd-buffer-limit: 8192` events each. The enumerated logger
+call-sites and field maxima bound each application line to a conservative 4 KiB; two producer queues therefore retain at
+most `4 KiB × 8192 × 2 = 67,108,864 B` of payload. That queue memory is in dockerd, outside service cgroups but inside
+the guest's 1,003,282,432 B headroom; a full queue leaves 936,173,568 B for the remaining guest/dockerd work.
+The four service limits total 896 MiB: API 320 MiB, worker 320 MiB, Postgres 192 MiB and Vector 64 MiB.
+Rerun the `batch-envelope.yml` 2-hour memory proof before deployment.
+
+`BETTERSTACK_SOURCE_TOKEN` is supplied only through the GitHub `ptx-batch` environment secret. The entrypoint writes
+it with umask 077 to Vector's directory secrets backend and unsets the shell variable before starting Vector. This does
+not hide the initial container environment from Docker: `docker inspect`/the Docker API can expose the token in
+`Config.Env`, just as they can expose `POSTGRES_PASSWORD`. Trusted Docker-daemon/root users can read it; this is not
+an isolation boundary.

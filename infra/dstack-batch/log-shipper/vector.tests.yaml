@@ -1,191 +1,374 @@
 tests:
-  - name: batch completion keeps only approved metrics
+  - name: "completed job exports exactly the TC-1045 fields"
     inputs:
       - insert_at: allowlist
         type: log
         log_fields:
-          tag: ptx-batch.worker
-          log: '{"ts":"2026-10-14T10:00:00Z","level":"info","msg":"batch job finished","job_id":"trn_01J9ABCDEF0123456789ABCDEF","status":"completed","code":null,"stage":"assemble","outcome":"completed","duration_seconds":6.5,"tinfoil_calls":2,"tinfoil_audio_seconds":5,"voiced_seconds":4.5,"dropped_above_floor_pct":2,"vad_fallback":false,"segments":2,"content_type":"audio/mpeg","text":"secret transcript","ownerId":"secret-owner"}'
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch job finished\",\"job_id\":\"trn_01J9ABCDEF0123456789ABCDEF\",\"outcome\":\"completed\",\"code\":null,\"duration_seconds\":6.5,\"tinfoil_calls\":2,\"tinfoil_audio_seconds\":5,\"voiced_seconds\":4.5,\"dropped_above_floor_pct\":2,\"vad_fallback\":false,\"segments\":2,\"content_type\":\"audio/mpeg\",\"text\":\"transcript-probe\",\"ownerId\":\"owner-probe\"}"
     outputs:
       - extract_from: allowlist
         conditions:
           - type: vrl
             source: |
-              assert_eq!(.event, "batch job finished")
+              assert_eq!(.event, "batch_job_finished")
+              assert_eq!(.svc, "worker")
               assert_eq!(.job_id, "trn_01J9ABCDEF0123456789ABCDEF")
-              assert_eq!(.status, "completed")
-              assert_eq!(.code, null)
-              assert_eq!(.stage, "assemble")
               assert_eq!(.outcome, "completed")
+              assert_eq!(.code, null)
               assert_eq!(.duration_seconds, 6.5)
               assert_eq!(.tinfoil_calls, 2)
-              assert_eq!(.tinfoil_audio_seconds, 5)
+              assert_eq!(.tinfoil_audio_seconds, 5.0)
               assert_eq!(.voiced_seconds, 4.5)
-              assert_eq!(.dropped_above_floor_pct, 2)
+              assert_eq!(.dropped_above_floor_pct, 2.0)
               assert_eq!(.vad_fallback, false)
               assert_eq!(.segments, 2)
               assert_eq!(.content_type, "audio/mpeg")
+              assert_eq!(length(keys(.)), 15)
+              assert!(!exists(.status))
+              assert!(!exists(.stage))
               assert!(!exists(.text))
               assert!(!exists(.ownerId))
-              assert_eq!(length(keys(.)), 16)
-  - name: no speech completion preserves known and null metrics
+  - name: "no speech completion preserves only its eleven fields"
     inputs:
       - insert_at: allowlist
         type: log
         log_fields:
-          tag: ptx-batch.worker
-          log: '{"level":"info","msg":"batch job finished","job_id":"trn_01J9ABCDEF0123456789ABCDEF","status":"failed","code":"no_speech","stage":"vad","outcome":"no_speech","duration_seconds":7,"tinfoil_calls":null,"tinfoil_audio_seconds":null,"voiced_seconds":null,"dropped_above_floor_pct":null,"vad_fallback":null,"segments":0,"content_type":"audio/wav"}'
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch job finished\",\"job_id\":\"trn_01J9ABCDEF0123456789ABCDEF\",\"outcome\":\"no_speech\",\"code\":\"no_speech\",\"duration_seconds\":7,\"tinfoil_calls\":0,\"tinfoil_audio_seconds\":null,\"voiced_seconds\":null,\"dropped_above_floor_pct\":null,\"vad_fallback\":null,\"segments\":0,\"content_type\":\"audio/wav\",\"stage\":\"vad\",\"status\":\"failed\"}"
     outputs:
       - extract_from: allowlist
         conditions:
           - type: vrl
             source: |
-              assert_eq!(.job_id, "trn_01J9ABCDEF0123456789ABCDEF")
-              assert_eq!(.status, "failed")
-              assert_eq!(.code, "no_speech")
-              assert_eq!(.stage, "vad")
               assert_eq!(.outcome, "no_speech")
-              assert_eq!(.duration_seconds, 7)
-              assert_eq!(.tinfoil_calls, null)
+              assert_eq!(.code, "no_speech")
+              assert_eq!(.tinfoil_calls, 0)
               assert_eq!(.tinfoil_audio_seconds, null)
               assert_eq!(.voiced_seconds, null)
               assert_eq!(.dropped_above_floor_pct, null)
               assert_eq!(.vad_fallback, null)
               assert_eq!(.segments, 0)
               assert_eq!(.content_type, "audio/wav")
-              assert_eq!(length(keys(.)), 16)
-  - name: batch request event excludes all unapproved fields
+              assert_eq!(length(keys(.)), 15)
+              assert!(!exists(.status))
+              assert!(!exists(.stage))
+  - name: "real create event retains validated identifiers"
     inputs:
       - insert_at: allowlist
         type: log
         log_fields:
-          tag: ptx-batch.api
-          log: '{"level":"info","msg":"batch transcription create","stage":"create","transcriptionId":"01J9ABCDEF0123456789ABCDEF","correlationId":"01J9ABCDEF0123456789ABCDEF","created":true,"owner":"secret","address":"person@example.com"}'
+          tag: "ptx-batch.api"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch transcription create\",\"stage\":\"create\",\"transcriptionId\":\"trn_01J9ABCDEF0123456789ABCDEF\",\"correlationId\":\"f083fd48-372b-4234-b1c9-b1ddab23ab00\",\"created\":true,\"owner\":\"owner-probe\",\"address\":\"owner@example.invalid\"}"
     outputs:
       - extract_from: allowlist
         conditions:
           - type: vrl
             source: |
-              assert_eq!(.event, "batch transcription create")
-              assert!(!exists(.created))
-              assert!(!exists(.owner))
-              assert!(!contains(encode_json(.), "person@example.com"))
-  - name: correlation and job identifiers require expected opaque formats
-    inputs:
-      - insert_at: allowlist
-        type: log
-        log_fields:
-          tag: ptx-batch.api
-          log: '{"level":"info","msg":"batch transcription create","transcriptionId":"trn_01J9ABCDEF0123456789ABCDEF","correlationId":"did:pkh:eip155:1:0xd559CCd9EB87c530A9a349262669386dE93cf412"}'
-    outputs:
-      - extract_from: allowlist
-        conditions:
-          - type: vrl
-            source: |
+              assert_eq!(.svc, "api")
+              assert_eq!(.event, "batch_transcription_create")
+              assert_eq!(.stage, "create")
               assert_eq!(.transcriptionId, "trn_01J9ABCDEF0123456789ABCDEF")
-              assert!(!exists(.correlationId))
-              assert!(!contains(encode_json(.), "d559"))
-              assert_eq!(length(keys(.)), 4)
-  - name: non-JSON system line is redacted and capped
+              assert_eq!(.correlationId, "f083fd48-372b-4234-b1c9-b1ddab23ab00")
+              assert_eq!(.created, true)
+              assert!(!exists(.owner))
+              assert!(!contains(encode_json(.), "owner@example.invalid"))
+  - name: "unknown tag is dropped"
     inputs:
       - insert_at: allowlist
         type: log
         log_fields:
-          tag: ptx-batch.api
-          log: 'client 198.51.100.22 contacted user@example.com; bearer abc.def-123'
-    outputs:
-      - extract_from: allowlist
-        conditions:
-          - type: vrl
-            source: |
-              assert!(!contains(encode_json(.), "198.51.100.22"))
-              assert!(!contains(encode_json(.), "user@example.com"))
-              assert!(length(string!(.event)) <= 300)
-  - name: unknown tag is dropped
-    inputs:
-      - insert_at: allowlist
-        type: log
-        log_fields:
-          tag: unknown.container
-          log: '{"level":"info","msg":"ignored"}'
+          tag: "untrusted.container"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch job finished\"}"
     no_outputs_from: [allowlist]
-  - name: signed kv ticket URL is redacted
+  - name: "malformed values under allowed keys are discarded"
     inputs:
       - insert_at: allowlist
         type: log
         log_fields:
-          tag: ptx-batch.api
-          log: '{"level":"info","msg":"request /signed/kv/secret-ticket-123"}'
+          tag: "ptx-batch.api"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch job finished\",\"stage\":{\"path\":\"/uploads/probe\"},\"code\":{\"owner\":\"probe\"},\"status\":\"Bearer status-probe\",\"alert\":\"203.0.113.7\",\"outcome\":\"did:pkh:eip155:1:0xdeadbeef\",\"correlationId\":\"/uploads/probe\",\"job_id\":\"/tmp/probe.wav\",\"duration_seconds\":[1],\"tinfoil_calls\":\"https://teams.microsoft.com/probe\",\"tinfoil_audio_seconds\":{\"value\":3},\"voiced_seconds\":\"Alice\",\"dropped_above_floor_pct\":\"203.0.113.9\",\"vad_fallback\":\"yes\",\"segments\":[{\"text\":\"transcript-probe\"}],\"content_type\":\"audio/wav; name=confidential.wav\"}"
+    no_outputs_from: [allowlist]
+  - name: "unknown key values never expand the output schema"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch job finished\",\"job_id\":\"trn_01J9ABCDEF0123456789ABCDEF\",\"outcome\":\"completed\",\"code\":null,\"duration_seconds\":1,\"tinfoil_calls\":1,\"tinfoil_audio_seconds\":1,\"voiced_seconds\":1,\"dropped_above_floor_pct\":0,\"vad_fallback\":false,\"segments\":1,\"content_type\":\"audio/wav\",\"text\":\"private\",\"owner\":{\"id\":\"x\"},\"filename\":\"meeting.wav\",\"arbitrary\":[1,{\"x\":\"y\"}]}"
     outputs:
       - extract_from: allowlist
         conditions:
           - type: vrl
             source: |
-              assert!(!contains(string!(.event), "secret-ticket-123"))
-  - name: authorization bearer header is redacted
+              for_each(keys(.)) -> |_i, key| {
+                assert!(includes(["svc", "level", "ts", "event", "job_id", "outcome", "code", "duration_seconds", "tinfoil_calls", "tinfoil_audio_seconds", "voiced_seconds", "dropped_above_floor_pct", "vad_fallback", "segments", "content_type"], key), "unexpected output key")
+              }
+              assert_eq!(length(keys(.)), 15)
+              assert!(!contains(encode_json(.), "private"))
+              assert!(!contains(encode_json(.), "meeting.wav"))
+              assert!(!contains(encode_json(.), "arbitrary"))
+  - name: "API request path and malformed IDs are omitted"
     inputs:
       - insert_at: allowlist
         type: log
         log_fields:
-          tag: ptx-batch.api
-          log: '{"level":"warn","msg":"Authorization: Bearer supersecret-token"}'
+          tag: "ptx-batch.api"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch transcription create\",\"stage\":\"PUT /uploads/probe\",\"transcriptionId\":\"../../private.wav\",\"correlationId\":\"not-a-uuid\",\"created\":true}"
     outputs:
       - extract_from: allowlist
         conditions:
           - type: vrl
             source: |
-              assert!(!contains(encode_json(.), "supersecret-token"))
-  - name: jwt and api key are redacted
+              assert_eq!(.event, "batch_transcription_create")
+              assert!(!exists(.stage))
+              assert!(!exists(.transcriptionId))
+              assert!(!exists(.correlationId))
+              assert!(!contains(encode_json(.), "private.wav"))
+  - name: "non-JSON lines are dropped without forwarding text"
     inputs:
       - insert_at: allowlist
         type: log
         log_fields:
-          tag: ptx-batch.api
-          log: '{"level":"error","msg":"token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.signature api_key=sk_live_12345678901234567890"}'
+          tag: "ptx-batch.api"
+          log: "error: raw path /uploads/trn_probe Authorization Basic probe-value"
+    no_outputs_from: [allowlist]
+  - name: "unparseable JSON is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":"
+    no_outputs_from: [allowlist]
+  - name: "non-object JSON is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "[\"speaker-probe\",\"transcript-probe\"]"
+    no_outputs_from: [allowlist]
+  - name: "Docker partial records are dropped before parsing"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch job finished\",\"text\":\"partial transcript\"}"
+          partial_message: true
+    no_outputs_from: [allowlist]
+  - name: "IP crossing the former truncation boundary is dropped intact"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.api"
+          log: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx 198.51.100.22"
+    no_outputs_from: [allowlist]
+  - name: "Astra: raw uploads path is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.api"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"GET /uploads/trn_01J9ABCDEF0123456789ABCDEF?token=path-probe\"}"
+    no_outputs_from: [allowlist]
+  - name: "Astra: stderr file path and job identifier are dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"error\",\"msg\":\"ffmpeg failed at /var/lib/ptx-batch/uploads/trn_01J9ABCDEF0123456789ABCDEF/audio.wav\"}"
+    no_outputs_from: [allowlist]
+  - name: "Astra: Zoom URL and password are dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.api"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"warn\",\"msg\":\"meeting https://zoom.us/j/123456789?pwd=zoom-probe\"}"
+    no_outputs_from: [allowlist]
+  - name: "Astra: unlabelled transcript text is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"We should move the launch to next Thursday after the budget review.\"}"
+    no_outputs_from: [allowlist]
+  - name: "Astra: Basic authorization text is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.api"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"error\",\"msg\":\"Authorization: Basic basic-probe-value\"}"
+    no_outputs_from: [allowlist]
+  - name: "Astra: nested owner in content_type is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch job finished\",\"job_id\":\"trn_01J9ABCDEF0123456789ABCDEF\",\"outcome\":\"completed\",\"duration_seconds\":1,\"content_type\":{\"owner\":\"owner-probe\",\"mime\":\"audio/wav\"}}"
+    no_outputs_from: [allowlist]
+  - name: "Opus A1: nested object under code is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch job finished\",\"job_id\":\"trn_01J9ABCDEF0123456789ABCDEF\",\"outcome\":\"completed\",\"duration_seconds\":1,\"content_type\":\"audio/wav\",\"code\":{\"text\":\"transcript-probe\",\"owner\":\"owner-probe\"}}"
     outputs:
       - extract_from: allowlist
         conditions:
           - type: vrl
             source: |
-              assert!(!contains(encode_json(.), "eyJhbGci"))
-              assert!(!contains(encode_json(.), "sk_live_"))
-  - name: transcript text never ships from logger message
+              assert_eq!(.code, null)
+              assert_eq!(length(keys(.)), 15)
+  - name: "Opus A2: nested segment speaker and text are dropped"
     inputs:
       - insert_at: allowlist
         type: log
         log_fields:
-          tag: ptx-batch.worker
-          log: '{"level":"info","msg":"transcript: the secret phrase spoken in the meeting"}'
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch job finished\",\"job_id\":\"trn_01J9ABCDEF0123456789ABCDEF\",\"outcome\":\"completed\",\"duration_seconds\":1,\"content_type\":\"audio/wav\",\"segments\":[{\"speaker\":\"Alice Smith\",\"text\":\"transcript-probe\"}]}"
     outputs:
       - extract_from: allowlist
         conditions:
           - type: vrl
             source: |
-              assert!(!contains(encode_json(.), "secret phrase"))
-  - name: SQL with literal values never ships
+              assert_eq!(.segments, null)
+              assert_eq!(length(keys(.)), 15)
+              assert!(!contains(encode_json(.), "Alice Smith") && !contains(encode_json(.), "transcript-probe"))
+  - name: "Opus A3: strings in allowlisted fields are all rejected"
     inputs:
       - insert_at: allowlist
         type: log
         log_fields:
-          tag: ptx-batch.api
-          log: '{"level":"error","msg":"SELECT * FROM users WHERE email = ''person@example.com''"}'
+          tag: "ptx-batch.api"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch job finished\",\"stage\":\"PUT /uploads/trn_probe?sig=signature-probe\",\"status\":\"Bearer status-probe\",\"alert\":\"203.0.113.9\",\"outcome\":\"did:pkh:eip155:1:0xdeadbeef\",\"content_type\":\"audio/wav; name=Board-layoffs-Alice.wav\",\"tinfoil_calls\":\"https://meet.google.com/abc-defg-hij\"}"
+    no_outputs_from: [allowlist]
+  - name: "Opus A4: free text message and speaker names are dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"Alice Smith: we will lay off forty people on Friday\"}"
+    no_outputs_from: [allowlist]
+  - name: "Opus A5: DSN password Basic auth API key and bearer tail are dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.api"
+          log: "error: connect failed postgres://ptx:dsn-probe@postgres:5432/ptx Authorization: Basic basic-probe Bearer abc/TAILPROBE+x== {\"apiKey\":\"key-probe\"}"
+    no_outputs_from: [allowlist]
+  - name: "Opus A6: paths file names Zoom Teams and encoded KV tickets are dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "    at open (/var/lib/ptx-batch/uploads/trn_probe/Board meeting - Alice.m4a) https://us02web.zoom.test/j/88123456789?pwd=zoom-probe https://teams.microsoft.test/l/meetup-join/teams-probe signed%2Fkv%2Fkv-probe ?ticket=kv-probe-2"
+    no_outputs_from: [allowlist]
+  - name: "Opus A7: Drizzle params continuation is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.api"
+          log: "params: trn_probe,deadbeefdeadbeef,[\"Alice Smith\",\"Bob Jones\"]"
+    no_outputs_from: [allowlist]
+  - name: "Opus A8: 16 KiB partial records are dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch job finished\",\"speakers\":[\"Alice Smith\"],\"text\":\"transcript-probe\"}"
+          partial_message: true
+    no_outputs_from: [allowlist]
+  - name: "Opus A9: non-object JSON is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "[\"Alice Smith\",\"transcript-probe\"]"
+    no_outputs_from: [allowlist]
+  - name: "Opus A11: job-finished strips status and stage"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch job finished\",\"job_id\":\"trn_01J9ABCDEF0123456789ABCDEF\",\"outcome\":\"completed\",\"duration_seconds\":1,\"content_type\":\"audio/wav\",\"tinfoil_calls\":1,\"tinfoil_audio_seconds\":1,\"voiced_seconds\":1,\"dropped_above_floor_pct\":0,\"vad_fallback\":false,\"segments\":1,\"status\":\"completed\",\"stage\":\"assemble\"}"
     outputs:
       - extract_from: allowlist
         conditions:
           - type: vrl
             source: |
-              assert!(!contains(encode_json(.), "SELECT"))
-              assert!(!contains(encode_json(.), "person@example.com"))
-  - name: meeting URL is redacted
+              assert_eq!(.event, "batch_job_finished")
+              assert!(!exists(.status))
+              assert!(!exists(.stage))
+              assert_eq!(.job_id, "trn_01J9ABCDEF0123456789ABCDEF")
+  - name: "Opus A12: tc_live and tcu credentials in free text are dropped"
     inputs:
       - insert_at: allowlist
         type: log
         log_fields:
-          tag: ptx-batch.api
-          log: '{"level":"info","msg":"meeting https://meet.google.com/abc-defg-hij"}'
-    outputs:
-      - extract_from: allowlist
-        conditions:
-          - type: vrl
-            source: |
-              assert!(!contains(encode_json(.), "abc-defg-hij"))
+          tag: "ptx-batch.api"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"warn\",\"msg\":\"rejected key tc_live_probe_api_key_123456789 and tcu_probe_capability_abcdefghijklmnopqrstuvwxyz\"}"
+    no_outputs_from: [allowlist]
+  - name: "TC-961: signed KV ticket URL is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.api"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"request /signed/kv/ticket-probe\"}"
+    no_outputs_from: [allowlist]
+  - name: "TC-961: Authorization Bearer header is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.api"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"warn\",\"msg\":\"Authorization: Bearer bearer-probe\"}"
+    no_outputs_from: [allowlist]
+  - name: "TC-961: JWT and API key are dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.api"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"jwt eyJprobe.part.signature and api_key=key-probe\"}"
+    no_outputs_from: [allowlist]
+  - name: "TC-961: transcript text is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"transcript text: private words here\"}"
+    no_outputs_from: [allowlist]
+  - name: "TC-961: SQL with literal values is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.api"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"error\",\"msg\":\"SELECT * FROM users WHERE email='owner@example.invalid'\"}"
+    no_outputs_from: [allowlist]
+  - name: "TC-961: Google Meet URL is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.api"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"meeting https://meet.google.com/abc-defg-hij\"}"
+    no_outputs_from: [allowlist]

@@ -9,32 +9,211 @@ transforms:
     inputs: [docker_fluent]
     drop_on_abort: true
     source: |
-      svc = string(.tag) ?? ""
-      line = string(.log) ?? ""
-      if svc != "ptx-batch.api" && svc != "ptx-batch.worker" { abort }
-      j, err = parse_json(line)
-      if err != null || !is_object(j) {
-        . = {"svc": svc, "event": redact(truncate(line, 300), filters: [r'\b(?:\d{1,3}\.){3}\d{1,3}\b', r'\b(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}\b', r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}', r'0x[0-9a-fA-F]{8,}', r'did:[a-z0-9]+:[A-Za-z0-9.:%_\-]+', r'tinycloud:[A-Za-z0-9.:%_\-]+', r'(?i)bearer\s+[A-Za-z0-9._\-]+', r'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.?[A-Za-z0-9_\-]*', r'/signed/kv/\S+', r'(?i)authorization\s*:\s*bearer\s+\S+', r'(?i)api[_-]?key\s*[:=]\s*\S+', r'(?i)\bsk_(?:live|test)_[A-Za-z0-9]+\b', r'(?i)\b(select|insert|update|delete)\b.*', r'(?i)transcript(?:ion)?(?: text)?\s*[:=].*', r'(?i)https?://meet\.google\.com/\S+'])}
-      } else {
-        out = {"svc": svc}
-        level = string(j.level) ?? ""
-        if level == "debug" || level == "info" || level == "warn" || level == "error" { out.level = level }
-        if j.msg != null {
-          msg = redact(string(j.msg) ?? "", filters: [r'\b(?:\d{1,3}\.){3}\d{1,3}\b', r'\b(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}\b', r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}', r'0x[0-9a-fA-F]{8,}', r'did:[a-z0-9]+:[A-Za-z0-9.:%_\-]+', r'tinycloud:[A-Za-z0-9.:%_\-]+', r'(?i)bearer\s+[A-Za-z0-9._\-]+', r'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.?[A-Za-z0-9_\-]*', r'/signed/kv/\S+', r'(?i)authorization\s*:\s*bearer\s+\S+', r'(?i)api[_-]?key\s*[:=]\s*\S+', r'(?i)\bsk_(?:live|test)_[A-Za-z0-9]+\b', r'(?i)\b(select|insert|update|delete)\b.*', r'(?i)transcript(?:ion)?(?: text)?\s*[:=].*', r'(?i)https?://meet\.google\.com/\S+'])
-          out.event = truncate(msg, 300)
+      # BEGIN GENERATED FROM fields.json
+      if exists(.partial_message) { abort }
+      if !is_string(.tag) { abort }
+      tag = .tag
+      svc = if tag == "ptx-batch.api" { "api" } else if tag == "ptx-batch.worker" { "worker" } else { abort }
+      if !is_string(.log) { abort }
+      line = .log
+      j, parse_err = parse_json(line)
+      if parse_err != null || !is_object(j) { abort }
+      if !is_string(j.msg) { abort }
+      msg = j.msg
+      event = if msg == "batch artifact deletion failed" { "batch_artifact_deletion_failed" }
+      else if msg == "batch claim recovered" { "batch_claim_recovered" }
+      else if msg == "batch artifact reappeared after verified deletion" { "batch_artifact_reappeared_after_verified_deletion" }
+      else if msg == "batch transcription create" { "batch_transcription_create" }
+      else if msg == "batch transcription cancel" { "batch_transcription_cancel" }
+      else if msg == "batch transcription delete" { "batch_transcription_delete" }
+      else if msg == "batch retention lag exceeded" { "batch_retention_lag_exceeded" }
+      else if msg == "batch request failed" { "batch_request_failed" }
+      else if msg == "batch admission mode changed" { "batch_admission_mode_changed" }
+      else if msg == "batch admission stopped by disk high-water" { "batch_admission_stopped_by_disk_high_water" }
+      else if msg == "batch upload refused by disk high-water" { "batch_upload_refused_by_disk_high_water" }
+      else if msg == "batch upload accepted" { "batch_upload_accepted" }
+      else if msg == "batch upload rejected" { "batch_upload_rejected" }
+      else if msg == "batch job finished" { "batch_job_finished" }
+      else if msg == "batch claim fenced out" { "batch_claim_fenced_out" }
+      else if msg == "batch job failed unexpectedly" { "batch_job_failed_unexpectedly" }
+      else if msg == "batch VAD fell back to the floor threshold" { "batch_vad_fell_back_to_the_floor_threshold" }
+      else if msg == "batch VAD could not cover the recording" { "batch_vad_could_not_cover_the_recording" }
+      else if msg == "batch diarization failed" { "batch_diarization_failed" }
+      else if msg == "batch provider rejected the service credential or model" { "batch_provider_rejected_the_service_credential_or_model" }
+      else if msg == "batch job failed at dispatch" { "batch_job_failed_at_dispatch" }
+      else if msg == "batch worker heartbeat failed" { "batch_worker_heartbeat_failed" }
+      else if msg == "batch sweep failed" { "batch_sweep_failed" }
+      else if msg == "batch worker iteration failed" { "batch_worker_iteration_failed" }
+      else if msg == "batch worker started" { "batch_worker_started" }
+      else { abort }
+      out = {"svc": svc, "event": event}
+      value = get(j, ["level"]) ?? null
+      if !is_string(value) { abort }
+      string_value = to_string(value) ?? ""
+      if includes(["debug","info","warn","error"], string_value) { out.level = string_value } else { abort }
+      value = get(j, ["ts"]) ?? null
+      if !is_string(value) { abort }
+      string_value = to_string(value) ?? ""
+      if length(string_value) <= 24 && match(string_value, r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$') { out.ts = string_value } else { abort }
+        value = get(j, ["correlationId"]) ?? null
+        if !is_null(value) {
+          if is_string(value) {
+            string_value = to_string(value) ?? ""
+            if length(string_value) <= 36 && match(string_value, r'^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$') { out.correlationId = string_value }
+          }
         }
-        jkeys, keys_err = keys(j)
-        for_each(["stage", "code", "status", "alert", "outcome", "tinfoil_calls", "tinfoil_audio_seconds", "voiced_seconds", "dropped_above_floor_pct", "vad_fallback", "segments", "duration_seconds", "content_type"]) -> |_i, key| {
-          if keys_err == null && includes(jkeys, key) { out = set!(out, [key], get(j, [key]) ?? null) }
+        value = get(j, ["transcriptionId"]) ?? null
+        if !is_null(value) {
+          if is_string(value) {
+            string_value = to_string(value) ?? ""
+            if length(string_value) <= 30 && match(string_value, r'^trn_[0-9A-HJKMNP-TV-Z]{26}$') { out.transcriptionId = string_value }
+          }
         }
-        correlation_id = string(j.correlationId) ?? ""
-        if length(correlation_id) == 36 && match(correlation_id, r'^[A-Fa-f0-9-]{36}') { out.correlationId = correlation_id }
-        for_each(["transcriptionId", "job_id"]) -> |_i, key| {
-          id = string(get(j, [key]) ?? "") ?? ""
-          if length(id) == 30 && match(id, r'^trn_[0-9A-HJKMNP-TV-Z]{26}') { out = set!(out, [key], id) }
+      if event == "batch_job_finished" {
+        value = get(j, ["job_id"]) ?? null
+        if is_null(value) { abort }
+        if !is_null(value) {
+          if is_string(value) {
+            string_value = to_string(value) ?? ""
+            if length(string_value) <= 30 && match(string_value, r'^trn_[0-9A-HJKMNP-TV-Z]{26}$') { out.job_id = string_value } else { abort }
+          } else { abort }
         }
-        . = out
       }
+      if !(event == "batch_job_finished") {
+        value = get(j, ["stage"]) ?? null
+        if !is_null(value) {
+          if is_string(value) {
+            string_value = to_string(value) ?? ""
+            if includes(["create","cancel","delete","health","api_unhandled","admission","upload","deletion","claim_recovery","reconcile","vad","diarize","pipeline","fence","dispatch","heartbeat","sweep","loop"], string_value) { out.stage = string_value }
+          }
+        }
+      }
+        if event == "batch_job_finished" { out.code = null }
+        value = get(j, ["code"]) ?? null
+        if !is_null(value) {
+          if is_string(value) {
+            string_value = to_string(value) ?? ""
+            if includes(["invalid_request","diarization_unavailable","unauthorized","insufficient_scope","idempotency_conflict","transcription_not_found","active_transcription_exists","recording_too_large","quota_exceeded","service_busy","service_paused","service_unavailable","upload_capability_limit","upload_capability_invalid","upload_capability_expired","upload_length_mismatch","unsupported_media_type","upload_in_progress","upload_interrupted","upload_rejected","transcript_expired","not_found","internal_error","upload_expired","upload_integrity_failed","invalid_audio","recording_too_long","unsupported_recording","no_speech","provider_unavailable","provider_outcome_unknown","processing_timeout","processing_failed","transcription_failed","cancelled"], string_value) { out.code = string_value }
+          }
+        }
+        value = get(j, ["alert"]) ?? null
+        if !is_null(value) {
+          if is_boolean(value) { out.alert = value }
+        }
+      if event == "batch_job_finished" {
+        value = get(j, ["outcome"]) ?? null
+        if is_null(value) { abort }
+        if !is_null(value) {
+          if is_string(value) {
+            string_value = to_string(value) ?? ""
+            if includes(["completed","failed","no_speech"], string_value) { out.outcome = string_value } else { abort }
+          } else { abort }
+        }
+      }
+      if event == "batch_job_finished" {
+        value = get(j, ["duration_seconds"]) ?? null
+        if is_null(value) { abort }
+        if (is_integer(value) || is_float(value)) {
+          numeric_value, conversion_err = to_float(value)
+          if conversion_err == null {
+            if numeric_value >= 0 && numeric_value <= 86400 { out.duration_seconds = numeric_value } else { abort }
+          } else { abort }
+        } else { abort }
+      }
+      if event == "batch_job_finished" {
+        if event == "batch_job_finished" { out.tinfoil_calls = null }
+        value = get(j, ["tinfoil_calls"]) ?? null
+        if is_integer(value) {
+          numeric_value, conversion_err = to_int(value)
+          if conversion_err == null {
+            if numeric_value >= 0 && numeric_value <= 100000 { out.tinfoil_calls = numeric_value }
+          }
+        }
+      }
+      if event == "batch_job_finished" {
+        if event == "batch_job_finished" { out.tinfoil_audio_seconds = null }
+        value = get(j, ["tinfoil_audio_seconds"]) ?? null
+        if (is_integer(value) || is_float(value)) {
+          numeric_value, conversion_err = to_float(value)
+          if conversion_err == null {
+            if numeric_value >= 0 && numeric_value <= 7200 { out.tinfoil_audio_seconds = numeric_value }
+          }
+        }
+      }
+      if event == "batch_job_finished" {
+        if event == "batch_job_finished" { out.voiced_seconds = null }
+        value = get(j, ["voiced_seconds"]) ?? null
+        if (is_integer(value) || is_float(value)) {
+          numeric_value, conversion_err = to_float(value)
+          if conversion_err == null {
+            if numeric_value >= 0 && numeric_value <= 7200 { out.voiced_seconds = numeric_value }
+          }
+        }
+      }
+      if event == "batch_job_finished" {
+        if event == "batch_job_finished" { out.dropped_above_floor_pct = null }
+        value = get(j, ["dropped_above_floor_pct"]) ?? null
+        if (is_integer(value) || is_float(value)) {
+          numeric_value, conversion_err = to_float(value)
+          if conversion_err == null {
+            if numeric_value >= 0 && numeric_value <= 100 { out.dropped_above_floor_pct = numeric_value }
+          }
+        }
+      }
+      if event == "batch_job_finished" {
+        if event == "batch_job_finished" { out.vad_fallback = null }
+        value = get(j, ["vad_fallback"]) ?? null
+        if !is_null(value) {
+          if is_boolean(value) { out.vad_fallback = value }
+        }
+      }
+      if event == "batch_job_finished" {
+        if event == "batch_job_finished" { out.segments = null }
+        value = get(j, ["segments"]) ?? null
+        if is_integer(value) {
+          numeric_value, conversion_err = to_int(value)
+          if conversion_err == null {
+            if numeric_value >= 0 && numeric_value <= 100000 { out.segments = numeric_value }
+          }
+        }
+      }
+      if event == "batch_job_finished" {
+        value = get(j, ["content_type"]) ?? null
+        if is_null(value) { abort }
+        if !is_null(value) {
+          if is_string(value) {
+            string_value = to_string(value) ?? ""
+            if includes(["audio/mpeg","audio/wav","audio/ogg","audio/mp4","audio/webm","audio/flac"], string_value) { out.content_type = string_value } else { abort }
+          } else { abort }
+        }
+      }
+        value = get(j, ["retentionLagSeconds"]) ?? null
+        if (is_integer(value) || is_float(value)) {
+          numeric_value, conversion_err = to_float(value)
+          if conversion_err == null {
+            if numeric_value >= 0 && numeric_value <= 31536000 { out.retentionLagSeconds = numeric_value }
+          }
+        }
+        value = get(j, ["usedPercent"]) ?? null
+        if (is_integer(value) || is_float(value)) {
+          numeric_value, conversion_err = to_float(value)
+          if conversion_err == null {
+            if numeric_value >= 0 && numeric_value <= 100 { out.usedPercent = numeric_value }
+          }
+        }
+        value = get(j, ["mode"]) ?? null
+        if !is_null(value) {
+          if is_string(value) {
+            string_value = to_string(value) ?? ""
+            if includes(["open","drain","closed"], string_value) { out.mode = string_value }
+          }
+        }
+        value = get(j, ["created"]) ?? null
+        if !is_null(value) {
+          if is_boolean(value) { out.created = value }
+        }
+      . = out
+      # END GENERATED FROM fields.json
 sinks:
   betterstack:
     type: http

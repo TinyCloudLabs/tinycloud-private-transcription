@@ -58,8 +58,8 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(composeText).not.toMatch(/image: \$\{/);
   });
 
-  test("renders the embedded Vector config byte-identically to its canonical file", () => {
-    expect(render()["log-shipper"]!.environment.VECTOR_CONFIG_YAML).toBe(read("infra/dstack-batch/log-shipper/vector.yaml"));
+  test("renders the embedded Vector config byte-identically after Compose dollar unescaping", () => {
+    expect(render()["log-shipper"]!.environment.VECTOR_CONFIG_YAML.replaceAll("$$", "$")).toBe(read("infra/dstack-batch/log-shipper/vector.yaml"));
   });
 
   test("runs the batch role with no meeting workload, docker socket, or fault injection", () => {
@@ -94,14 +94,14 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     const services = render();
     for (const [name, tag] of [["api", "ptx-batch.api"], ["upload-worker", "ptx-batch.worker"]] as const) {
       expect(services[name]!.logging).toEqual({ driver: "fluentd", options: {
-        "fluentd-address": "127.0.0.1:24224", "fluentd-async": "true", "fluentd-buffer-limit": "4194304",
+        "fluentd-address": "127.0.0.1:24224", "fluentd-async": "true", "fluentd-buffer-limit": "8192",
         tag, "cache-max-size": "20m", "cache-max-file": "5",
       } });
     }
     expect(services.postgres!.logging?.driver).toBe("json-file");
   });
 
-  test("fits tdx.small: service budgets total 928 MiB and shipper logs remain bounded", () => {
+  test("fits tdx.small: service budgets total 896 MiB and retain at least 1 GB guest headroom", () => {
     const services = render();
     const limits = { api: 320, "upload-worker": 320, postgres: 192 } as const;
     for (const [name, mib] of Object.entries(limits)) {
