@@ -95,12 +95,15 @@ dockerd. The four service caps total 896 MiB (api 320m + worker 320m + Postgres 
 | postgres | 192m | 64m | tuned Postgres; unshipped |
 | log-shipper | 64m, 0.25 CPU | — | Vector allowlist and Better Stack HTTP sink; memory buffer capped at 1,000 events |
 
-The four limits leave 1,003,282,432 B to the guest. The 8,192-event Docker queues are each budgeted at 4 KiB per line:
-`4 KiB × 8,192 × 2 producers = 67,108,864 B` worst-case payload. This memory is in dockerd, outside service cgroups
-but inside the guest headroom; if both queues are full, 936,173,568 B remains for guest OS, dstack and dockerd work.
-An 8,192-event burst with the stub sink stopped measured a sampled Vector container-memory peak of 16.83 MiB, below
-the 48 MiB review threshold. The sidecar stays capped at 64 MiB and a quarter CPU. Api and worker use Docker's
-driver; if Vector is down, logging can be lost once Docker's bounded buffer fills, but the applications continue.
+The four limits leave 1,003,282,432 B to the guest. Docker may queue raw stderr lines up to 16 KiB before Vector drops
+split partials; Docker does not enforce a per-line bound. Budget an additional assumed 1 KiB per event for Fluentd/driver
+metadata: `17 KiB × 7,000 events × 2 producers = 243,712,000 B` worst-case queue payload and overhead. This memory is in
+dockerd, outside service cgroups but inside guest headroom; `1,003,282,432 - 243,712,000 = 759,570,432 B` (~724.2 MiB)
+remains for guest OS, dstack and dockerd. The 1 KiB per-event overhead is a planning allowance, not a Docker guarantee.
+An earlier 8,192-event burst with the stub sink stopped measured a sampled Vector container-memory peak of 16.83 MiB
+(five `docker stats` samples), below the 48 MiB review threshold. This predates the final static hardening; final burst
+measurement is pending. The sidecar stays capped at 64 MiB and a quarter CPU. Api and worker use Docker's driver; if
+Vector is down, logging can be lost once Docker's bounded buffer fills, but the applications continue.
 Postgres remains on local json-file logs.
 
 `max_connections=40` covers the Bun.SQL pools (10 each: api, its boot migrator, worker) and the 3 superuser slots. A cgroup
@@ -231,12 +234,13 @@ Postgres remains on capped `json-file` because database diagnostics can carry SQ
 not routed to Better Stack. Vector also remains on capped `json-file`: shipping its own Fluent source logs would create
 a feedback loop. Neither service is attached to the shipper's input, so neither reaches the telemetry sink.
 
-The API and worker use `fluentd-async: true` with `fluentd-buffer-limit: 8192` events each. The enumerated logger
-call-sites and field maxima bound each application line to a conservative 4 KiB; two producer queues therefore retain at
-most `4 KiB × 8192 × 2 = 67,108,864 B` of payload. That queue memory is in dockerd, outside service cgroups but inside
-the guest's 1,003,282,432 B headroom; a full queue leaves 936,173,568 B for the remaining guest/dockerd work.
-The four service limits total 896 MiB: API 320 MiB, worker 320 MiB, Postgres 192 MiB and Vector 64 MiB.
-Rerun the `batch-envelope.yml` 2-hour memory proof before deployment.
+The API and worker use `fluentd-async: true` with `fluentd-buffer-limit: 7000` events each. Docker may queue raw stderr
+lines up to 16 KiB before Vector drops split partials; Docker does not enforce a per-line bound. Budget an additional
+assumed 1 KiB per event for Fluentd/driver metadata: `17 KiB × 7,000 × 2 = 243,712,000 B` worst-case queue payload and
+overhead. Queue memory is in dockerd, outside service cgroups but inside the guest's 1,003,282,432 B headroom; a full
+queue leaves `759,570,432 B` (~724.2 MiB) for guest OS, dstack and dockerd. The 1 KiB overhead is a planning allowance,
+not a Docker guarantee. The four service limits total 896 MiB: API 320 MiB, worker 320 MiB, Postgres 192 MiB and Vector
+64 MiB. Rerun the `batch-envelope.yml` 2-hour memory proof before deployment.
 
 `BETTERSTACK_SOURCE_TOKEN` is supplied only through the GitHub `ptx-batch` environment secret. The entrypoint writes
 it with umask 077 to Vector's directory secrets backend and unsets the shell variable before starting Vector. This does

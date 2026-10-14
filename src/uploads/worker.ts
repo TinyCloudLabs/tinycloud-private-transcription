@@ -474,7 +474,7 @@ async function settleDispatch(
   if (typeof result === "object") {
     logJobFinished(ctx, result.row, "failed", result.row.errorCode, {
       tinfoil_calls: result.row.tinfoilCalls,
-      tinfoil_audio_seconds: Math.round(result.row.tinfoilAudioSeconds * 1000) / 1000,
+      tinfoil_audio_seconds: result.row.tinfoilAudioSeconds === null || result.row.tinfoilAudioSeconds === undefined ? null : Math.round(result.row.tinfoilAudioSeconds * 1000) / 1000,
       voiced_seconds: null,
       dropped_above_floor_pct: result.row.vadDroppedAboveFloorPct,
       vad_fallback: result.row.vadFallback,

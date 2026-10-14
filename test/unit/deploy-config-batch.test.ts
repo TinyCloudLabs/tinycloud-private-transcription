@@ -94,7 +94,7 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     const services = render();
     for (const [name, tag] of [["api", "ptx-batch.api"], ["upload-worker", "ptx-batch.worker"]] as const) {
       expect(services[name]!.logging).toEqual({ driver: "fluentd", options: {
-        "fluentd-address": "127.0.0.1:24224", "fluentd-async": "true", "fluentd-buffer-limit": "8192",
+        "fluentd-address": "127.0.0.1:24224", "fluentd-async": "true", "fluentd-buffer-limit": "7000",
         tag, "cache-max-size": "20m", "cache-max-file": "5",
       } });
     }

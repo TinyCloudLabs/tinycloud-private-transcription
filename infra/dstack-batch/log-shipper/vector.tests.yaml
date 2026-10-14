@@ -89,6 +89,67 @@ tests:
           tag: "ptx-batch.api"
           log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch job finished\",\"stage\":{\"path\":\"/uploads/probe\"},\"code\":{\"owner\":\"probe\"},\"status\":\"Bearer status-probe\",\"alert\":\"203.0.113.7\",\"outcome\":\"did:pkh:eip155:1:0xdeadbeef\",\"correlationId\":\"/uploads/probe\",\"job_id\":\"/tmp/probe.wav\",\"duration_seconds\":[1],\"tinfoil_calls\":\"https://teams.microsoft.com/probe\",\"tinfoil_audio_seconds\":{\"value\":3},\"voiced_seconds\":\"Alice\",\"dropped_above_floor_pct\":\"203.0.113.9\",\"vad_fallback\":\"yes\",\"segments\":[{\"text\":\"transcript-probe\"}],\"content_type\":\"audio/wav; name=confidential.wav\"}"
     no_outputs_from: [allowlist]
+  - name: "wrongly typed optional non-completion fields are omitted"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.api"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"warn\",\"msg\":\"batch admission mode changed\",\"stage\":\"admission\",\"alert\":\"true\",\"mode\":{\"owner\":\"probe\"},\"created\":\"true\",\"retentionLagSeconds\":\"10\",\"usedPercent\":[10]}"
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "batch_admission_mode_changed")
+              assert_eq!(.stage, "admission")
+              assert!(!exists(.alert))
+              assert!(!exists(.mode))
+              assert!(!exists(.created))
+              assert!(!exists(.retentionLagSeconds))
+              assert!(!exists(.usedPercent))
+              assert_eq!(length(keys(.)), 5)
+  - name: "completion events exclude DID and wallet values from unknown and optional fields"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch job finished\",\"job_id\":\"trn_01J9ABCDEF0123456789ABCDEF\",\"outcome\":\"completed\",\"duration_seconds\":12,\"content_type\":\"audio/wav\",\"code\":\"did:pkh:eip155:1:0x1111111111111111111111111111111111111111\",\"transcriptionId\":\"0x2222222222222222222222222222222222222222\",\"unknown_did\":\"did:pkh:eip155:1:0x1111111111111111111111111111111111111111\",\"unknown_wallet\":\"0x2222222222222222222222222222222222222222\"}"
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "batch_job_finished")
+              assert_eq!(.job_id, "trn_01J9ABCDEF0123456789ABCDEF")
+              assert!(!contains(encode_json(.), "did:pkh:eip155:1:0x1111111111111111111111111111111111111111"))
+              assert!(!contains(encode_json(.), "0x2222222222222222222222222222222222222222"))
+              assert!(!exists(.transcriptionId))
+              assert_eq!(.code, null)
+              assert!(!exists(.unknown_did))
+              assert!(!exists(.unknown_wallet))
+  - name: "non-completion events exclude DID and wallet values from unknown and optional fields"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.api"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch transcription create\",\"stage\":\"create\",\"created\":true,\"code\":\"did:pkh:eip155:1:0x3333333333333333333333333333333333333333\",\"transcriptionId\":\"0x4444444444444444444444444444444444444444\",\"unknown_did\":\"did:pkh:eip155:1:0x3333333333333333333333333333333333333333\",\"unknown_wallet\":\"0x4444444444444444444444444444444444444444\"}"
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "batch_transcription_create")
+              assert_eq!(.stage, "create")
+              assert_eq!(.created, true)
+              assert!(!contains(encode_json(.), "did:pkh:eip155:1:0x3333333333333333333333333333333333333333"))
+              assert!(!contains(encode_json(.), "0x4444444444444444444444444444444444444444"))
+              assert!(!exists(.transcriptionId))
+              assert!(!exists(.code))
+              assert!(!exists(.unknown_did))
+              assert!(!exists(.unknown_wallet))
   - name: "unknown key values never expand the output schema"
     inputs:
       - insert_at: allowlist

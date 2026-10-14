@@ -14,9 +14,10 @@
 #
 # Sized for Phala tdx.small (1 vCPU, 2048 MB; the guest sees 1,853 MiB). The four services are capped at 896 MiB
 # together (api 320m + worker 320m + postgres 192m + log-shipper 64m), leaving 1,003,282,432 B for guest OS,
-# dstack and dockerd. The shipper is limited to 0.25 CPU. Api and worker use async fluentd with 8,192-event limits;
-# at a conservative 4 KiB per serialized line, two producers retain at most 64 MiB of payload inside that headroom.
-# That queue is in dockerd (outside the service cgroups) but consumes the guest headroom.
+# dstack and dockerd. The shipper is limited to 0.25 CPU. Api and worker use async fluentd with 7,000-event limits.
+# Budget 16 KiB raw lines plus an assumed 1 KiB per event for driver/metadata overhead (Docker does not enforce this
+# per-line bound): 17 KiB × 7,000 × 2 producers = 243,712,000 B; 759,570,432 B of guest headroom remains.
+#
 # Postgres stays capped json-file: its diagnostic output can contain SQL/error context and is not safe telemetry.
 # Vector stays capped json-file: sending its own logs through its Fluent source would create a feedback loop.
 # Neither service is attached to the shipper input. The batch-envelope.yml 2-hour stereo proof should be rerun.
@@ -65,7 +66,7 @@ services:
       options:
         fluentd-address: "127.0.0.1:24224"
         fluentd-async: "true"
-        fluentd-buffer-limit: "8192"
+        fluentd-buffer-limit: "7000"
         tag: ptx-batch.api
         cache-max-size: "20m"
         cache-max-file: "5"
@@ -98,7 +99,7 @@ services:
       options:
         fluentd-address: "127.0.0.1:24224"
         fluentd-async: "true"
-        fluentd-buffer-limit: "8192"
+        fluentd-buffer-limit: "7000"
         tag: ptx-batch.worker
         cache-max-size: "20m"
         cache-max-file: "5"
@@ -154,6 +155,7 @@ services:
             type: remap
             inputs: [docker_fluent]
             drop_on_abort: true
+            drop_on_error: true
             source: |
               # BEGIN GENERATED FROM fields.json
               if exists(.partial_message) { abort }

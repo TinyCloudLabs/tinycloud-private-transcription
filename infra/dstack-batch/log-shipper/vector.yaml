@@ -8,6 +8,7 @@ transforms:
     type: remap
     inputs: [docker_fluent]
     drop_on_abort: true
+    drop_on_error: true
     source: |
       # BEGIN GENERATED FROM fields.json
       if exists(.partial_message) { abort }
