@@ -123,9 +123,10 @@ isolated network, with the dockerd publish bound only to host loopback. The firs
 exactly, then reconstructs an event from only the approved service tag and GELF `message`, removing every dockerd
 underscore field and all other GELF metadata. The existing `fields.json` 25-event allowlist and 11 TC-1045 completion
 fields remain unchanged. Unlabelled, unexpected-label and partial/unparseable inputs produce fixed, content-free
-counters; unexpected labels emit only a throttled fixed event. The token is written from the entrypoint environment
-to `/run/vector-secrets` tmpfs, unset before Vector starts, and resolved through Vector's `SECRET[]` local-directory
-provider.
+counters; unexpected labels emit only a throttled fixed event. The token is written from the entrypoint environment to
+`/run/vector-secrets` tmpfs and resolved through Vector's `SECRET[]` local-directory provider. The entrypoint removes
+the config and token variables from Vector's environment; tini (PID 1, same uid) retains the initial environment,
+which is equivalent exposure to the tmpfs token file and `docker inspect`.
 
 The API image pin contains migration 0018; it predates this PR's completion logging. After merge, publish the new image
 and re-pin it before deployment.
@@ -254,9 +255,9 @@ With a fixed Vector IP, the restart diagnostic passed `docker restart`, crash pl
 These spike results are not a substitute for the prepared five-cycle-per-path acceptance script.
 
 Vector uses a non-root UID 65532, read-only root filesystem, `cap_drop: [ALL]`, and `no-new-privileges:true`. Only the
-bounded `/var/lib/vector` data tmpfs and `/run/vector-secrets` secret tmpfs are writable. The entrypoint writes the token
-to the latter and unsets both `BETTERSTACK_SOURCE_TOKEN` and `VECTOR_CONFIG_YAML` before `exec vector`; the original
-Compose environment remains visible to Docker daemon/API principals. API, upload-worker, and Postgres drop `NET_RAW`;
+bounded `/var/lib/vector` data tmpfs and `/run/vector-secrets` secret tmpfs are writable. The entrypoint removes the
+config and token variables from Vector's environment; tini (PID 1, same uid) retains the initial environment, which
+is equivalent exposure to the tmpfs token file and `docker inspect`. API, upload-worker, and Postgres drop `NET_RAW`;
 they do not need raw sockets and therefore cannot forge Ethernet frames to bypass the UDP isolation. Vector's 0.59
 socket source accepts chunked GELF with a 262,144-byte source limit; the native spike reassembled 20 KiB. The shared
 batch logger caps each serialized line at 15,000 UTF-8 bytes including newline, below Docker GELF's 16 KiB split point.
