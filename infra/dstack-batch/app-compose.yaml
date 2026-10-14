@@ -6,7 +6,7 @@
 #   POSTGRES_PASSWORD      internal Postgres password
 #   BATCH_TINFOIL_API_KEY  the owner's dedicated batch Tinfoil key
 #   PTX_BOOTSTRAP_KEYS     hashed API keys: tinychat (transcriptions:*) and owner-admin (admin:*)
-#   BETTERSTACK_SOURCE_TOKEN  ingest-only token, written by the entrypoint to a tmpfs secret file
+#   BETTERSTACK_SOURCE_TOKEN  ingest-only token, written to tmpfs and read by Vector through SECRET[local_directory.betterstack_source_token]
 #
 # The api/worker image is an immutable pin that only a PR changes; it cannot be overridden from the sealed env.
 # Until the first batch image exists (P2 merged → publish-image.yml), it is the placeholder below, which

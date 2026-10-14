@@ -29,7 +29,7 @@ type Service = {
   image: string; build?: unknown; command?: string[]; environment: Record<string, string>;
   volumes?: { type?: string; source?: string; target: string; read_only?: boolean; bind?: { create_host_path?: boolean } }[];
   tmpfs?: string[]; entrypoint?: string[]; labels?: Record<string, string>;
-  ports?: { target: number; published: string; host_ip: string; protocol: string }[];
+  ports?: { target: number; published: string; host_ip: string; protocol: string; mode?: string }[];
   networks?: Record<string, { ipv4_address?: string }>;
   mem_limit?: string; memswap_limit?: string; mem_reservation?: string; cpuset?: string; cpus?: number;
   read_only?: boolean; user?: string; cap_drop?: string[]; security_opt?: string[];
@@ -49,7 +49,7 @@ const vectorConfig = Bun.YAML.parse(vectorConfigText) as {
   secret: { local_directory: { type: string; path: string; remove_trailing_whitespace: boolean } };
 };
 const composeDocument = Bun.YAML.parse(composeConfig) as {
-  services: Record<string, { networks?: Record<string, { ipv4_address?: string }> }>;
+  services: Record<string, { command?: string[]; entrypoint?: string[]; networks?: Record<string, { ipv4_address?: string }> }>;
   networks: { logship: { ipam: { config: { subnet: string }[] } } };
 };
 
@@ -81,7 +81,7 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
   });
 
   test("renders the canonical Vector config from the embedded Compose environment", () => {
-    expect(render()["log-shipper"]!.environment.VECTOR_CONFIG_YAML).toBe(vectorConfigText);
+    expect(render()["log-shipper"]!.environment.VECTOR_CONFIG_YAML.replace(/\$\$/g, "$")).toBe(vectorConfigText);
   });
 
   test("runs the batch role with no meeting workload, docker socket, or fault injection", () => {
@@ -102,7 +102,7 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
   });
 
   test("takes only the expected sealed values and optional quiet-mode rollback flag", () => {
-    const sealed = [...new Set([...composeConfig.matchAll(/\$\{([A-Z0-9_]+)/g)].map((m) => m[1]))].sort();
+    const sealed = [...new Set([...composeConfig.matchAll(/(?<!\$)\$\{([A-Z0-9_]+)/g)].map((m) => m[1]))].sort();
     expect(sealed).toEqual(["BATCH_TINFOIL_API_KEY", "BATCH_VAD_QUIET_MODE", "BETTERSTACK_SOURCE_TOKEN", "POSTGRES_PASSWORD", "PTX_BOOTSTRAP_KEYS"]);
     expect([...(envExample.match(/^[A-Z0-9_]+(?==)/gm) ?? [])].sort()).toEqual(sealed.filter((key) => key !== "BATCH_VAD_QUIET_MODE"));
     const services = render();
@@ -147,7 +147,7 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(shipper.read_only).toBe(true);
     expect(shipper.cap_drop).toEqual(["ALL"]);
     expect(shipper.security_opt).toContain("no-new-privileges:true");
-    expect(shipper.ports).toEqual([{ target: 12201, published: "12201", host_ip: "127.0.0.1", protocol: "udp" }]);
+    expect(shipper.ports).toEqual([{ target: 12201, published: "12201", host_ip: "127.0.0.1", protocol: "udp", mode: "ingress" }]);
     expect(Object.keys(shipper.networks ?? {})).toEqual(["logship"]);
     expect(shipper.networks).toMatchObject({ logship: { ipv4_address: "172.31.250.10" } });
     expect(composeDocument.networks.logship.ipam.config).toEqual([{ subnet: "172.31.250.0/24" }]);
@@ -157,14 +157,27 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(shipper.volumes ?? []).toEqual([]);
     expect(shipper.tmpfs).toContain("/var/lib/vector:uid=65532,gid=65532,mode=0700,size=8m");
     expect(shipper.tmpfs).toContain("/run/vector-secrets:uid=65532,gid=65532,mode=0700,size=1m");
-    expect(shipper.environment.VECTOR_CONFIG_YAML).toBe(vectorConfigText);
+    expect(shipper.environment.VECTOR_CONFIG_YAML.replace(/\$\$/g, "$")).toBe(vectorConfigText);
+    const sourceCommand = composeDocument.services["log-shipper"]!.command;
     expect(shipper.entrypoint).toEqual(["/bin/sh", "-ec"]);
+    expect(sourceCommand).toHaveLength(1);
+    expect(shipper.command).toEqual(sourceCommand);
     expect(shipper.command?.[0]).toContain('unset BETTERSTACK_SOURCE_TOKEN');
     expect(shipper.command?.[0]).toContain('unset VECTOR_CONFIG_YAML');
     expect(shipper.command?.[0]).toContain('/run/vector-secrets/betterstack_source_token');
-    expect(shipper.command?.[0]).toContain('printf "%s\\n" "${VECTOR_CONFIG_YAML}" > /var/lib/vector/vector.yaml');
+    expect(shipper.command?.[0].replace(/\$\$/g, "$")).toContain('printf "%s\\n" "${VECTOR_CONFIG_YAML}" > /var/lib/vector/vector.yaml');
     expect(shipper.command?.[0].indexOf('unset VECTOR_CONFIG_YAML')).toBeGreaterThan(shipper.command?.[0].indexOf('> /var/lib/vector/vector.yaml') ?? -1);
     expect(composeConfig).not.toContain("/var/lib/docker");
+  });
+  test("every Compose sh -ec script is one exact rendered argv element", () => {
+    const rendered = render();
+    const shellServices = Object.entries(composeDocument.services)
+      .filter(([, service]) => service.entrypoint?.[0] === "/bin/sh" && service.entrypoint?.[1] === "-ec");
+    expect(shellServices.length).toBeGreaterThan(0);
+    for (const [name, source] of shellServices) {
+      expect(source.command).toHaveLength(1);
+      expect(rendered[name]!.command).toEqual(source.command);
+    }
   });
 
   test("fits tdx.small: service budgets total 896 MiB and retain at least 1 GB guest headroom", () => {

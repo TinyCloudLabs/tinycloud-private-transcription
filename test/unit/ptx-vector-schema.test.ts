@@ -27,6 +27,21 @@ test.each([
 ])("rejects repository-relative %s references", (_label, text) => {
   expect(() => checkNoRepoRelativeComposeFiles(Bun.YAML.parse(text))).toThrow();
 });
+test.each([
+  ["configs.file", { configs: { vector: { "<<": { file: "./vector.yaml" } } } }],
+  ["env_file", { services: { api: { "<<": { env_file: "./.env" } } } }],
+  ["relative bind source", { services: { api: { "<<": { volumes: ["./config:/etc/config:ro"] } } } }],
+])("rejects %s inside an unresolved YAML merge", (_label, compose) => {
+  expect(() => checkNoRepoRelativeComposeFiles(compose)).toThrow();
+});
+
+test.each([
+  ["configs.file", "x-file: &file ./vector.yaml\nconfigs:\n  vector:\n    file: *file\n"],
+  ["env_file", "x-env: &env {env_file: ./.env}\nservices:\n  api:\n    <<: *env\n"],
+  ["relative bind source", "x-volume: &volume {volumes: [./config:/etc/config:ro]}\nservices:\n  api:\n    <<: *volume\n"],
+])("rejects %s introduced through YAML aliases/merges", (_label, text) => {
+  expect(() => checkNoRepoRelativeComposeFiles(Bun.YAML.parse(text))).toThrow();
+});
 test("the Vector allowlist validation is generated exactly from common and ptx-batch schema", () => {
   expect(() => checkVectorFile(schema)).not.toThrow();
 });

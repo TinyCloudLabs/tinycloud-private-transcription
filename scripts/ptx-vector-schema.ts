@@ -173,12 +173,39 @@ export function checkComposeVectorConfig(compose: unknown, vectorYaml: string): 
   if (rendered !== expected) throw new Error("Compose VECTOR_CONFIG_YAML differs from vector.yaml after $$ unescaping");
 }
 
+function resolveComposeMerges(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(resolveComposeMerges);
+  if (!value || typeof value !== "object") return value;
+
+  const source = value as Record<string, unknown>;
+  const resolved = new Map<string, unknown>();
+  if ("<<" in source) {
+    const merges = Array.isArray(source["<<"]) ? source["<<"] as unknown[] : [source["<<"]];
+    for (let index = merges.length - 1; index >= 0; index--) {
+      const merge = resolveComposeMerges(merges[index]);
+      if (!merge || typeof merge !== "object" || Array.isArray(merge)) {
+        throw new Error("Compose YAML merge entries must be mappings");
+      }
+      for (const [key, entry] of Object.entries(merge)) resolved.set(key, entry);
+    }
+  }
+  for (const [key, entry] of Object.entries(source)) {
+    if (key !== "<<") resolved.set(key, entry);
+  }
+  return Object.fromEntries([...resolved].map(([key, entry]) => [key, resolveComposeMerges(entry)]));
+}
+
+
 export function checkNoRepoRelativeComposeFiles(compose: unknown): void {
-  const document = compose as {
+
+  const resolved = resolveComposeMerges(compose);
+  if (!resolved || typeof resolved !== "object" || Array.isArray(resolved)) {
+    throw new Error("Compose document must be an object");
+  }
+  const document = resolved as {
     configs?: Record<string, { file?: unknown }>;
     services?: Record<string, ComposeService>;
-  } | null;
-  if (!document || typeof document !== "object") throw new Error("Compose document must be an object");
+  };
   for (const [name, config] of Object.entries(document.configs ?? {})) {
     if (config && typeof config === "object" && "file" in config) {
       throw new Error(`Compose configs.${name}.file must not reference a local file`);
