@@ -310,4 +310,4 @@ sinks:
     type: prometheus_exporter
     inputs: [gate_counters, received_metrics]
     address: 127.0.0.1:9598
-    flush_period_secs: 5
+    flush_period_secs: 86400

@@ -45,6 +45,7 @@ const vectorConfig = Bun.YAML.parse(vectorConfigText) as {
     };
   };
   transforms: Record<string, { type?: string; inputs: string[]; threshold?: number; window_secs?: number }>;
+  sinks: { gate_metrics: { flush_period_secs: number } };
   secret: { local_directory: { type: string; path: string; remove_trailing_whitespace: boolean } };
 };
 const composeDocument = Bun.YAML.parse(composeConfig) as {
@@ -116,8 +117,11 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     for (const [name, label] of [["api", "ptx-batch-api"], ["upload-worker", "ptx-batch-worker"]] as const) {
       expect(services[name]!.labels?.["tc.logship"]).toBe(label);
       expect(services[name]!.logging).toEqual({ driver: "gelf", options: {
-        "gelf-address": "udp://127.0.0.1:12201", labels: "tc.logship",
+        "gelf-address": "udp://127.0.0.1:12201", labels: "tc.logship", "cache-disabled": "true",
       } });
+    }
+    for (const name of ["api", "upload-worker", "postgres"] as const) {
+      expect(services[name]!.cap_drop).toEqual(["NET_RAW"]);
     }
     for (const name of ["postgres", "log-shipper"] as const) {
       expect(services[name]!.labels?.["tc.logship"]).toBeUndefined();
@@ -138,6 +142,7 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(vectorConfig.sources).not.toHaveProperty("docker_files");
     expect(vectorConfig.transforms.gelf_gate!.inputs).toEqual(["gelf_in"]);
     expect(vectorConfig.secret.local_directory).toEqual({ type: "directory", path: "/run/vector-secrets", remove_trailing_whitespace: true });
+    expect(vectorConfig.sinks.gate_metrics!.flush_period_secs).toBe(86400);
     expect(shipper.user).toBe("65532:65532");
     expect(shipper.read_only).toBe(true);
     expect(shipper.cap_drop).toEqual(["ALL"]);
@@ -155,8 +160,10 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(shipper.environment.VECTOR_CONFIG_YAML).toBe(vectorConfigText);
     expect(shipper.entrypoint).toEqual(["/bin/sh", "-ec"]);
     expect(shipper.command?.[0]).toContain('unset BETTERSTACK_SOURCE_TOKEN');
+    expect(shipper.command?.[0]).toContain('unset VECTOR_CONFIG_YAML');
     expect(shipper.command?.[0]).toContain('/run/vector-secrets/betterstack_source_token');
     expect(shipper.command?.[0]).toContain('printf "%s\\n" "${VECTOR_CONFIG_YAML}" > /var/lib/vector/vector.yaml');
+    expect(shipper.command?.[0].indexOf('unset VECTOR_CONFIG_YAML')).toBeGreaterThan(shipper.command?.[0].indexOf('> /var/lib/vector/vector.yaml') ?? -1);
     expect(composeConfig).not.toContain("/var/lib/docker");
   });
 

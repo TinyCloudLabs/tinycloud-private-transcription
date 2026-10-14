@@ -6,7 +6,7 @@
 #   POSTGRES_PASSWORD      internal Postgres password
 #   BATCH_TINFOIL_API_KEY  the owner's dedicated batch Tinfoil key
 #   PTX_BOOTSTRAP_KEYS     hashed API keys: tinychat (transcriptions:*) and owner-admin (admin:*)
-#   BETTERSTACK_SOURCE_TOKEN  ingest-only token, interpolated by Vector at startup
+#   BETTERSTACK_SOURCE_TOKEN  ingest-only token, written by the entrypoint to a tmpfs secret file
 #
 # The api/worker image is an immutable pin that only a PR changes; it cannot be overridden from the sealed env.
 # Until the first batch image exists (P2 merged → publish-image.yml), it is the placeholder below, which
@@ -16,8 +16,8 @@
 # together (api 320m + worker 320m + postgres 192m + log-shipper 64m), leaving 1,003,282,432 B for guest OS,
 # dstack and dockerd. There is no Fluentd daemon queue. The 1,000-event Vector sink buffer is in its 64 MiB cgroup.
 #
-# Postgres and Vector use capped json-file logs (10m × 3 each), at most 60m on the 20G disk. The api and worker
-# use dockerd GELF over UDP; there is no local file log or daemon queue for those services.
+# Postgres and Vector use capped json-file logs (10m × 3 each), at most 60m on the 20G disk. The api and worker use
+# dockerd GELF over UDP with Docker's dual-logging cache disabled; no GELF local cache or daemon queue is retained.
 #
 # Postgres remains unlabelled and capped json-file: its diagnostic output can contain SQL/error context and is not safe
 # telemetry. Vector is isolated on its own network; its source accepts the dockerd GELF path published on host loopback.
@@ -62,6 +62,7 @@ services:
     mem_limit: 320m
     memswap_limit: 320m
     mem_reservation: 96m
+    cap_drop: [NET_RAW]
     labels:
       tc.logship: ptx-batch-api
     logging:
@@ -69,6 +70,7 @@ services:
       options:
         gelf-address: "udp://127.0.0.1:12201"
         labels: tc.logship
+        cache-disabled: "true"
   upload-worker:
     image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:508cb0be60a27e6b2bb4eefd888ad7c98954c3e5@sha256:72568fe357e87aefb13a4430b0124b16a4c5e98395281e80e9ee09471c9aaf4d
     restart: unless-stopped
@@ -92,11 +94,15 @@ services:
     mem_limit: 320m
     memswap_limit: 320m
     mem_reservation: 96m
+    cap_drop: [NET_RAW]
+    labels:
+      tc.logship: ptx-batch-worker
     logging:
       driver: gelf
       options:
         gelf-address: "udp://127.0.0.1:12201"
         labels: tc.logship
+        cache-disabled: "true"
 
   postgres:
     image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
@@ -106,6 +112,7 @@ services:
     mem_limit: 192m
     memswap_limit: 192m
     mem_reservation: 64m
+    cap_drop: [NET_RAW]
     logging:
       driver: json-file
       options:
@@ -458,7 +465,7 @@ services:
             type: prometheus_exporter
             inputs: [gate_counters, received_metrics]
             address: 127.0.0.1:9598
-            flush_period_secs: 5
+            flush_period_secs: 86400
     entrypoint: ["/bin/sh", "-ec"]
     tmpfs:
       - /var/lib/vector:uid=65532,gid=65532,mode=0700,size=8m
@@ -467,7 +474,7 @@ services:
       logship:
         ipv4_address: 172.31.250.10
     command:
-      - 'umask 077; printf "%s" "$${BETTERSTACK_SOURCE_TOKEN}" > /run/vector-secrets/betterstack_source_token; unset BETTERSTACK_SOURCE_TOKEN; printf "%s\n" "$${VECTOR_CONFIG_YAML}" > /var/lib/vector/vector.yaml; exec vector --config /var/lib/vector/vector.yaml'
+      - 'umask 077; printf "%s" "$${BETTERSTACK_SOURCE_TOKEN}" > /run/vector-secrets/betterstack_source_token; unset BETTERSTACK_SOURCE_TOKEN; printf "%s\n" "$${VECTOR_CONFIG_YAML}" > /var/lib/vector/vector.yaml; unset VECTOR_CONFIG_YAML; exec vector --config /var/lib/vector/vector.yaml'
 
 networks:
   logship:

@@ -2,6 +2,7 @@ import { and, asc, eq, sql } from "drizzle-orm";
 import { mkdir, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { config as processConfig } from "../config.ts";
+import { installFatalLogHandlers } from "../log.ts";
 import { providerDispatchSlots, transcriptionAdmission, transcriptionAttempts, transcriptionRegions, transcriptionResults, transcriptions, transcriptionWorkers, type TranscriptionRow } from "../db/schema.ts";
 import { pcmToWav } from "../providers/transcription/audio.ts";
 import { decodeChannelToPcm, PCM_RATE, readPcmRange } from "./audio.ts";
@@ -625,6 +626,7 @@ export function startBatchWorker(ctx: BatchContext, opts: { sweep?: boolean } = 
 }
 
 if (import.meta.main) {
+  installFatalLogHandlers();
   if (processConfig.role !== "batch") throw new Error("src/uploads/worker.ts runs only with PTX_ROLE=batch");
   const { createBatchContext } = await import("../roles/batch.ts");
   const ctx = createBatchContext();

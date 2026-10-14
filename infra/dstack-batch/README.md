@@ -96,10 +96,10 @@ dockerd. The four service caps total 896 MiB (api 320m + worker 320m + Postgres 
 | postgres | 192m | 64m | tuned Postgres; unshipped |
 | log-shipper | 64m, 0.25 CPU | — | Vector allowlist and Better Stack HTTP sink; memory buffer capped at 1,000 events |
 
-The four service caps leave 1,003,282,432 B to the guest OS, dstack and dockerd. Docker's Fluentd queue is gone. The
-api and upload-worker use dockerd GELF/UDP, so they have no local log-file retention while the shipper is down.
-Postgres and Vector retain capped `json-file` logs at 10m × 3 each: 60 MB total on the 20 GB disk. Vector's 1,000-event
-memory sink buffer remains within its 64 MiB cgroup. The GELF source has no checkpoints or persistent data volume.
+The four service caps leave 1,003,282,432 B to the guest OS, dstack and dockerd. The Docker Fluentd queue is gone. API
+and upload-worker use GELF/UDP with `cache-disabled: "true"`, so Docker's dual-logging cache does not retain local app
+logs while Vector is down. Postgres and Vector retain capped `json-file` logs at 10m × 3 each: at most 60 MB total on
+the 20 GB disk. Vector's 1,000-event memory sink buffer remains within its 64 MiB cgroup.
 
 Vector runs as UID/GID 65532 on its isolated `logship` bridge (`172.31.250.0/24`, fixed address `172.31.250.10`);
 only `127.0.0.1:12201/udp` is published. Its root filesystem is read-only, every capability is dropped, and
@@ -107,7 +107,7 @@ only `127.0.0.1:12201/udp` is published. Its root filesystem is read-only, every
 Docker-root bind, named data volume, or Docker socket.
 
 The batch workload and sidecar limits still total 896 MiB, preserving the ≥1,000,000,000 B guest-headroom invariant.
-The sink's 1,000-event memory buffer remains within the 64 MiB Vector cgroup; there is no dockerd Fluentd queue.
+The sink's 1,000-event memory buffer remains within Vector's 64 MiB cgroup; neither Fluentd queue nor GELF local cache exists.
 
 `max_connections=40` covers the Bun.SQL pools (10 each: api, its boot migrator, worker) and the 3 superuser slots. A cgroup
 limit also counts page cache, which the kernel reclaims first, so a container sitting near its limit while it writes
@@ -153,7 +153,7 @@ new four-service compose before deployment. The local sidecar burst rehearsal do
 | item | bound |
 |---|---|
 | images (api ~0.25 GB, postgres ~0.27 GB, one update overlap; dstack prunes after `compose up`), dstack data | ≤ 2.4 GB (a live tdx.small uses 1.77 GB) |
-| container logs: api, worker, Postgres and Vector json-file caps (10m × 3 each) | ≤ 120 MB |
+| container logs: Postgres and Vector capped `json-file` (10m × 3 each); api/worker GELF cache disabled | ≤ 60 MB |
 | Postgres data + WAL (`max_wal_size=256MB`) | ≤ 0.5 GB |
 | accepted audio + in-flight `.part` files (`BATCH_MAX_RESERVED_BYTES`) | ≤ 1.21 GB |
 | PCM of the one processing job: 2 ch × 7,200 s × 32,000 B/s = 0.46 GB; ×2 while a crashed claim's work dir awaits the sweeper | ≤ 0.92 GB |
@@ -235,11 +235,11 @@ boot (the sweeper retries pending deletions and removes unauthorized files).
 
 ## GELF transport and isolation
 
-The api and upload-worker use Docker's GELF driver with `gelf-address=udp://127.0.0.1:12201` and `labels=tc.logship`.
-Vector is the only service on the non-internal `logship` bridge, fixed at `172.31.250.10/24`; it publishes UDP 12201
-only on host loopback. App and Postgres containers remain on the ordinary application network and cannot reach the
-Vector address or host-published listener. Postgres and Vector use capped `json-file` logs; no `tc.logship` label is
-attached to either.
+The api and upload-worker use Docker's GELF driver with `gelf-address=udp://127.0.0.1:12201`, `labels=tc.logship`, and
+`cache-disabled=true`. Vector is the only service on the non-internal `logship` bridge, fixed at `172.31.250.10/24`; it
+publishes UDP 12201 only on host loopback. App and Postgres containers remain on the ordinary application network and
+cannot reach the Vector address or host-published listener. Postgres and Vector use capped `json-file` logs; neither has
+a `tc.logship` label.
 
 Fluentd was rejected after run 10: Vector restart yielded zero delivered events for 150 seconds, while restarting the
 api restored delivery in six seconds. The file-source alternative was rejected because mounting Docker's root exposes
@@ -255,7 +255,14 @@ These spike results are not a substitute for the prepared five-cycle-per-path ac
 
 Vector uses a non-root UID 65532, read-only root filesystem, `cap_drop: [ALL]`, and `no-new-privileges:true`. Only the
 bounded `/var/lib/vector` data tmpfs and `/run/vector-secrets` secret tmpfs are writable. The entrypoint writes the token
-to the latter and unsets `BETTERSTACK_SOURCE_TOKEN` before `exec vector`; the original Compose environment remains
-visible to Docker daemon/API principals. Vector's 0.59 socket source accepts chunked GELF with a 262,144-byte source
-limit; the native spike reassembled 20 KiB. Docker splits lines over 16 KiB; fragments that are not valid application
-JSON are dropped and counted without retaining the message.
+to the latter and unsets both `BETTERSTACK_SOURCE_TOKEN` and `VECTOR_CONFIG_YAML` before `exec vector`; the original
+Compose environment remains visible to Docker daemon/API principals. API, upload-worker, and Postgres drop `NET_RAW`;
+they do not need raw sockets and therefore cannot forge Ethernet frames to bypass the UDP isolation. Vector's 0.59
+socket source accepts chunked GELF with a 262,144-byte source limit; the native spike reassembled 20 KiB. The shared
+batch logger caps each serialized line at 15,000 UTF-8 bytes including newline, below Docker GELF's 16 KiB split point.
+Oversized string fields are truncated with a marker; if a non-string payload still exceeds the cap, it emits a fixed
+valid-JSON marker record. API and worker fatal handlers use the same bounded logger, so neither a giant error field nor
+a runtime stack can become a valid-looking GELF tail fragment.
+The local gate-counter exporter uses an 86,400-second flush period to avoid Vector's short stale-series expiry. Its
+metrics endpoint is loopback-only inside Vector; the acceptance check verifies a counter increment and that the probe
+content is absent from the sink.
