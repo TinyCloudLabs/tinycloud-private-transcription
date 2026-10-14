@@ -217,6 +217,22 @@ describe("VAD coverage (TC-1045)", () => {
     expect(old.stats).not.toHaveProperty("dropped_above_noise_pct");
   });
 
+  test("TC-1093: a crash between region insert and stats write rolls back both", async () => {
+    const id = await h.submit(pcmToWav(pcmFromLevels(quietSpeechLevels()), PCM_RATE), { contentType: "audio/wav" });
+    h.faults.once("worker.regions_inserted", "crash");
+    await expect(h.work()).rejects.toThrow("simulated crash at worker.regions_inserted");
+    expect(await regions(id)).toEqual([]);
+    expect((await h.row(id)).vadStats).toBeNull();
+    expect(h.tinfoil.calls).toEqual([]);
+    await h.ctx.db.update(transcriptions).set({ claimHeartbeatAt: new Date(Date.now() - 120_000) }).where(eq(transcriptions.id, id));
+    expect(await h.work()).toBe(true);
+    expect((await regions(id)).length).toBeGreaterThan(0);
+    expect((await h.row(id)).vadStats?.vad_mode).toBe("quiet");
+    const body = await (await result(id)).json();
+    expect(body.status).toBe("completed");
+    expect(body.stats).toMatchObject({ vad_mode: "quiet", vad_fallback: false });
+  });
+
   test("TC-1093: quiet PCM stats survive re-claim and appear unchanged in result JSON", async () => {
     const pcm = pcmFromLevels(quietSpeechLevels());
     const energies = Float64Array.from({ length: 1_000 }, (_, f) => {
@@ -254,6 +270,26 @@ describe("VAD coverage (TC-1045)", () => {
     } finally {
       h.ctx.config.vad.quietMode = true;
     }
+  });
+
+  test("TC-1093: separate stereo reports quiet precedence and retains the other channel's fallback flag", async () => {
+    const quiet = pcmFromLevels(quietSpeechLevels());
+    const fallback = pcmFromLevels(new Float64Array(1_000).fill(-46));
+    const interleaved = new Int16Array(quiet.length * 2);
+    for (let s = 0; s < quiet.length; s++) {
+      interleaved[2 * s] = quiet[s]!;
+      interleaved[2 * s + 1] = fallback[s]!;
+    }
+    const wav = pcmToWav(interleaved, PCM_RATE);
+    const header = new DataView(wav.buffer, wav.byteOffset, wav.byteLength);
+    header.setUint16(22, 2, true); // channels
+    header.setUint32(28, PCM_RATE * 4, true); // byte rate
+    header.setUint16(32, 4, true); // block alignment
+    const id = await h.submit(wav, { contentType: "audio/wav", body: { channel_mode: "separate" } });
+    await h.work();
+    const body = await (await result(id)).json();
+    expect(body).toMatchObject({ status: "completed", channels: 2, stats: { vad_mode: "quiet", vad_fallback: true, voiced_seconds: 122 } });
+    expect((await h.row(id)).vadStats?.vad_mode).toBe("quiet");
   });
 });
 

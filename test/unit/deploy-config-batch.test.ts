@@ -327,6 +327,41 @@ sed -n "$((n + 1))p" "${dir}/gets"
 
   const serve = (body: string) => ({ curl: `printf '%s' '${body}'` });
 
+  test("the sealed env carries BATCH_VAD_QUIET_MODE and keeps every sealed key", () => {
+    const captureDir = mkdtempSync(join(tmpdir(), "ptx-sealed-capture-"));
+    const { keys, env } = mintBootstrapKeys([
+      { id: "tinychat-batch", project: "tinychat", scopes: ["transcriptions:*"] },
+      { id: "owner-admin", project: "ops", scopes: ["admin:*"] },
+    ]);
+    const password = "a".repeat(64), providerKey = "test-tinfoil";
+    try {
+      for (const mode of ["true", "false"]) {
+        const capture = join(captureDir, `sealed-${mode}.txt`);
+        const run = runStep("Validate the sealed environment", {
+          BATCH_POSTGRES_PASSWORD: password, BATCH_TINFOIL_API_KEY: providerKey, PTX_BOOTSTRAP_KEYS: env,
+          PTX_BATCH_ADMIN_KEY: keys[1]!.key, BATCH_VAD_QUIET_MODE: mode, SEALED_CAPTURE: capture,
+        }, { docker: `while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--env-file" ]; then cp -- "$2" "$SEALED_CAPTURE"; exit; fi
+  shift
+done
+exit 1` });
+        expect(run.exitCode).toBe(0);
+        // runStep has removed its temp directory; this copy contains only generated test values.
+        const lines = readFileSync(capture, "utf8").trimEnd().split("\n");
+        expect(lines.map((line) => line.slice(0, line.indexOf("="))).sort())
+          .toEqual(["BATCH_TINFOIL_API_KEY", "BATCH_VAD_QUIET_MODE", "POSTGRES_PASSWORD", "PTX_BOOTSTRAP_KEYS"]);
+        expect(lines).toContain(`BATCH_VAD_QUIET_MODE=${mode}`);
+        expect(lines).toContain(`POSTGRES_PASSWORD=${password}`);
+        expect(lines).toContain(`BATCH_TINFOIL_API_KEY=${providerKey}`);
+        expect(lines).toContain(`PTX_BOOTSTRAP_KEYS=${env}`);
+        expect(render(mode)["upload-worker"]!.environment.BATCH_VAD_QUIET_MODE).toBe(mode);
+      }
+      expect(workflowText).toContain("${{ vars.BATCH_VAD_QUIET_MODE || 'true' }}");
+    } finally {
+      rmSync(captureDir, { recursive: true, force: true });
+    }
+  });
+
   test("the admission gate requires closed after a create and drain after an update; open is never accepted", () => {
     const gate = (mode: string, body: string) => runStep("Admission gate (the deployed service is not open)", { MODE: mode, BATCH_URL: "https://batch.test", PTX_BATCH_ADMIN_KEY: "k" }, serve(body));
     expect(gate("create", counts(0, 0, 0, "closed")).exitCode).toBe(0);

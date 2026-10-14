@@ -164,6 +164,20 @@ describe("VAD regions", () => {
       expect(batchConfigFromEnv().vad.quietMode).toBe(false);
       process.env.BATCH_VAD_QUIET_MODE = "true";
       expect(batchConfigFromEnv().vad.quietMode).toBe(true);
+      const warnings: string[] = [];
+      const log = { warn: (message: string) => { warnings.push(message); } };
+      for (const [value, enabled] of [["FALSE", false], [" false ", false], ["TRUE", true], ["", true], ["   ", true]] as const) {
+        process.env.BATCH_VAD_QUIET_MODE = value;
+        expect(batchConfigFromEnv(log).vad.quietMode).toBe(enabled);
+      }
+      expect(warnings).toEqual([]);
+      for (const value of ["0", "off", "bogus"]) {
+        warnings.length = 0;
+        process.env.BATCH_VAD_QUIET_MODE = value;
+        expect(batchConfigFromEnv(log).vad.quietMode).toBe(true);
+        expect(warnings).toEqual(["Invalid BATCH_VAD_QUIET_MODE; quiet mode enabled"]);
+        expect(warnings[0]).not.toContain(value);
+      }
     } finally {
       if (old === undefined) delete process.env.BATCH_VAD_QUIET_MODE;
       else process.env.BATCH_VAD_QUIET_MODE = old;

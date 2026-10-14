@@ -149,6 +149,7 @@ async function runPipeline(ctx: BatchContext, job: TranscriptionRow, fence: Fenc
     await ctx.db.transaction(async (tx) => {
       await holdFence(tx, fence);
       await insertRegions(tx, fence, detected.regions);
+      await ctx.faults.hit("worker.regions_inserted", { id: job.id });
       // Bind JSON as text before casting: Bun.SQL otherwise re-encodes Drizzle's JSON string as a JSONB string.
       await tx.update(transcriptions).set({ vadDroppedAboveFloorPct: detected.droppedAboveFloorPct, vadFallback: detected.fallback,
         vadStats: sql`${JSON.stringify(detected.stats)}::text::jsonb` }).where(fenceGuard(fence));

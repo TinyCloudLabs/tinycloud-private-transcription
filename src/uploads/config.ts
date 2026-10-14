@@ -1,4 +1,5 @@
 import { positiveIntegerEnv } from "../config.ts";
+import { logger, type Logger } from "../log.ts";
 import { parseCorsOrigins } from "./cors.ts";
 
 /** 2 h at 128 kbps stereo + 5% (the same formula Exo uses for its 8 h local cap). */
@@ -88,7 +89,11 @@ export interface BatchConfig {
 
 const str = (name: string, fallback: string) => process.env[name] ?? fallback;
 
-export function batchConfigFromEnv(): BatchConfig {
+export function batchConfigFromEnv(log: Pick<Logger, "warn"> = logger): BatchConfig {
+  const quietMode = str("BATCH_VAD_QUIET_MODE", "true").trim().toLowerCase();
+  if (quietMode && quietMode !== "true" && quietMode !== "false") {
+    log.warn("Invalid BATCH_VAD_QUIET_MODE; quiet mode enabled");
+  }
   const percent = positiveIntegerEnv("BATCH_DISK_HIGH_WATER_PERCENT", "80");
   if (percent >= 100) throw new Error("BATCH_DISK_HIGH_WATER_PERCENT must be below 100");
   return {
@@ -104,7 +109,7 @@ export function batchConfigFromEnv(): BatchConfig {
       timeoutMs: positiveIntegerEnv("BATCH_TINFOIL_TIMEOUT_MS", "180000"),
     },
     corsOrigins: parseCorsOrigins(str("BATCH_CORS_ORIGINS", "")),
-    vad: { quietMode: str("BATCH_VAD_QUIET_MODE", "true") === "true" },
+    vad: { quietMode: quietMode !== "false" },
     diarization: {
       enabled: str("BATCH_DIARIZATION_ENABLED", "false") === "true",
       dir: str("BATCH_DIARIZATION_DIR", "/opt/sherpa-onnx"),

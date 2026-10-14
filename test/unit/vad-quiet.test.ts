@@ -96,6 +96,26 @@ test("quiet mode retains fallback audio below its own threshold, coalescing and 
   }
 });
 
+test("quiet threshold lower clamp excludes sub -65 audio despite qualifying peaks", () => {
+  const e = new Float64Array(1_000).fill(-90);
+  e.fill(-60, 100, 110);
+  e.fill(-70, 400, 500);
+  const detection = detectSpeech(e);
+  expect(detection.stats.vad_mode).toBe("quiet");
+  expect(detection.regions).toEqual([{ startMs: 9_500, endMs: 11_500 }]);
+});
+
+test("quiet threshold upper clamp includes a short -49.5 burst below fallback trigger", () => {
+  const e = new Float64Array(1_000).fill(-52);
+  e.fill(-31, 100, 110);
+  e.fill(-49.5, 400, 403);
+  expect(baselineDetection(e, -57).fallback).toBe(false);
+  const detection = detectSpeech(e);
+  expect(detection.stats.vad_mode).toBe("quiet");
+  expect(detection.fallback).toBe(false);
+  expect(detection.regions).toEqual([{ startMs: 9_500, endMs: 11_500 }, { startMs: 39_500, endMs: 40_800 }]);
+});
+
 test("every non-quiet case is byte-identical to PR 1; the rollback flag restores PR 1 even for quiet inputs", () => {
   const cases = [new Float64Array(), new Float64Array(1).fill(-20), new Float64Array(600).fill(-120),
     new Float64Array(600).fill(-60), new Float64Array(600).fill(-34), new Float64Array(600).fill(-46),
@@ -127,4 +147,24 @@ test("channel diagnostics pool actual frames and coverage, with quiet/fallback/p
   const summary = summarizeVad([{ energies: quiet, regions: q.regions, mode: "quiet" }, { energies: normal, regions: n.regions, mode: "primary" }]);
   expect(summary).toEqual({ vad_mode: "quiet", noise_floor_dbfs: -58, median_dbfs: -36, p99_dbfs: -25, speech_peak_s: 101, dropped_above_noise_pct: 0 });
   expect(summarizeVad([{ energies: normal, regions: n.regions, mode: "primary" }, { energies: normal, regions: n.regions, mode: "fallback" }]).vad_mode).toBe("fallback");
+});
+
+test("a quiet channel takes mode precedence over a genuinely falling-back channel", () => {
+  const quiet = quietSpeechLevels(), fallingBack = new Float64Array(1_000).fill(-46);
+  const q = detectSpeech(quiet), f = detectSpeech(fallingBack);
+  expect(q.stats.vad_mode).toBe("quiet");
+  expect(q.fallback).toBe(false);
+  expect(f.stats.vad_mode).toBe("fallback");
+  expect(f.fallback).toBe(true);
+  expect(summarizeVad([{ energies: quiet, regions: q.regions, mode: q.stats.vad_mode },
+    { energies: fallingBack, regions: f.regions, mode: f.stats.vad_mode }]).vad_mode).toBe("quiet");
+});
+
+test("noise-relative loss clamps at -65 when p10 is below -71", () => {
+  const e = new Float64Array(100).fill(-80);
+  e.fill(-70, 20, 40); // below -65: must not inflate the denominator or the dropped count
+  e.fill(-64, 60, 80);
+  const stats = summarizeVad([{ energies: e, regions: [{ startMs: 6_000, endMs: 7_000 }], mode: "primary" }]);
+  expect(stats.noise_floor_dbfs).toBe(-80);
+  expect(stats.dropped_above_noise_pct).toBe(50); // 10 of 20 above -65 frames; without the clamp, 30 of 40 = 75%
 });
