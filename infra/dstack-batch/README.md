@@ -44,8 +44,8 @@ that run's summary and open a PR that sets both `image:` lines to `api:<sha>@sha
 
 The first creation needs an image that contains migration 0018 (a fresh install starts with admission `closed`); the
 workflow refuses a pin whose commit lacks `src/db/migrations/0018_batch_admission_closed.sql`, because an older image
-seeds admission `open`. For this logging change, the current API image pin predates the completion fields and shipper; after
-merge, publish the new image and open the required re-pin PR before deployment. The order remains:
+seeds admission `open`. The current API image pin contains migration 0018 but predates this PR's completion logging and
+shipper configuration. After merge, publish the new image and open the required re-pin PR before deployment. The order remains:
 merge → `publish-image.yml` publishes → re-pin PR merged → dispatch.
 
 ## Deploy
@@ -54,13 +54,6 @@ merge → `publish-image.yml` publishes → re-pin PR merged → dispatch.
 gh workflow run deploy-batch.yml -R $R --ref main -f confirm=ptx-batch
 ```
 
-**Pre-deploy DockerRootDir gate:** on the target CVM, before applying this Compose, run:
-
-```sh
-docker info --format '{{.DockerRootDir}}'
-```
-
-It must print `/var/lib/docker`; abort the deploy if it does not.
 
 - **Tooling.** Bun is pinned, every action is SHA-pinned, and the repo's dependencies plus the Phala CLI/SDK
   ([`.github/scripts/package-lock.json`](../../.github/scripts/package-lock.json)) are installed with lifecycle scripts
@@ -103,18 +96,15 @@ dockerd. The four service caps total 896 MiB (api 320m + worker 320m + Postgres 
 | postgres | 192m | 64m | tuned Postgres; unshipped |
 | log-shipper | 64m, 0.25 CPU | — | Vector allowlist and Better Stack HTTP sink; memory buffer capped at 1,000 events |
 
-The four limits leave 1,003,282,432 B to the guest OS, dstack and dockerd. The async Fluentd driver and dockerd queue
-are removed. API and worker logs use Docker's capped `json-file` driver; `max-size: 10m` and `max-file: 3` cap each
-service at 30m on the 20G disk. Postgres and Vector have the same cap, for at most 120m across all four services.
-The file source reads from the end on first start, then stores checkpoints in the named `ptx-batch-vector-data`
-volume. Its 65,536-byte line cap covers the 16 KiB maximum JSON app line doubled for Docker JSON escaping plus a
-1 KiB envelope allowance (33 KiB total). Rotated files match the source glob.
+The four service caps leave 1,003,282,432 B to the guest OS, dstack and dockerd. Docker's Fluentd queue is gone. The
+api and upload-worker use dockerd GELF/UDP, so they have no local log-file retention while the shipper is down.
+Postgres and Vector retain capped `json-file` logs at 10m × 3 each: 60 MB total on the 20 GB disk. Vector's 1,000-event
+memory sink buffer remains within its 64 MiB cgroup. The GELF source has no checkpoints or persistent data volume.
 
-The vector image runs as UID 0 because its pinned Alpine Dockerfile creates `/var/lib/vector` as root and sets no
-`USER`; the named volume is initialized from that root-owned path, and checkpoints must be writable. `CAP_DAC_READ_SEARCH`
-would grant read/search access to Docker's root-owned files but not write access to the checkpoint volume. The Vector
-process therefore has `cap_drop: [ALL]`, `no-new-privileges:true`, a read-only root filesystem, a read-only host bind,
-and only the named data volume writable. Upstream evidence: [Vector 0.59.0 Alpine Dockerfile](https://github.com/vectordotdev/vector/blob/v0.59.0/distribution/docker/alpine/Dockerfile).
+Vector runs as UID/GID 65532 on its isolated `logship` bridge (`172.31.250.0/24`, fixed address `172.31.250.10`);
+only `127.0.0.1:12201/udp` is published. Its root filesystem is read-only, every capability is dropped, and
+`no-new-privileges:true` is enabled. `/var/lib/vector` and `/run/vector-secrets` are bounded tmpfs mounts; Vector has no
+Docker-root bind, named data volume, or Docker socket.
 
 The batch workload and sidecar limits still total 896 MiB, preserving the ≥1,000,000,000 B guest-headroom invariant.
 The sink's 1,000-event memory buffer remains within the 64 MiB Vector cgroup; there is no dockerd Fluentd queue.
@@ -123,20 +113,22 @@ The sink's 1,000-event memory buffer remains within the 64 MiB Vector cgroup; th
 limit also counts page cache, which the kernel reclaims first, so a container sitting near its limit while it writes
 PCM is normal. An OOM kill stays inside that container.
 
-**Private logs.** [`log-shipper/vector.yaml`](./log-shipper/vector.yaml) is the canonical Vector pipeline loaded through a
-read-only Compose config; the vendored `fields.json` remains the 25-event app contract checked against generated VRL.
-Only api and worker have the exact `tc.logship` label, exposed by Docker's `json-file` `labels` option. The first Vector
-transform matches the raw Docker envelope before parsing. Unlabelled and unexpected-label lines are replaced with
-content-free counters/events; approved lines are parsed, label-checked again, then passed to the existing allowlist.
-Unknown app events, non-JSON/non-object records and partial records are still dropped by that allowlist.
+**Private logs.** [`log-shipper/vector.yaml`](./log-shipper/vector.yaml) is canonical and embedded into
+`app-compose.yaml` by `bun scripts/ptx-vector-schema.ts --write-compose`; every Compose-sensitive `$` is doubled.
+CI checks the rendered bytes against `vector.yaml` and rejects repo-relative Compose files and bind sources.
 
-Postgres remains unlabelled and unshipped because its diagnostics can contain SQL/error context. Vector is also
-unlabelled, so the source reads and counts its own lines but never feeds them to Better Stack. The capped `json-file`
-drivers keep applications serving while Vector is unavailable; the file source resumes from its checkpoint after a
-restart, but lines older than the retained rotations can be lost. Vector's gate counter is local on its loopback-only
-Prometheus endpoint. The token remains the existing `BETTERSTACK_SOURCE_TOKEN` GitHub Environment secret and is
-interpolated at Vector startup; Docker inspect can expose the container environment. The sidecar remains capped at
-64 MiB and 0.25 CPU, with a bounded 1,000-event sink buffer.
+Only api and upload-worker have the exact `tc.logship` service label. Docker's GELF driver exposes it as
+`_tc.logship`; Postgres and Vector stay unlabelled on capped `json-file`. The socket source receives GELF/UDP on its
+isolated network, with the dockerd publish bound only to host loopback. The first transform compares `_tc.logship`
+exactly, then reconstructs an event from only the approved service tag and GELF `message`, removing every dockerd
+underscore field and all other GELF metadata. The existing `fields.json` 25-event allowlist and 11 TC-1045 completion
+fields remain unchanged. Unlabelled, unexpected-label and partial/unparseable inputs produce fixed, content-free
+counters; unexpected labels emit only a throttled fixed event. The token is written from the entrypoint environment
+to `/run/vector-secrets` tmpfs, unset before Vector starts, and resolved through Vector's `SECRET[]` local-directory
+provider.
+
+The API image pin contains migration 0018; it predates this PR's completion logging. After merge, publish the new image
+and re-pin it before deployment.
 
 The decode path never holds a recording in memory: ffmpeg writes 16 kHz s16le PCM to disk per channel, the VAD reads
 it in 60 s slices (a 2 h channel is 72,000 frame energies, 576 KB), and each dispatch reads one region of at most
@@ -241,32 +233,29 @@ boot (the sweeper retries pending deletions and removes unauthorized files).
 - Go-live gate: create and verify separate Better Stack silence alerts for `svc=api` and `svc=worker`; do not open
   admission until both alerts are active.
 
-## Logging sidecar
+## GELF transport and isolation
 
-The file source reads Docker's JSON log files from `/host/containers/*/*-json.log*`, which is a read-only bind of
-`/var/lib/docker/containers`. It starts at the end, follows rotated files, and checkpoints in the named
-`ptx-batch-vector-data` volume. `max_line_bytes: 65536` covers a 16 KiB serialized app line doubled by Docker's JSON
-escaping plus 1 KiB of envelope metadata (33 KiB total).
+The api and upload-worker use Docker's GELF driver with `gelf-address=udp://127.0.0.1:12201` and `labels=tc.logship`.
+Vector is the only service on the non-internal `logship` bridge, fixed at `172.31.250.10/24`; it publishes UDP 12201
+only on host loopback. App and Postgres containers remain on the ordinary application network and cannot reach the
+Vector address or host-published listener. Postgres and Vector use capped `json-file` logs; no `tc.logship` label is
+attached to either.
 
-Only api and upload-worker have `tc.logship` labels, and their `json-file` logging options expose only that label in
-Docker's `attrs`; each file set is capped at 10m × 3. Postgres and Vector remain unlabelled and capped locally. The
-first Vector transform is a raw-string match of the Docker envelope's exact `attrs` label value. App content remains
-JSON-escaped at this stage, so it cannot forge the unescaped attribute marker. Unmatched lines are replaced immediately
-with fixed reason-only events and increment `logship_gate_dropped_total{reason}`; no source line is parsed, logged or
-retained on that branch. An unexpected label emits only the fixed `logship_unexpected_label` event. Only the two
-approved labels continue to Docker-envelope parsing; the parsed attribute is checked again before the inner `log` is
-passed to the unchanged 25-event `fields.json` allowlist. The TC-1045 completion event retains the existing eleven
-completion fields. The gate counter is exposed on Vector's loopback-only Prometheus endpoint.
+Fluentd was rejected after run 10: Vector restart yielded zero delivered events for 150 seconds, while restarting the
+api restored delivery in six seconds. The file-source alternative was rejected because mounting Docker's root exposes
+every container's `config.v2.json`, including environment secrets, even read-only; it also requires persisted
+checkpoints.
 
-The pinned Vector 0.59.0 Alpine image creates `/var/lib/vector` as root and does not declare a non-root `USER`; the
-named volume inherits that root-owned data directory, so the process needs UID 0 to write checkpoints. `CAP_DAC_READ_SEARCH`
-would not grant the required writes. The Vector process drops every Linux capability, enables `no-new-privileges`,
-uses a read-only root filesystem and host bind, and has only the named data volume writable. See the upstream
-[Vector 0.59.0 Alpine Dockerfile](https://github.com/vectordotdev/vector/blob/v0.59.0/distribution/docker/alpine/Dockerfile).
+The GELF spike shipped a genuine app line, reassembled a chunked line, received/shipped zero sibling-forged packets,
+and received zero packets on external host interfaces. A 5,000-line burst sent while Vector was up lost zero; 500 lines
+took 70 ms with Vector up and 89 ms with it down, with the app still running. The first dynamic-IP restart test failed.
+With a fixed Vector IP, the restart diagnostic passed `docker restart`, crash plus restart policy, recreate, and a
+500-line burst during downtime; each next probe arrived within one second and app restart counts stayed unchanged.
+These spike results are not a substitute for the prepared five-cycle-per-path acceptance script.
 
-There is no Fluentd source, port or dockerd queue. All four `json-file` sets together are capped at 120m on the 20G
-disk; the former 243,712,000 B dockerd queue estimate no longer applies. The 1,000-event sink memory buffer remains
-bounded inside Vector's 64 MiB cgroup.
-
-`BETTERSTACK_SOURCE_TOKEN` remains the existing sealed environment secret. Vector resolves it with explicitly enabled
-environment interpolation; Docker inspect can still expose the original container environment to daemon/API principals.
+Vector uses a non-root UID 65532, read-only root filesystem, `cap_drop: [ALL]`, and `no-new-privileges:true`. Only the
+bounded `/var/lib/vector` data tmpfs and `/run/vector-secrets` secret tmpfs are writable. The entrypoint writes the token
+to the latter and unsets `BETTERSTACK_SOURCE_TOKEN` before `exec vector`; the original Compose environment remains
+visible to Docker daemon/API principals. Vector's 0.59 socket source accepts chunked GELF with a 262,144-byte source
+limit; the native spike reassembled 20 KiB. Docker splits lines over 16 KiB; fragments that are not valid application
+JSON are dropped and counted without retaining the message.

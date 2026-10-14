@@ -28,13 +28,29 @@ const POSTGRES = "postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b
 type Service = {
   image: string; build?: unknown; command?: string[]; environment: Record<string, string>;
   volumes?: { type?: string; source?: string; target: string; read_only?: boolean; bind?: { create_host_path?: boolean } }[];
-  configs?: { source: string; target: string }[]; labels?: Record<string, string>; ports?: unknown[];
+  tmpfs?: string[]; entrypoint?: string[]; labels?: Record<string, string>;
+  ports?: { target: number; published: string; host_ip: string; protocol: string }[];
+  networks?: Record<string, { ipv4_address?: string }>;
   mem_limit?: string; memswap_limit?: string; mem_reservation?: string; cpuset?: string; cpus?: number;
   read_only?: boolean; user?: string; cap_drop?: string[]; security_opt?: string[];
   logging?: { driver?: string; options?: Record<string, string> };
 };
 const vectorConfigText = read("infra/dstack-batch/log-shipper/vector.yaml");
-const vectorConfig = Bun.YAML.parse(vectorConfigText);
+const vectorConfig = Bun.YAML.parse(vectorConfigText) as {
+  data_dir: string;
+  sources: {
+    gelf_in: {
+      type: string; mode: string; address: string; max_length: number; host_key: string;
+      framing: { method: string; chunked_gelf: { decompression: string } }; decoding: { codec: string };
+    };
+  };
+  transforms: Record<string, { type?: string; inputs: string[]; threshold?: number; window_secs?: number }>;
+  secret: { local_directory: { type: string; path: string; remove_trailing_whitespace: boolean } };
+};
+const composeDocument = Bun.YAML.parse(composeConfig) as {
+  services: Record<string, { networks?: Record<string, { ipv4_address?: string }> }>;
+  networks: { logship: { ipam: { config: { subnet: string }[] } } };
+};
 
 function render(quietMode?: string): Record<string, Service> {
   const rendered = Bun.spawnSync(
@@ -56,15 +72,15 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(services.api!.image).toMatch(API_IMAGE);
     expect(services["upload-worker"]!.image).toBe(services.api!.image);
     expect(services.postgres!.image).toBe(POSTGRES);
-    expect(services["log-shipper"]!.ports ?? []).toEqual([]);
+    expect(services["log-shipper"]!.ports).toHaveLength(1);
     expect(services["log-shipper"]!.cpus).toBe(0.25);
     expect(Number(services["log-shipper"]!.mem_limit)).toBe(64 * 1024 * 1024);
     expect(composeText).not.toMatch(/^\s+(build|context|dockerfile):/m);
     expect(composeText).not.toMatch(/image: \$\{/);
   });
 
-  test("mounts Vector's canonical config through a Compose config", () => {
-    expect(render()["log-shipper"]!.configs).toEqual([{ source: "vector-config", target: "/etc/vector/vector.yaml" }]);
+  test("renders the canonical Vector config from the embedded Compose environment", () => {
+    expect(render()["log-shipper"]!.environment.VECTOR_CONFIG_YAML).toBe(vectorConfigText);
   });
 
   test("runs the batch role with no meeting workload, docker socket, or fault injection", () => {
@@ -95,40 +111,53 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(render("false")["upload-worker"]!.environment.BATCH_VAD_QUIET_MODE).toBe("false");
   });
 
-  test("api and worker alone expose their Docker label through capped json-file logs", () => {
+  test("api and worker alone ship labeled GELF logs; other services retain capped json-file logs", () => {
     const services = render();
     for (const [name, label] of [["api", "ptx-batch-api"], ["upload-worker", "ptx-batch-worker"]] as const) {
       expect(services[name]!.labels?.["tc.logship"]).toBe(label);
-      expect(services[name]!.logging).toEqual({ driver: "json-file", options: {
-        "max-size": "10m", "max-file": "3", labels: "tc.logship",
+      expect(services[name]!.logging).toEqual({ driver: "gelf", options: {
+        "gelf-address": "udp://127.0.0.1:12201", labels: "tc.logship",
       } });
     }
-    expect(services.postgres!.labels?.["tc.logship"]).toBeUndefined();
-    expect(services["log-shipper"]!.labels?.["tc.logship"]).toBeUndefined();
-    expect(services.postgres!.logging?.driver).toBe("json-file");
+    for (const name of ["postgres", "log-shipper"] as const) {
+      expect(services[name]!.labels?.["tc.logship"]).toBeUndefined();
+      expect(services[name]!.logging).toEqual({ driver: "json-file", options: { "max-size": "10m", "max-file": "3" } });
+    }
     expect(composeConfig).not.toMatch(/driver:\s*fluentd|fluentd-address|24224/);
   });
 
-  test("Vector gates raw Docker labels first and reads only the host log tree read-only", () => {
+  test("Vector receives GELF only through the loopback publish on its isolated fixed-IP network", () => {
     const services = render();
     const shipper = services["log-shipper"]!;
-    expect(Object.keys(vectorConfig.transforms!)[0]).toBe("raw_label_gate");
-    expect(vectorConfig.sources!.docker_files).toEqual({
-      type: "file", include: ["/host/containers/*/*-json.log*"], read_from: "end", max_line_bytes: 65536,
+    expect(Object.keys(vectorConfig.transforms)[0]).toBe("gelf_gate");
+    expect(vectorConfig.sources.gelf_in).toEqual({
+      type: "socket", mode: "udp", address: "0.0.0.0:12201", max_length: 262144, host_key: "peer_addr",
+      framing: { method: "chunked_gelf", chunked_gelf: { decompression: "Auto" } },
+      decoding: { codec: "gelf" },
     });
-    expect(vectorConfig.transforms!.raw_label_gate!.inputs).toEqual(["docker_files"]);
-    expect(shipper.user).toBe("0:0");
+    expect(vectorConfig.sources).not.toHaveProperty("docker_files");
+    expect(vectorConfig.transforms.gelf_gate!.inputs).toEqual(["gelf_in"]);
+    expect(vectorConfig.secret.local_directory).toEqual({ type: "directory", path: "/run/vector-secrets", remove_trailing_whitespace: true });
+    expect(shipper.user).toBe("65532:65532");
     expect(shipper.read_only).toBe(true);
     expect(shipper.cap_drop).toEqual(["ALL"]);
     expect(shipper.security_opt).toContain("no-new-privileges:true");
-    expect(shipper.ports ?? []).toEqual([]);
-    expect(shipper.volumes?.find((volume) => volume.target === "/host/containers")).toMatchObject({
-      type: "bind", source: "/var/lib/docker/containers", read_only: true, bind: { create_host_path: false },
-    });
-    expect(shipper.volumes?.find((volume) => volume.target === "/var/lib/vector")).toMatchObject({
-      type: "volume", source: "ptx-batch-vector-data",
-    });
-    expect(shipper.environment.VECTOR_CONFIG_YAML).toBeUndefined();
+    expect(shipper.ports).toEqual([{ target: 12201, published: "12201", host_ip: "127.0.0.1", protocol: "udp" }]);
+    expect(Object.keys(shipper.networks ?? {})).toEqual(["logship"]);
+    expect(shipper.networks).toMatchObject({ logship: { ipv4_address: "172.31.250.10" } });
+    expect(composeDocument.networks.logship.ipam.config).toEqual([{ subnet: "172.31.250.0/24" }]);
+    for (const name of ["api", "upload-worker", "postgres"] as const) {
+      expect(services[name]!.networks?.logship).toBeUndefined();
+    }
+    expect(shipper.volumes ?? []).toEqual([]);
+    expect(shipper.tmpfs).toContain("/var/lib/vector:uid=65532,gid=65532,mode=0700,size=8m");
+    expect(shipper.tmpfs).toContain("/run/vector-secrets:uid=65532,gid=65532,mode=0700,size=1m");
+    expect(shipper.environment.VECTOR_CONFIG_YAML).toBe(vectorConfigText);
+    expect(shipper.entrypoint).toEqual(["/bin/sh", "-ec"]);
+    expect(shipper.command?.[0]).toContain('unset BETTERSTACK_SOURCE_TOKEN');
+    expect(shipper.command?.[0]).toContain('/run/vector-secrets/betterstack_source_token');
+    expect(shipper.command?.[0]).toContain('printf "%s\\n" "${VECTOR_CONFIG_YAML}" > /var/lib/vector/vector.yaml');
+    expect(composeConfig).not.toContain("/var/lib/docker");
   });
 
   test("fits tdx.small: service budgets total 896 MiB and retain at least 1 GB guest headroom", () => {
@@ -145,9 +174,10 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     const total = Object.values(services).reduce((sum, service) => sum + Number(service.mem_limit), 0);
     expect(total).toBe(896 * 1024 * 1024);
     expect(1_942_806_528 - total).toBeGreaterThanOrEqual(1_000_000_000);
-    for (const name of ["api", "upload-worker", "postgres", "log-shipper"]) {
-      expect(services[name]!.logging).toEqual({ driver: "json-file", options: { "max-size": "10m", "max-file": "3", ...(name === "api" || name === "upload-worker" ? { labels: "tc.logship" } : {}) } });
+    for (const name of ["postgres", "log-shipper"]) {
+      expect(services[name]!.logging).toEqual({ driver: "json-file", options: { "max-size": "10m", "max-file": "3" } });
     }
+    for (const name of ["api", "upload-worker"]) expect(services[name]!.logging?.driver).toBe("gelf");
     expect(services.postgres!.command).toEqual(["postgres", "-c", "max_connections=40", "-c", "shared_buffers=32MB", "-c", "work_mem=2MB",
       "-c", "maintenance_work_mem=16MB", "-c", "max_wal_size=256MB"]);
   });

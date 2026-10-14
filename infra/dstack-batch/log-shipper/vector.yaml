@@ -1,62 +1,78 @@
 data_dir: /var/lib/vector
+secret:
+  local_directory:
+    type: directory
+    path: /run/vector-secrets
+    remove_trailing_whitespace: true
 sources:
-  docker_files:
-    type: file
-    include: [/host/containers/*/*-json.log*]
-    read_from: end
-    max_line_bytes: 65536
+  gelf_in:
+    type: socket
+    mode: udp
+    address: 0.0.0.0:12201
+    max_length: 262144
+    host_key: peer_addr
+    framing: { method: chunked_gelf, chunked_gelf: { decompression: Auto } }
+    decoding: { codec: gelf }
+  vector_metrics:
+    type: internal_metrics
+    scrape_interval_secs: 1
 transforms:
-  raw_label_gate:
+  gelf_gate:
     type: remap
-    inputs: [docker_files]
+    inputs: [gelf_in]
     drop_on_abort: true
     drop_on_error: true
     source: |
-      message = string!(.message)
-      if contains(message, "\"attrs\":{\"tc.logship\":\"ptx-batch-api\"}") {
-        .gate_status = "accepted"
-      } else if contains(message, "\"attrs\":{\"tc.logship\":\"ptx-batch-worker\"}") {
-        .gate_status = "accepted"
-      } else if contains(message, "\"attrs\":{\"tc.logship\":\"") {
-        . = {"gate_status": "unexpected", "reason": "unexpected_label", "count": 1}
-      } else {
+      lbl = string(get(., ["_tc.logship"]) ?? null) ?? ""
+      if lbl == "ptx-batch-api" {
+        . = {"gate_status": "accepted", "tag": "ptx-batch.api", "log": string(get(., ["message"]) ?? null) ?? ""}
+      } else if lbl == "ptx-batch-worker" {
+        . = {"gate_status": "accepted", "tag": "ptx-batch.worker", "log": string(get(., ["message"]) ?? null) ?? ""}
+      } else if lbl == "" {
         . = {"gate_status": "dropped", "reason": "unlabelled", "count": 1}
+      } else {
+        . = {"gate_status": "unexpected", "reason": "unexpected_label", "count": 1}
       }
   gate_routes:
     type: route
-    inputs: [raw_label_gate]
+    inputs: [gelf_gate]
     route:
       accepted: .gate_status == "accepted"
       dropped: .gate_status == "dropped"
       unexpected: .gate_status == "unexpected"
+  unexpected_label_throttle:
+    type: throttle
+    inputs: [gate_routes.unexpected]
+    threshold: 1
+    window_secs: 60
+    key_field: reason
   gate_unmatched:
     type: remap
     inputs: [gate_routes._unmatched]
     drop_on_error: true
     source: |
       . = {"reason": "route_unmatched", "count": 1}
-  parse_docker_envelope:
+  partial_record_counter:
     type: remap
     inputs: [gate_routes.accepted]
     drop_on_abort: true
     drop_on_error: true
     source: |
-      envelope, parse_err = parse_json(.message)
-      if parse_err != null || !is_object(envelope) { abort }
-      if !is_object(envelope.attrs) { abort }
-      label = envelope.attrs."tc.logship"
-      tag = if label == "ptx-batch-api" { "ptx-batch.api" } else if label == "ptx-batch-worker" { "ptx-batch.worker" } else { abort }
-      if !is_string(envelope.log) { abort }
-      . = {"tag": tag, "log": envelope.log}
+      parsed, parse_err = parse_json(.log)
+      if parse_err != null || !is_object(parsed) {
+        . = {"reason": "partial_or_unparseable", "count": 1}
+      } else {
+        abort
+      }
   gate_unexpected_event:
     type: remap
-    inputs: [gate_routes.unexpected]
+    inputs: [unexpected_label_throttle]
     drop_on_error: true
     source: |
       . = {"event": "logship_unexpected_label", "reason": "unapproved_label"}
   gate_counters:
     type: log_to_metric
-    inputs: [gate_routes.dropped, gate_routes.unexpected, gate_unmatched]
+    inputs: [gate_routes.dropped, gate_routes.unexpected, gate_unmatched, partial_record_counter]
     metrics:
       - type: counter
         field: count
@@ -65,14 +81,17 @@ transforms:
         increment_by_value: true
         tags:
           reason: "{{reason}}"
+  received_metrics:
+    type: filter
+    inputs: [vector_metrics]
+    condition: '.name == "component_received_events_total" && .tags.component_id == "gelf_in"'
   allowlist:
     type: remap
-    inputs: [parse_docker_envelope]
+    inputs: [gate_routes.accepted]
     drop_on_abort: true
     drop_on_error: true
     source: |
       # BEGIN GENERATED FROM fields.json
-      if exists(.partial_message) { abort }
       if !is_string(.tag) { abort }
       tag = .tag
       svc = if tag == "ptx-batch.api" { "api" } else if tag == "ptx-batch.worker" { "worker" } else { abort }
@@ -284,11 +303,11 @@ sinks:
     uri: "https://s2795436.us-west-2a.betterstackdata.com/"
     encoding: { codec: json }
     compression: gzip
-    auth: { strategy: bearer, token: "${BETTERSTACK_SOURCE_TOKEN}" }
+    auth: { strategy: bearer, token: "SECRET[local_directory.betterstack_source_token]" }
     batch: { max_bytes: 4000000, timeout_secs: 5 }
     buffer: { type: memory, max_events: 1000, when_full: drop_newest }
   gate_metrics:
     type: prometheus_exporter
-    inputs: [gate_counters]
+    inputs: [gate_counters, received_metrics]
     address: 127.0.0.1:9598
     flush_period_secs: 5

@@ -41,14 +41,25 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Verify self-contained batch Compose and Vector parity
+        run: |
+          set -euo pipefail
+          bun scripts/ptx-vector-schema.ts --check-compose
+          docker compose -f infra/dstack-batch/app-compose.yaml \
+            --env-file infra/dstack-batch/.env.example config --format json \
+            > "$RUNNER_TEMP/ptx-batch-compose.json"
+          bun scripts/ptx-vector-schema.ts --check-compose-render "$RUNNER_TEMP/ptx-batch-compose.json"
+
       - name: Test Vector allowlist
         run: |
           set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/vector-secrets"
+          printf 'vector-ci-test-token' > "$RUNNER_TEMP/vector-secrets/betterstack_source_token"
           sudo docker run --rm \
-            -e BETTERSTACK_SOURCE_TOKEN=vector-test-token \
             -v "$PWD/infra/dstack-batch/log-shipper:/vector-config:ro" \
+            -v "$RUNNER_TEMP/vector-secrets:/run/vector-secrets:ro" \
             timberio/vector:0.59.0-alpine@sha256:0e36bc2a290039e9b6a5e92f04bd2f133223506f72d09682c1df16c015172b7a \
-            test --dangerously-allow-env-var-interpolation /vector-config/vector.yaml /vector-config/vector.tests.yaml
+            test /vector-config/vector.yaml /vector-config/vector.tests.yaml
       - name: Build Signal seat image
         run: docker build --file infra/signal-seat/Dockerfile --tag ptx-signal-seat:test .
 

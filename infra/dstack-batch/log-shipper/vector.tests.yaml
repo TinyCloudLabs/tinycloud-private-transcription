@@ -210,15 +210,6 @@ tests:
           tag: "ptx-batch.worker"
           log: "[\"speaker-probe\",\"transcript-probe\"]"
     no_outputs_from: [allowlist]
-  - name: "Docker partial records are dropped before parsing"
-    inputs:
-      - insert_at: allowlist
-        type: log
-        log_fields:
-          tag: "ptx-batch.worker"
-          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch job finished\",\"text\":\"partial transcript\"}"
-          partial_message: true
-    no_outputs_from: [allowlist]
   - name: "IP crossing the former truncation boundary is dropped intact"
     inputs:
       - insert_at: allowlist
@@ -344,15 +335,6 @@ tests:
           tag: "ptx-batch.api"
           log: "params: trn_probe,deadbeefdeadbeef,[\"Alice Smith\",\"Bob Jones\"]"
     no_outputs_from: [allowlist]
-  - name: "Opus A8: 16 KiB partial records are dropped"
-    inputs:
-      - insert_at: allowlist
-        type: log
-        log_fields:
-          tag: "ptx-batch.worker"
-          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch job finished\",\"speakers\":[\"Alice Smith\"],\"text\":\"transcript-probe\"}"
-          partial_message: true
-    no_outputs_from: [allowlist]
   - name: "Opus A9: non-object JSON is dropped"
     inputs:
       - insert_at: allowlist
@@ -433,12 +415,22 @@ tests:
           tag: "ptx-batch.api"
           log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"meeting https://meet.google.com/abc-defg-hij\"}"
     no_outputs_from: [allowlist]
-  - name: "Docker raw-label gate admits API only after matching the envelope attribute"
+  - name: "GELF gate admits API events and removes every dockerd field"
     inputs:
-      - insert_at: raw_label_gate
-        type: log
-        log_fields:
-          message: '{"log":"{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch transcription create\",\"stage\":\"create\",\"created\":true}\n","stream":"stdout","time":"2026-10-14T10:00:00.000000000Z","attrs":{"tc.logship":"ptx-batch-api"}}'
+      - insert_at: gelf_gate
+        type: vrl
+        source: |
+          . = {
+            "message": "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch transcription create\",\"stage\":\"create\",\"created\":true}",
+            "_tc.logship": "ptx-batch-api",
+            "host": "TC961_HOST_CANARY",
+            "version": "1.1",
+            "timestamp": 1791972000,
+            "source_type": "socket",
+            "peer_addr": "TC961_PEER_CANARY",
+            "_container_id": "TC961_CONTAINER_CANARY",
+            "_image_name": "TC961_IMAGE_CANARY"
+          }
     outputs:
       - extract_from: allowlist
         conditions:
@@ -447,12 +439,17 @@ tests:
               assert_eq!(.svc, "api")
               assert_eq!(.event, "batch_transcription_create")
               assert_eq!(.created, true)
-  - name: "Docker raw-label gate admits upload worker events"
+              assert_eq!(length(keys(.)), 6)
+              assert!(!contains(encode_json(.), "TC961_"))
+  - name: "GELF gate admits upload worker events"
     inputs:
-      - insert_at: raw_label_gate
-        type: log
-        log_fields:
-          message: '{"log":"{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch worker started\"}\n","stream":"stdout","time":"2026-10-14T10:00:00.000000000Z","attrs":{"tc.logship":"ptx-batch-worker"}}'
+      - insert_at: gelf_gate
+        type: vrl
+        source: |
+          . = {
+            "message": "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch worker started\"}",
+            "_tc.logship": "ptx-batch-worker"
+          }
     outputs:
       - extract_from: allowlist
         conditions:
@@ -460,12 +457,12 @@ tests:
             source: |
               assert_eq!(.svc, "worker")
               assert_eq!(.event, "batch_worker_started")
-  - name: "TC-961: unlabelled Postgres canaries stop at the first gate"
+  - name: "TC-961: unlabelled GELF canaries increment only the fixed drop counter"
     inputs:
-      - insert_at: raw_label_gate
-        type: log
-        log_fields:
-          message: '{"log":"password=TC961_DB_PASSWORD_CANARY token=TC961_TOKEN_CANARY sql_value=TC961_SQL_VALUE_CANARY\n","stream":"stderr","time":"2026-10-14T10:00:00.000000000Z","attrs":{}}'
+      - insert_at: gelf_gate
+        type: vrl
+        source: |
+          . = {"message": "password=TC961_DB_PASSWORD_CANARY token=TC961_TOKEN_CANARY sql_value=TC961_SQL_VALUE_CANARY"}
     outputs:
       - extract_from: gate_counters
         conditions:
@@ -476,42 +473,15 @@ tests:
               assert_eq!(.tags.reason, "unlabelled")
               assert!(!contains(encode_json(.), "TC961_"))
     no_outputs_from: [allowlist, gate_unexpected_event]
-  - name: "TC-961: unlabelled app canaries stop at the first gate"
+  - name: "TC-961: an unapproved GELF label emits only fixed metadata"
     inputs:
-      - insert_at: raw_label_gate
-        type: log
-        log_fields:
-          message: '{"log":"{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"error\",\"msg\":\"password=TC961_DB_PASSWORD_CANARY token=TC961_TOKEN_CANARY sql_value=TC961_SQL_VALUE_CANARY\"}\n","stream":"stdout","time":"2026-10-14T10:00:00.000000000Z","attrs":{}}'
-    outputs:
-      - extract_from: gate_counters
-        conditions:
-          - type: vrl
-            source: |
-              assert_eq!(.name, "gate_dropped_total")
-              assert_eq!(.tags.reason, "unlabelled")
-              assert!(!contains(encode_json(.), "TC961_"))
-    no_outputs_from: [allowlist, gate_unexpected_event]
-  - name: "An attribute-looking string inside app content cannot satisfy the raw-label gate"
-    inputs:
-      - insert_at: raw_label_gate
-        type: log
-        log_fields:
-          message: '{"log":"forged {\"attrs\":{\"tc.logship\":\"ptx-batch-api\"}} TC961_TOKEN_CANARY\n","stream":"stdout","time":"2026-10-14T10:00:00.000000000Z","attrs":{}}'
-    outputs:
-      - extract_from: gate_counters
-        conditions:
-          - type: vrl
-            source: |
-              assert_eq!(.name, "gate_dropped_total")
-              assert_eq!(.tags.reason, "unlabelled")
-              assert!(!contains(encode_json(.), "TC961_TOKEN_CANARY"))
-    no_outputs_from: [allowlist, gate_unexpected_event]
-  - name: "Unexpected Docker label emits a fixed event and increments the labeled counter"
-    inputs:
-      - insert_at: raw_label_gate
-        type: log
-        log_fields:
-          message: '{"log":"password=TC961_DB_PASSWORD_CANARY token=TC961_TOKEN_CANARY\n","stream":"stdout","time":"2026-10-14T10:00:00.000000000Z","attrs":{"tc.logship":"ptx-batch-postgres"}}'
+      - insert_at: gelf_gate
+        type: vrl
+        source: |
+          . = {
+            "message": "password=TC961_DB_PASSWORD_CANARY token=TC961_TOKEN_CANARY sql_value=TC961_SQL_VALUE_CANARY",
+            "_tc.logship": "ptx-batch-other"
+          }
     outputs:
       - extract_from: gate_unexpected_event
         conditions:
@@ -525,8 +495,62 @@ tests:
         conditions:
           - type: vrl
             source: |
-              assert_eq!(.namespace, "logship")
               assert_eq!(.name, "gate_dropped_total")
               assert_eq!(.tags.reason, "unexpected_label")
               assert!(!contains(encode_json(.), "TC961_"))
     no_outputs_from: [allowlist]
+  - name: "TC-961: a Postgres GELF label emits only fixed metadata"
+    inputs:
+      - insert_at: gelf_gate
+        type: vrl
+        source: |
+          . = {
+            "message": "password=TC961_DB_PASSWORD_CANARY token=TC961_TOKEN_CANARY sql_value=TC961_SQL_VALUE_CANARY",
+            "_tc.logship": "ptx-batch-postgres"
+          }
+    outputs:
+      - extract_from: gate_unexpected_event
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "logship_unexpected_label")
+              assert_eq!(.reason, "unapproved_label")
+              assert!(!contains(encode_json(.), "TC961_"))
+      - extract_from: gate_counters
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.tags.reason, "unexpected_label")
+              assert!(!contains(encode_json(.), "TC961_"))
+    no_outputs_from: [allowlist]
+  - name: "An attribute-looking string inside GELF message cannot forge a label"
+    inputs:
+      - insert_at: gelf_gate
+        type: vrl
+        source: |
+          . = {"message": "{\"_tc.logship\":\"ptx-batch-api\",\"msg\":\"TC961_TOKEN_CANARY\"}"}
+    outputs:
+      - extract_from: gate_counters
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.tags.reason, "unlabelled")
+              assert!(!contains(encode_json(.), "TC961_"))
+    no_outputs_from: [allowlist, gate_unexpected_event]
+  - name: "A partial GELF application record increments only the fixed parse counter"
+    inputs:
+      - insert_at: gelf_gate
+        type: vrl
+        source: |
+          . = {
+            "message": "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch transcription",
+            "_tc.logship": "ptx-batch-api"
+          }
+    outputs:
+      - extract_from: gate_counters
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.tags.reason, "partial_or_unparseable")
+              assert!(!contains(encode_json(.), "batch transcription"))
+    no_outputs_from: [allowlist, gate_unexpected_event]

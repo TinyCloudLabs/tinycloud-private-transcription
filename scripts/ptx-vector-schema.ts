@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
@@ -86,7 +87,6 @@ export function renderAllowlist(schema: Schema): string {
 
   const lines = [
     beginMarker,
-    "if exists(.partial_message) { abort }",
     "if !is_string(.tag) { abort }",
     "tag = .tag",
     "svc = if tag == \"ptx-batch.api\" { \"api\" } else if tag == \"ptx-batch.worker\" { \"worker\" } else { abort }",
@@ -158,11 +158,80 @@ export function checkVectorFile(schema: Schema, yaml = readFileSync(vectorPath, 
   if (actual !== expected) throw new Error("vector.yaml allowlist differs from fields.json-generated VRL");
 }
 
+type ComposeService = {
+  env_file?: unknown;
+  environment?: Record<string, unknown>;
+  volumes?: unknown[];
+};
+
+export function checkComposeVectorConfig(compose: unknown, vectorYaml: string): void {
+  const services = (compose as { services?: Record<string, ComposeService> } | null)?.services;
+  const config = services?.["log-shipper"]?.environment?.VECTOR_CONFIG_YAML;
+  if (typeof config !== "string") throw new Error("Compose does not embed VECTOR_CONFIG_YAML");
+  const rendered = config.replace(/\$\$/g, "$").replace(/\r\n/g, "\n").replace(/\n+$/, "");
+  const expected = vectorYaml.replace(/\r\n/g, "\n").replace(/\n+$/, "");
+  if (rendered !== expected) throw new Error("Compose VECTOR_CONFIG_YAML differs from vector.yaml after $$ unescaping");
+}
+
+export function checkNoRepoRelativeComposeFiles(compose: unknown): void {
+  const document = compose as {
+    configs?: Record<string, { file?: unknown }>;
+    services?: Record<string, ComposeService>;
+  } | null;
+  if (!document || typeof document !== "object") throw new Error("Compose document must be an object");
+  for (const [name, config] of Object.entries(document.configs ?? {})) {
+    if (config && typeof config === "object" && "file" in config) {
+      throw new Error(`Compose configs.${name}.file must not reference a local file`);
+    }
+  }
+  for (const [name, service] of Object.entries(document.services ?? {})) {
+    if (service.env_file !== undefined) throw new Error(`Compose services.${name}.env_file must not reference a local file`);
+    for (const volume of service.volumes ?? []) {
+      if (typeof volume === "string") {
+        const source = volume.split(":")[0] ?? "";
+        const relativePath = source.includes("/") && !isAbsolute(source);
+        if (
+          source === "." ||
+          source === ".." ||
+          source.startsWith("./") ||
+          source.startsWith("../") ||
+          source.startsWith("~/") ||
+          relativePath
+        ) {
+          throw new Error(`Compose services.${name} has a relative bind source`);
+        }
+      } else if (volume && typeof volume === "object" && "type" in volume && volume.type === "bind") {
+        const source = "source" in volume && typeof volume.source === "string" ? volume.source : "";
+        if (!isAbsolute(source)) throw new Error(`Compose services.${name} has a relative bind source`);
+      }
+    }
+  }
+}
+
+function checkComposePayload(): void {
+  const composePath = `${root}infra/dstack-batch/app-compose.yaml`;
+  const compose = Bun.YAML.parse(readFileSync(composePath, "utf8"));
+  checkNoRepoRelativeComposeFiles(compose);
+  checkComposeVectorConfig(compose, readFileSync(vectorPath, "utf8"));
+}
+
+function checkRenderedComposePayload(path: string): void {
+  const rendered = JSON.parse(readFileSync(path, "utf8"));
+  checkComposeVectorConfig(rendered, readFileSync(vectorPath, "utf8"));
+}
+
 if (import.meta.main) {
   const schema = JSON.parse(readFileSync(schemaPath, "utf8")) as Schema;
   const rendered = renderAllowlist(schema);
   if (process.argv.includes("--check")) {
     checkVectorFile(schema);
+  } else if (process.argv.includes("--check-compose")) {
+    checkComposePayload();
+  } else if (process.argv.includes("--check-compose-render")) {
+    const index = process.argv.indexOf("--check-compose-render");
+    const path = process.argv[index + 1];
+    if (!path) throw new Error("--check-compose-render requires a JSON render path");
+    checkRenderedComposePayload(path);
   } else if (process.argv.includes("--write")) {
     const yaml = readFileSync(vectorPath, "utf8");
     if (!yaml.includes(beginMarker) || !yaml.includes(endMarker)) throw new Error("vector.yaml is missing generated allowlist markers");
