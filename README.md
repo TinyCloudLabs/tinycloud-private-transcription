@@ -355,9 +355,12 @@ accepted API default comes from main commit `0c5b5ae1`; the unchanged Signal-sea
 references and must remain digest-pinned.
 
 MinIO is pinned to the exact releases running on `ptx-dev`: server
-`RELEASE.2025-09-07T16-13-09Z` and client `RELEASE.2025-08-13T08-35-41Z`. Their public Quay manifest-list
-digests match the images already cached by the CVM, so fresh pulls are deterministic without changing the
-MinIO command, `/data` volume, health check, credentials, or initialization flow.
+`RELEASE.2025-09-07T16-13-09Z` and client `RELEASE.2025-08-13T08-35-41Z`. quay.io no longer serves MinIO's
+community images anonymously, so both are mirrored to `ghcr.io/tinycloudlabs/mirror/minio` and
+`ghcr.io/tinycloudlabs/mirror/minio-mc`, copied from the images cached on the CVM (`docker save`). The mirror
+re-serialises the layers, so its manifest digests differ from Quay's; the image config digests (Docker image
+IDs `sha256:69b2ec20…` for the server and `sha256:c2ad7742…` for the client) and the layer diff_ids are
+unchanged. The MinIO command, `/data` volume, health check, credentials, and initialization flow are unchanged.
 
 The CVM must be able to pull these images. dstack's pre-launch script runs `docker image prune -af` on every
 boot and `docker compose pull` before `up`, so a pre-pulled image does not survive an update — the registry

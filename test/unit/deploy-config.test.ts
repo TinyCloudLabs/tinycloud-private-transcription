@@ -67,18 +67,18 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(compose).not.toMatch(/^\s+dockerfile:/m);
   });
 
-  test("pins public pullable MinIO server and client releases by digest", () => {
+  test("pins the GHCR-mirrored MinIO server and client releases by digest", () => {
     const serverImage = compose.match(/\n  minio:\n    image: ([^\n]+)/)?.[1];
     const clientImage = compose.match(/\n  minio-init:\n    image: ([^\n]+)/)?.[1];
 
     expect(serverImage).toBe(
-      "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
+      "ghcr.io/tinycloudlabs/mirror/minio:RELEASE.2025-09-07T16-13-09Z@sha256:25e301eb686e796ead885d0e254cc6397424df7d7a79cee48ff08b720570ced6",
     );
     expect(clientImage).toBe(
-      "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727",
+      "ghcr.io/tinycloudlabs/mirror/minio-mc:RELEASE.2025-08-13T08-35-41Z@sha256:4545427b5ba8e7553be881a34db1706dc9b307cbd13e6c9fe9b58faba9d2f380",
     );
     expect(compose).not.toMatch(/image:\s+minio\/(?:minio|mc):/);
-    expect(compose).not.toMatch(/image:\s+quay\.io\/minio\/(?:minio|mc):latest/);
+    expect(compose).not.toMatch(/image:\s+quay\.io\/minio\//);
   });
 
   test("pins every deploy and runtime-pulled image to an approved immutable digest", () => {
@@ -92,8 +92,8 @@ describe("infra/dstack/app-compose.yaml", () => {
       redis: "redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf",
       "vexa-redis": "valkey/valkey:8-alpine@sha256:d2e18f3410b6f616de1417f570fa55261af2898b9c5b2cfb6781ce2373ea43d1",
       "vexa-postgres": "postgres:17-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73",
-      minio: "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
-      "minio-init": "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727",
+      minio: "ghcr.io/tinycloudlabs/mirror/minio:RELEASE.2025-09-07T16-13-09Z@sha256:25e301eb686e796ead885d0e254cc6397424df7d7a79cee48ff08b720570ced6",
+      "minio-init": "ghcr.io/tinycloudlabs/mirror/minio-mc:RELEASE.2025-08-13T08-35-41Z@sha256:4545427b5ba8e7553be881a34db1706dc9b307cbd13e6c9fe9b58faba9d2f380",
       "admin-api": "vexaai/v012-admin-api:v012@sha256:4c702354384eafe3a933cd537a106b7c15067cfd368a5f6da1a6e675e7e03e04",
       "bot-image-keeper": "ghcr.io/tinycloudlabs/vexa/bot:tc-e5b5307@sha256:32404172d0c843d29ec2617df52d8ca9cb09d510f6423e6aa355aac859196253",
       "bot-janitor": "docker:27.5.1-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c",
