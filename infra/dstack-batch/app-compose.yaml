@@ -133,6 +133,7 @@ services:
   log-shipper:
     image: timberio/vector:0.59.0-alpine@sha256:0e36bc2a290039e9b6a5e92f04bd2f133223506f72d09682c1df16c015172b7a
     restart: unless-stopped
+    init: true
     user: "65532:65532"
     read_only: true
     cap_drop: [ALL]

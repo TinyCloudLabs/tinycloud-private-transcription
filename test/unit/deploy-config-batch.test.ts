@@ -32,7 +32,7 @@ type Service = {
   ports?: { target: number; published: string; host_ip: string; protocol: string; mode?: string }[];
   networks?: Record<string, { ipv4_address?: string }>;
   mem_limit?: string; memswap_limit?: string; mem_reservation?: string; cpuset?: string; cpus?: number;
-  read_only?: boolean; user?: string; cap_drop?: string[]; security_opt?: string[];
+  read_only?: boolean; user?: string; cap_drop?: string[]; security_opt?: string[]; init?: boolean;
   logging?: { driver?: string; options?: Record<string, string> };
 };
 const vectorConfigText = read("infra/dstack-batch/log-shipper/vector.yaml");
@@ -144,6 +144,7 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(vectorConfig.secret.local_directory).toEqual({ type: "directory", path: "/run/vector-secrets", remove_trailing_whitespace: true });
     expect(vectorConfig.sinks.gate_metrics!.flush_period_secs).toBe(86400);
     expect(shipper.user).toBe("65532:65532");
+    expect(shipper.init).toBe(true);
     expect(shipper.read_only).toBe(true);
     expect(shipper.cap_drop).toEqual(["ALL"]);
     expect(shipper.security_opt).toContain("no-new-privileges:true");
