@@ -3,8 +3,8 @@
 The batch API advertises nominal `max_duration_seconds=10800`, inclusive raw
 `accepted_max_duration_seconds=11101`, and inclusive `max_bytes=186496800`. It emits no
 `duration_grace_seconds`. Create/PUT and Bun's HTTP body limit share the byte cap; worker decode uses the accepted
-duration. Default concurrent reservations are 1,864,968,000 bytes (ten caps); the daily tenant budget is 559,490,400
-bytes (three caps).
+duration. Default and shipped-compose API concurrent reservations are 1,864,968,000 bytes (ten caps); the daily tenant budget
+is 559,490,400 bytes (three caps).
 
 Raw ffprobe duration is compared before millisecond rounding. Exactly 11,101 seconds is accepted; one 16 kHz sample
 above it rejects. Exactly 11,100 decoded seconds of the measured MP3 reported 11,100.029388 raw seconds: a strict
@@ -57,12 +57,18 @@ Postgres/Redis ports were verified closed, PID files absent, stop commands exit 
 at 23:09:11Z. This released the host slot for OpenKey Check2. No three-hour Docker envelope was rerun.
 
 The new API regressions exercise exact public capabilities, full-cap create equality/+1, inclusive reservation/daily
-budgets, small streamed PUT equality/+1, raw equality/+sample/padded MP3 rejection decisions and cleanup, full accepted
+budgets from both defaults and the shipped compose environment, small streamed PUT equality/+1, raw equality/+sample/padded MP3 rejection decisions and cleanup, full accepted
 tail dispatch with a scaled eight-second fixture, and unchanged ordinary notes. Metadata stubs isolate the duration
 comparison; they do not claim a new three-hour encoder or ASR run. The manual replay is
 `test/support/batch-duration-smoke.ts`, against an isolated loopback `tc922` database, production HTTP API entrypoint,
 durable worker and local mock provider. It also exercises a real full-byte-cap HTTP body using short audio with legal
 ID3 padding, avoiding a long encode/decode and a whole-body heap buffer.
+
+The first PR CI head `a7093ab5aa29289979d091e3e66c5a54212c7e1a` exposed the shipped compose
+API's old explicit reservation/daily overrides. Both are corrected to the approved values; the image pin, other
+limits and runtime source are unchanged. API budget regressions now consume shipped compose values as well as
+defaults. The correction is gated by the shipped-profile API consumer tests and a fresh HTTP budget replay; see the PR for
+the latest exact head and results. Service-backed local checks wait for the coordinated host reservation release.
 
 ## Held capacity evidence and limits
 

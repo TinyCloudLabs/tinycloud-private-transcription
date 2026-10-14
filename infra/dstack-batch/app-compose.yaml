@@ -15,7 +15,10 @@
 # reports ~1.27 GB used, so ~1 GiB is left to the guest OS, dstack and dockerd. The three services are capped at
 # 832 MiB together (api 320m + upload-worker 320m + postgres 192m), with no swap, so a runaway process is OOM-killed
 # inside its own container instead of taking the guest down. The cgroup limit also counts page cache, which the kernel
-# reclaims first. Container logs are json-file, capped at 3 x 10 MB per service. .github/workflows/batch-envelope.yml proves these limits with a 2-hour stereo recording on one CPU.
+# reclaims first. Container logs are json-file, capped at 3 x 10 MB per service.
+# CI retains the ordinary 2-hour envelope on one CPU. TC-922's held 3-hour/grace-tail evidence and its cache/peak
+# limitations are documented in docs/tc-922-validation.md. Admission is nominal 10800 s, accepted raw 11101 s,
+# with a shared 186496800-byte cap; the explicit API budgets below reserve ten full-size jobs and three per day.
 services:
   api:
     image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:508cb0be60a27e6b2bb4eefd888ad7c98954c3e5@sha256:72568fe357e87aefb13a4430b0124b16a4c5e98395281e80e9ee09471c9aaf4d
@@ -34,10 +37,10 @@ services:
       BATCH_TINFOIL_API_KEY: ${BATCH_TINFOIL_API_KEY:-}
       BATCH_TINFOIL_MODEL: voxtral-small-24b
       BATCH_MAX_ACTIVE_JOBS: "10"
-      BATCH_MAX_RESERVED_BYTES: "1209600000"
+      BATCH_MAX_RESERVED_BYTES: "1864968000"
       BATCH_MAX_CONCURRENT_UPLOADS: "3"
       BATCH_DISK_HIGH_WATER_PERCENT: "80"
-      BATCH_TENANT_DAILY_BYTES: "362880000"
+      BATCH_TENANT_DAILY_BYTES: "559490400"
       BATCH_UPLOAD_MAX_PUT_SECONDS: "1800"
       BATCH_UPLOAD_MIN_BYTES_PER_SECOND: "32768"
       # Browser and app origins allowed to PUT /uploads/{id} directly (Exo web, Pages previews, desktop, mobile).

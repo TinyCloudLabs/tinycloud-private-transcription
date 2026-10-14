@@ -39,30 +39,44 @@ describe("TC-922 consumer contract", () => {
     expect((await over.json()).error.code).toBe("recording_too_large");
   });
 
-  test("default byte reservation admits ten full-cap jobs inclusively, then rejects one extra byte", async () => {
-    // Raise only the job-count gate so a byte-budget consumer error cannot hide behind that independent gate.
-    h.ctx.config.limits.maxActiveJobs = 20;
-    const bytes = await audio("stereo");
-    for (let index = 1; index <= 10; index++) {
-      expect((await h.create(bytes, { tenant: tenant(index), body: { byte_size: 186_496_800 } })).status).toBe(201);
-    }
-    const over = await h.create(bytes, { tenant: tenant(11), body: { byte_size: 1 } });
-    expect(over.status).toBe(429);
-    expect((await over.json()).error.code).toBe("service_busy");
-  });
+  for (const profile of ["defaults", "shipped compose"] as const) {
+    const applyBudgetProfile = async () => {
+      if (profile !== "shipped compose") return;
+      const compose = Bun.YAML.parse(await Bun.file(new URL("../../infra/dstack-batch/app-compose.yaml", import.meta.url)).text()) as {
+        services: { api: { environment: Record<string, string> } };
+      };
+      Object.assign(h.ctx.config.limits, {
+        maxReservedBytes: Number(compose.services.api.environment.BATCH_MAX_RESERVED_BYTES),
+        tenantDailyBytes: Number(compose.services.api.environment.BATCH_TENANT_DAILY_BYTES),
+      });
+    };
+    test(`${profile}: byte reservation admits ten full-cap jobs inclusively, then rejects one extra byte`, async () => {
+      await applyBudgetProfile();
+      // Raise only the job-count gate so a byte-budget consumer error cannot hide behind that independent gate.
+      h.ctx.config.limits.maxActiveJobs = 20;
+      const bytes = await audio("stereo");
+      for (let index = 1; index <= 10; index++) {
+        expect((await h.create(bytes, { tenant: tenant(index), body: { byte_size: 186_496_800 } })).status).toBe(201);
+      }
+      const over = await h.create(bytes, { tenant: tenant(11), body: { byte_size: 1 } });
+      expect(over.status).toBe(429);
+      expect((await over.json()).error.code).toBe("service_busy");
+    });
 
-  test("default daily budget admits three full-cap jobs inclusively, then rejects one extra byte", async () => {
-    const bytes = await audio("stereo");
-    for (let index = 0; index < 3; index++) {
-      const created = await h.create(bytes, { body: { byte_size: 186_496_800 } });
-      expect(created.status).toBe(201);
-      const job = await created.json();
-      expect((await h.api(`/v1/transcriptions/${job.id}/cancel`, { method: "POST" })).status).toBe(200);
-    }
-    const over = await h.create(bytes, { body: { byte_size: 1 } });
-    expect(over.status).toBe(429);
-    expect((await over.json()).error.code).toBe("quota_exceeded");
-  });
+    test(`${profile}: daily budget admits three full-cap jobs inclusively, then rejects one extra byte`, async () => {
+      await applyBudgetProfile();
+      const bytes = await audio("stereo");
+      for (let index = 0; index < 3; index++) {
+        const created = await h.create(bytes, { body: { byte_size: 186_496_800 } });
+        expect(created.status).toBe(201);
+        const job = await created.json();
+        expect((await h.api(`/v1/transcriptions/${job.id}/cancel`, { method: "POST" })).status).toBe(200);
+      }
+      const over = await h.create(bytes, { body: { byte_size: 1 } });
+      expect(over.status).toBe(429);
+      expect((await over.json()).error.code).toBe("quota_exceeded");
+    });
+  }
 
   test("small byte boundary exercises actual create and streamed PUT equality / one extra byte", async () => {
     const bytes = await audio("stereo");

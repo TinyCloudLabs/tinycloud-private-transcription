@@ -24,6 +24,10 @@ const provider = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request
   return Response.json({ text: `local smoke ${decoded.length}`, language: "en" });
 } });
 const h = await startBatchHarness();
+const compose = Bun.YAML.parse(await Bun.file(new URL("../../infra/dstack-batch/app-compose.yaml", import.meta.url)).text()) as {
+  services: { api: { environment: Record<string, string> } };
+};
+const shipped = compose.services.api.environment;
 h.ctx.provider = new BatchTinfoilClient({ ...h.ctx.config.tinfoil, baseUrl: `http://127.0.0.1:${provider.port}`, apiKey: "local-smoke" });
 const decoder = join(h.uploadDir, "ffmpeg");
 const decoderArgs = join(output, "decoder-args.jsonl");
@@ -43,6 +47,8 @@ const api = Bun.spawn([process.execPath, "--no-env-file", "src/api/server.ts"], 
     PATH: process.env.PATH!, PTX_ROLE: "batch", PORT: String(port), AUTO_MIGRATE: "false",
     DATABASE_URL: database.href, BATCH_UPLOAD_DIR: h.uploadDir, BATCH_DISK_HIGH_WATER_PERCENT: "99",
     BATCH_TINFOIL_API_KEY: "local-smoke", BATCH_TINFOIL_BASE_URL: `http://127.0.0.1:${provider.port}`, FFPROBE_PATH: probe,
+    BATCH_MAX_RESERVED_BYTES: shipped.BATCH_MAX_RESERVED_BYTES,
+    BATCH_TENANT_DAILY_BYTES: shipped.BATCH_TENANT_DAILY_BYTES,
   },
   stdout: apiLog, stderr: apiLog,
 });
@@ -51,11 +57,11 @@ const report: Record<string, unknown> = { mode: "local HTTP, mock provider; shor
 async function request(path: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bearer ${h.keys.transcriptions}`);
-  headers.set("X-Tenant-Ref", TENANT_A);
+  if (!headers.has("X-Tenant-Ref")) headers.set("X-Tenant-Ref", TENANT_A);
   return fetch(`http://127.0.0.1:${port}${path}`, { ...init, headers, signal: AbortSignal.timeout(30_000) });
 }
-async function create(size: number, digest: string) {
-  return request("/v1/transcriptions", { method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
+async function create(size: number, digest: string, tenant = TENANT_A) {
+  return request("/v1/transcriptions", { method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID(), "X-Tenant-Ref": tenant },
     body: JSON.stringify({ content_type: "audio/mpeg", byte_size: size, sha256: digest, language: "en" }) });
 }
 async function upload(job: any, body: Blob | Uint8Array, size: number) {
@@ -140,6 +146,29 @@ try {
       report[raw] = { put: status, result: await completed(job.id) };
     }
   }
+  // Consume the shipped API environment, rather than merely comparing its literals with defaults.
+  const reserved: { id: string; tenant: string }[] = [];
+  for (let index = 1; index <= 10; index++) {
+    const tenant = index.toString(16).padStart(64, "0");
+    const response = await create(cap, digest, tenant);
+    assert.equal(response.status, 201);
+    reserved.push({ id: ((await response.json()) as any).id, tenant });
+  }
+  const busy = await create(1, digest, "c".repeat(64));
+  assert.equal(busy.status, 429);
+  assert.equal(((await busy.json()) as any).error.code, "service_busy");
+  for (const job of reserved) assert.equal((await request(`/v1/transcriptions/${job.id}/cancel`, { method: "POST", headers: { "X-Tenant-Ref": job.tenant } })).status, 200);
+  const dailyTenant = "d".repeat(64);
+  for (let index = 0; index < 3; index++) {
+    const response = await create(cap, digest, dailyTenant);
+    assert.equal(response.status, 201);
+    const job = await response.json() as any;
+    assert.equal((await request(`/v1/transcriptions/${job.id}/cancel`, { method: "POST", headers: { "X-Tenant-Ref": dailyTenant } })).status, 200);
+  }
+  const quota = await create(1, digest, dailyTenant);
+  assert.equal(quota.status, 429);
+  assert.equal(((await quota.json()) as any).error.code, "quota_exceeded");
+  report.shippedBudgets = { tenFullCapReservations: 201, nextCreate: 429, threeFullCapDailyCreates: 201, nextByte: 429 };
   const args = (await readFile(decoderArgs, "utf8")).trim().split("\n").map(line => JSON.parse(line) as string[]);
   assert.equal(args.length, 8);
   assert(args.every(argv => argv[argv.indexOf("-fs") + 1] === "355232000"));

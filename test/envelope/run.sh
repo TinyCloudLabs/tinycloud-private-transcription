@@ -16,6 +16,8 @@
 #      window, in the upload-worker cgroup) + per-turn dispatch; the job must complete diarized with its audio deleted.
 # Fails on a timeout, an OOM kill or a restart in any container; prints peak memory per container (and to
 # $GITHUB_STEP_SUMMARY when set).
+# This stays a fixed ordinary 2-hour regression; TC-922's accepted 3-hour/grace-tail capacity evidence is held
+# separately in docs/tc-922-validation.md. Do not interpret this fixture's size budget as the current upload cap.
 set -euo pipefail
 
 : "${ENVELOPE_IMAGE:?ENVELOPE_IMAGE (the api image built from this commit) is required}"
@@ -24,7 +26,7 @@ export ENVELOPE_IMAGE ENVELOPE_DIR="$REPO/test/envelope"
 WORK="$(mktemp -d "${RUNNER_TEMP:-/tmp}/ptx-envelope.XXXXXX")"
 PROCESS_DEADLINE_SECONDS="${PROCESS_DEADLINE_SECONDS:-1200}"
 DIARIZE_DEADLINE_SECONDS="${DIARIZE_DEADLINE_SECONDS:-2700}"
-DURATION_SECONDS=7199 # the 7,200 s cap minus room for MP3 encoder padding
+DURATION_SECONDS=7199 # fixed ordinary 2-hour control, retained for comparison with earlier envelope runs
 URL=http://127.0.0.1:8080
 MOCK=http://127.0.0.1:18081
 SERVICES=(api upload-worker postgres)
@@ -65,7 +67,7 @@ docker run --rm --user "$(id -u):$(id -g)" --volume "$WORK:/out" "$ENVELOPE_IMAG
 SIZE="$(stat -c %s "$MP3")"
 SHA="$(sha256sum "$MP3" | cut -d' ' -f1)"
 echo "recording.mp3: $SIZE bytes in $((SECONDS - started)) s"
-[ "$SIZE" -le 120960000 ] || fail "the fixture is over the 120,960,000-byte upload cap"
+[ "$SIZE" -le 120960000 ] || fail "the two-hour fixture exceeds its fixed 120,960,000-byte control budget"
 echo "::endgroup::"
 
 echo "::group::Generate a ${DURATION_SECONDS} s two-voice mono MP3 for diarization"
