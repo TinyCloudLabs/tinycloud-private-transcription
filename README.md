@@ -461,16 +461,10 @@ prove an out-of-memory kill; confirm runtime events.
 a failed provider, including after transcript salvage. It contains only that discriminator;
 private provider error text is not exposed. Older provider builds may omit it.
 
-Search structured worker logs by `meetingId`: `bot dispatched` ties it to the bot/container and
-provider meeting IDs and captures the timeout/mode; `capture status observed` carries lifecycle
-evidence; `capture heartbeat` shows continued successful polling; `meeting status changed`
-connects capture with transcript finalization. Capture health is explicitly `not_reported` by this
-API. For continuous-speech incidents, correlate provider bot logs for:
-
-- `aloneness: silence verdict` (last detected audio time and silence window)
-- `Google Meet removal detected` (which selector matched)
-- `termination signal` and runtime/container exit events
-- `[PerSpeaker]` frame-flow/worklet/context logs
+Worker and Vexa bot logs report lifecycle outcomes, counters, lengths and durations only. They do
+not include participant names, transcript or caption text, meeting URLs/native meeting codes, or raw
+provider error messages. Google Meet admission diagnostics are opt-in through `DEBUG_ADMISSION`;
+the deployed compose does not set it, and the dump itself is count-only.
 
 The pinned Google Meet detector currently accepts generic alert dialogs and `Reconnecting` as
 removal indicators. Also, its audio-ready flag is cleared only during capture teardown; stalled

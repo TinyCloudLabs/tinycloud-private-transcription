@@ -30,7 +30,10 @@ export function startHousekeeping(ctx: AppContext, opts: { store?: ArtifactStore
         if (!store) ctx.log.error("artifact retention is enabled but its MinIO credentials are not available yet; skipping this sweep", { mode: retention.mode });
         else await runArtifactRetention(ctx, store, retention.mode);
       } catch (error) {
-        ctx.log.error("artifact retention sweep failed", { mode: retention.mode, error: (error as Error).message });
+        const errorCode = typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+          ? error.code
+          : "unknown";
+        ctx.log.error("artifact retention sweep failed", { mode: retention.mode, error_code: errorCode });
       } finally {
         sweeping = false;
       }

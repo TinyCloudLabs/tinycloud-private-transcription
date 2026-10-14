@@ -3,7 +3,7 @@ import { integerListEnv, parseArtifactRetentionMode, percentEnv } from "../../sr
 import type { AppContext } from "../../src/context.ts";
 import { artifactMeetingId, linkedVexaMeetingIds, queuedEvalMeetingIds, RECORDING_LIFETIME_SLACK_MS, recordingWithinLifetime, retentionDecision, type PtxMeetingState } from "../../src/services/artifact-retention.ts";
 import type { Queue } from "../../src/worker/queue.ts";
-import { checkDisk } from "../../src/worker/housekeeping.ts";
+import { checkDisk, startHousekeeping } from "../../src/worker/housekeeping.ts";
 
 const cutoff = new Date("2026-10-01T00:00:00Z");
 const policy = { cutoff, keepVexaMeetingIds: new Set<number>(), orphans: false };
@@ -79,6 +79,33 @@ test("the worker warns while disk usage is at or above the high-water mark", asy
   warnings.length = 0;
   await checkDisk(ctx(1));
   expect(warnings).toEqual([["disk usage above high-water mark", { path: "/", used_percent: expect.any(Number), high_water_percent: 1 }]]);
+});
+test("retention sweep logs only an error code when artifact storage fails", async () => {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  const errors: Array<[string, Record<string, unknown> | undefined]> = [];
+  const ctx = {
+    config: {
+      disk: { path: "/", highWaterPercent: 100 },
+      artifactRetention: { mode: "dry-run", intervalMs: 60_000, days: 14, orphans: false, keepVexaMeetingIds: [], s3: {} },
+    },
+    log: {
+      debug() {},
+      info() {},
+      warn() {},
+      error: (msg: string, data?: Record<string, unknown>) => { errors.push([msg, data]); resolve(); },
+    },
+  } as unknown as AppContext;
+  const store = {
+    list: async function* () { throw Object.assign(new Error("s3://TC965_KEY_CANARY/private-object?token=TC965_TOKEN_CANARY"), { code: "AccessDenied" }); },
+    delete: async () => {},
+  };
+  const housekeeping = startHousekeeping(ctx, { store });
+  await promise;
+  housekeeping.stop();
+  expect(errors).toEqual([["artifact retention sweep failed", { mode: "dry-run", error_code: "unknown" }]]);
+  const output = JSON.stringify(errors);
+  expect(output).not.toContain("TC965_KEY_CANARY");
+  expect(output).not.toContain("TC965_TOKEN_CANARY");
 });
 
 test("a ptx meeting links to Vexa by vexa_meeting_id or by the id in vexa_bot_id", () => {
