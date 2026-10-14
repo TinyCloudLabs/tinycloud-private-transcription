@@ -9,6 +9,7 @@ import { transcriptionCapabilities, transcriptions, transcriptionWorkers } from 
 import { silentLogger } from "../../src/log.ts";
 import { createBatchApp } from "../../src/roles/batch.ts";
 import { parseCorsOrigins } from "../../src/uploads/cors.ts";
+import { batchConfigFromEnv } from "../../src/uploads/config.ts";
 import { runSweep } from "../../src/uploads/ledger.ts";
 import { audioName, jobDir } from "../../src/uploads/storage.ts";
 import { audio, exists, laceBombWebm, sha256, startBatchHarness, TENANT_A, TENANT_B, tenant, trickle, type BatchHarness } from "./batch-harness.ts";
@@ -23,7 +24,7 @@ afterEach(async () => {
   // Each test starts from an empty job table, open admission and the default limits.
   await h.ctx.db.execute(sql`truncate table transcriptions, transcription_tenant_usage cascade`);
   await h.ctx.db.execute(sql`update transcription_admission set mode = 'open' where id = 1`);
-  Object.assign(h.ctx.config.limits, { maxActiveJobs: 10, maxReservedBytes: 1_209_600_000, maxConcurrentUploads: 3, diskHighWaterPercent: 99, tenantDailyBytes: 362_880_000, maxDurationSeconds: 7_200, durationScanSeconds: 45 });
+  Object.assign(h.ctx.config.limits, batchConfigFromEnv().limits, { diskHighWaterPercent: 99 });
   Object.assign(h.ctx.config.upload, { maxPutSeconds: 1_800, minBytesPerSecond: 32_768, progressGraceSeconds: 60, idleTimeoutSeconds: 60, leaseStaleSeconds: 120 });
   h.tinfoil.calls = [];
 });
@@ -80,12 +81,12 @@ describe("scopes on every batch route", () => {
 });
 
 describe("create and admission", () => {
-  test("validates the body and caps byte_size at 120,960,000 before any state is written", async () => {
+  test("validates the body and caps byte_size at 186,496,800 before any state is written", async () => {
     const bytes = await audio("stereo");
     const bad = [
       [{ content_type: "audio/aac" }, 400, "invalid_request"],
       [{ byte_size: 0 }, 400, "invalid_request"],
-      [{ byte_size: 120_960_001 }, 413, "recording_too_large"],
+      [{ byte_size: 186_496_801 }, 413, "recording_too_large"],
       [{ sha256: "XYZ" }, 400, "invalid_request"],
       [{ language: "en; drop" }, 400, "invalid_request"],
       [{ channel_labels: ["a", "b", "c"] }, 400, "invalid_request"],
@@ -613,10 +614,11 @@ describe("upload validation fails the job and deletes its bytes", () => {
     ["declared mp4, bytes are wav", "mono_wav", "audio/mp4", {}, "invalid_audio"],
     ["declared webm, bytes are m4a", "stereo_m4a", "audio/webm", {}, "invalid_audio"],
     ["three channels", "three_channel_wav", "audio/wav", {}, "unsupported_recording"],
-    ["over the 7,200 s cap", "over_cap_mp3", "audio/mpeg", {}, "recording_too_long"],
+    ["over a scaled raw duration cap", "over_cap_mp3", "audio/mpeg", {}, "recording_too_long"],
   ] as const;
   for (const [label, fixture, contentType, body, code] of cases) {
     test(label, async () => {
+      if (fixture === "over_cap_mp3") Object.assign(h.ctx.config.limits, { maxDurationSeconds: 2, acceptedMaxDurationSeconds: 3 });
       const bytes = await audio(fixture);
       const job = await (await h.create(bytes, { contentType, body })).json();
       const res = await h.put(job.id, job.upload.capability, bytes, { contentType });
@@ -625,7 +627,7 @@ describe("upload validation fails the job and deletes its bytes", () => {
       expect(await h.row(job.id)).toMatchObject({ status: "failed", errorCode: code, deletionState: "files_deleted" });
       expect(await exists(jobDir(h.uploadDir, job.id))).toBe(false);
       expect((await h.put(job.id, job.upload.capability, bytes, { contentType })).status).toBe(401);
-    }, 60_000); // generating the real 7,201 s fixture takes seconds on CI runners
+    });
   }
 });
 
@@ -637,7 +639,7 @@ describe("measuring a recording without a container duration is bounded", () => 
   };
 
   test("more packets than the duration cap allows fails recording_too_long, whatever the timestamps claim", async () => {
-    h.ctx.config.limits.maxDurationSeconds = 60; // at most 24,000 packets of 2.5 ms
+    Object.assign(h.ctx.config.limits, { maxDurationSeconds: 30, acceptedMaxDurationSeconds: 60 }); // at most 24,000 packets of 2.5 ms
     const { job, res, error } = await upload(laceBombWebm(200)); // 51,200 packets whose timestamps span 2 s
     expect(res.status).toBe(422);
     expect(error).toMatchObject({ code: "upload_rejected", job_error: { code: "recording_too_long" } });
