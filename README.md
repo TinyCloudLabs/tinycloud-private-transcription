@@ -461,9 +461,10 @@ prove an out-of-memory kill; confirm runtime events.
 a failed provider, including after transcript salvage. It contains only that discriminator;
 private provider error text is not exposed. Older provider builds may omit it.
 
-Worker and Vexa bot logs report lifecycle outcomes, counters, lengths and durations only. They do
-not include participant names, transcript or caption text, meeting URLs/native meeting codes, or raw
-provider error messages. Google Meet admission diagnostics are opt-in through `DEBUG_ADMISSION`;
+Vexa bot log redaction is not active in the currently pinned image. The Vexa #16 changes must land,
+then the bot image must be rebuilt and re-pinned in ptx. Only after those steps, and behind the
+ptx-dev shipper allowlist, should Vexa logs be treated as scrubbed. The shipper allowlist remains
+the enforcement boundary. Google Meet admission diagnostics are opt-in through `DEBUG_ADMISSION`;
 the deployed compose does not set it, and the dump itself is count-only.
 
 The pinned Google Meet detector currently accepts generic alert dialogs and `Reconnecting` as
