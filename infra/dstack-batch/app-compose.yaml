@@ -140,7 +140,7 @@ services:
     security_opt: ["no-new-privileges:true"]
     mem_limit: 64m
     memswap_limit: 64m
-    cpus: 0.25
+    cpus: 0.5
     logging:
       driver: json-file
       options:

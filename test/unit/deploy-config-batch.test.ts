@@ -74,7 +74,7 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(services["upload-worker"]!.image).toBe(services.api!.image);
     expect(services.postgres!.image).toBe(POSTGRES);
     expect(services["log-shipper"]!.ports).toHaveLength(1);
-    expect(services["log-shipper"]!.cpus).toBe(0.25);
+    expect(services["log-shipper"]!.cpus).toBe(0.5);
     expect(Number(services["log-shipper"]!.mem_limit)).toBe(64 * 1024 * 1024);
     expect(composeText).not.toMatch(/^\s+(build|context|dockerfile):/m);
     expect(composeText).not.toMatch(/image: \$\{/);

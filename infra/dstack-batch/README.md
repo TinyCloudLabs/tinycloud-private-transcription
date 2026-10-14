@@ -94,7 +94,7 @@ dockerd. The four service caps total 896 MiB (api 320m + worker 320m + Postgres 
 | api | 320m | 96m | Bun + Hono; PUT bodies stream to disk; ffprobe; healthcheck |
 | upload-worker | 320m | 96m | Bun; ffmpeg decodes one channel at a time to PCM on disk |
 | postgres | 192m | 64m | tuned Postgres; unshipped |
-| log-shipper | 64m, 0.25 CPU | — | Vector allowlist and Better Stack HTTP sink; memory buffer capped at 1,000 events |
+| log-shipper | 64m, 0.5 CPU | — | Vector allowlist and Better Stack HTTP sink; memory buffer capped at 1,000 events |
 
 The four service caps leave 1,003,282,432 B to the guest OS, dstack and dockerd. The Docker Fluentd queue is gone. API
 and upload-worker use GELF/UDP with `cache-disabled: "true"`, so Docker's dual-logging cache does not retain local app
