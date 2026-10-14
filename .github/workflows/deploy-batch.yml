@@ -222,10 +222,10 @@ jobs:
           set -euo pipefail
           echo "Deploying $IMAGE ($MODE)"
           if [ "$MODE" = "update" ]; then
-            "$PHALA" deploy --cvm-id "$CVM_ID" -c "$COMPOSE" -e "$ENV_FILE" --no-public-logs --wait
+            "$PHALA" deploy --cvm-id "$CVM_ID" -c "$COMPOSE" -e "$ENV_FILE" --no-public-logs --no-public-sysinfo --wait
           else
             "$PHALA" deploy -n "$CVM_NAME" -c "$COMPOSE" -e "$ENV_FILE" -t "$INSTANCE_TYPE" --disk-size "$DISK_SIZE" \
-              --no-dev-os --no-public-logs --wait
+              --no-dev-os --no-public-logs --no-public-sysinfo --wait
             RAW="$("$PHALA" cvms get "$CVM_NAME" --json)"
             CVM_ID="$(echo "$RAW" | jq -r '.id')"
             echo "CVM_ID=$CVM_ID" >> "$GITHUB_ENV"
