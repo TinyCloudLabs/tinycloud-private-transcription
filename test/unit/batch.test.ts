@@ -155,6 +155,34 @@ describe("provider outcome classification", () => {
 });
 
 describe("VAD regions", () => {
+  test("quiet detection is enabled by default and has one batch config rollback flag", () => {
+    const old = process.env.BATCH_VAD_QUIET_MODE;
+    try {
+      delete process.env.BATCH_VAD_QUIET_MODE;
+      expect(batchConfigFromEnv().vad.quietMode).toBe(true);
+      process.env.BATCH_VAD_QUIET_MODE = "false";
+      expect(batchConfigFromEnv().vad.quietMode).toBe(false);
+      process.env.BATCH_VAD_QUIET_MODE = "true";
+      expect(batchConfigFromEnv().vad.quietMode).toBe(true);
+      const warnings: string[] = [];
+      const log = { warn: (message: string) => { warnings.push(message); } };
+      for (const [value, enabled] of [["FALSE", false], [" false ", false], ["TRUE", true], ["", true], ["   ", true]] as const) {
+        process.env.BATCH_VAD_QUIET_MODE = value;
+        expect(batchConfigFromEnv(log).vad.quietMode).toBe(enabled);
+      }
+      expect(warnings).toEqual([]);
+      for (const value of ["0", "off", "bogus"]) {
+        warnings.length = 0;
+        process.env.BATCH_VAD_QUIET_MODE = value;
+        expect(batchConfigFromEnv(log).vad.quietMode).toBe(true);
+        expect(warnings).toEqual(["Invalid BATCH_VAD_QUIET_MODE; quiet mode enabled"]);
+        expect(warnings[0]).not.toContain(value);
+      }
+    } finally {
+      if (old === undefined) delete process.env.BATCH_VAD_QUIET_MODE;
+      else process.env.BATCH_VAD_QUIET_MODE = old;
+    }
+  });
   const frames = (spec: [number, number][], total: number) => {
     // spec: [startFrame, endFrame) voiced at -20 dBFS; everything else digital silence (-120).
     const e = new Float64Array(total).fill(-120);
@@ -217,10 +245,10 @@ describe("VAD coverage guard (TC-1045)", () => {
   });
 
   test("a quiet talker in a quiet room is not lost because they speak for only a small part of the recording", () => {
-    // 100 s in a -55 dBFS room; a -45 dBFS talker speaks for 8 s. The threshold (p10 + 12 = -43) drops all of it: 8% of
+    // 100 s in a -60 dBFS room; a -49 dBFS talker speaks for 8 s. The threshold (p10 + 12 = -48) drops all of it: 8% of
     // the recording but 100% of its non-silent audio, so the guard measures against the non-silent audio.
-    const e = new Float64Array(1_000).fill(-55);
-    e.fill(-45, 500, 580);
+    const e = new Float64Array(1_000).fill(-60);
+    e.fill(-49, 500, 580);
     const detection = detectSpeech(e);
     expect(detection).toMatchObject({ primaryDroppedShare: 1, fallback: true, covered: true, droppedFrames: 0 });
     expect(detection.regions).toEqual([{ startMs: 49_750, endMs: 58_250 }]);

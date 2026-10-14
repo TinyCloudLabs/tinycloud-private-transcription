@@ -11,9 +11,10 @@ import { PCM_BYTES_PER_SECOND } from "./audio.ts";
  * whose background is louder than -40 dBFS is sent whole: no speech is lost, at the cost of sending the background.
  */
 export const VAD = {
-  frameMs: 100, floorDbfs: -50, aboveP10Db: 12, capDbfs: -40, mergeGapMs: 1_000, padMs: 250, minMs: 400, maxMs: 30_000, splitSearchMs: 10_000,
+  frameMs: 100, floorDbfs: -50, fallbackDbfs: -57, aboveP10Db: 12, capDbfs: -40, mergeGapMs: 1_000, padMs: 250, minMs: 400, maxMs: 30_000, splitSearchMs: 10_000,
   /** Coverage guard: at most this share of the non-silent audio (frames ≥ floorDbfs) may go unsent before the VAD falls back. */
   maxDroppedAboveFloor: 0.1,
+  quiet: { enabled: true, medianBelowDbfs: -50, p99BelowDbfs: -30, peakAboveP10Db: 21, minPeakMs: 1_000, aboveP10Db: 3, minDbfs: -65, padMs: 500 },
 };
 
 export type VadParams = typeof VAD;
@@ -131,20 +132,81 @@ export interface Detection {
   droppedFrames: number;
   /** Frames above the floor: the guard's denominator. */
   aboveFloorFrames: number;
-  /** The relative threshold left too much audio above the floor unsent, so the regions use the floor alone. */
+  /** The relative threshold left too much audio above the floor unsent, so the regions use fallbackDbfs. */
   fallback: boolean;
   /** Share of the audio above the floor that the relative threshold would have left unsent (what tripped the fallback). */
   primaryDroppedShare: number;
-  /** false: even the floor-only regions leave more than the bound unsent. The job must fail, never complete. */
+  /** false: even the selected regions leave more than the bound unsent. The job must fail, never complete. */
   covered: boolean;
+  stats: VadStats;
+}
+
+export type VadMode = "primary" | "fallback" | "quiet";
+
+/** Additive result stats. Frame-centre coverage uses the same convention as the existing floor guard. */
+export interface VadStats {
+  vad_mode: VadMode;
+  noise_floor_dbfs: number;
+  median_dbfs: number;
+  p99_dbfs: number;
+  speech_peak_s: number;
+  dropped_above_noise_pct: number;
+}
+
+function energyProfile(energies: Float64Array, vad: VadParams) {
+  const sorted = Float64Array.from(energies).sort();
+  // Floor-index percentiles match vadThreshold and REPORT.md's TS sketch. Empty PCM has the digital-silence level.
+  const at = (q: number) => sorted.length === 0 ? -120 : sorted[Math.floor(q * (sorted.length - 1))]!;
+  const p10 = at(0.1), median = at(0.5), p99 = at(0.99);
+  let peakFrames = 0;
+  for (const energy of energies) if (energy >= p10 + vad.quiet.peakAboveP10Db) peakFrames++;
+  return { p10, median, p99, peakFrames };
+}
+
+function statsForRegions(energies: Float64Array, regions: readonly Region[], mode: VadMode, vad: VadParams, profile = energyProfile(energies, vad)): VadStats {
+  const noiseVad = { ...vad, floorDbfs: Math.max(vad.quiet.minDbfs, profile.p10 + 6) };
+  const aboveNoise = aboveFloorFrames(energies, noiseVad);
+  return {
+    vad_mode: mode, noise_floor_dbfs: profile.p10, median_dbfs: profile.median, p99_dbfs: profile.p99,
+    speech_peak_s: profile.peakFrames * vad.frameMs / 1000,
+    dropped_above_noise_pct: aboveNoise === 0 ? 0 : Math.round(droppedAboveFloorFrames(energies, regions, noiseVad) / aboveNoise * 1000) / 10,
+  };
+}
+
+/** Job diagnostics over pooled channel frames; mode is quiet if any channel is quiet, then fallback, then primary. */
+export function summarizeVad(channels: readonly { energies: Float64Array; regions: readonly Region[]; mode: VadMode }[], vad: VadParams = VAD): VadStats {
+  const pooled = new Float64Array(channels.reduce((sum, c) => sum + c.energies.length, 0));
+  const regions: Region[] = [];
+  let offset = 0;
+  for (const channel of channels) {
+    pooled.set(channel.energies, offset);
+    regions.push(...channel.regions.map((r) => ({ startMs: r.startMs + offset * vad.frameMs, endMs: r.endMs + offset * vad.frameMs })));
+    offset += channel.energies.length;
+  }
+  const mode = channels.some((c) => c.mode === "quiet") ? "quiet" : channels.some((c) => c.mode === "fallback") ? "fallback" : "primary";
+  return statsForRegions(pooled, regions, mode, vad);
+}
+
+/** Coalesce the exact union, then split without gaps or duplicate audio. Do not merge additional gaps here. */
+function unionRegions(regions: readonly Region[], energies: Float64Array, vad: VadParams): Region[] {
+  const sorted = [...regions].sort((a, b) => a.startMs - b.startMs);
+  const union: Region[] = [];
+  for (const region of sorted) {
+    const last = union.at(-1);
+    if (last && region.startMs <= last.endMs) last.endMs = Math.max(last.endMs, region.endMs);
+    else union.push({ ...region });
+  }
+  return union.flatMap((region) => splitLong(region, energies, vad));
 }
 
 /**
  * VAD regions with a fail-closed coverage guard. If the relative threshold leaves more than `maxDroppedAboveFloor` of
- * the non-silent audio (frames at or above the floor) unsent, the regions are recomputed with the floor as the threshold:
+ * the non-silent audio (frames at or above the floor) unsent, the regions are recomputed with `fallbackDbfs` as the threshold:
  * every stretch of non-silent audio, still merged, padded and cut at 30 s. A pause in a quiet room is below the floor and
  * never counts. The bound is never below one minimum region (`minMs`): the VAD never sends a stretch shorter than that
  * on its own, so a sub-second recording or a lone click at either end is the VAD's resolution, not lost speech.
+ * Quiet mode uses the speech-presence gate and p10-relative threshold from TC-1093, with 500 ms padding, and retains
+ * the exact union with the non-quiet path. The floor guard and primaryDroppedShare keep their original meanings.
  */
 export function detectSpeech(energies: Float64Array, vad: VadParams = VAD): Detection {
   const aboveFloor = aboveFloorFrames(energies, vad);
@@ -152,10 +214,19 @@ export function detectSpeech(energies: Float64Array, vad: VadParams = VAD): Dete
   const primary = regionsFromEnergies(energies, vadThreshold(energies, vad), vad);
   const primaryDropped = droppedAboveFloorFrames(energies, primary, vad);
   const primaryDroppedShare = aboveFloor === 0 ? 0 : primaryDropped / aboveFloor;
-  if (primaryDropped <= bound) {
-    return { regions: primary, droppedFrames: primaryDropped, aboveFloorFrames: aboveFloor, fallback: false, primaryDroppedShare, covered: true };
+  const fallback = primaryDropped > bound;
+  let regions = fallback ? regionsFromEnergies(energies, vad.fallbackDbfs, vad) : primary;
+  const profile = energyProfile(energies, vad);
+  const quiet = vad.quiet.enabled && profile.median < vad.quiet.medianBelowDbfs && profile.p99 < vad.quiet.p99BelowDbfs
+    && profile.peakFrames * vad.frameMs >= vad.quiet.minPeakMs;
+  if (quiet) {
+    const threshold = Math.min(vad.floorDbfs, Math.max(vad.quiet.minDbfs, profile.p10 + vad.quiet.aboveP10Db));
+    const quietRegions = regionsFromEnergies(energies, threshold, { ...vad, padMs: vad.quiet.padMs });
+    // The exact quiet threshold can be higher than TC-1090's fallback (-57). Retain all previously sent audio.
+    regions = unionRegions([...regions, ...quietRegions], energies, vad);
   }
-  const regions = regionsFromEnergies(energies, vad.floorDbfs, vad);
   const droppedFrames = droppedAboveFloorFrames(energies, regions, vad);
-  return { regions, droppedFrames, aboveFloorFrames: aboveFloor, fallback: true, primaryDroppedShare, covered: droppedFrames <= bound };
+  const mode = quiet ? "quiet" : fallback ? "fallback" : "primary";
+  return { regions, droppedFrames, aboveFloorFrames: aboveFloor, fallback: quiet ? false : fallback, primaryDroppedShare, covered: droppedFrames <= bound,
+    stats: statsForRegions(energies, regions, mode, vad, profile) };
 }

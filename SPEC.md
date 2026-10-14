@@ -203,11 +203,21 @@ not_received|stored|deletion_pending|deleted, audio_deleted_at, transcript_expir
 error:{type,code,message}|null, created_at, upload_deadline_at, uploaded_at, processing_started_at, finished_at}`.
 Completed result: `{id, status, language, duration_seconds, provider:"tinfoil", model, channels, diarized, speakers:[{id,
 name, channel}], segments:[{id, speaker_id, channel, start, end, text}], text, stats:{tinfoil_calls,
-tinfoil_audio_seconds, voiced_seconds, dropped_above_floor_pct, vad_fallback}}`. `voiced_seconds` is the audio the VAD (or
+tinfoil_audio_seconds, voiced_seconds, dropped_above_floor_pct, vad_fallback, vad_mode, noise_floor_dbfs, median_dbfs,
+p99_dbfs, speech_peak_s, dropped_above_noise_pct}}`. `voiced_seconds` is the audio the VAD (or
 diarizer) selected to send, summed over channels (a `separate` stereo job can exceed `duration_seconds`);
 `dropped_above_floor_pct` is the share of the non-silent audio (at or above −50 dBFS) that was not sent; `vad_fallback`
 is true when the coverage guard (below) replaced the VAD threshold. The last two are null for a job whose regions were
-detected before TC-1045. Without `diarize`, `diarized` is false, speakers are `channel_N` (named by `channel_labels`) and
+detected before TC-1045. TC-1093 adds `vad_mode: "primary" | "fallback" | "quiet"`, `noise_floor_dbfs` (p10),
+`median_dbfs` (p50), `p99_dbfs`, `speech_peak_s` (seconds of frames ≥ p10 + 21 dB), and `dropped_above_noise_pct`
+(0–100: share of frames ≥ max(−65, p10 + 6) whose centres are unsent). All five numeric fields are finite numbers;
+an empty input has p10/p50/p99 = −120 and zero counts. Percentiles use floor-index order statistics.
+For separate stereo, scalar diagnostics pool the channel frames; `speech_peak_s` sums channel-frame duration and
+can exceed wall-clock duration. The gate runs per channel; the job mode is quiet if any channel is quiet, otherwise
+fallback if any falls back, otherwise primary. Diarized jobs keep the diarizer's regions and report primary with
+diagnostics measured against those actual regions. These six additions are persisted with the regions and retained
+across re-claims; they are absent for jobs detected before TC-1093. Existing saved results are returned unchanged.
+Without `diarize`, `diarized` is false, speakers are `channel_N` (named by `channel_labels`) and
 timestamps are region-level (VAD regions, below). With `diarize`, `diarized` is true, `channels` is 1, speakers are
 `{id:"speaker_N", name:"Speaker N+1", channel:0}` (N 0–31, numbered by first appearance; only speakers with text are
 listed) and every segment is one speaker turn on channel 0, in time order. Results stored before `diarized` existed
@@ -282,10 +292,17 @@ decodes to 16 kHz PCM on disk, stopping at 7,200 s of PCM (counted in bytes, wha
 Tinfoil request. No speech → `no_speech`. The −40 dBFS cap keeps continuous speech over a steady noise floor, where the
 10th percentile lies inside the speech (TC-1045); a background louder than −40 dBFS is therefore sent with the speech.
 **Coverage guard:** if the regions leave more than 10% of the channel's non-silent audio (frames at or above −50 dBFS)
-unsent, or more than one minimum region (0.4 s) if that is larger, the channel's regions are recomputed with −50 dBFS as
+unsent, or more than one minimum region (0.4 s) if that is larger, the channel's regions are recomputed with −57 dBFS as
 the threshold (every non-silent stretch, merged, padded and cut at 30 s) and the job records `vad_fallback`; if even
 those leave more than that unsent, the job fails `processing_failed` rather than completing with part of the recording.
 A recording too short for any region still fails `no_speech`.
+
+**Quiet mode:** when the median is below −50 dBFS, p99 is below −30 dBFS, and at least 1 s of 100 ms frames is
+≥ p10 + 21 dB, build regions at min(−50, max(−65, p10 + 3)) with ±0.5 s padding. Send their exact union with the
+primary/fallback regions above, coalesced and split at 30 s, so quiet mode never removes previously selected audio.
+The absolute coverage guard still measures at −50 dBFS, and a quiet channel records `vad_fallback: false`.
+Every non-quiet channel keeps the previous regions exactly. `BATCH_VAD_QUIET_MODE=false` disables the gate and
+quiet constants for new detections, returning to TC-1090's primary/−57 fallback paths; additive stats remain available.
 
 **Diarization** (`diarize: true`; [docs/diarization-benchmark.md](./docs/diarization-benchmark.md)). After the mono
 decode, speech is labelled with speakers in equal windows of at most 10 min that overlap by 60 s, one window at a time,

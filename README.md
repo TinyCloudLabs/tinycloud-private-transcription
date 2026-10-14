@@ -130,6 +130,7 @@ bun run cli create-key --project tinychat --scopes 'transcriptions:*'
 | `BATCH_TINFOIL_API_KEY` | – | the batch service's own Tinfoil key; `TINFOIL_API_KEY` is never read in this role. Unset = every create answers `503 service_unavailable` |
 | `BATCH_TINFOIL_BASE_URL` / `BATCH_TINFOIL_MODEL` / `BATCH_TINFOIL_TIMEOUT_MS` | `https://inference.tinfoil.sh` / `voxtral-small-24b` / `180000` | |
 | `BATCH_UPLOAD_DIR` | `/var/lib/ptx-batch/uploads` | accepted audio, in-flight uploads, PCM work files (both processes mount it) |
+| `BATCH_VAD_QUIET_MODE` | `true` | trimmed, case-insensitive `false` rolls back quiet detection to TC-1090's primary/−57 dBFS fallback paths; unknown non-empty values enable quiet mode with a warning naming the variable; set on the batch worker |
 | `BATCH_MAX_ACTIVE_JOBS` | `10` | service-wide awaiting_upload + queued + processing |
 | `BATCH_MAX_RESERVED_BYTES` | `1209600000` | service-wide declared bytes of those jobs (10 × the 120,960,000-byte cap) |
 | `BATCH_MAX_CONCURRENT_UPLOADS` | `3` | service-wide live PUTs |

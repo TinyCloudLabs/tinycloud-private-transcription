@@ -177,6 +177,13 @@ started` log line has `diarization: true`.
 
 ## Rollback
 
+For TC-1093 quiet-mode rollback, set the optional `ptx-batch` GitHub Environment variable `BATCH_VAD_QUIET_MODE=false`
+and deploy. The workflow includes it in the complete sealed deploy environment, and the worker compose passes it
+through (default `true`); the existing deploy workflow syncs added env names to
+the CVM allowlist. New detections use TC-1090's primary/−57 dBFS fallback regions; already committed regions and
+their stats remain intact. Migration 0026 only adds nullable `transcriptions.vad_stats` JSONB, with no backfill or
+default, so keep the column when rolling back an image. No data migration is needed for the flag.
+
 Drain, then open a PR that sets the previous image pin, merge it, and dispatch. Migration 0017 only adds tables and 0018
 only changes the admission default (and closes a fresh install's seed row), so an older batch image runs against the
 newer schema. **Never purge the volumes** while any job has

@@ -7,7 +7,10 @@ import { runSweep, retentionLagSeconds } from "../../src/uploads/ledger.ts";
 import type { FaultPoint } from "../../src/uploads/faults.ts";
 import { jobDir, jobsRoot } from "../../src/uploads/storage.ts";
 import { claimNext, insertRegions, processClaim, recordWorkerHeartbeat, REGION_INSERT_CHUNK, startBatchWorker } from "../../src/uploads/worker.ts";
-import { VAD } from "../../src/uploads/vad.ts";
+import { detectSpeech, VAD } from "../../src/uploads/vad.ts";
+import { PCM_RATE } from "../../src/uploads/audio.ts";
+import { pcmToWav } from "../../src/providers/transcription/audio.ts";
+import { pcmFromLevels, quietSpeechLevels } from "../support/vad-fixtures.ts";
 import { holdFence } from "../../src/uploads/fence.ts";
 import { audio, exists, startBatchHarness, TENANT_A, TENANT_B, tenant, type BatchHarness } from "./batch-harness.ts";
 
@@ -141,6 +144,8 @@ describe("VAD coverage (TC-1045)", () => {
     expect([stats.vad_fallback, typeof stats.voiced_seconds, typeof stats.dropped_above_floor_pct]).toEqual([false, "number", "number"]);
     expect(stats.voiced_seconds / body.duration_seconds).toBeGreaterThanOrEqual(0.9);
     expect(stats.dropped_above_floor_pct).toBeLessThanOrEqual(10);
+    expect(stats.vad_mode).toBe("primary");
+    for (const name of ["noise_floor_dbfs", "median_dbfs", "p99_dbfs", "speech_peak_s", "dropped_above_noise_pct"]) expect(typeof stats[name]).toBe("number");
     expect(stats.tinfoil_audio_seconds).toBeCloseTo(stats.voiced_seconds, 3);
     expect(sentSeconds(body)).toBeCloseTo(stats.voiced_seconds, 3);
     expect(await h.row(id)).toMatchObject({ vadFallback: false, vadDroppedAboveFloorPct: stats.dropped_above_floor_pct });
@@ -152,6 +157,7 @@ describe("VAD coverage (TC-1045)", () => {
     const body = await (await result(id)).json();
     expect(body.status).toBe("completed");
     expect(body.stats.vad_fallback).toBe(true);
+    expect(body.stats.vad_mode).toBe("fallback");
     expect(body.stats.voiced_seconds / body.duration_seconds).toBeGreaterThanOrEqual(0.9);
     expect(body.stats.dropped_above_floor_pct).toBeLessThanOrEqual(10);
     expect(sentSeconds(body)).toBeCloseTo(body.stats.voiced_seconds, 3);
@@ -186,6 +192,7 @@ describe("VAD coverage (TC-1045)", () => {
     h.faults.once("worker.after_regions", "crash");
     await expect(h.work()).rejects.toThrow("simulated crash");
     const stored = await h.row(resumed);
+    expect(stored.vadStats?.vad_mode).toBe("primary");
     expect([stored.vadFallback, typeof stored.vadDroppedAboveFloorPct]).toEqual([false, "number"]);
     // Sentinels: a resumed claim that re-ran detection would overwrite them.
     await h.ctx.db.update(transcriptions).set({ vadFallback: true, vadDroppedAboveFloorPct: 7.5, claimHeartbeatAt: new Date(Date.now() - 120_000) })
@@ -193,6 +200,8 @@ describe("VAD coverage (TC-1045)", () => {
     expect(await h.work()).toBe(true);
     const body = await (await result(resumed)).json();
     expect([body.status, body.stats.vad_fallback, body.stats.dropped_above_floor_pct]).toEqual(["completed", true, 7.5]);
+    expect(await h.row(resumed)).toMatchObject({ vadStats: stored.vadStats });
+    expect(body.stats).toMatchObject(stored.vadStats!);
 
     // Legacy: regions inserted the way the previous image did, without the coverage columns.
     const legacy = await h.submit(await audio("stereo"));
@@ -204,6 +213,83 @@ describe("VAD coverage (TC-1045)", () => {
     await processClaim(h.ctx, claim);
     const old = await (await result(legacy)).json();
     expect([old.status, old.stats.voiced_seconds, old.stats.dropped_above_floor_pct, old.stats.vad_fallback]).toEqual(["completed", 5, null, null]);
+    expect(old.stats).not.toHaveProperty("vad_mode");
+    expect(old.stats).not.toHaveProperty("dropped_above_noise_pct");
+  });
+
+  test("TC-1093: a crash between region insert and stats write rolls back both", async () => {
+    const id = await h.submit(pcmToWav(pcmFromLevels(quietSpeechLevels()), PCM_RATE), { contentType: "audio/wav" });
+    h.faults.once("worker.regions_inserted", "crash");
+    await expect(h.work()).rejects.toThrow("simulated crash at worker.regions_inserted");
+    expect(await regions(id)).toEqual([]);
+    expect((await h.row(id)).vadStats).toBeNull();
+    expect(h.tinfoil.calls).toEqual([]);
+    await h.ctx.db.update(transcriptions).set({ claimHeartbeatAt: new Date(Date.now() - 120_000) }).where(eq(transcriptions.id, id));
+    expect(await h.work()).toBe(true);
+    expect((await regions(id)).length).toBeGreaterThan(0);
+    expect((await h.row(id)).vadStats?.vad_mode).toBe("quiet");
+    const body = await (await result(id)).json();
+    expect(body.status).toBe("completed");
+    expect(body.stats).toMatchObject({ vad_mode: "quiet", vad_fallback: false });
+  });
+
+  test("TC-1093: quiet PCM stats survive re-claim and appear unchanged in result JSON", async () => {
+    const pcm = pcmFromLevels(quietSpeechLevels());
+    const energies = Float64Array.from({ length: 1_000 }, (_, f) => {
+      let sum = 0;
+      for (let s = f * 1_600; s < (f + 1) * 1_600; s++) sum += (pcm[s]! / 32768) ** 2;
+      return 20 * Math.log10(Math.sqrt(sum / 1_600));
+    });
+    const expected = detectSpeech(energies).stats;
+    const id = await h.submit(pcmToWav(pcm, PCM_RATE), { contentType: "audio/wav" });
+    h.faults.once("worker.after_regions", "crash");
+    await expect(h.work()).rejects.toThrow("simulated crash");
+    expect((await h.row(id)).vadStats).toEqual(expected);
+    expect(await h.ctx.db.execute(sql`select jsonb_typeof(vad_stats) as kind from transcriptions where id = ${id}`)).toEqual([{ kind: "object" }]);
+    // A retry must use the committed diagnostics even if quiet mode is switched off meanwhile.
+    h.ctx.config.vad.quietMode = false;
+    try {
+      await h.ctx.db.update(transcriptions).set({ claimHeartbeatAt: new Date(Date.now() - 120_000) }).where(eq(transcriptions.id, id));
+      await h.work();
+    } finally {
+      h.ctx.config.vad.quietMode = true;
+    }
+    const body = await (await result(id)).json();
+    expect(body.status).toBe("completed");
+    expect(body.stats).toMatchObject({ ...expected, vad_mode: "quiet", dropped_above_noise_pct: 0, vad_fallback: false, voiced_seconds: 22, tinfoil_audio_seconds: 22 });
+    expect(sentSeconds(body)).toBe(22);
+  });
+
+  test("TC-1093 rollback flag restores PR 1 regions while still reporting diagnostics", async () => {
+    h.ctx.config.vad.quietMode = false;
+    try {
+      const id = await h.submit(pcmToWav(pcmFromLevels(quietSpeechLevels()), PCM_RATE), { contentType: "audio/wav" });
+      await h.work();
+      const body = await (await result(id)).json();
+      expect(body.stats).toMatchObject({ vad_mode: "primary", vad_fallback: false, voiced_seconds: 1.5, dropped_above_noise_pct: 90.9 });
+    } finally {
+      h.ctx.config.vad.quietMode = true;
+    }
+  });
+
+  test("TC-1093: separate stereo reports quiet precedence and retains the other channel's fallback flag", async () => {
+    const quiet = pcmFromLevels(quietSpeechLevels());
+    const fallback = pcmFromLevels(new Float64Array(1_000).fill(-46));
+    const interleaved = new Int16Array(quiet.length * 2);
+    for (let s = 0; s < quiet.length; s++) {
+      interleaved[2 * s] = quiet[s]!;
+      interleaved[2 * s + 1] = fallback[s]!;
+    }
+    const wav = pcmToWav(interleaved, PCM_RATE);
+    const header = new DataView(wav.buffer, wav.byteOffset, wav.byteLength);
+    header.setUint16(22, 2, true); // channels
+    header.setUint32(28, PCM_RATE * 4, true); // byte rate
+    header.setUint16(32, 4, true); // block alignment
+    const id = await h.submit(wav, { contentType: "audio/wav", body: { channel_mode: "separate" } });
+    await h.work();
+    const body = await (await result(id)).json();
+    expect(body).toMatchObject({ status: "completed", channels: 2, stats: { vad_mode: "quiet", vad_fallback: true, voiced_seconds: 122 } });
+    expect((await h.row(id)).vadStats?.vad_mode).toBe("quiet");
   });
 });
 

@@ -13,6 +13,7 @@ import { config } from "../../src/config.ts";
 import type { AppContext } from "../../src/context.ts";
 import { createDb, type Db } from "../../src/db/client.ts";
 import { runMigrations } from "../../src/db/migrate.ts";
+import { transcriptions } from "../../src/db/schema.ts";
 import { silentLogger } from "../../src/log.ts";
 
 const migrationsSource = fileURLToPath(new URL("../../src/db/migrations/", import.meta.url));
@@ -156,7 +157,7 @@ test("0004-0015 retain production retry, fallback, terminal delivery, and deleti
     expect(signalColumns).toEqual({ count: 2 });
 
     const [migrationCount] = await db.execute(sql`SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`);
-    expect(migrationCount).toEqual({ count: 26 });
+    expect(migrationCount).toEqual({ count: 27 });
 
     const [deletionAdmission] = await db.execute(sql`
       SELECT count(*)::int AS count
@@ -417,7 +418,7 @@ test("0024 upgrades 0023 data additively and tolerates the old image after rollb
       segmentsJson: sql`'{"speakers":[],"segments":[],"text":""}'::jsonb` });
     expect(await db.execute(sql`select version, published_at from transcripts where meeting_id = 'mtg_old_insert'`))
       .toEqual([{ version: 1, published_at: null }]);
-    expect(await db.execute(sql`select count(*)::int as count from drizzle.__drizzle_migrations`)).toEqual([{ count: 26 }]);
+    expect(await db.execute(sql`select count(*)::int as count from drizzle.__drizzle_migrations`)).toEqual([{ count: 27 }]);
     // Generated DDL must stay additive: rollback means retaining this schema, never dropping it.
     const migration = await readFile(join(migrationsSource, "0024_transcript_versions.sql"), "utf8");
     expect(/^\s*(drop|truncate|delete)\b/im.test(migration)).toBe(false);
@@ -453,7 +454,7 @@ test("0025 adds the VAD coverage columns without touching existing jobs, and the
     await before.$client.close();
 
     db = await runMigrations(databaseUrl.toString());
-    const [rowAfter] = await db.execute(sql`select to_jsonb(t) - 'vad_dropped_above_floor_pct' - 'vad_fallback' as row,
+    const [rowAfter] = await db.execute(sql`select to_jsonb(t) - 'vad_dropped_above_floor_pct' - 'vad_fallback' - 'vad_stats' as row,
       vad_dropped_above_floor_pct, vad_fallback from transcriptions t`);
     expect(rowAfter).toEqual({ ...(rowBefore as object), vad_dropped_above_floor_pct: null, vad_fallback: null });
     // The old migrator ignores the newer journal; the old image's insert still works and leaves the columns null.
@@ -462,6 +463,45 @@ test("0025 adds the VAD coverage columns without touching existing jobs, and the
     expect(await db.execute(sql`select vad_dropped_above_floor_pct, vad_fallback from transcriptions where id = 'trn_old_image'`))
       .toEqual([{ vad_dropped_above_floor_pct: null, vad_fallback: null }]);
     const migration = await readFile(join(migrationsSource, "0025_vad_coverage.sql"), "utf8");
+    expect(/^\s*(drop|truncate|delete|update)\b/im.test(migration)).toBe(false);
+    expect(/\b(default|not null)\b/i.test(migration)).toBe(false);
+  } finally {
+    await db?.$client.close();
+    await admin.unsafe(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`);
+    await admin.close();
+    await rm(fixture, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("0026 persists VAD diagnostics additively; old jobs and old-image inserts remain compatible", async () => {
+  const databaseName = `ptx_quiet_${crypto.randomUUID().replaceAll("-", "")}`;
+  const url = new URL(config.databaseUrl); url.pathname = `/${databaseName}`;
+  const adminUrl = new URL(config.databaseUrl); adminUrl.pathname = "/postgres";
+  const admin = new SQL(adminUrl.toString());
+  const fixture = await productionMigrationsFixture(26);
+  let db: Db | undefined;
+  const insertJob = (target: Db, id: string) => target.execute(sql`insert into transcriptions (id, project_id, tenant_ref, status,
+    idempotency_key, request_hash, content_type, byte_size, sha256, channel_mode, channel_labels, upload_deadline_at)
+    values (${id}, 'upgrade', 'tenant', 'completed', ${id}, 'hash', 'audio/mpeg', 1, 'sha', 'mixed', '[]'::jsonb, now())`);
+  try {
+    await admin.unsafe(`CREATE DATABASE "${databaseName}"`);
+    const before = createDb(url.toString());
+    await migrate(before, { migrationsFolder: fixture });
+    await before.execute(sql`insert into projects (id, name, webhook_secret) values ('upgrade', 'fixture', 'fixture')`);
+    await insertJob(before, "trn_before");
+    const [rowBefore] = await before.execute(sql`select to_jsonb(t) as row from transcriptions t`);
+    await before.$client.close();
+    db = await runMigrations(url.toString());
+    const [rowAfter] = await db.execute(sql`select to_jsonb(t) - 'vad_stats' as row, vad_stats from transcriptions t`);
+    expect(rowAfter).toEqual({ ...(rowBefore as object), vad_stats: null });
+    const stats = { vad_mode: "quiet" as const, noise_floor_dbfs: -58, median_dbfs: -54, p99_dbfs: -38, speech_peak_s: 8.8, dropped_above_noise_pct: 0 };
+    await db.update(transcriptions).set({ vadStats: sql`${JSON.stringify(stats)}::text::jsonb` }).where(eq(transcriptions.id, "trn_before"));
+    expect(await db.select({ stats: transcriptions.vadStats }).from(transcriptions).where(eq(transcriptions.id, "trn_before"))).toEqual([{ stats }]);
+    expect(await db.execute(sql`select jsonb_typeof(vad_stats) as kind from transcriptions where id = 'trn_before'`)).toEqual([{ kind: "object" }]);
+    await migrate(db, { migrationsFolder: fixture });
+    await insertJob(db, "trn_old_image");
+    expect(await db.execute(sql`select vad_stats from transcriptions where id = 'trn_old_image'`)).toEqual([{ vad_stats: null }]);
+    const migration = await readFile(join(migrationsSource, "0026_vad_quiet_stats.sql"), "utf8");
     expect(/^\s*(drop|truncate|delete|update)\b/im.test(migration)).toBe(false);
     expect(/\b(default|not null)\b/i.test(migration)).toBe(false);
   } finally {

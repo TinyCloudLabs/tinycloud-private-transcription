@@ -6,6 +6,7 @@ name: Deploy ptx-batch
 #   secrets: PHALA_CLOUD_API_KEY, BATCH_POSTGRES_PASSWORD, BATCH_TINFOIL_API_KEY, PTX_BOOTSTRAP_KEYS,
 #            PTX_BATCH_ADMIN_KEY (plaintext of the admin:* key whose hash is in PTX_BOOTSTRAP_KEYS)
 #   variable: PTX_BATCH_CVM_ID  (unset = first creation; set it to the id this workflow prints afterwards)
+#             BATCH_VAD_QUIET_MODE (optional, defaults to true; false rolls back quiet detection)
 #
 # Deploy tooling (Bun, the repo's dependencies, the Phala CLI and SDK) is installed from lockfiles with lifecycle
 # scripts disabled before any secret is in scope; credential-bearing steps run only those installed binaries.
@@ -116,6 +117,7 @@ jobs:
 
       - name: Validate the sealed environment
         env:
+          BATCH_VAD_QUIET_MODE: ${{ vars.BATCH_VAD_QUIET_MODE || 'true' }}
           BATCH_POSTGRES_PASSWORD: ${{ secrets.BATCH_POSTGRES_PASSWORD }}
           BATCH_TINFOIL_API_KEY: ${{ secrets.BATCH_TINFOIL_API_KEY }}
           PTX_BOOTSTRAP_KEYS: ${{ secrets.PTX_BOOTSTRAP_KEYS }}
@@ -131,8 +133,11 @@ jobs:
           # shellcheck disable=SC2016 # single quotes on purpose: a JS snippet with template literals
           bun -e 'const { checkBatchDeployKeys } = await import("./src/api/bootstrap-keys.ts"); const keys = checkBatchDeployKeys(process.env.PTX_BOOTSTRAP_KEYS ?? "", process.env.PTX_BATCH_ADMIN_KEY ?? ""); console.log(`bootstrap keys: ${keys.map((k) => `${k.id}(${k.scopes.join(",")})`).join(" ")}`);'
           ENV_FILE="$RUNNER_TEMP/ptx-batch.env"
+          quiet_mode="${BATCH_VAD_QUIET_MODE:-true}"
+          case "$quiet_mode" in true|false) ;; *) echo "::error title=Deploy refused::BATCH_VAD_QUIET_MODE must be true or false"; exit 1 ;; esac
           umask 077
           {
+            printf 'BATCH_VAD_QUIET_MODE=%s\n' "$quiet_mode"
             printf '%s\n' "POSTGRES_PASSWORD=$BATCH_POSTGRES_PASSWORD"
             printf '%s\n' "BATCH_TINFOIL_API_KEY=$BATCH_TINFOIL_API_KEY"
             printf '%s\n' "PTX_BOOTSTRAP_KEYS=$PTX_BOOTSTRAP_KEYS"

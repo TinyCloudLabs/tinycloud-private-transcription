@@ -12,6 +12,7 @@ export const FAULT_POINTS = [
   "worker.after_claim",
   "worker.after_decode",
   "worker.after_rename",
+  "worker.regions_inserted",
   "worker.after_regions",
   "worker.before_dispatch",
   "worker.after_response",
