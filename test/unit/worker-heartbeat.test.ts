@@ -15,6 +15,20 @@ test("worker log heartbeat interval defaults to 900 seconds and is configurable"
   }
 });
 
+test("worker log heartbeat interval accepts the maximum timer duration and rejects overflow", () => {
+  const previous = process.env.BATCH_WORKER_LOG_HEARTBEAT_SECONDS;
+  const maxSeconds = Math.floor(2_147_483_647 / 1_000);
+  try {
+    process.env.BATCH_WORKER_LOG_HEARTBEAT_SECONDS = String(maxSeconds);
+    expect(batchConfigFromEnv().worker.logHeartbeatSeconds).toBe(maxSeconds);
+    process.env.BATCH_WORKER_LOG_HEARTBEAT_SECONDS = String(maxSeconds + 1);
+    expect(() => batchConfigFromEnv()).toThrow();
+  } finally {
+    if (previous === undefined) delete process.env.BATCH_WORKER_LOG_HEARTBEAT_SECONDS;
+    else process.env.BATCH_WORKER_LOG_HEARTBEAT_SECONDS = previous;
+  }
+});
+
 test("worker log heartbeat emits one constant message per interval and stops", () => {
   vi.useFakeTimers();
   const messages: { message: string; fields?: Record<string, unknown> }[] = [];
