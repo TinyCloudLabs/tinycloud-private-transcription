@@ -67,6 +67,7 @@ export interface BatchConfig {
   worker: {
     pollIntervalMs: number;
     heartbeatSeconds: number;
+    logHeartbeatSeconds: number;
     /** API readiness and slot reclamation treat a worker process silent this long as dead. */
     workerStaleSeconds: number;
     claimRenewSeconds: number;
@@ -139,6 +140,7 @@ export function batchConfigFromEnv(log: Pick<Logger, "warn"> = logger): BatchCon
     worker: {
       pollIntervalMs: 1_000,
       heartbeatSeconds: 10,
+      logHeartbeatSeconds: positiveIntegerEnv("BATCH_WORKER_LOG_HEARTBEAT_SECONDS", "900"),
       workerStaleSeconds: 30,
       claimRenewSeconds: 20,
       claimStaleSeconds: 60,

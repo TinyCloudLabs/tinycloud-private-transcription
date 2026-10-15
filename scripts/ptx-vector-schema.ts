@@ -34,6 +34,7 @@ const sourceMessages: Record<string, string> = {
   "batch sweep failed": "batch_sweep_failed",
   "batch worker iteration failed": "batch_worker_iteration_failed",
   "batch worker started": "batch_worker_started",
+  "batch worker heartbeat": "batch_worker_heartbeat",
 };
 
 type FieldSpec = {

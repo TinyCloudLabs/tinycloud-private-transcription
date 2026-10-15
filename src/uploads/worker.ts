@@ -575,6 +575,14 @@ export async function recordWorkerHeartbeat(ctx: BatchContext, observedAt = new 
 export interface BatchWorkerHandle {
   stop(): Promise<void>;
 }
+function logWorkerHeartbeat(ctx: Pick<BatchContext, "log">) {
+  ctx.log.info("batch worker heartbeat");
+}
+
+export function startWorkerLogHeartbeat(ctx: Pick<BatchContext, "log">, intervalSeconds: number): () => void {
+  const timer = setInterval(() => logWorkerHeartbeat(ctx), intervalSeconds * 1000);
+  return () => clearInterval(timer);
+}
 
 /** The worker process loop: heartbeat, periodic sweep, and one claimed job at a time. */
 export function startBatchWorker(ctx: BatchContext, opts: { sweep?: boolean } = {}): BatchWorkerHandle {
@@ -582,6 +590,7 @@ export function startBatchWorker(ctx: BatchContext, opts: { sweep?: boolean } = 
   const beat = () => recordWorkerHeartbeat(ctx).catch(() => ctx.log.error("batch worker heartbeat failed", { stage: "heartbeat" }));
   void beat();
   const heartbeat = setInterval(beat, ctx.config.worker.heartbeatSeconds * 1000);
+  const stopLogHeartbeat = startWorkerLogHeartbeat(ctx, ctx.config.worker.logHeartbeatSeconds);
   let sweeping = false;
   const sweep = async () => {
     if (sweeping || opts.sweep === false) return;
@@ -616,6 +625,7 @@ export function startBatchWorker(ctx: BatchContext, opts: { sweep?: boolean } = 
     async stop() {
       running = false;
       await loop;
+      stopLogHeartbeat();
       clearInterval(heartbeat);
       clearInterval(sweeper);
       while (sweeping) await Bun.sleep(10);
