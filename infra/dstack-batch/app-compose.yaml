@@ -24,7 +24,7 @@
 # The batch-envelope.yml 2-hour stereo proof should be rerun.
 services:
   api:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:508cb0be60a27e6b2bb4eefd888ad7c98954c3e5@sha256:72568fe357e87aefb13a4430b0124b16a4c5e98395281e80e9ee09471c9aaf4d
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:51a27ec7b353097197efb1f308db43288dda1e2f@sha256:7b5df3e1d6cee0684bb4502725fec1ceb9f9816db9e59941bbe2a7b191495cfc
     restart: unless-stopped
     depends_on:
       postgres:
@@ -72,7 +72,7 @@ services:
         labels: tc.logship
         cache-disabled: "true"
   upload-worker:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:508cb0be60a27e6b2bb4eefd888ad7c98954c3e5@sha256:72568fe357e87aefb13a4430b0124b16a4c5e98395281e80e9ee09471c9aaf4d
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:51a27ec7b353097197efb1f308db43288dda1e2f@sha256:7b5df3e1d6cee0684bb4502725fec1ceb9f9816db9e59941bbe2a7b191495cfc
     restart: unless-stopped
     command: ["bun", "run", "src/uploads/worker.ts"]
     depends_on:
