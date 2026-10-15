@@ -4,7 +4,8 @@ name: Deploy ptx-batch
 #
 # Secrets and variables live in the `ptx-batch` GitHub Environment (add required reviewers there):
 #   secrets: PHALA_CLOUD_API_KEY, BATCH_POSTGRES_PASSWORD, BATCH_TINFOIL_API_KEY, PTX_BOOTSTRAP_KEYS,
-#            PTX_BATCH_ADMIN_KEY (plaintext of the admin:* key whose hash is in PTX_BOOTSTRAP_KEYS)
+#            PTX_BATCH_ADMIN_KEY (plaintext of the admin:* key whose hash is in PTX_BOOTSTRAP_KEYS),
+#            BETTERSTACK_SOURCE_TOKEN (ingest-only; GitHub Environment secret only)
 #   variable: PTX_BATCH_CVM_ID  (unset = first creation; set it to the id this workflow prints afterwards)
 #             BATCH_VAD_QUIET_MODE (optional, defaults to true; false rolls back quiet detection)
 #
@@ -90,6 +91,7 @@ jobs:
           BATCH_TINFOIL_API_KEY: ${{ secrets.BATCH_TINFOIL_API_KEY }}
           PTX_BOOTSTRAP_KEYS: ${{ secrets.PTX_BOOTSTRAP_KEYS }}
           PTX_BATCH_ADMIN_KEY: ${{ secrets.PTX_BATCH_ADMIN_KEY }}
+          BETTERSTACK_SOURCE_TOKEN: ${{ secrets.BETTERSTACK_SOURCE_TOKEN }}
         run: |
           set -euo pipefail
           fail() { echo "::error title=Deploy refused::$1"; exit 1; }
@@ -97,7 +99,7 @@ jobs:
           [ "$GITHUB_REF" = "refs/heads/main" ] || fail "deploy only from main (got $GITHUB_REF)"
           [[ "$DRAIN_TIMEOUT_MINUTES" =~ ^[0-9]+$ ]] && [ "$DRAIN_TIMEOUT_MINUTES" -ge 1 ] && [ "$DRAIN_TIMEOUT_MINUTES" -le 300 ] \
             || fail "drain_timeout_minutes must be an integer from 1 to 300"
-          for name in PHALA_CLOUD_API_KEY BATCH_POSTGRES_PASSWORD BATCH_TINFOIL_API_KEY PTX_BOOTSTRAP_KEYS PTX_BATCH_ADMIN_KEY; do
+          for name in PHALA_CLOUD_API_KEY BATCH_POSTGRES_PASSWORD BATCH_TINFOIL_API_KEY PTX_BOOTSTRAP_KEYS PTX_BATCH_ADMIN_KEY BETTERSTACK_SOURCE_TOKEN; do
             [ -n "${!name}" ] || fail "secret $name is not set in the ptx-batch environment"
           done
           if grep -q PTX_FAULT_INJECT "$COMPOSE"; then fail "PTX_FAULT_INJECT must never appear in a deploy compose"; fi
@@ -108,7 +110,6 @@ jobs:
           sha="${BASH_REMATCH[1]}"
           digest="${BASH_REMATCH[2]}"
           git merge-base --is-ancestor "$sha" origin/main || fail "image commit $sha is not on main"
-          # An older image seeds admission `open` on a fresh install; only 0018 and later start it closed.
           git cat-file -e "$sha:src/db/migrations/0018_batch_admission_closed.sql" 2>/dev/null \
             || fail "pinned image $sha predates migration 0018 (admission starts closed); re-pin to a later main image first (infra/dstack-batch/README.md)"
           published="$(docker buildx imagetools inspect "${IMAGE_REPO}:${sha}" --format '{{json .Manifest}}' | jq -r '.digest')"
@@ -122,15 +123,11 @@ jobs:
           BATCH_TINFOIL_API_KEY: ${{ secrets.BATCH_TINFOIL_API_KEY }}
           PTX_BOOTSTRAP_KEYS: ${{ secrets.PTX_BOOTSTRAP_KEYS }}
           PTX_BATCH_ADMIN_KEY: ${{ secrets.PTX_BATCH_ADMIN_KEY }}
+          BETTERSTACK_SOURCE_TOKEN: ${{ secrets.BETTERSTACK_SOURCE_TOKEN }}
         run: |
           set -euo pipefail
-          # The password is interpolated into DATABASE_URL (postgres://ptx:<password>@postgres/ptx), so it must be
-          # URI-unreserved: a '/', '@', ':' or '%' would change where the api and worker connect.
           [[ "$BATCH_POSTGRES_PASSWORD" =~ ^[A-Za-z0-9._~-]{32,}$ ]] \
             || { echo "::error title=Deploy refused::BATCH_POSTGRES_PASSWORD must be 32+ URI-unreserved characters (use openssl rand -hex 32)"; exit 1; }
-          # API boot fails on an invalid value; refuse it here instead, without printing it. The admin key the drain
-          # and the admission gates use must hash to an admin:* entry, so a mismatch fails before anything deploys.
-          # shellcheck disable=SC2016 # single quotes on purpose: a JS snippet with template literals
           bun -e 'const { checkBatchDeployKeys } = await import("./src/api/bootstrap-keys.ts"); const keys = checkBatchDeployKeys(process.env.PTX_BOOTSTRAP_KEYS ?? "", process.env.PTX_BATCH_ADMIN_KEY ?? ""); console.log(`bootstrap keys: ${keys.map((k) => `${k.id}(${k.scopes.join(",")})`).join(" ")}`);'
           ENV_FILE="$RUNNER_TEMP/ptx-batch.env"
           quiet_mode="${BATCH_VAD_QUIET_MODE:-true}"
@@ -141,6 +138,7 @@ jobs:
             printf '%s\n' "POSTGRES_PASSWORD=$BATCH_POSTGRES_PASSWORD"
             printf '%s\n' "BATCH_TINFOIL_API_KEY=$BATCH_TINFOIL_API_KEY"
             printf '%s\n' "PTX_BOOTSTRAP_KEYS=$PTX_BOOTSTRAP_KEYS"
+            printf '%s\n' "BETTERSTACK_SOURCE_TOKEN=$BETTERSTACK_SOURCE_TOKEN"
           } > "$ENV_FILE"
           docker compose -f "$COMPOSE" --env-file "$ENV_FILE" config --quiet
           echo "ENV_FILE=$ENV_FILE" >> "$GITHUB_ENV"

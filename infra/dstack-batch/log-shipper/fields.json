@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "common": {
+    "level": { "type": "enum", "values": ["debug", "info", "warn", "error"] },
+    "ts": { "type": "string", "regex": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$", "max_len": 24 },
+    "event": { "type": "event" }
+  },
+  "reader_output": {
+    "bucket": { "type": "string", "regex": "^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}$", "max_len": 19 },
+    "status_class": { "type": "enum", "values": ["1xx", "2xx", "3xx", "4xx", "5xx", "unknown"] },
+    "count": { "type": "integer", "min": 0, "max": 1000000000 }
+  },
+  "services": {
+    "ptx-batch": {
+      "events": [
+        "batch_artifact_deletion_failed",
+        "batch_claim_recovered",
+        "batch_artifact_reappeared_after_verified_deletion",
+        "batch_transcription_create",
+        "batch_transcription_cancel",
+        "batch_transcription_delete",
+        "batch_retention_lag_exceeded",
+        "batch_request_failed",
+        "batch_admission_mode_changed",
+        "batch_admission_stopped_by_disk_high_water",
+        "batch_upload_refused_by_disk_high_water",
+        "batch_upload_accepted",
+        "batch_upload_rejected",
+        "batch_job_finished",
+        "batch_claim_fenced_out",
+        "batch_job_failed_unexpectedly",
+        "batch_vad_fell_back_to_the_floor_threshold",
+        "batch_vad_could_not_cover_the_recording",
+        "batch_diarization_failed",
+        "batch_provider_rejected_the_service_credential_or_model",
+        "batch_job_failed_at_dispatch",
+        "batch_worker_heartbeat_failed",
+        "batch_sweep_failed",
+        "batch_worker_iteration_failed",
+        "batch_worker_started"
+      ],
+      "fields": {
+        "svc": { "type": "enum", "values": ["api", "worker"] },
+        "correlationId": { "type": "string", "regex": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", "max_len": 36 },
+        "transcriptionId": { "type": "string", "regex": "^trn_[0-9A-HJKMNP-TV-Z]{26}$", "max_len": 30 },
+        "job_id": { "type": "string", "regex": "^trn_[0-9A-HJKMNP-TV-Z]{26}$", "max_len": 30 },
+        "stage": { "type": "enum", "values": ["create", "cancel", "delete", "health", "api_unhandled", "admission", "upload", "deletion", "claim_recovery", "reconcile", "vad", "diarize", "pipeline", "fence", "dispatch", "heartbeat", "sweep", "loop"] },
+        "code": { "type": "enum", "values": ["invalid_request", "diarization_unavailable", "unauthorized", "insufficient_scope", "idempotency_conflict", "transcription_not_found", "active_transcription_exists", "recording_too_large", "quota_exceeded", "service_busy", "service_paused", "service_unavailable", "upload_capability_limit", "upload_capability_invalid", "upload_capability_expired", "upload_length_mismatch", "unsupported_media_type", "upload_in_progress", "upload_interrupted", "upload_rejected", "transcript_expired", "not_found", "internal_error", "upload_expired", "upload_integrity_failed", "invalid_audio", "recording_too_long", "unsupported_recording", "no_speech", "provider_unavailable", "provider_outcome_unknown", "processing_timeout", "processing_failed", "transcription_failed", "cancelled"], "nullable": true },
+        "alert": { "type": "boolean" },
+        "outcome": { "type": "enum", "values": ["completed", "failed", "no_speech"] },
+        "duration_seconds": { "type": "number", "min": 0, "max": 86400 },
+        "tinfoil_calls": { "type": "integer", "min": 0, "max": 100000, "nullable": true },
+        "tinfoil_audio_seconds": { "type": "number", "min": 0, "max": 7200, "nullable": true },
+        "voiced_seconds": { "type": "number", "min": 0, "max": 7200, "nullable": true },
+        "dropped_above_floor_pct": { "type": "number", "min": 0, "max": 100, "nullable": true },
+        "vad_fallback": { "type": "boolean", "nullable": true },
+        "segments": { "type": "integer", "min": 0, "max": 100000, "nullable": true },
+        "content_type": { "type": "enum", "values": ["audio/mpeg", "audio/wav", "audio/ogg", "audio/mp4", "audio/webm", "audio/flac"] },
+        "retentionLagSeconds": { "type": "number", "min": 0, "max": 31536000 },
+        "usedPercent": { "type": "number", "min": 0, "max": 100 },
+        "mode": { "type": "enum", "values": ["open", "drain", "closed"] },
+        "created": { "type": "boolean" }
+      }
+    },
+    "tinycloud-node": { "events": [], "fields": {} },
+    "tinychat-backend": { "events": [], "fields": {} },
+    "tinycloud-mcp": { "events": [], "fields": {} },
+    "ptx-dev": { "events": [], "fields": {} },
+    "openkey-api": { "events": [], "fields": {} }
+  }
+}

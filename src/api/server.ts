@@ -3,8 +3,10 @@ import { runMigrations } from "../db/migrate.ts";
 import { createApp } from "./app.ts";
 import { parseBootstrapKeys, syncBootstrapKeys } from "./bootstrap-keys.ts";
 import { config } from "../config.ts";
+import { installFatalLogHandlers } from "../log.ts";
 
 if (config.role === "batch") {
+  installFatalLogHandlers();
   // Dedicated batch-transcription service: src/roles/batch-server.ts. The meeting path below is unchanged.
   await import("../roles/batch-server.ts");
 } else {
