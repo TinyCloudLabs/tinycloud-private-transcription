@@ -101,9 +101,9 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(workflowText).toContain("PTX_FAULT_INJECT must never appear");
   });
 
-  test("takes only the expected sealed values and optional quiet-mode rollback flag", () => {
+  test("takes only the expected sealed values and worker runtime options", () => {
     const sealed = [...new Set([...composeConfig.matchAll(/(?<!\$)\$\{([A-Z0-9_]+)/g)].map((m) => m[1]))].sort();
-    expect(sealed).toEqual(["BATCH_TINFOIL_API_KEY", "BATCH_VAD_QUIET_MODE", "BETTERSTACK_SOURCE_TOKEN", "POSTGRES_PASSWORD", "PTX_BOOTSTRAP_KEYS"]);
+    expect(sealed).toEqual(["BATCH_TINFOIL_API_KEY", "BATCH_VAD_QUIET_MODE", "BATCH_WORKER_LOG_HEARTBEAT_SECONDS", "BETTERSTACK_SOURCE_TOKEN", "POSTGRES_PASSWORD", "PTX_BOOTSTRAP_KEYS"]);
     expect([...(envExample.match(/^[A-Z0-9_]+(?==)/gm) ?? [])].sort()).toEqual(sealed.filter((key) => key !== "BATCH_VAD_QUIET_MODE"));
     const services = render();
     expect(services.api!.environment.PTX_BOOTSTRAP_KEYS).toBe("");
@@ -217,6 +217,7 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
 
   test("its literal limits match the code defaults and the upload cap", () => {
     const env = render().api!.environment;
+    const workerEnv = render()["upload-worker"]!.environment;
     const defaults = batchConfigFromEnv();
     expect(Number(env.BATCH_MAX_ACTIVE_JOBS)).toBe(defaults.limits.maxActiveJobs);
     expect(Number(env.BATCH_MAX_RESERVED_BYTES)).toBe(defaults.limits.maxReservedBytes);
@@ -224,6 +225,7 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(Number(env.BATCH_DISK_HIGH_WATER_PERCENT)).toBe(defaults.limits.diskHighWaterPercent);
     expect(Number(env.BATCH_TENANT_DAILY_BYTES)).toBe(defaults.limits.tenantDailyBytes);
     expect(env.BATCH_TINFOIL_MODEL).toBe("voxtral-small-24b");
+    expect(Number(workerEnv.BATCH_WORKER_LOG_HEARTBEAT_SECONDS)).toBe(defaults.worker.logHeartbeatSeconds);
   });
 
   test("lets Exo's web, desktop and mobile origins upload, and no other site", () => {

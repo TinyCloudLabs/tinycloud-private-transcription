@@ -37,7 +37,8 @@
         "batch_worker_heartbeat_failed",
         "batch_sweep_failed",
         "batch_worker_iteration_failed",
-        "batch_worker_started"
+        "batch_worker_started",
+        "batch_worker_heartbeat"
       ],
       "fields": {
         "svc": { "type": "enum", "values": ["api", "worker"] },
