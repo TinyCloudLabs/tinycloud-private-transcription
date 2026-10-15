@@ -137,6 +137,7 @@ transforms:
       if !is_string(value) { abort }
       string_value = to_string(value) ?? ""
       if length(string_value) <= 24 && match(string_value, r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$') { out.ts = string_value } else { abort }
+      if event != "batch_worker_heartbeat" {
         value = get(j, ["correlationId"]) ?? null
         if !is_null(value) {
           if is_string(value) {
@@ -294,6 +295,7 @@ transforms:
         if !is_null(value) {
           if is_boolean(value) { out.created = value }
         }
+      }
       . = out
       # END GENERATED FROM fields.json
 sinks:

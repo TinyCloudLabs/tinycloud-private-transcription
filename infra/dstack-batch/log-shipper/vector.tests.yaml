@@ -587,3 +587,19 @@ tests:
               assert_eq!(length(keys(.)), 4)
               assert!(!exists(.payload))
               assert!(!exists(.extra))
+  - name: "worker heartbeat omits other allowlisted fields"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch worker heartbeat\",\"stage\":\"loop\",\"code\":\"internal_error\",\"correlationId\":\"123e4567-e89b-42d3-a456-426614174000\"}"
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(length(keys(.)), 4)
+              assert!(!exists(.stage))
+              assert!(!exists(.code))
+              assert!(!exists(.correlationId))
