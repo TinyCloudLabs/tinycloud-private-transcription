@@ -95,12 +95,12 @@ describe("infra/dstack/app-compose.yaml", () => {
       minio: "ghcr.io/tinycloudlabs/mirror/minio:RELEASE.2025-09-07T16-13-09Z@sha256:25e301eb686e796ead885d0e254cc6397424df7d7a79cee48ff08b720570ced6",
       "minio-init": "ghcr.io/tinycloudlabs/mirror/minio-mc:RELEASE.2025-08-13T08-35-41Z@sha256:4545427b5ba8e7553be881a34db1706dc9b307cbd13e6c9fe9b58faba9d2f380",
       "admin-api": "vexaai/v012-admin-api:v012@sha256:4c702354384eafe3a933cd537a106b7c15067cfd368a5f6da1a6e675e7e03e04",
-      "bot-image-keeper": "ghcr.io/tinycloudlabs/vexa/bot:tc-e5b5307@sha256:32404172d0c843d29ec2617df52d8ca9cb09d510f6423e6aa355aac859196253",
+      "bot-image-keeper": "ghcr.io/tinycloudlabs/vexa/bot:tc-63970d8@sha256:12d79f627da80833cc887a645095f6f8de61ce4925f7e7d0d02770bedbfb5236",
       "bot-janitor": "docker:27.5.1-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c",
       runtime: "vexaai/v012-runtime:v012@sha256:a1f6448fbb380b9433364e8b572ec25a12aa4f274bf403f1d83a89cbf5812f2d",
       whisper: "fedirz/faster-whisper-server:latest-cpu@sha256:760e5e43d427dc6cfbbc4731934b908b7de9c7e6d5309c6a1f0c8c923a5b6030",
-      "meeting-api": "ghcr.io/tinycloudlabs/vexa/meeting-api:tc-c8d7f33@sha256:944c2c36d1ba8617d1c49eae5453750a14db2587ba53f40533f8bcfdcfa37566",
-      gateway: "ghcr.io/tinycloudlabs/vexa/gateway:tc-36f0304@sha256:0e82c34a3f5838d6f592c71d6e8bebe4e79d3d0414160261def07a57971ef238",
+      "meeting-api": "ghcr.io/tinycloudlabs/vexa/meeting-api:tc-63970d8@sha256:0a976dba383951030116296c7c45e0b80b07bbd40ff4d075df5ab564ff9c845e",
+      gateway: "ghcr.io/tinycloudlabs/vexa/gateway:tc-63970d8@sha256:5a2542727f2f7841032f732595018711b6ee73e0f72cec704e7297532a78e7ec",
       "vexa-provision": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
     } as const;
 
@@ -111,7 +111,7 @@ describe("infra/dstack/app-compose.yaml", () => {
 
     const runtime = serviceEnv("runtime");
     expect(runtime).toContain(
-      "BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-e5b5307@sha256:32404172d0c843d29ec2617df52d8ca9cb09d510f6423e6aa355aac859196253}",
+      "BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-63970d8@sha256:12d79f627da80833cc887a645095f6f8de61ce4925f7e7d0d02770bedbfb5236}",
     );
     expect(runtime).toContain(
       "AGENT_IMAGE: ${VEXA_AGENT_IMAGE:-vexaai/v012-agent-api:v012@sha256:6eb37574b33aab233aabbe5907e06e106bae44a403e5df781a436da8201a928d}",
@@ -126,27 +126,13 @@ describe("infra/dstack/app-compose.yaml", () => {
       .filter((line) => /^[A-Z_]+_IMAGE=/.test(line));
     expect(imageOverrides.length).toBe(5);
     for (const line of imageOverrides) expect(line).toMatch(/@sha256:[0-9a-f]{64}$/);
+    expect(imageOverrides.find((line) => line.startsWith("PTX_BOT_IMAGE="))).toBe(
+      `PTX_BOT_IMAGE=${serviceImage("bot-image-keeper")}`,
+    );
     expect(compose).not.toContain("${PTX_IMAGE");
     expect(compose).not.toContain("${SIGNAL_CAPTURE_IMAGE");
     expect(envExample).not.toMatch(/^PTX_IMAGE=/m);
     expect(envExample).not.toMatch(/^SIGNAL_CAPTURE_IMAGE=/m);
-  });
-
-  test("pins the Vexa bot, meeting-api, and gateway to the accepted fork commits and digests", () => {
-    expect(compose).toContain(
-      "ghcr.io/tinycloudlabs/vexa/bot:tc-e5b5307@sha256:32404172d0c843d29ec2617df52d8ca9cb09d510f6423e6aa355aac859196253",
-    );
-    expect(compose).toContain(
-      "ghcr.io/tinycloudlabs/vexa/meeting-api:tc-c8d7f33@sha256:944c2c36d1ba8617d1c49eae5453750a14db2587ba53f40533f8bcfdcfa37566",
-    );
-    expect(compose).toContain(
-      "ghcr.io/tinycloudlabs/vexa/gateway:tc-36f0304@sha256:0e82c34a3f5838d6f592c71d6e8bebe4e79d3d0414160261def07a57971ef238",
-    );
-    expect(compose).not.toContain("tc-2db950b");
-    expect(compose).not.toContain("vexaai/v012-meeting-api");
-    expect(compose).not.toContain("vexaai/v012-gateway");
-    expect(compose).toContain("vexaai/v012-runtime:v012@sha256:");
-    expect(compose).toContain("vexaai/v012-agent-api:v012@sha256:");
   });
 
   test("the api service enables deployed meeting platforms including Signal", () => {
