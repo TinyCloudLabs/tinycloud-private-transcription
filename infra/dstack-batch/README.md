@@ -75,6 +75,11 @@ gh workflow run deploy-batch.yml -R $R --ref main -f confirm=ptx-batch
   drain ahead of time (`PUT … {"mode":"drain"}`) and dispatch once `active` is 0.
 - A failure after the drain leaves admission in **drain**. Investigate, then reopen deliberately:
   `curl -X PUT $URL/v1/admin/admission -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d '{"mode":"open"}'`.
+- **Reopen only** (existing drained CVM, with operator authorization): dispatch the same manual workflow with
+  `-f confirm=ptx-batch -f reopen_only=true`. This requires `PTX_BATCH_CVM_ID` and the existing `ptx-batch` Environment
+  credentials, but does not drain, deploy, write a sealed environment or sync `allowed_envs`. It resolves the CVM,
+  waits for `running`, checks `/health/live` and upload readiness, then requires authenticated admission mode `drain`
+  with three valid zero active-job counts before opening admission. If any gate fails, it does not open admission.
 
 `$URL` is `https://<app_id>-8080.<gateway base domain>` (printed in the workflow summary). It becomes Exo's compiled-in
 PTX upload origin (P7) and TinyChat's `PRIVATE_CLOUD_TRANSCRIPTION_API_URL`.

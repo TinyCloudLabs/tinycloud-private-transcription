@@ -274,7 +274,7 @@ describe(".github/workflows/deploy-batch.yml", () => {
     const order = ["Install dependencies and deploy tooling from lockfiles", "Guard inputs, secrets and the image pin", "Validate the sealed environment", "Resolve the CVM", "Drain admission and wait for zero active jobs", "Deploy", "Sync allowed_envs", "Wait for running and resolve the gateway URL", "Health gate (live, then upload_transcription.ready)", "Admission gate (the deployed service is not open)", "Open admission"].map(index);
     expect(order.every((i) => i >= 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
-    expect(steps[index("Drain admission and wait for zero active jobs")]!.if).toBe("env.MODE == 'update'");
+    expect(steps[index("Drain admission and wait for zero active jobs")]!.if).toBe("${{ env.MODE == 'update' && !inputs.reopen_only }}");
     expect(steps[index("Health gate (live, then upload_transcription.ready)")]!.run).toContain(".checks.upload_transcription.ready");
   });
 
@@ -478,6 +478,45 @@ exit 1` });
     expect(open.out).not.toContain("does not open admission");
     // A rejected admin key (curl -f) fails the gate too.
     expect(runStep("Admission gate (the deployed service is not open)", { MODE: "create", BATCH_URL: "https://batch.test", PTX_BATCH_ADMIN_KEY: "k" }, { curl: "exit 22" }).exitCode).not.toBe(0);
+  });
+
+  test("reopen_only checks the existing drained CVM without deploying or accepting active jobs", () => {
+    const dispatch = workflow.on.workflow_dispatch;
+    if (!dispatch || typeof dispatch !== "object" || !("inputs" in dispatch) ||
+      !dispatch.inputs || typeof dispatch.inputs !== "object" || !("reopen_only" in dispatch.inputs)) {
+      throw new Error("Missing reopen_only workflow_dispatch input");
+    }
+    expect(dispatch.inputs.reopen_only).toEqual({ description: "Reopen admission without deploying", type: "boolean", required: false, default: false });
+    const selected = steps.filter((step) => {
+      if (!step.name) return false;
+      if (!step.if) return true;
+      const condition = step.if.replace(/^\$\{\{\s*|\s*\}\}$/g, "");
+      if (condition === "!inputs.reopen_only" || condition === "env.MODE == 'update' && !inputs.reopen_only") return false;
+      throw new Error(`Unexpected step condition: ${step.if}`);
+    }).map((step) => step.name);
+    expect(selected).toEqual([
+      "Install dependencies and deploy tooling from lockfiles", "Guard inputs, secrets and the image pin",
+      "Resolve the CVM", "Wait for running and resolve the gateway URL",
+      "Health gate (live, then upload_transcription.ready)", "Admission gate (the deployed service is not open)", "Open admission",
+    ]);
+
+    const guard = (ref: string, id: string) => runStep("Guard inputs, secrets and the image pin", {
+      CONFIRM: "ptx-batch", CVM_NAME: "ptx-batch", GITHUB_REF: ref, REOPEN_ONLY: "true", PTX_BATCH_CVM_ID: id,
+      DRAIN_TIMEOUT_MINUTES: "130",
+    });
+    expect(guard("refs/heads/main", "cvm_existing").exitCode).toBe(0);
+    expect(guard("refs/heads/other", "cvm_existing").exitCode).toBe(1);
+    expect(guard("refs/heads/main", "").exitCode).toBe(1);
+    expect(runStep("Resolve the CVM", { REOPEN_ONLY: "true", PTX_BATCH_CVM_ID: "", CVM_NAME: "ptx-batch", PHALA: "/bin/false" }).exitCode).toBe(1);
+
+    const gate = (body: string) => runStep("Admission gate (the deployed service is not open)", {
+      MODE: "update", REOPEN_ONLY: "true", ADMISSION_ACTIVE_JQ: workflow.env.ADMISSION_ACTIVE_JQ!,
+      BATCH_URL: "https://batch.test", PTX_BATCH_ADMIN_KEY: "k",
+    }, serve(body));
+    expect(gate(counts(0, 0, 0)).exitCode).toBe(0);
+    for (const body of [counts(0, 1, 0), counts(0, 0, 0, "open"), counts(0, 0, 0, "closed"), '{"mode":"drain","active":{}}']) {
+      expect({ body, exitCode: gate(body).exitCode }).toEqual({ body, exitCode: 1 });
+    }
   });
 
   test("the guard refuses a pinned image whose commit predates migration 0018", () => {
