@@ -36,6 +36,10 @@ false for a valid ID or absent ID that was minted. No rejected text is recorded.
 Legacy jobs or reconciliation wakeups without a request ID mint a new worker ID; this is not a durable
 meeting-wide trace across a lost Redis wakeup. Delayed work identity excludes request metadata; the
 first pending work+dedup suffix keeps its original payload and due time atomically.
+Malformed delayed members encountered during migration/promotion are retained in a private quarantine
+set, never logged or enqueued; they do not abort healthy work. Migration, promotion and work-targeted
+cancellation process at most 64 entries per Lua call. Migration/cancellation resume between calls;
+promotion leaves further due jobs queued. Each batch updates payload/work indexes atomically.
 The batch role's existing `X-Correlation-Id` upload/transcription contract is separate and unchanged.
 
 Scopes: each authenticated route group requires exactly one scope on the key; otherwise `403`

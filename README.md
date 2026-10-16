@@ -206,11 +206,31 @@ tenant/account identity, token, provider response or exception text. The existin
 dependency/console output are **not** made universally safe by these events.
 
 Delayed-job deduplication ignores request metadata: the first pending work+dedup-suffix entry retains
-its original payload, ID and due time. Atomic Redis scripts select/release that identity during push,
-promotion and cancellation. Existing raw `JSON|suffix` entries remain readable; a lazy index chooses
-the earliest due entry if legacy request metadata already created duplicates (lexical tie-break).
+its original payload, ID and due time. Push and each promotion/cancellation batch atomically maintain
+selected-payload and work indexes. Existing raw `JSON|suffix` entries remain readable; resumable legacy
+indexing selects the earliest due duplicate (lexical tie-break), repairs old/partially failed indexes,
+and preserves the selected raw payload.
+
+Migration, due promotion and work-targeted cancellation visit at most **64 entries per Redis EVAL**.
+Migration/cancellation continue across awaited calls; their total duration still scales with backlog.
+Promotion moves at most 64 healthy jobs per call and leaves remaining due work for subsequent calls.
+The row cap bounds work per script, not a production latency SLA or a byte-size limit. Index reset uses
+`UNLINK` so freeing a large old index is not performed inside the blocking script.
+
+Protected decoding isolates malformed delayed JSON, primitive/array payloads and missing separators
+instead of aborting Lua after earlier mutations. Invalid members retain their original bytes and due
+score in the private `<prefix>:jobs:delayed:invalid` sorted set when encountered during migration or due
+promotion. They are not enqueued or logged. Inspect only its `ZCARD` count in routine diagnostics; never
+ship or print quarantined payloads. Healthy work continues, and cancellation reads the work index rather
+than decoding unrelated future members. `Queue.clear()` explicitly clears indexes/quarantine too.
+
+Local real-Redis smoke verified 1,000 legacy jobs migrate in 16 pages plus one push EVAL, 1,001 due jobs
+promote in 16 batches, and 1,000 matching jobs cancel in 16 batches while an unrelated job survives.
+A connection failure after a committed 64-row migration page resumes without losing healthy work.
+These are synthetic local checks, not production throughput or real-sink evidence.
+
 Cutover must quiesce old queue writers; mixed old/new writers are not supported. After an old-writer
-rollback epoch, rebuild the identity index under the same quiescence gate before roll-forward.
+rollback epoch, rebuild the identity indexes under the same quiescence gate before roll-forward.
 
 **Code-only; not a shipping enablement.** No image pins, Compose, Vector, credentials or production
 settings change here. Before ptx-dev shipping, separately review the canonical schema and a fail-closed

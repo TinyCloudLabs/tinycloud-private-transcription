@@ -1,4 +1,4 @@
-import { afterAll, expect, test } from "bun:test";
+import { afterAll, expect, spyOn, test } from "bun:test";
 import { RedisClient } from "bun";
 import { Queue } from "../../src/worker/queue.ts";
 import { withRequestId } from "../../src/request-context.ts";
@@ -248,4 +248,120 @@ test("wakeup markers are owned by wakeupId and orphaned markers re-acquire", asy
   expect(repaired!.wakeupId).not.toBe(lost!.wakeupId);
   await wq.releaseStartWakeup(meetingId, repaired!.wakeupId!);
   expect(await wq.hasStartWakeup(meetingId)).toBe(false);
+});
+
+const malformedDelayed: Record<string, string> = {
+  json: "PRIVATE_QUEUE_PAYLOAD not-json|bad",
+  null: "null|PRIVATE_QUEUE_PAYLOAD",
+  array: '["PRIVATE_QUEUE_PAYLOAD"]|bad',
+  separator: '{"type":"meeting.start","meetingId":"PRIVATE_QUEUE_PAYLOAD"}',
+};
+
+for (const [label, malformed] of Object.entries(malformedDelayed)) {
+  test(`malformed due ${label} cannot block healthy ready/delayed work or poison dedup`, async () => {
+    const { queue, prefix, delayedKey } = isolatedQueue();
+    const delayed = { type: "meeting.start", meetingId: "healthy-delayed", requestId: crypto.randomUUID() } as const;
+    const ready = { type: "meeting.start", meetingId: "healthy-ready" } as const;
+    await queue.push(delayed, 60_000, "healthy");
+    const [member] = await redis.zrangebyscore(delayedKey, "-inf", "+inf");
+    await redis.zadd(delayedKey, "0", member!);
+    await redis.zadd(delayedKey, "-1", malformed);
+    await queue.push(ready);
+    const output = spyOn(console, "log").mockImplementation(() => {});
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const processed = [await queue.pop(0.1), await queue.pop(0.1)];
+      expect(processed.map((job) => job && "meetingId" in job ? job.meetingId : undefined).sort()).toEqual(["healthy-delayed", "healthy-ready"]);
+      expect(processed.find((job) => job && "meetingId" in job && job.meetingId === delayed.meetingId)).toEqual(delayed);
+      expect(await queue.size()).toEqual({ ready: 0, delayed: 0 });
+      expect(await redis.zrangebyscore(`${delayedKey}:invalid`, "-inf", "+inf")).toEqual([malformed]);
+      await queue.push(delayed, 60_000, "healthy");
+      await withRequestId(crypto.randomUUID(), () => queue.push(delayed, 120_000, "healthy"));
+      expect((await queue.pending()).delayed.map(({ job }) => job)).toEqual([delayed]);
+      expect(await redis.lrange(`${prefix}:jobs:ready`, 0, -1)).toEqual([]);
+      expect([...output.mock.calls, ...errors.mock.calls].flat().join("\n")).not.toContain("PRIVATE_QUEUE_PAYLOAD");
+    } finally { output.mockRestore(); errors.mockRestore(); }
+  });
+
+  test(`malformed future ${label} cannot abort lazy indexing after partial old-script effects`, async () => {
+    const { queue, delayedKey } = isolatedQueue();
+    const legacy = { type: "attributed.batch", meetingId: "legacy", batchId: "healthy", requestId: crypto.randomUUID() } as const;
+    const other = { type: "meeting.start", meetingId: "unrelated" } as const;
+    const legacyMember = `${JSON.stringify(legacy)}|legacy`;
+    const otherMember = `${JSON.stringify(other)}|other`;
+    const future = Date.now() + 60_000;
+    await redis.zadd(delayedKey, String(future), legacyMember);
+    await redis.zadd(delayedKey, String(future + 1), malformed);
+    await redis.zadd(delayedKey, String(future + 2), otherMember);
+    // A Redis Lua error does not roll prior HSETs back. Reproduce a partial, unsentinelled index.
+    await redis.send("HSET", [`${delayedKey}:index`, "stale-partial-guard", "missing-member|old"]);
+    const fresh = { type: "attributed.batch", meetingId: "fresh", batchId: "new" } as const;
+    const selectedId = crypto.randomUUID();
+    await withRequestId(selectedId, () => queue.push(fresh, 120_000, "fresh"));
+    await withRequestId(crypto.randomUUID(), () => queue.push(fresh, 240_000, "fresh"));
+    const pending = (await queue.pending()).delayed;
+    expect(pending.map(({ job }) => job)).toEqual([legacy, other, { ...fresh, requestId: selectedId }]);
+    expect(pending.slice(0, 2).map(({ runAt }) => runAt)).toEqual([future, future + 2]);
+    expect(await redis.zrangebyscore(`${delayedKey}:invalid`, "-inf", "+inf")).toEqual([malformed]);
+    const members = await redis.zrangebyscore(delayedKey, "-inf", "+inf");
+    const guards = await redis.send("HVALS", [`${delayedKey}:index`]) as string[];
+    expect(guards.filter((value) => value.includes("|")).sort()).toEqual([...members].sort());
+    await redis.zadd(delayedKey, "0", legacyMember);
+    expect(await queue.pop(0.1)).toEqual(legacy);
+    await queue.push(legacy, 60_000, "legacy");
+    expect((await queue.pending()).delayed.filter(({ job }) => job.type === "attributed.batch" && job.batchId === "healthy")).toHaveLength(1);
+  });
+
+  test(`malformed future ${label} cannot abort cancellation or prevent healthy progress`, async () => {
+    const { queue, delayedKey } = isolatedQueue();
+    const cancelled = { type: "attributed.batch", meetingId: "cancelled", batchId: "target", requestId: crypto.randomUUID() } as const;
+    const survivor = { type: "meeting.start", meetingId: "survivor", requestId: crypto.randomUUID() } as const;
+    await queue.push(cancelled, 60_000, "cancel");
+    await queue.push(survivor, 120_000, "survivor");
+    await redis.zadd(delayedKey, String(Date.now() + 90_000), malformed);
+    await queue.push({ type: "meeting.start", meetingId: "ready-survivor" });
+    expect(await queue.removeDelayed(cancelled)).toBe(1);
+    const members = await redis.zrangebyscore(delayedKey, "-inf", "+inf");
+    expect(members.some((member) => member.startsWith(JSON.stringify(cancelled)))).toBe(false);
+    for (const member of members) await redis.zadd(delayedKey, "0", member);
+    const progressed = [await queue.pop(0.1), await queue.pop(0.1)];
+    expect(progressed.map((job) => job && "meetingId" in job ? job.meetingId : undefined).sort()).toEqual(["ready-survivor", "survivor"]);
+    expect(progressed.find((job) => job && "meetingId" in job && job.meetingId === survivor.meetingId)).toEqual(survivor);
+    expect(await redis.zrangebyscore(`${delayedKey}:invalid`, "-inf", "+inf")).toEqual([malformed]);
+    const nextId = crypto.randomUUID();
+    await withRequestId(nextId, () => queue.push(cancelled, 60_000, "cancel"));
+    expect((await queue.pending()).delayed.map(({ job }) => job)).toEqual([{ ...cancelled, requestId: nextId }]);
+    const guards = await redis.send("HVALS", [`${delayedKey}:index`]) as string[];
+    expect(guards.filter((value) => value.includes("|"))).toEqual(await redis.zrangebyscore(delayedKey, "-inf", "+inf"));
+  });
+}
+
+test("large due backlog promotes at most 64 entries per call without losing healthy jobs", async () => {
+  const { queue, delayedKey } = isolatedQueue();
+  const expected = Array.from({ length: 300 }, (_, i) => ({ type: "meeting.start", meetingId: `bounded-${i}` }));
+  for (const job of expected) await redis.zadd(delayedKey, "0", `${JSON.stringify(job)}|legacy-${job.meetingId}`);
+  expect(await queue.promoteDue()).toBe(64);
+  expect(await queue.size()).toEqual({ ready: 64, delayed: 236 });
+  for (let i = 0; i < 4; i++) await queue.promoteDue();
+  const pending = await queue.pending();
+  expect(pending.delayed).toEqual([]);
+  expect(pending.ready.map((job) => "meetingId" in job ? job.meetingId : "").sort()).toEqual(expected.map((job) => job.meetingId).sort());
+});
+
+test("chunked legacy indexing and cancellation preserve work across malformed page boundaries", async () => {
+  const { queue, delayedKey } = isolatedQueue();
+  const target = { type: "attributed.batch", meetingId: "bulk", batchId: "cancel" } as const;
+  const survivors = Array.from({ length: 300 }, (_, i) => ({ type: "meeting.start", meetingId: `survivor-${i}` }));
+  for (const [i, job] of survivors.entries()) {
+    await redis.zadd(delayedKey, String(Date.now() + 60_000 + i * 3), `${JSON.stringify(job)}|survivor-${i}`);
+    await redis.zadd(delayedKey, String(Date.now() + 60_000 + i * 3 + 1), `${JSON.stringify({ ...target, requestId: crypto.randomUUID() })}|target-${i}`);
+    if (i % 30 === 0) await redis.zadd(delayedKey, String(Date.now() + 60_000 + i * 3 + 2), `PRIVATE_QUEUE_PAYLOAD-${i}|malformed`);
+  }
+  expect(await queue.removeDelayed(target)).toBe(300);
+  expect((await queue.pending()).delayed.map(({ job }) => "meetingId" in job ? job.meetingId : "").sort()).toEqual(survivors.map((job) => job.meetingId).sort());
+  expect((await redis.zrangebyscore(`${delayedKey}:invalid`, "-inf", "+inf"))).toHaveLength(10);
+  const guards = await redis.send("HVALS", [`${delayedKey}:index`]) as string[];
+  expect(guards.filter((value) => value.includes("|")).sort()).toEqual((await redis.zrangebyscore(delayedKey, "-inf", "+inf")).sort());
+  await queue.push(target, 60_000, "target-0");
+  expect((await queue.pending()).delayed.filter(({ job }) => job.type === target.type)).toHaveLength(1);
 });

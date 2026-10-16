@@ -22,82 +22,143 @@ export type Job = (
 // longer delays repairing a genuinely lost wakeup.
 const WAKEUP_MARKER_TTL_MS = 120_000;
 
-// The index separates work identity from the selected raw JSON|suffix member. Canonicalize only
-// identity (Job fields are scalar values or string arrays); never rewrite the winning payload.
+const DELAYED_BATCH_SIZE = 64;
+
+// Each EVAL visits at most one bounded page. Payload parsing is protected before any member
+// mutation: Redis does not roll a script's earlier writes back when a later command throws.
 const DELAYED_IDENTITY_SCRIPT = `
 local function workIdentity(payload)
-  local job = cjson.decode(payload)
-  job.requestId = nil
-  local fields = {}
-  for key in pairs(job) do fields[#fields + 1] = key end
-  table.sort(fields)
-  for i, key in ipairs(fields) do fields[i] = cjson.encode(key) .. ":" .. cjson.encode(job[key]) end
-  return "{" .. table.concat(fields, ",") .. "}"
+  if type(payload) ~= "string" then return nil end
+  local ok, work = pcall(function()
+    local job = cjson.decode(payload)
+    if type(job) ~= "table" or type(job.type) ~= "string" then return nil end
+    job.requestId = nil
+    local fields = {}
+    for key in pairs(job) do
+      if type(key) ~= "string" then return nil end
+      fields[#fields + 1] = key
+    end
+    table.sort(fields)
+    for i, key in ipairs(fields) do fields[i] = cjson.encode(key) .. ":" .. cjson.encode(job[key]) end
+    return "{" .. table.concat(fields, ",") .. "}"
+  end)
+  if ok then return work end
+  return nil
 end
 local function memberParts(member)
   local payload, suffix = string.match(member, "^(.*)|([^|]*)$")
   local work = workIdentity(payload)
+  if not work then return nil end
   return payload, work .. "|" .. suffix, work
 end
 local function forgetMember(member, identity)
   local removed = redis.call("ZREM", KEYS[1], member)
-  if redis.call("HGET", KEYS[2], identity) == member then redis.call("HDEL", KEYS[2], identity) end
+  if redis.call("HGET", KEYS[2], identity) == member then
+    redis.call("HDEL", KEYS[2], identity)
+    redis.call("ZREM", KEYS[3], identity)
+  end
   return removed
 end
+local function quarantine(member)
+  local score = redis.call("ZSCORE", KEYS[1], member)
+  if score then
+    redis.call("ZADD", KEYS[4], score, member)
+    redis.call("ZREM", KEYS[1], member)
+  end
+end
+`;
+
+const INDEX_DELAYED_SCRIPT = `-- queue:index-delayed
+${DELAYED_IDENTITY_SCRIPT}
+local state = redis.call("HGET", KEYS[2], "")
+if state == "v2:ready" then return 1 end
+local offset = tonumber(string.match(state or "", "^v2:(%d+)$"))
+if not offset then
+  -- Rebuild old/partially failed indexes, retaining raw pending payloads and scores.
+  redis.call("UNLINK", KEYS[2], KEYS[3])
+  offset = 0
+end
+local members = redis.call("ZRANGE", KEYS[1], offset, offset + ${DELAYED_BATCH_SIZE - 1})
+local retained = 0
+for _, member in ipairs(members) do
+  local payload, identity = memberParts(member)
+  if not payload then quarantine(member)
+  else
+    local selected = redis.call("HGET", KEYS[2], identity)
+    if not selected then
+      redis.call("HSET", KEYS[2], identity, member)
+      redis.call("ZADD", KEYS[3], 0, identity)
+      retained = retained + 1
+    elseif selected == member then retained = retained + 1
+    else forgetMember(member, identity) end
+  end
+end
+offset = offset + retained
+if #members < ${DELAYED_BATCH_SIZE} or offset >= redis.call("ZCARD", KEYS[1]) then
+  redis.call("HSET", KEYS[2], "", "v2:ready")
+  return 1
+end
+redis.call("HSET", KEYS[2], "", "v2:" .. offset)
+return 0
 `;
 
 const PUSH_DELAYED_SCRIPT = `-- queue:push-delayed
 ${DELAYED_IDENTITY_SCRIPT}
-if redis.call("HEXISTS", KEYS[2], "") == 0 then
-  -- Index pre-cutover raw members once, in due-score order. If old request metadata already
-  -- forked one work identity, retain its earliest pending member (lexical order breaks ties).
-  local members = redis.call("ZRANGE", KEYS[1], 0, -1)
-  for _, member in ipairs(members) do
-    local _, identity = memberParts(member)
-    local selected = redis.call("HGET", KEYS[2], identity)
-    if not selected then redis.call("HSET", KEYS[2], identity, member)
-    elseif selected ~= member then forgetMember(member, identity) end
-  end
-  redis.call("HSET", KEYS[2], "", "1")
-end
-local identity = workIdentity(ARGV[1]) .. "|" .. ARGV[2]
+if redis.call("HGET", KEYS[2], "") ~= "v2:ready" then return -1 end
+local work = workIdentity(ARGV[1])
+if not work then return -2 end
+local identity = work .. "|" .. ARGV[2]
 local selected = redis.call("HGET", KEYS[2], identity)
 if selected and redis.call("ZSCORE", KEYS[1], selected) then return 0 end
 local member = ARGV[1] .. "|" .. ARGV[2]
 redis.call("ZADD", KEYS[1], "NX", ARGV[3], member)
 redis.call("HSET", KEYS[2], identity, member)
+redis.call("ZADD", KEYS[3], 0, identity)
 return 1
 `;
 
 const PROMOTE_DUE_SCRIPT = `-- queue:promote-due
 ${DELAYED_IDENTITY_SCRIPT}
-local due = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", ARGV[1])
+if redis.call("HGET", KEYS[2], "") ~= "v2:ready" then return -1 end
+local due = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", ARGV[1], "LIMIT", 0, ${DELAYED_BATCH_SIZE})
+local promoted = 0
 for _, member in ipairs(due) do
   local payload, identity = memberParts(member)
-  if forgetMember(member, identity) == 1 then redis.call("RPUSH", KEYS[3], payload) end
+  if not payload then quarantine(member)
+  elseif forgetMember(member, identity) == 1 then
+    redis.call("RPUSH", KEYS[5], payload)
+    promoted = promoted + 1
+  end
 end
-return #due
+return promoted
 `;
 
 const REMOVE_DELAYED_SCRIPT = `-- queue:remove-delayed
 ${DELAYED_IDENTITY_SCRIPT}
+if redis.call("HGET", KEYS[2], "") ~= "v2:ready" then return {-1, 0} end
 local target = workIdentity(ARGV[1])
+if not target then return {-2, 0} end
+local prefix = target .. "|"
+local identities = redis.call("ZRANGEBYLEX", KEYS[3], "[" .. prefix, "[" .. prefix .. string.char(255), "LIMIT", 0, ${DELAYED_BATCH_SIZE})
 local removed = 0
-for _, member in ipairs(redis.call("ZRANGE", KEYS[1], 0, -1)) do
-  local _, identity, work = memberParts(member)
-  if work == target then removed = removed + forgetMember(member, identity) end
+for _, identity in ipairs(identities) do
+  local member = redis.call("HGET", KEYS[2], identity)
+  if member then removed = removed + forgetMember(member, identity)
+  else redis.call("ZREM", KEYS[3], identity) end
 end
-return removed
+return {removed, #identities}
 `;
 
 /**
- * Minimal Redis-backed queue: a ready list, a delayed sorted set (score = run-at ms), and a
- * delayed identity index. `pop` atomically promotes due delayed jobs then blocks on the ready list.
+ * Minimal Redis-backed queue: ready/delayed jobs, selected-payload and work indexes, and an
+ * isolated invalid-member set. Every migration/promotion/cancellation EVAL processes at most 64 rows.
  */
 export class Queue {
   private readonly ready: string;
   private readonly delayed: string;
   private readonly delayedIndex: string;
+  private readonly delayedWork: string;
+  private readonly delayedInvalid: string;
   private readonly startLease: (meetingId: string) => string;
   private readonly pollLease: (meetingId: string) => string;
   private readonly startWakeup: (meetingId: string) => string;
@@ -110,6 +171,8 @@ export class Queue {
     this.ready = `${prefix}:jobs:ready`;
     this.delayed = `${prefix}:jobs:delayed`;
     this.delayedIndex = `${this.delayed}:index`;
+    this.delayedWork = `${this.delayed}:work`;
+    this.delayedInvalid = `${this.delayed}:invalid`;
     this.pollLease = (meetingId) => `${prefix}:poll:${meetingId}`;
     this.startLease = (meetingId) => `${prefix}:start:${meetingId}`;
     this.startWakeup = (meetingId) => `${prefix}:wake:start:${meetingId}`;
@@ -121,24 +184,40 @@ export class Queue {
     return JSON.stringify(id ? { ...job, requestId: id } : job);
   }
 
+  private async prepareDelayed(): Promise<void> {
+    // All delayed writers/drainers wait on the same resumable index cursor. Only this script
+    // changes membership until ready; immediate jobs remain independent. Each await releases Redis.
+    while (await this.redis.send("EVAL", [
+      INDEX_DELAYED_SCRIPT, "4", this.delayed, this.delayedIndex, this.delayedWork, this.delayedInvalid,
+    ]) !== 1) {}
+  }
+
   async push(job: Job, delayMs = 0, dedupKey?: string): Promise<void> {
     const payload = this.payload(job);
     if (delayMs > 0) {
-      // The first pending payload and score win, independent of request metadata. Index selection,
-      // insertion, and slot release on promotion/cancellation are atomic across queue clients.
-      await this.redis.send("EVAL", [
-        PUSH_DELAYED_SCRIPT, "2", this.delayed, this.delayedIndex,
-        payload, dedupKey ?? crypto.randomUUID(), String(Date.now() + delayMs),
-      ]);
+      for (;;) {
+        await this.prepareDelayed();
+        const result = await this.redis.send("EVAL", [
+          PUSH_DELAYED_SCRIPT, "4", this.delayed, this.delayedIndex, this.delayedWork, this.delayedInvalid,
+          payload, dedupKey ?? crypto.randomUUID(), String(Date.now() + delayMs),
+        ]) as number;
+        if (result === -1) continue;
+        if (result === -2) throw new Error("Invalid delayed queue job");
+        return;
+      }
     } else {
       await this.redis.lpush(this.ready, payload);
     }
   }
 
   async promoteDue(): Promise<number> {
-    return await this.redis.send("EVAL", [
-      PROMOTE_DUE_SCRIPT, "3", this.delayed, this.delayedIndex, this.ready, String(Date.now()),
-    ]) as number;
+    for (;;) {
+      await this.prepareDelayed();
+      const result = await this.redis.send("EVAL", [
+        PROMOTE_DUE_SCRIPT, "5", this.delayed, this.delayedIndex, this.delayedWork, this.delayedInvalid, this.ready, String(Date.now()),
+      ]) as number;
+      if (result !== -1) return result;
+    }
   }
 
   /** Blocks up to `timeoutSec` (fractional ok), but never past the next delayed job's due time. */
@@ -157,9 +236,17 @@ export class Queue {
 
   /** Deletes every delayed member for this work, regardless of its request metadata or suffix. */
   async removeDelayed(job: Job): Promise<number> {
-    return await this.redis.send("EVAL", [
-      REMOVE_DELAYED_SCRIPT, "2", this.delayed, this.delayedIndex, JSON.stringify(job),
-    ]) as number;
+    let total = 0;
+    for (;;) {
+      await this.prepareDelayed();
+      const [removed, visited] = await this.redis.send("EVAL", [
+        REMOVE_DELAYED_SCRIPT, "4", this.delayed, this.delayedIndex, this.delayedWork, this.delayedInvalid, JSON.stringify(job),
+      ]) as [number, number];
+      if (removed === -1) continue;
+      if (removed === -2) throw new Error("Invalid delayed queue job");
+      total += removed;
+      if (visited < DELAYED_BATCH_SIZE) return total;
+    }
   }
 
   async size(): Promise<{ ready: number; delayed: number }> {
@@ -167,7 +254,7 @@ export class Queue {
   }
 
   async clear() {
-    await this.redis.del(this.ready, this.delayed, this.delayedIndex);
+    await this.redis.del(this.ready, this.delayed, this.delayedIndex, this.delayedWork, this.delayedInvalid);
   }
 
   /** Claims the lease when absent, or refreshes it while this chain still holds it. */
