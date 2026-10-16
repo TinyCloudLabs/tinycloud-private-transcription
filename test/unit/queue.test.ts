@@ -1,11 +1,19 @@
 import { afterAll, expect, test } from "bun:test";
 import { RedisClient } from "bun";
 import { Queue } from "../../src/worker/queue.ts";
+import { withRequestId } from "../../src/request-context.ts";
 
 const redis = new RedisClient(process.env.REDIS_URL ?? "redis://localhost:56379");
-const q = new Queue(redis, `test:${crypto.randomUUID()}`);
+const queues: Queue[] = [];
+function isolatedQueue() {
+  const prefix = `test:${crypto.randomUUID()}`;
+  const queue = new Queue(redis, prefix);
+  queues.push(queue);
+  return { queue, prefix, delayedKey: `${prefix}:jobs:delayed` };
+}
+const { queue: q } = isolatedQueue();
 afterAll(async () => {
-  await q.clear();
+  for (const queue of queues) await queue.clear();
   redis.close();
 });
 
@@ -62,6 +70,153 @@ test("deduped delayed pushes keep one entry and re-add after promotion", async (
   expect(await q.pop(1)).toEqual(job);
   await q.push(job, 60_000, `batch:${batchId}`);
   expect((await q.pending()).delayed.filter((e) => e.job.type === "attributed.batch" && e.job.batchId === batchId)).toHaveLength(1);
+});
+
+test("ten metadata-free reconciliation wakeups keep the first minted request ID and due score", async () => {
+  const { queue, delayedKey } = isolatedQueue();
+  const job = { type: "attributed.batch", meetingId: "reconcile", batchId: "minted" } as const;
+  const ids: string[] = [];
+  await withRequestId(undefined, async (id) => {
+    ids.push(id);
+    await queue.push(job, 60_000, "batch:minted");
+  });
+  const [member] = await redis.zrangebyscore(delayedKey, "-inf", "+inf");
+  const due = Date.now() + 30_000;
+  await redis.zadd(delayedKey, String(due), member!);
+  for (let i = 1; i < 10; i++) {
+    await withRequestId(undefined, async (id) => {
+      ids.push(id);
+      await queue.push(job, 120_000, "batch:minted");
+    });
+  }
+  expect(new Set(ids).size).toBe(10);
+  expect(await queue.size()).toEqual({ ready: 0, delayed: 1 });
+  expect((await queue.pending()).delayed).toEqual([{ job: { ...job, requestId: ids[0] }, runAt: due }]);
+});
+
+test("ten valid request contexts share delayed work identity without rewriting the first payload", async () => {
+  const { queue, delayedKey } = isolatedQueue();
+  const job = { type: "attributed.batch", meetingId: "reconcile", batchId: "valid" } as const;
+  const ids = Array.from({ length: 10 }, () => crypto.randomUUID());
+  await withRequestId(ids[0], () => queue.push(job, 60_000, "batch:valid"));
+  const [member] = await redis.zrangebyscore(delayedKey, "-inf", "+inf");
+  const due = Date.now() + 30_000;
+  await redis.zadd(delayedKey, String(due), member!);
+  for (const id of ids.slice(1)) await withRequestId(id, () => queue.push(job, 120_000, "batch:valid"));
+  expect(await queue.size()).toEqual({ ready: 0, delayed: 1 });
+  expect((await queue.pending()).delayed).toEqual([{ job: { ...job, requestId: ids[0] }, runAt: due }]);
+
+  // A dedup suffix is scoped to the work, not a global slot that could discard a different job.
+  const otherJob = { ...job, batchId: "other" };
+  await withRequestId(ids[1], () => queue.push(otherJob, 60_000, "batch:valid"));
+  expect((await queue.pending()).delayed).toHaveLength(2);
+});
+
+test("concurrent Redis clients atomically select and retain one delayed payload", async () => {
+  const { queue, prefix, delayedKey } = isolatedQueue();
+  const otherRedis = new RedisClient(process.env.REDIS_URL ?? "redis://localhost:56379");
+  const otherQueue = new Queue(otherRedis, prefix);
+  const job = { type: "attributed.batch", meetingId: "reconcile", batchId: "concurrent" } as const;
+  const ids: string[] = Array.from({ length: 10 }, () => crypto.randomUUID());
+  try {
+    await Promise.all(ids.map((id, i) => withRequestId(id, () => (i % 2 ? otherQueue : queue).push(job, 60_000, "batch:concurrent"))));
+    const selected = (await queue.pending()).delayed;
+    expect(selected).toHaveLength(1);
+    expect(ids).toContain(selected[0]!.job.requestId!);
+    const [member] = await redis.zrangebyscore(delayedKey, "-inf", "+inf");
+    const due = Date.now() + 30_000;
+    await redis.zadd(delayedKey, String(due), member!);
+    await Promise.all(ids.map((id, i) => withRequestId(id, () => (i % 2 ? queue : otherQueue).push(job, 120_000, "batch:concurrent"))));
+    expect((await queue.pending()).delayed).toEqual([{ job: selected[0]!.job, runAt: due }]);
+
+    // Promotion and a new push are serialized together, including release of the identity slot.
+    await redis.zadd(delayedKey, "0", member!);
+    const replacementId = crypto.randomUUID();
+    const [promoted] = await Promise.all([
+      queue.promoteDue(),
+      withRequestId(replacementId, () => otherQueue.push(job, 60_000, "batch:concurrent")),
+    ]);
+    expect(promoted).toBe(1);
+    expect(await queue.pop(1)).toEqual(selected[0]!.job);
+    const afterRace = (await queue.pending()).delayed;
+    expect(afterRace.length).toBeLessThanOrEqual(1);
+    if (afterRace.length) expect(afterRace[0]!.job.requestId).toBe(replacementId);
+    await withRequestId(replacementId, () => otherQueue.push(job, 60_000, "batch:concurrent"));
+    expect((await queue.pending()).delayed.map(({ job: pendingJob }) => pendingJob)).toEqual([{ ...job, requestId: replacementId }]);
+  } finally {
+    otherRedis.close();
+  }
+});
+
+test("promotion releases delayed identity and preserves each selected request ID", async () => {
+  const { queue, delayedKey } = isolatedQueue();
+  const job = { type: "attributed.batch", meetingId: "reconcile", batchId: "promotion" } as const;
+  const firstId = crypto.randomUUID();
+  const nextId = crypto.randomUUID();
+  await withRequestId(firstId, () => queue.push(job, 60_000, "batch:promotion"));
+  const [member] = await redis.zrangebyscore(delayedKey, "-inf", "+inf");
+  await redis.zadd(delayedKey, "0", member!);
+  expect(await queue.promoteDue()).toBe(1);
+  expect(await queue.promoteDue()).toBe(0);
+  expect(await queue.pop(1)).toEqual({ ...job, requestId: firstId });
+  await withRequestId(nextId, () => queue.push(job, 60_000, "batch:promotion"));
+  expect((await queue.pending()).delayed.map(({ job: pendingJob }) => pendingJob)).toEqual([{ ...job, requestId: nextId }]);
+});
+
+test("delayed cancellation ignores request metadata and releases every removed identity", async () => {
+  const { queue } = isolatedQueue();
+  const job = { type: "attributed.batch", meetingId: "reconcile", batchId: "removal" } as const;
+  await withRequestId(crypto.randomUUID(), () => queue.push(job, 60_000, "batch:removal:a"));
+  await withRequestId(crypto.randomUUID(), () => queue.push(job, 60_000, "batch:removal:b"));
+  await withRequestId(crypto.randomUUID(), () => queue.push(job, 60_000));
+  expect(await withRequestId(crypto.randomUUID(), () => queue.removeDelayed(job))).toBe(3);
+  expect(await queue.size()).toEqual({ ready: 0, delayed: 0 });
+  const nextId = crypto.randomUUID();
+  await withRequestId(nextId, () => queue.push(job, 60_000, "batch:removal:a"));
+  expect((await queue.pending()).delayed.map(({ job: pendingJob }) => pendingJob)).toEqual([{ ...job, requestId: nextId }]);
+  await queue.clear();
+  await withRequestId(nextId, () => queue.push(job, 60_000, "batch:removal:a"));
+  expect((await queue.pending()).delayed).toHaveLength(1);
+});
+
+for (const attributed of [false, true]) {
+  test(`pending legacy raw JSON entries ${attributed ? "with" : "without"} requestId retain their payload and due score`, async () => {
+    const { queue, delayedKey } = isolatedQueue();
+    const job = { type: "attributed.batch", meetingId: "legacy", batchId: "continuity" } as const;
+    const legacyJob = attributed ? { ...job, requestId: crypto.randomUUID() } : job;
+    const due = Date.now() + 30_000;
+    await redis.zadd(delayedKey, String(due), `${JSON.stringify(legacyJob)}|batch:continuity`);
+    expect((await queue.pending()).delayed).toEqual([{ job: legacyJob, runAt: due }]);
+    for (let i = 0; i < 10; i++) {
+      await withRequestId(crypto.randomUUID(), () => queue.push(job, 120_000, "batch:continuity"));
+    }
+    expect(await queue.size()).toEqual({ ready: 0, delayed: 1 });
+    expect((await queue.pending()).delayed).toEqual([{ job: legacyJob, runAt: due }]);
+    const [member] = await redis.zrangebyscore(delayedKey, "-inf", "+inf");
+    await redis.zadd(delayedKey, "0", member!);
+    expect(await queue.promoteDue()).toBe(1);
+    expect(await queue.pop(1)).toEqual(legacyJob);
+    const nextId = crypto.randomUUID();
+    await withRequestId(nextId, () => queue.push(job, 60_000, "batch:continuity"));
+    expect((await queue.pending()).delayed.map(({ job: pendingJob }) => pendingJob)).toEqual([{ ...job, requestId: nextId }]);
+  });
+}
+
+test("legacy delayed cancellation removes metadata-free and attributed payloads without leaving dedup guards", async () => {
+  const { queue, delayedKey } = isolatedQueue();
+  const job = { type: "attributed.batch", meetingId: "legacy", batchId: "cancel" } as const;
+  const due = String(Date.now() + 60_000);
+  await redis.zadd(delayedKey, due, `${JSON.stringify(job)}|batch:cancel:a`);
+  await redis.zadd(delayedKey, due, `${JSON.stringify({ ...job, requestId: crypto.randomUUID() })}|batch:cancel:b`);
+  expect(await withRequestId(crypto.randomUUID(), () => queue.removeDelayed(job))).toBe(2);
+  expect((await queue.pending()).delayed).toEqual([]);
+  const nextId = crypto.randomUUID();
+  await withRequestId(nextId, () => queue.push(job, 60_000, "batch:cancel:a"));
+  await withRequestId(nextId, () => queue.push(job, 60_000, "batch:cancel:b"));
+  expect((await queue.pending()).delayed.map(({ job: pendingJob }) => pendingJob)).toEqual([
+    { ...job, requestId: nextId },
+    { ...job, requestId: nextId },
+  ]);
 });
 
 test("wakeup markers are owned by wakeupId and orphaned markers re-acquire", async () => {

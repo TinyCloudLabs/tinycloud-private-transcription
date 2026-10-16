@@ -4,7 +4,6 @@ import { meetings, projects, webhookDeliveries, type MeetingRow, type Transcript
 import { newDeliveryId, newEventId } from "../domain/ids.ts";
 import { getTranscript, transcriptProviderFields } from "../services/meetings.ts";
 import { signWebhookBody, WEBHOOK_SIGNATURE_HEADER } from "./signature.ts";
-import { requestIdHeaders } from "../request-context.ts";
 
 export type WebhookEventType = "meeting.completed" | "meeting.failed";
 // A queue wakeup may sit behind unrelated work. The lease is therefore refreshed immediately
@@ -108,7 +107,6 @@ export async function deliverWebhook(ctx: AppContext, deliveryId: string, claimT
         [WEBHOOK_SIGNATURE_HEADER]: signWebhookBody(secret, d.payload),
         "X-Webhook-Event": d.eventType,
         "X-Webhook-Delivery": d.id,
-        ...requestIdHeaders(),
       },
       body: d.payload,
       signal: AbortSignal.timeout(WEBHOOK_REQUEST_TIMEOUT_MS),

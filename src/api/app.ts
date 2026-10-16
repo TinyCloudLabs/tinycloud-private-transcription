@@ -57,7 +57,7 @@ export function mountScopedGroups(app: Hono<AuthEnv>, ctx: Pick<AppContext, "db"
 
 export function createApp(ctx: AppContext, groups: ScopedGroups = meetingGroups(ctx)) {
   const app = new Hono<AuthEnv>();
-  app.use("*", async (c, next) => withRequestId(c.req.header("x-request-id"), async (id) => {
+  app.use("*", async (c, next) => withRequestId(c.req.header("x-request-id"), async (id, replaced) => {
     const started = performance.now();
     c.header("X-Request-Id", id);
     await next();
@@ -65,6 +65,7 @@ export function createApp(ctx: AppContext, groups: ScopedGroups = meetingGroups(
     ctx.log.info("ptx_realtime_request", {
       event: "ptx_realtime_request",
       request_id: id,
+      request_id_replaced: replaced,
       method: /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/.test(c.req.method) ? c.req.method : "OTHER",
       route: Object.hasOwn(REQUEST_ROUTES, routePath(c, -1)) ? REQUEST_ROUTES[routePath(c, -1)]! : "unmatched",
       status: c.res.status,

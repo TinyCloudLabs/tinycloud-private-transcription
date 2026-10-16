@@ -177,17 +177,24 @@ bun run cli create-key --project tinychat --scopes 'transcriptions:*'
 
 The meeting API accepts a canonical UUID `X-Request-Id` (RFC variant, versions 1–8), lowercases it,
 or mints v4 when missing/invalid. Every response echoes it, including 401/403/404/500. Queue payloads
-carry `requestId`; the worker restores an isolated async scope before dispatch, so retries and outbound
-Vexa, Signal capture, Tinfoil and webhook HTTP requests carry the same lowercase header. Calls outside
-these scopes are unchanged. A legacy/reconciled job without an ID mints a new worker ID; Redis wakeup
-loss does not preserve a durable meeting-wide trace. Batch `X-Correlation-Id`, uploads, CORS, provider
-dispatch and transcription contracts are unchanged. No account/space pseudonym or common HMAC key is
-introduced.
+carry `requestId`; the worker restores an isolated async scope before dispatch and retries retain that
+local ID. **No outbound HTTP request-ID forwarding is enabled:** Vexa/Google, Tinfoil, generic webhooks
+and Signal receive no `X-Request-Id`, including across redirects. A configured Signal URL is not proof
+of first-party ownership or fail-closed redirect handling, so it is excluded too. Provider correlation
+is not claimed. Any future forwarding requires an explicit owned first-party origin and a redirect
+policy that cannot disclose the ID to another origin.
+
+A legacy/reconciled job without an ID mints a new worker ID; Redis wakeup loss does not preserve a
+durable meeting-wide trace. Batch `X-Correlation-Id`, uploads, CORS, provider dispatch and transcription
+contracts are unchanged. No account/space pseudonym or common HMAC key is introduced.
 
 At `LOG_LEVEL=info` (or `debug`), the API emits one `ptx_realtime_request` event per completed request
 and the worker one `ptx_realtime_worker` event per dispatched job, including errors. Both have fixed
-`ts`, `level=info`, `msg` (equal to the event name), `event`, lowercase UUID `request_id` and integer
-`duration_ms` clamped to 0–86,400,000. Event-specific fields:
+`ts`, `level=info`, `msg` (equal to the event name), `event`, lowercase UUID `request_id`, boolean
+`request_id_replaced`, and integer `duration_ms` clamped to 0–86,400,000. Replacement is evaluated at
+each boundary: true only for a rejected incoming/persisted ID, false for a valid ID or an absent ID
+that was minted. Rejected text is never included. Canonical UUID vectors are vendored from N0 in
+`test/fixtures/request-id-vectors.json`. Event-specific fields:
 
 | Event | Fields |
 | --- | --- |
@@ -197,6 +204,13 @@ and the worker one `ptx_realtime_worker` event per dispatched job, including err
 Neither event includes request/response payloads, raw URI/query, meeting URL, native meeting ID,
 tenant/account identity, token, provider response or exception text. The existing general logger and
 dependency/console output are **not** made universally safe by these events.
+
+Delayed-job deduplication ignores request metadata: the first pending work+dedup-suffix entry retains
+its original payload, ID and due time. Atomic Redis scripts select/release that identity during push,
+promotion and cancellation. Existing raw `JSON|suffix` entries remain readable; a lazy index chooses
+the earliest due entry if legacy request metadata already created duplicates (lexical tie-break).
+Cutover must quiesce old queue writers; mixed old/new writers are not supported. After an old-writer
+rollback epoch, rebuild the identity index under the same quiescence gate before roll-forward.
 
 **Code-only; not a shipping enablement.** No image pins, Compose, Vector, credentials or production
 settings change here. Before ptx-dev shipping, separately review the canonical schema and a fail-closed

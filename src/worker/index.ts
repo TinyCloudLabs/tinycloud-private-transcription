@@ -13,8 +13,18 @@ import { requestDurationMs, withRequestId } from "../request-context.ts";
 
 export type JobOutcome = "processed" | "noop" | "deferred";
 
+const JOB_TYPES: Record<Job["type"], true> = {
+  "meeting.start": true,
+  "meeting.poll": true,
+  "meeting.join_deadline": true,
+  "attributed.batch": true,
+  "attributed.finalize": true,
+  "webhook.deliver": true,
+  "eval.meeting": true,
+};
+
 export async function processJob(ctx: AppContext, job: Job): Promise<JobOutcome> {
-  return withRequestId(job.requestId, async (id) => {
+  return withRequestId(job.requestId, async (id, replaced) => {
     const started = performance.now();
     let outcome: JobOutcome | "error" = "error";
     try {
@@ -23,7 +33,8 @@ export async function processJob(ctx: AppContext, job: Job): Promise<JobOutcome>
     } finally {
       ctx.log.info("ptx_realtime_worker", {
         event: "ptx_realtime_worker", request_id: id,
-        job_type: /^(meeting\.(start|poll|join_deadline)|attributed\.(batch|finalize)|webhook\.deliver|eval\.meeting)$/.test(job.type) ? job.type : "unknown",
+        request_id_replaced: replaced,
+        job_type: typeof job.type === "string" && Object.hasOwn(JOB_TYPES, job.type) ? job.type : "unknown",
         outcome, duration_ms: requestDurationMs(started),
       });
     }

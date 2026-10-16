@@ -1,6 +1,5 @@
 import { open } from "node:fs/promises";
 import { ApiError } from "../../domain/errors.ts";
-import { requestIdHeaders } from "../../request-context.ts";
 import type {
   VexaMeetingCreate,
   VexaMeetingResponse,
@@ -58,7 +57,6 @@ export class VexaClient {
         method,
         headers: {
           "X-API-Key": this.apiKey,
-          ...requestIdHeaders(),
           ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
         },
         body: body !== undefined ? JSON.stringify(body) : undefined,

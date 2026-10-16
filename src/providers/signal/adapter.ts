@@ -1,6 +1,5 @@
 import { ApiError } from "../../domain/errors.ts";
 import type { RawSegment } from "../../domain/transcript.ts";
-import { currentRequestId } from "../../request-context.ts";
 
 export type SignalCaptureStatus = "joining" | "waiting_for_admission" | "in_progress" | "completed" | "failed";
 export interface SignalCaptureSnapshot { status: SignalCaptureStatus; segments?: RawSegment[]; errorCode?: "meeting_join_failed" | "waiting_room_timeout" | "bot_removed" | "meeting_ended" | "capture_failed"; }
@@ -61,8 +60,6 @@ export class LoopbackSignalCaptureAdapter implements SignalCaptureAdapter {
 
   private headers(seat: number, initial?: RequestInit["headers"]): Headers {
     const headers = new Headers(initial);
-    const requestId = currentRequestId();
-    if (requestId) headers.set("X-Request-Id", requestId);
     const token = this.controlTokens[seat];
     if (token) headers.set("authorization", `Bearer ${token}`);
     return headers;

@@ -4,19 +4,15 @@ import { AsyncLocalStorage } from "node:async_hooks";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const requests = new AsyncLocalStorage<string>();
 
-export function withRequestId<T>(presented: unknown, run: (id: string) => T): T {
-  const id = typeof presented === "string" && presented.length === 36 && UUID.test(presented)
-    ? presented.toLowerCase() : crypto.randomUUID();
-  return requests.run(id, () => run(id));
+export function withRequestId<T>(presented: unknown, run: (id: string, replaced: boolean) => T): T {
+  const valid = typeof presented === "string" && presented.length === 36 && UUID.test(presented);
+  const id = valid ? presented.toLowerCase() : crypto.randomUUID();
+  const replaced = presented !== undefined && !valid;
+  return requests.run(id, () => run(id, replaced));
 }
 
 /** Undefined outside realtime API/job scopes: batch's correlation contract is independent. */
 export function currentRequestId(): string | undefined { return requests.getStore(); }
-
-export function requestIdHeaders(): Record<string, string> {
-  const id = requests.getStore();
-  return id ? { "X-Request-Id": id } : {};
-}
 
 /** Monotonic whole milliseconds, bounded for the typed request/worker event schema. */
 export function requestDurationMs(started: number): number {

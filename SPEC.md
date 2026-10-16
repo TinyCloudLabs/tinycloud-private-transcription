@@ -27,10 +27,15 @@ Realtime meeting API responses (including auth, validation, not-found and intern
 `X-Request-Id`. A single canonical UUID with RFC variant and version 1–8 is accepted case-insensitively
 and normalized to lowercase; missing, malformed, repeated/list, nil or max UUID values mint a fresh v4
 UUID. This is correlation metadata, not authentication or an account identity.
-The same ID travels in queued job metadata, is restored in the worker's async scope, and is forwarded
-as `X-Request-Id` to Vexa, Signal capture, Tinfoil and meeting webhooks. Retry/continuation jobs inherit
-that scope. Legacy jobs or reconciliation wakeups without a request ID mint a new worker ID; this is
-not a durable meeting-wide trace across a lost Redis wakeup. Webhook bodies/signatures are unchanged.
+The same ID travels in queued job metadata and is restored in the worker's local async scope.
+Retry/continuation jobs inherit that scope. No `X-Request-Id` is forwarded to Vexa/Google, Tinfoil,
+Signal or generic webhooks, nor to redirect targets. No owned first-party HTTP forwarding origin is
+established by this PR. Provider correlation is not claimed; webhook bodies/signatures are unchanged.
+API/worker events include boolean `request_id_replaced`: true for a rejected incoming/persisted ID;
+false for a valid ID or absent ID that was minted. No rejected text is recorded.
+Legacy jobs or reconciliation wakeups without a request ID mint a new worker ID; this is not a durable
+meeting-wide trace across a lost Redis wakeup. Delayed work identity excludes request metadata; the
+first pending work+dedup suffix keeps its original payload and due time atomically.
 The batch role's existing `X-Correlation-Id` upload/transcription contract is separate and unchanged.
 
 Scopes: each authenticated route group requires exactly one scope on the key; otherwise `403`

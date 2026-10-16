@@ -4,7 +4,6 @@ import { decodeToPcm, rmsDbfs, sliceToWav, pcmToWav, type Pcm16 } from "./audio.
 import type { AttributedBatch } from "./attributed.ts";
 import { batchTimeline, paddedBatchPcm, type AttributedResult, type ResultWindow, type TimedPiece, type TimelineEntry } from "./attributed-assembly.ts";
 import type { TranscriptionInput, TranscriptionProvider } from "./types.ts";
-import { requestIdHeaders } from "../../request-context.ts";
 
 export interface TinfoilOptions {
   baseUrl: string;
@@ -340,7 +339,7 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     try {
       response = await this.fetchImpl(`${this.opts.baseUrl.replace(/\/$/, "")}/v1/audio/transcriptions`, {
         method: "POST",
-        headers: { Authorization: `Bearer ${this.opts.apiKey}`, ...requestIdHeaders() },
+        headers: { Authorization: `Bearer ${this.opts.apiKey}` },
         body: form,
         signal: AbortSignal.timeout(timeoutMs),
       });
