@@ -34,7 +34,6 @@ const sourceMessages: Record<string, string> = {
   "batch sweep failed": "batch_sweep_failed",
   "batch worker iteration failed": "batch_worker_iteration_failed",
   "batch worker started": "batch_worker_started",
-  "batch worker heartbeat": "batch_worker_heartbeat",
 };
 
 type FieldSpec = {
@@ -114,7 +113,6 @@ export function renderAllowlist(schema: Schema): string {
 
   const fields = Object.entries(service.fields).filter(([name]) => name !== "svc");
   const completion = "event == \"batch_job_finished\"";
-  lines.push("if event != \"batch_worker_heartbeat\" {");
   for (const [name, spec] of fields) {
     const completionField = spec.nullable === true;
     const requiredCompletionField = ["job_id", "outcome", "duration_seconds", "content_type"].includes(name);
@@ -147,7 +145,6 @@ export function renderAllowlist(schema: Schema): string {
     }
     if (name === "stage" || onlyCompletion) lines.push("}");
   }
-  lines.push("}");
   lines.push(". = out");
   lines.push(endMarker);
   return lines.join("\n");
