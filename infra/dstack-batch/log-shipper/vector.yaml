@@ -126,7 +126,6 @@ transforms:
       else if msg == "batch sweep failed" { "batch_sweep_failed" }
       else if msg == "batch worker iteration failed" { "batch_worker_iteration_failed" }
       else if msg == "batch worker started" { "batch_worker_started" }
-      else if msg == "batch worker heartbeat" { "batch_worker_heartbeat" }
       else { abort }
       out = {"svc": svc, "event": event}
       value = get(j, ["level"]) ?? null
@@ -137,7 +136,6 @@ transforms:
       if !is_string(value) { abort }
       string_value = to_string(value) ?? ""
       if length(string_value) <= 24 && match(string_value, r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$') { out.ts = string_value } else { abort }
-      if event != "batch_worker_heartbeat" {
         value = get(j, ["correlationId"]) ?? null
         if !is_null(value) {
           if is_string(value) {
@@ -295,7 +293,6 @@ transforms:
         if !is_null(value) {
           if is_boolean(value) { out.created = value }
         }
-      }
       . = out
       # END GENERATED FROM fields.json
 sinks:

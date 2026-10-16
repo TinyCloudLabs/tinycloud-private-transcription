@@ -24,7 +24,7 @@
 # The batch-envelope.yml 2-hour stereo proof should be rerun.
 services:
   api:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:51a27ec7b353097197efb1f308db43288dda1e2f@sha256:7b5df3e1d6cee0684bb4502725fec1ceb9f9816db9e59941bbe2a7b191495cfc
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:508cb0be60a27e6b2bb4eefd888ad7c98954c3e5@sha256:72568fe357e87aefb13a4430b0124b16a4c5e98395281e80e9ee09471c9aaf4d
     restart: unless-stopped
     depends_on:
       postgres:
@@ -72,7 +72,7 @@ services:
         labels: tc.logship
         cache-disabled: "true"
   upload-worker:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:51a27ec7b353097197efb1f308db43288dda1e2f@sha256:7b5df3e1d6cee0684bb4502725fec1ceb9f9816db9e59941bbe2a7b191495cfc
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:508cb0be60a27e6b2bb4eefd888ad7c98954c3e5@sha256:72568fe357e87aefb13a4430b0124b16a4c5e98395281e80e9ee09471c9aaf4d
     restart: unless-stopped
     command: ["bun", "run", "src/uploads/worker.ts"]
     depends_on:
@@ -86,7 +86,6 @@ services:
       BATCH_TINFOIL_API_KEY: ${BATCH_TINFOIL_API_KEY:-}
       BATCH_TINFOIL_MODEL: voxtral-small-24b
       BATCH_DIARIZATION_ENABLED: "true"
-      BATCH_WORKER_LOG_HEARTBEAT_SECONDS: "${BATCH_WORKER_LOG_HEARTBEAT_SECONDS:-900}"
       # Runtime rollback for newly detected jobs; the sealed deploy env can override this one flag.
       BATCH_VAD_QUIET_MODE: "${BATCH_VAD_QUIET_MODE:-true}"
       LOG_LEVEL: info
@@ -283,7 +282,6 @@ services:
               else if msg == "batch sweep failed" { "batch_sweep_failed" }
               else if msg == "batch worker iteration failed" { "batch_worker_iteration_failed" }
               else if msg == "batch worker started" { "batch_worker_started" }
-              else if msg == "batch worker heartbeat" { "batch_worker_heartbeat" }
               else { abort }
               out = {"svc": svc, "event": event}
               value = get(j, ["level"]) ?? null
@@ -294,7 +292,6 @@ services:
               if !is_string(value) { abort }
               string_value = to_string(value) ?? ""
               if length(string_value) <= 24 && match(string_value, r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$$') { out.ts = string_value } else { abort }
-              if event != "batch_worker_heartbeat" {
                 value = get(j, ["correlationId"]) ?? null
                 if !is_null(value) {
                   if is_string(value) {
@@ -452,7 +449,6 @@ services:
                 if !is_null(value) {
                   if is_boolean(value) { out.created = value }
                 }
-              }
               . = out
               # END GENERATED FROM fields.json
         sinks:

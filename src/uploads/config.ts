@@ -8,8 +8,6 @@ export const MAX_DURATION_SECONDS = 7_200;
 export const MAX_CHANNELS = 2;
 export const CONTENT_TYPES = ["audio/mpeg", "audio/wav", "audio/ogg", "audio/mp4", "audio/webm", "audio/flac"] as const;
 export type UploadContentType = (typeof CONTENT_TYPES)[number];
-// Bun clamps delays above 2^31-1 ms to 1 ms; validate before converting seconds.
-const MAX_WORKER_LOG_HEARTBEAT_SECONDS = Math.floor(2_147_483_647 / 1_000);
 
 /**
  * Batch-role configuration. Read only when PTX_ROLE=batch; the meeting role never evaluates it. The batch
@@ -69,7 +67,6 @@ export interface BatchConfig {
   worker: {
     pollIntervalMs: number;
     heartbeatSeconds: number;
-    logHeartbeatSeconds: number;
     /** API readiness and slot reclamation treat a worker process silent this long as dead. */
     workerStaleSeconds: number;
     claimRenewSeconds: number;
@@ -99,10 +96,6 @@ export function batchConfigFromEnv(log: Pick<Logger, "warn"> = logger): BatchCon
   }
   const percent = positiveIntegerEnv("BATCH_DISK_HIGH_WATER_PERCENT", "80");
   if (percent >= 100) throw new Error("BATCH_DISK_HIGH_WATER_PERCENT must be below 100");
-  const logHeartbeatSeconds = positiveIntegerEnv("BATCH_WORKER_LOG_HEARTBEAT_SECONDS", "900");
-  if (logHeartbeatSeconds > MAX_WORKER_LOG_HEARTBEAT_SECONDS) {
-    throw new Error("BATCH_WORKER_LOG_HEARTBEAT_SECONDS exceeds the maximum safe timer interval");
-  }
   return {
     port: positiveIntegerEnv("PORT", "8080"),
     databaseUrl: str("DATABASE_URL", ""),
@@ -146,7 +139,6 @@ export function batchConfigFromEnv(log: Pick<Logger, "warn"> = logger): BatchCon
     worker: {
       pollIntervalMs: 1_000,
       heartbeatSeconds: 10,
-      logHeartbeatSeconds,
       workerStaleSeconds: 30,
       claimRenewSeconds: 20,
       claimStaleSeconds: 60,
