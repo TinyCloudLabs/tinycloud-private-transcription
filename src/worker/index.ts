@@ -9,10 +9,28 @@ import { MIN_RECOVERY_ACK_BUDGET_MS, recoveryAckBudgetMs } from "../services/rec
 import { handleEvalJob } from "../services/transcript-eval.ts";
 import type { Job } from "./queue.ts";
 import { startHousekeeping } from "./housekeeping.ts";
+import { requestDurationMs, withRequestId } from "../request-context.ts";
 
 export type JobOutcome = "processed" | "noop" | "deferred";
 
 export async function processJob(ctx: AppContext, job: Job): Promise<JobOutcome> {
+  return withRequestId(job.requestId, async (id) => {
+    const started = performance.now();
+    let outcome: JobOutcome | "error" = "error";
+    try {
+      outcome = await dispatchJob(ctx, job);
+      return outcome;
+    } finally {
+      ctx.log.info("ptx_realtime_worker", {
+        event: "ptx_realtime_worker", request_id: id,
+        job_type: /^(meeting\.(start|poll|join_deadline)|attributed\.(batch|finalize)|webhook\.deliver|eval\.meeting)$/.test(job.type) ? job.type : "unknown",
+        outcome, duration_ms: requestDurationMs(started),
+      });
+    }
+  });
+}
+
+async function dispatchJob(ctx: AppContext, job: Job): Promise<JobOutcome> {
   switch (job.type) {
     case "meeting.start":
       await handleMeetingStart(ctx, job.meetingId, job.attempt ?? 1, job.startToken, job.wakeupId); return "processed";
@@ -28,6 +46,8 @@ export async function processJob(ctx: AppContext, job: Job): Promise<JobOutcome>
       await deliverWebhook(ctx, job.deliveryId, job.claimToken); return "processed";
     case "eval.meeting":
       return handleEvalJob(ctx, job.meetingId, job.models);
+    default:
+      throw new Error("Unknown worker job type");
   }
 }
 

@@ -23,6 +23,16 @@ Consumers: TinyCloud (`listen` app) and Conclave-shaped clients.
 ## API
 Auth: `Authorization: Bearer tc_live_xxx`. A missing, malformed or unknown key → `401 unauthorized`.
 
+Realtime meeting API responses (including auth, validation, not-found and internal errors) echo
+`X-Request-Id`. A single canonical UUID with RFC variant and version 1–8 is accepted case-insensitively
+and normalized to lowercase; missing, malformed, repeated/list, nil or max UUID values mint a fresh v4
+UUID. This is correlation metadata, not authentication or an account identity.
+The same ID travels in queued job metadata, is restored in the worker's async scope, and is forwarded
+as `X-Request-Id` to Vexa, Signal capture, Tinfoil and meeting webhooks. Retry/continuation jobs inherit
+that scope. Legacy jobs or reconciliation wakeups without a request ID mint a new worker ID; this is
+not a durable meeting-wide trace across a lost Redis wakeup. Webhook bodies/signatures are unchanged.
+The batch role's existing `X-Correlation-Id` upload/transcription contract is separate and unchanged.
+
 Scopes: each authenticated route group requires exactly one scope on the key; otherwise `403`
 `{"error":{"type":"authentication_error","code":"insufficient_scope","message":"…"}}`. Scopes are exact strings (the `:*`
 suffix is naming only): there is no global wildcard and no prefix matching, so `*`, `meetings` or `meetings:read` grant nothing.

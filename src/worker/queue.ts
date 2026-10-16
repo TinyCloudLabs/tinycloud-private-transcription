@@ -1,13 +1,15 @@
 import { RedisClient } from "bun";
+import { currentRequestId } from "../request-context.ts";
 
-export type Job =
+export type Job = (
   | { type: "meeting.start"; meetingId: string; attempt?: number; startToken?: string; wakeupId?: string }
   | { type: "meeting.poll"; meetingId: string; recoveryAttempt?: number; stagingAttempt?: number; pollToken?: string; wakeupId?: string }
   | { type: "meeting.join_deadline"; meetingId: string }
   | { type: "attributed.batch"; meetingId: string; batchId: string }
   | { type: "attributed.finalize"; meetingId: string }
   | { type: "eval.meeting"; meetingId: string; models?: string[] }
-  | { type: "webhook.deliver"; deliveryId: string; claimToken: string };
+  | { type: "webhook.deliver"; deliveryId: string; claimToken: string }
+) & { requestId?: string };
 
 // A wakeup marker's TTL is only a lost-job safety net. The marker value is the wakeupId carried
 // by the job it guards: the job deletes its own marker at handler entry, a failed push
@@ -44,8 +46,13 @@ export class Queue {
     this.pollWakeup = (meetingId) => `${prefix}:wake:poll:${meetingId}`;
   }
 
+  private payload(job: Job): string {
+    const id = currentRequestId();
+    return JSON.stringify(id ? { ...job, requestId: id } : job);
+  }
+
   async push(job: Job, delayMs = 0, dedupKey?: string): Promise<void> {
-    const payload = JSON.stringify(job);
+    const payload = this.payload(job);
     if (delayMs > 0) {
       const member = `${payload}|${dedupKey ?? crypto.randomUUID()}`;
       // A caller-provided dedup key keeps at most one delayed entry per key: ZADD NX folds repeats
@@ -84,7 +91,7 @@ export class Queue {
 
   /** Deletes every delayed member with exactly this payload; returns how many were removed. */
   async removeDelayed(job: Job): Promise<number> {
-    const payload = JSON.stringify(job);
+    const payload = this.payload(job);
     const members = await this.redis.zrangebyscore(this.delayed, "-inf", "+inf");
     let removed = 0;
     for (const member of members) {

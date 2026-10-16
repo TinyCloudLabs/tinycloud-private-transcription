@@ -173,6 +173,39 @@ bun run cli create-key --project tinychat --scopes 'transcriptions:*'
 | `PTX_BOOTSTRAP_KEYS` | unset | sealed JSON array of hashed API keys the API syncs at boot (see API-key scopes) |
 | `LOG_LEVEL` | `info` | JSON logs |
 
+### Realtime request correlation and logging gate (TC-959)
+
+The meeting API accepts a canonical UUID `X-Request-Id` (RFC variant, versions 1–8), lowercases it,
+or mints v4 when missing/invalid. Every response echoes it, including 401/403/404/500. Queue payloads
+carry `requestId`; the worker restores an isolated async scope before dispatch, so retries and outbound
+Vexa, Signal capture, Tinfoil and webhook HTTP requests carry the same lowercase header. Calls outside
+these scopes are unchanged. A legacy/reconciled job without an ID mints a new worker ID; Redis wakeup
+loss does not preserve a durable meeting-wide trace. Batch `X-Correlation-Id`, uploads, CORS, provider
+dispatch and transcription contracts are unchanged. No account/space pseudonym or common HMAC key is
+introduced.
+
+At `LOG_LEVEL=info` (or `debug`), the API emits one `ptx_realtime_request` event per completed request
+and the worker one `ptx_realtime_worker` event per dispatched job, including errors. Both have fixed
+`ts`, `level=info`, `msg` (equal to the event name), `event`, lowercase UUID `request_id` and integer
+`duration_ms` clamped to 0–86,400,000. Event-specific fields:
+
+| Event | Fields |
+| --- | --- |
+| `ptx_realtime_request` | `method`: GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS or OTHER; `route`: registered health/meeting template or `unmatched`; numeric HTTP `status` |
+| `ptx_realtime_worker` | `job_type`: meeting.start/meeting.poll/meeting.join_deadline/attributed.batch/attributed.finalize/webhook.deliver/eval.meeting or `unknown`; `outcome`: processed/noop/deferred/error |
+
+Neither event includes request/response payloads, raw URI/query, meeting URL, native meeting ID,
+tenant/account identity, token, provider response or exception text. The existing general logger and
+dependency/console output are **not** made universally safe by these events.
+
+**Code-only; not a shipping enablement.** No image pins, Compose, Vector, credentials or production
+settings change here. Before ptx-dev shipping, separately review the canonical schema and a fail-closed
+Vector gate accepting only these typed API/worker JSON events/fields: drop unknown/unlabelled/nested/
+malformed/free-text input and all raw Vexa admin/runtime, uvicorn and Signal stdout/stderr. Require
+native gate tests, real-sink forbidden-value canaries with positive controls, volume/event-loss checks
+and rollback evidence. API/worker image promotion and any sidecar/Compose update require separate
+operator authorization under TC-1264/TC-965 and the zero-bot window; this PR does not lift those gates.
+
 ## Curl walkthrough (Definition of Done)
 
 ```bash
