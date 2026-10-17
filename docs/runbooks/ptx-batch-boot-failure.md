@@ -1,6 +1,6 @@
 # ptx-batch CVM boot failure: SignCert timeout / stuck stopped
 
-Applies to the production ptx-batch CVM (`cvm_OwmRYDj3`, Phala prod5) and any ptx CVM deployed with `phala deploy`.
+Applies to the production ptx-batch CVM (`cvm_OwmRYDj3`, Phala prod5); the same signature on other ptx CVMs should be treated the same way.
 
 ## Detection signature
 
@@ -28,9 +28,9 @@ Two CI updates (runs 38834532880 and 38837498099) failed this way, and a direct 
 
 If a ptx CVM boot fails the same way again (SignCert/certificate provisioning timeout on boot, or the CVM stuck `stopped`):
 
-1. Do not retry updates blindly; keep admission drained and follow the normal TC-959 recovery gates.
+1. Do not retry updates blindly; keep admission drained and keep admission in `drain` until health is confirmed.
 2. Prepare **one** Phala support ticket covering **both** incidents: start from `phala-ticket.md` in the evidence path above, and add the new incident's identifiers, UTC timeline and sanitized serial excerpt.
-3. Put the ticket to Sam as a card. Sam decides whether to send it.
+3. Put the ticket to Sam as a card (the usual card channel). Sam decides whether to send it; the 2026-10-16 skip does not carry over, so ask again.
 4. **Do not send it unasked.**
 
 Never include secret values, env contents or raw tokens in the ticket or evidence; names and public IDs only.
