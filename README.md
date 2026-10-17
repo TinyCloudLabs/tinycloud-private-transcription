@@ -173,6 +173,73 @@ bun run cli create-key --project tinychat --scopes 'transcriptions:*'
 | `PTX_BOOTSTRAP_KEYS` | unset | sealed JSON array of hashed API keys the API syncs at boot (see API-key scopes) |
 | `LOG_LEVEL` | `info` | JSON logs |
 
+### Realtime request correlation and logging gate (TC-959)
+
+The meeting API accepts a canonical UUID `X-Request-Id` (RFC variant, versions 1–8), lowercases it,
+or mints v4 when missing/invalid. Every response echoes it, including 401/403/404/500. Queue payloads
+carry `requestId`; the worker restores an isolated async scope before dispatch and retries retain that
+local ID. **No outbound HTTP request-ID forwarding is enabled:** Vexa/Google, Tinfoil, generic webhooks
+and Signal receive no `X-Request-Id`, including across redirects. A configured Signal URL is not proof
+of first-party ownership or fail-closed redirect handling, so it is excluded too. Provider correlation
+is not claimed. Any future forwarding requires an explicit owned first-party origin and a redirect
+policy that cannot disclose the ID to another origin.
+
+A legacy/reconciled job without an ID mints a new worker ID; Redis wakeup loss does not preserve a
+durable meeting-wide trace. Batch `X-Correlation-Id`, uploads, CORS, provider dispatch and transcription
+contracts are unchanged. No account/space pseudonym or common HMAC key is introduced.
+
+At `LOG_LEVEL=info` (or `debug`), the API emits one `ptx_realtime_request` event per completed request
+and the worker one `ptx_realtime_worker` event per dispatched job, including errors. Both have fixed
+`ts`, `level=info`, `msg` (equal to the event name), `event`, lowercase UUID `request_id`, boolean
+`request_id_replaced`, and integer `duration_ms` clamped to 0–86,400,000. Replacement is evaluated at
+each boundary: true only for a rejected incoming/persisted ID, false for a valid ID or an absent ID
+that was minted. Rejected text is never included. Canonical UUID vectors are vendored from N0 in
+`test/fixtures/request-id-vectors.json`. Event-specific fields:
+
+| Event | Fields |
+| --- | --- |
+| `ptx_realtime_request` | `method`: GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS or OTHER; `route`: registered health/meeting template or `unmatched`; numeric HTTP `status` |
+| `ptx_realtime_worker` | `job_type`: meeting.start/meeting.poll/meeting.join_deadline/attributed.batch/attributed.finalize/webhook.deliver/eval.meeting or `unknown`; `outcome`: processed/noop/deferred/error |
+
+Neither event includes request/response payloads, raw URI/query, meeting URL, native meeting ID,
+tenant/account identity, token, provider response or exception text. The existing general logger and
+dependency/console output are **not** made universally safe by these events.
+
+Delayed-job deduplication ignores request metadata: the first pending work+dedup-suffix entry retains
+its original payload, ID and due time. Push and each promotion/cancellation batch atomically maintain
+selected-payload and work indexes. Existing raw `JSON|suffix` entries remain readable; resumable legacy
+indexing selects the earliest due duplicate (lexical tie-break), repairs old/partially failed indexes,
+and preserves the selected raw payload.
+
+Migration, due promotion and work-targeted cancellation visit at most **64 entries per Redis EVAL**.
+Migration/cancellation continue across awaited calls; their total duration still scales with backlog.
+Promotion moves at most 64 healthy jobs per call and leaves remaining due work for subsequent calls.
+The row cap bounds work per script, not a production latency SLA or a byte-size limit. Index reset uses
+`UNLINK` so freeing a large old index is not performed inside the blocking script.
+
+Protected decoding isolates malformed delayed JSON, primitive/array payloads and missing separators
+instead of aborting Lua after earlier mutations. Invalid members retain their original bytes and due
+score in the private `<prefix>:jobs:delayed:invalid` sorted set when encountered during migration or due
+promotion. They are not enqueued or logged. Inspect only its `ZCARD` count in routine diagnostics; never
+ship or print quarantined payloads. Healthy work continues, and cancellation reads the work index rather
+than decoding unrelated future members. `Queue.clear()` explicitly clears indexes/quarantine too.
+
+Local real-Redis smoke verified 1,000 legacy jobs migrate in 16 pages plus one push EVAL, 1,001 due jobs
+promote in 16 batches, and 1,000 matching jobs cancel in 16 batches while an unrelated job survives.
+A connection failure after a committed 64-row migration page resumes without losing healthy work.
+These are synthetic local checks, not production throughput or real-sink evidence.
+
+Cutover must quiesce old queue writers; mixed old/new writers are not supported. After an old-writer
+rollback epoch, rebuild the identity indexes under the same quiescence gate before roll-forward.
+
+**Code-only; not a shipping enablement.** No image pins, Compose, Vector, credentials or production
+settings change here. Before ptx-dev shipping, separately review the canonical schema and a fail-closed
+Vector gate accepting only these typed API/worker JSON events/fields: drop unknown/unlabelled/nested/
+malformed/free-text input and all raw Vexa admin/runtime, uvicorn and Signal stdout/stderr. Require
+native gate tests, real-sink forbidden-value canaries with positive controls, volume/event-loss checks
+and rollback evidence. API/worker image promotion and any sidecar/Compose update require separate
+operator authorization under TC-1264/TC-965 and the zero-bot window; this PR does not lift those gates.
+
 ## Curl walkthrough (Definition of Done)
 
 ```bash
