@@ -1,9 +1,24 @@
 import { Hono } from "hono";
+import { routePath } from "hono/route";
 import type { AppContext } from "../context.ts";
 import { ApiError } from "../domain/errors.ts";
 import { bearerAuth, requireScope, type ApiKeyScope, type AuthEnv } from "./auth.ts";
 import { healthRoutes } from "./routes/health.ts";
 import { meetingRoutes } from "./routes/meetings.ts";
+import { requestDurationMs, withRequestId } from "../request-context.ts";
+
+// Never log a concrete URI, including on authentication errors or unmatched routes.
+const REQUEST_ROUTES: Record<string, string> = {
+  "/health": "/health",
+  "/health/live": "/health/live",
+  "/v1/meetings": "/v1/meetings",
+  "/v1/meetings/": "/v1/meetings",
+  "/v1/meetings/by-idempotency-key": "/v1/meetings/by-idempotency-key",
+  "/v1/meetings/:id": "/v1/meetings/:id",
+  "/v1/meetings/:id/stop": "/v1/meetings/:id/stop",
+  "/v1/meetings/:id/recover": "/v1/meetings/:id/recover",
+  "/v1/meetings/:id/transcript": "/v1/meetings/:id/transcript",
+};
 
 /** An authenticated route group and the single API-key scope every one of its routes requires. */
 export interface ScopedGroup {
@@ -42,6 +57,21 @@ export function mountScopedGroups(app: Hono<AuthEnv>, ctx: Pick<AppContext, "db"
 
 export function createApp(ctx: AppContext, groups: ScopedGroups = meetingGroups(ctx)) {
   const app = new Hono<AuthEnv>();
+  app.use("*", async (c, next) => withRequestId(c.req.header("x-request-id"), async (id, replaced) => {
+    const started = performance.now();
+    c.header("X-Request-Id", id);
+    await next();
+    c.res.headers.set("X-Request-Id", id);
+    ctx.log.info("ptx_realtime_request", {
+      event: "ptx_realtime_request",
+      request_id: id,
+      request_id_replaced: replaced,
+      method: /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/.test(c.req.method) ? c.req.method : "OTHER",
+      route: Object.hasOwn(REQUEST_ROUTES, routePath(c, -1)) ? REQUEST_ROUTES[routePath(c, -1)]! : "unmatched",
+      status: c.res.status,
+      duration_ms: requestDurationMs(started),
+    });
+  }));
 
   app.onError((err, c) => {
     if (err instanceof ApiError) {

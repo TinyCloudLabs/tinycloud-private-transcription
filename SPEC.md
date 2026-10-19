@@ -23,6 +23,25 @@ Consumers: TinyCloud (`listen` app) and Conclave-shaped clients.
 ## API
 Auth: `Authorization: Bearer tc_live_xxx`. A missing, malformed or unknown key → `401 unauthorized`.
 
+Realtime meeting API responses (including auth, validation, not-found and internal errors) echo
+`X-Request-Id`. A single canonical UUID with RFC variant and version 1–8 is accepted case-insensitively
+and normalized to lowercase; missing, malformed, repeated/list, nil or max UUID values mint a fresh v4
+UUID. This is correlation metadata, not authentication or an account identity.
+The same ID travels in queued job metadata and is restored in the worker's local async scope.
+Retry/continuation jobs inherit that scope. No `X-Request-Id` is forwarded to Vexa/Google, Tinfoil,
+Signal or generic webhooks, nor to redirect targets. No owned first-party HTTP forwarding origin is
+established by this PR. Provider correlation is not claimed; webhook bodies/signatures are unchanged.
+API/worker events include boolean `request_id_replaced`: true for a rejected incoming/persisted ID;
+false for a valid ID or absent ID that was minted. No rejected text is recorded.
+Legacy jobs or reconciliation wakeups without a request ID mint a new worker ID; this is not a durable
+meeting-wide trace across a lost Redis wakeup. Delayed work identity excludes request metadata; the
+first pending work+dedup suffix keeps its original payload and due time atomically.
+Malformed delayed members encountered during migration/promotion are retained in a private quarantine
+set, never logged or enqueued; they do not abort healthy work. Migration, promotion and work-targeted
+cancellation process at most 64 entries per Lua call. Migration/cancellation resume between calls;
+promotion leaves further due jobs queued. Each batch updates payload/work indexes atomically.
+The batch role's existing `X-Correlation-Id` upload/transcription contract is separate and unchanged.
+
 Scopes: each authenticated route group requires exactly one scope on the key; otherwise `403`
 `{"error":{"type":"authentication_error","code":"insufficient_scope","message":"…"}}`. Scopes are exact strings (the `:*`
 suffix is naming only): there is no global wildcard and no prefix matching, so `*`, `meetings` or `meetings:read` grant nothing.
