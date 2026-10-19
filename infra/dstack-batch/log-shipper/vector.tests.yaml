@@ -29,6 +29,34 @@ tests:
               assert!(!exists(.stage))
               assert!(!exists(.text))
               assert!(!exists(.ownerId))
+  - name: "three-hour audio seconds above the former 7200 cap are preserved"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch job finished\",\"job_id\":\"trn_01J9ABCDEF0123456789ABCDEF\",\"outcome\":\"completed\",\"code\":null,\"duration_seconds\":10800,\"tinfoil_calls\":1,\"tinfoil_audio_seconds\":10800,\"voiced_seconds\":10800,\"dropped_above_floor_pct\":0,\"vad_fallback\":false,\"segments\":1,\"content_type\":\"audio/wav\"}"
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.tinfoil_audio_seconds, 10800.0)
+              assert_eq!(.voiced_seconds, 10800.0)
+  - name: "audio seconds above the accepted 11101 maximum are discarded"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-14T10:00:00.000Z\",\"level\":\"info\",\"msg\":\"batch job finished\",\"job_id\":\"trn_01J9ABCDEF0123456789ABCDEF\",\"outcome\":\"completed\",\"code\":null,\"duration_seconds\":10800,\"tinfoil_calls\":1,\"tinfoil_audio_seconds\":11102,\"voiced_seconds\":11101.5,\"dropped_above_floor_pct\":0,\"vad_fallback\":false,\"segments\":1,\"content_type\":\"audio/wav\"}"
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.tinfoil_audio_seconds, null)
+              assert_eq!(.voiced_seconds, null)
   - name: "no speech completion preserves only its eleven fields"
     inputs:
       - insert_at: allowlist

@@ -217,7 +217,7 @@ transforms:
         if (is_integer(value) || is_float(value)) {
           numeric_value, conversion_err = to_float(value)
           if conversion_err == null {
-            if numeric_value >= 0 && numeric_value <= 7200 { out.tinfoil_audio_seconds = numeric_value }
+            if numeric_value >= 0 && numeric_value <= 11101 { out.tinfoil_audio_seconds = numeric_value }
           }
         }
       }
@@ -227,7 +227,7 @@ transforms:
         if (is_integer(value) || is_float(value)) {
           numeric_value, conversion_err = to_float(value)
           if conversion_err == null {
-            if numeric_value >= 0 && numeric_value <= 7200 { out.voiced_seconds = numeric_value }
+            if numeric_value >= 0 && numeric_value <= 11101 { out.voiced_seconds = numeric_value }
           }
         }
       }
