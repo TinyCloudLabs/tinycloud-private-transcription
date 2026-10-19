@@ -2,9 +2,11 @@ import { positiveIntegerEnv } from "../config.ts";
 import { logger, type Logger } from "../log.ts";
 import { parseCorsOrigins } from "./cors.ts";
 
-/** 2 h at 128 kbps stereo + 5% (the same formula Exo uses for its 8 h local cap). */
-export const MAX_UPLOAD_BYTES = 120_960_000;
-export const MAX_DURATION_SECONDS = 7_200;
+/** Accepted raw duration at 128 kbps stereo + 5%. Every container, including WAV, shares this byte cap. */
+export const MAX_UPLOAD_BYTES = 186_496_800;
+export const MAX_DURATION_SECONDS = 10_800;
+/** Inclusive raw ffprobe ceiling; encoder padding tolerance can also admit genuinely longer content. */
+export const ACCEPTED_MAX_DURATION_SECONDS = 11_101;
 export const MAX_CHANNELS = 2;
 export const CONTENT_TYPES = ["audio/mpeg", "audio/wav", "audio/ogg", "audio/mp4", "audio/webm", "audio/flac"] as const;
 export type UploadContentType = (typeof CONTENT_TYPES)[number];
@@ -34,6 +36,7 @@ export interface BatchConfig {
   limits: {
     maxBytes: number;
     maxDurationSeconds: number;
+    acceptedMaxDurationSeconds: number;
     maxChannels: number;
     /** Wall-clock budget for measuring a recording whose container carries no duration (inside the PUT). */
     durationScanSeconds: number;
@@ -117,6 +120,7 @@ export function batchConfigFromEnv(log: Pick<Logger, "warn"> = logger): BatchCon
     limits: {
       maxBytes: MAX_UPLOAD_BYTES,
       maxDurationSeconds: MAX_DURATION_SECONDS,
+      acceptedMaxDurationSeconds: ACCEPTED_MAX_DURATION_SECONDS,
       maxChannels: MAX_CHANNELS,
       durationScanSeconds: 45,
       maxActiveJobs: positiveIntegerEnv("BATCH_MAX_ACTIVE_JOBS", "10"),

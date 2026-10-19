@@ -225,7 +225,7 @@ export async function audio(kind: Fixture): Promise<Uint8Array> {
     mono_wav: ["-f", "lavfi", "-i", "sine=f=440:d=1", "-af", "apad=whole_dur=2", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le"],
     silent_wav: ["-f", "lavfi", "-i", "anullsrc=r=16000:cl=stereo", "-t", "3", "-c:a", "pcm_s16le"],
     three_channel_wav: ["-f", "lavfi", "-i", "sine=f=440:d=1", "-ac", "3", "-ar", "16000", "-c:a", "pcm_s16le"],
-    over_cap_mp3: ["-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono", "-t", "7201", "-c:a", "libmp3lame", "-b:a", "8k"],
+    over_cap_mp3: ["-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono", "-t", "4", "-c:a", "libmp3lame", "-b:a", "8k"],
     narration_mp3: ["-i", NARRATION, "-ac", "1", "-ar", "44100", "-c:a", "libmp3lame", "-b:a", "64k"],
     // The same narration 12 dB quieter: every frame above the -50 dBFS floor, most of them below the -40 dBFS cap.
     quiet_narration_mp3: ["-i", NARRATION, "-af", "volume=-12dB", "-ac", "1", "-ar", "44100", "-c:a", "libmp3lame", "-b:a", "64k"],

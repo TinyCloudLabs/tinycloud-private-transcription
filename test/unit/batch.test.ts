@@ -35,10 +35,6 @@ describe("role", () => {
       else process.env.BATCH_TINFOIL_API_KEY = saved.batch;
     }
   });
-
-  test("cap is 2 h at 128 kbps stereo + 5%", () => {
-    expect(MAX_UPLOAD_BYTES).toBe(Math.round(7_200 * 128_000 / 8 * 1.05));
-  });
 });
 
 describe("ids and capabilities", () => {

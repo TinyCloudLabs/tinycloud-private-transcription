@@ -13,6 +13,7 @@ import { PCM_RATE } from "../../src/uploads/audio.ts";
 import { pcmToWav } from "../../src/providers/transcription/audio.ts";
 import { pcmFromLevels, quietSpeechLevels } from "../support/vad-fixtures.ts";
 import { holdFence } from "../../src/uploads/fence.ts";
+import { batchConfigFromEnv } from "../../src/uploads/config.ts";
 import { audio, exists, startBatchHarness, TENANT_A, TENANT_B, tenant, type BatchHarness } from "./batch-harness.ts";
 
 let h: BatchHarness;
@@ -107,11 +108,11 @@ describe("single-slot arbiter", () => {
 
   test("decoding stops at the duration cap even when the accepted recording is longer than its probe said", async () => {
     const id = await h.submit(await audio("stereo")); // ch0 speaks 0.5–2.5 s, ch1 3.5–5.5 s
-    h.ctx.config.limits.maxDurationSeconds = 3;
+    Object.assign(h.ctx.config.limits, { maxDurationSeconds: 2, acceptedMaxDurationSeconds: 3 });
     try {
       await h.work();
     } finally {
-      h.ctx.config.limits.maxDurationSeconds = 7_200;
+      Object.assign(h.ctx.config.limits, batchConfigFromEnv().limits, { diskHighWaterPercent: 99 });
     }
     const body = await (await result(id)).json();
     expect(body.segments.map((s: { speaker_id: string; end: number }) => [s.speaker_id, s.end <= 3])).toEqual([["channel_0", true]]);

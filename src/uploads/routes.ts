@@ -62,6 +62,7 @@ function transcriptionRoutes(ctx: BatchContext) {
     return c.json({
       max_bytes: ctx.config.limits.maxBytes,
       max_duration_seconds: ctx.config.limits.maxDurationSeconds,
+      accepted_max_duration_seconds: ctx.config.limits.acceptedMaxDurationSeconds,
       max_channels: ctx.config.limits.maxChannels,
       content_types: CONTENT_TYPES,
       diarization: diarizationAvailable(ctx),

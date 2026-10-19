@@ -56,3 +56,16 @@ test("every remap drops events on runtime errors", () => {
   expect(remaps.length).toBeGreaterThan(0);
   for (const [name, transform] of remaps) expect(transform.drop_on_error, name).toBe(true);
 });
+
+test("duration fields admit the accepted 11101 s maximum in fields.json, vector.yaml and the Compose copy", () => {
+  const fields = JSON.stringify(schema);
+  expect(fields).not.toContain('"max":7200');
+  for (const name of ["tinfoil_audio_seconds", "voiced_seconds"]) {
+    expect(fields).toContain(`"${name}":{"type":"number","min":0,"max":11101,"nullable":true}`);
+    const guard = `numeric_value <= 11101 { out.${name} = numeric_value }`;
+    expect(vectorYaml).toContain(guard);
+    expect(composeText).toContain(guard);
+  }
+  expect(vectorYaml).not.toContain("<= 7200");
+  expect(composeText).not.toContain("<= 7200");
+});

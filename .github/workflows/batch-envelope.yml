@@ -5,6 +5,8 @@ name: Batch memory envelope
 # and the worker's real decode + VAD + per-region dispatch; then a 2-hour two-voice MP3 with diarize: true goes through the
 # worker's windowed speaker diarization. Fails on a timeout, an OOM kill or a restart; the job summary reports peak
 # memory per container. Uses no secret. Script: test/envelope/run.sh.
+# This remains a fixed 2-hour regression. TC-922's held 3-hour/grace-tail evidence and limitations are in
+# docs/tc-922-validation.md; this lane does not repeat that six-job assessment.
 
 on:
   pull_request:

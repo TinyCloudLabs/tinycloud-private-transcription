@@ -132,16 +132,24 @@ bun run cli create-key --project tinychat --scopes 'transcriptions:*'
 | `BATCH_UPLOAD_DIR` | `/var/lib/ptx-batch/uploads` | accepted audio, in-flight uploads, PCM work files (both processes mount it) |
 | `BATCH_VAD_QUIET_MODE` | `true` | trimmed, case-insensitive `false` rolls back quiet detection to TC-1090's primary/−57 dBFS fallback paths; unknown non-empty values enable quiet mode with a warning naming the variable; set on the batch worker |
 | `BATCH_MAX_ACTIVE_JOBS` | `10` | service-wide awaiting_upload + queued + processing |
-| `BATCH_MAX_RESERVED_BYTES` | `1209600000` | service-wide declared bytes of those jobs (10 × the 120,960,000-byte cap) |
+| `BATCH_MAX_RESERVED_BYTES` | `1864968000` | service-wide declared bytes of those jobs (10 × the 186,496,800-byte cap) |
 | `BATCH_MAX_CONCURRENT_UPLOADS` | `3` | service-wide live PUTs |
 | `BATCH_DISK_HIGH_WATER_PERCENT` | `80` | creates and PUTs refused at or above this volume usage |
-| `BATCH_TENANT_DAILY_BYTES` | `362880000` | per tenant per UTC day (3 × cap) |
+| `BATCH_TENANT_DAILY_BYTES` | `559490400` | per tenant per UTC day (3 × cap) |
 | `BATCH_UPLOAD_MAX_PUT_SECONDS` | `1800` | absolute cap on one PUT (also clamped to the job's 2 h upload deadline) |
 | `BATCH_UPLOAD_MIN_BYTES_PER_SECOND` | `32768` | minimum average PUT rate after 60 s |
 | `BATCH_CORS_ORIGINS` | unset | comma-separated browser origins allowed to `PUT /uploads/{id}` directly (exact, or one leading `*.` label, e.g. `https://*.tinychat-4jq.pages.dev`); unset = no CORS headers; a malformed entry fails boot |
 | `BATCH_DIARIZATION_ENABLED` | `false` | `true` offers speaker diarization (`capabilities.diarization`, create `diarize: true`) when the install below is complete; set it on both processes. Benchmark and sizing: [docs/diarization-benchmark.md](./docs/diarization-benchmark.md) |
 | `BATCH_DIARIZATION_DIR` | `/opt/sherpa-onnx` | the image's sherpa-onnx install: `diarize` (launcher of `src/uploads/diarize-window.c`), `models/segmentation.onnx`, `models/embedding.onnx`, `models/onnxruntime.config` |
 | `PTX_FAULT_INJECT` | unset | staging-only fault injection (`<point>:<crash|error|delay=<ms>>,…`); must never be set in a deploy |
+
+Batch capabilities advertise a nominal three hours (`max_duration_seconds=10800`) and an inclusive raw ffprobe
+ceiling (`accepted_max_duration_seconds=11101`), checked before millisecond rounding. The worker retains the accepted
+tail. All containers share `max_bytes=186496800`, also Bun's HTTP body ceiling. Long-recording validation scope is
+**MP3/AAC only; WAV ≤ max_bytes**; AAC in MP4/M4A has admission-only evidence, and long durationless WebM remains
+unproven. Encoder padding tolerance can admit about one second of genuinely longer content beyond 11,100 seconds.
+The 4 h processing ceiling, 2 h upload deadline, 1,800 s PUT deadline and 32,768 B/s rate floor remain unchanged.
+See [TC-922 validation and limits](docs/tc-922-validation.md); hosted ASR timing/quality and per-note dollar cost are unknown.
 
 ### Env vars
 
