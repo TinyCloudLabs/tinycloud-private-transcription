@@ -4,18 +4,25 @@
 #
 # Sealed env (phala deploy -e, see .env.example; values never live in this file):
 #   POSTGRES_PASSWORD      internal Postgres password
-#   BATCH_TINFOIL_API_KEY  the owner's dedicated batch Tinfoil key (never the meeting service's key)
+#   BATCH_TINFOIL_API_KEY  the owner's dedicated batch Tinfoil key
 #   PTX_BOOTSTRAP_KEYS     hashed API keys: tinychat (transcriptions:*) and owner-admin (admin:*)
+#   BETTERSTACK_SOURCE_TOKEN  ingest-only token, written to tmpfs; entrypoint removes config/token vars from Vector's environment; tini (PID 1, same uid) retains initial environment, equivalent exposure to the tmpfs token file and docker inspect
 #
 # The api/worker image is an immutable pin that only a PR changes; it cannot be overridden from the sealed env.
 # Until the first batch image exists (P2 merged → publish-image.yml), it is the placeholder below, which
 # .github/workflows/deploy-batch.yml refuses to deploy.
 #
-# Sized for Phala tdx.small (1 vCPU, 2048 MB; the guest sees 1,853 MiB). A live tdx.small with two small containers
-# reports ~1.27 GB used, so ~1 GiB is left to the guest OS, dstack and dockerd. The three services are capped at
-# 832 MiB together (api 320m + upload-worker 320m + postgres 192m), with no swap, so a runaway process is OOM-killed
-# inside its own container instead of taking the guest down. The cgroup limit also counts page cache, which the kernel
-# reclaims first. Container logs are json-file, capped at 3 x 10 MB per service.
+# Sized for Phala tdx.small (1 vCPU, 2048 MB; the guest sees 1,853 MiB). The four services are capped at 896 MiB
+# together (api 320m + worker 320m + postgres 192m + log-shipper 64m), leaving 1,003,282,432 B for guest OS,
+# dstack and dockerd. There is no Fluentd daemon queue. The 1,000-event Vector sink buffer is in its 64 MiB cgroup.
+#
+# Postgres and Vector use capped json-file logs (10m × 3 each), at most 60m on the 20G disk. The api and worker use
+# dockerd GELF over UDP with Docker's dual-logging cache disabled; no GELF local cache or daemon queue is retained.
+#
+# Postgres remains unlabelled and capped json-file: its diagnostic output can contain SQL/error context and is not safe
+# telemetry. Vector is isolated on its own network; its source accepts the dockerd GELF path published on host loopback.
+# The batch-envelope.yml 2-hour stereo proof should be rerun.
+#
 # CI retains the ordinary 2-hour envelope on one CPU. TC-922's held 3-hour/grace-tail evidence and its cache/peak
 # limitations are documented in docs/tc-922-validation.md. Admission is nominal 10800 s, accepted raw 11101 s,
 # with a shared 186496800-byte cap; the explicit API budgets below reserve ten full-size jobs and three per day.
@@ -43,9 +50,7 @@ services:
       BATCH_TENANT_DAILY_BYTES: "559490400"
       BATCH_UPLOAD_MAX_PUT_SECONDS: "1800"
       BATCH_UPLOAD_MIN_BYTES_PER_SECOND: "32768"
-      # Browser and app origins allowed to PUT /uploads/{id} directly (Exo web, Pages previews, desktop, mobile).
       BATCH_CORS_ORIGINS: "https://tinycloud.chat,https://tinychat-4jq.pages.dev,https://*.tinychat-4jq.pages.dev,tauri://localhost,http://tauri.localhost,capacitor://localhost,https://localhost"
-      # Speaker diarization (create diarize: true); set on both api (capabilities) and upload-worker (runs it).
       BATCH_DIARIZATION_ENABLED: "true"
       LOG_LEVEL: info
     ports:
@@ -58,22 +63,23 @@ services:
       timeout: 5s
       retries: 30
       start_period: 20s
-    # Bun + Hono + streamed uploads (to disk, hashed in flight) + ffprobe; the healthcheck's bun runs in this cgroup.
     mem_limit: 320m
     memswap_limit: 320m
     mem_reservation: 96m
+    cap_drop: [NET_RAW]
+    labels:
+      tc.logship: ptx-batch-api
     logging:
-      driver: json-file
+      driver: gelf
       options:
-        max-size: 10m
-        max-file: "3"
-
+        gelf-address: "udp://127.0.0.1:12201"
+        labels: tc.logship
+        cache-disabled: "true"
   upload-worker:
     image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:508cb0be60a27e6b2bb4eefd888ad7c98954c3e5@sha256:72568fe357e87aefb13a4430b0124b16a4c5e98395281e80e9ee09471c9aaf4d
     restart: unless-stopped
     command: ["bun", "run", "src/uploads/worker.ts"]
     depends_on:
-      # The api applies migrations before it reports live.
       api:
         condition: service_healthy
     environment:
@@ -89,28 +95,28 @@ services:
       LOG_LEVEL: info
     volumes:
       - ptx-batch-uploads:/var/lib/ptx-batch/uploads
-    # One job at a time: ffmpeg (a child, same cgroup) decodes each channel to PCM on disk; the VAD reads it in 60 s
-    # slices and each dispatch reads one region (<= 30 s, ~1 MB). Nothing holds a whole channel in memory. A diarized
-    # job runs one sherpa-onnx process per 10-minute window, one at a time (docs/diarization-benchmark.md).
     mem_limit: 320m
     memswap_limit: 320m
     mem_reservation: 96m
+    cap_drop: [NET_RAW]
+    labels:
+      tc.logship: ptx-batch-worker
     logging:
-      driver: json-file
+      driver: gelf
       options:
-        max-size: 10m
-        max-file: "3"
+        gelf-address: "udp://127.0.0.1:12201"
+        labels: tc.logship
+        cache-disabled: "true"
 
   postgres:
     image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     restart: unless-stopped
-    # Tiny-box tuning. max_connections 40 covers the Bun.SQL pools (10 each: api, its boot migrator, worker) plus the
-    # 3 superuser slots; max_wal_size bounds WAL on disk (see the disk budget in the runbook).
     command: ["postgres", "-c", "max_connections=40", "-c", "shared_buffers=32MB", "-c", "work_mem=2MB",
       "-c", "maintenance_work_mem=16MB", "-c", "max_wal_size=256MB"]
     mem_limit: 192m
     memswap_limit: 192m
     mem_reservation: 64m
+    cap_drop: [NET_RAW]
     logging:
       driver: json-file
       options:
@@ -127,6 +133,360 @@ services:
       interval: 5s
       timeout: 5s
       retries: 30
+
+  log-shipper:
+    image: timberio/vector:0.59.0-alpine@sha256:0e36bc2a290039e9b6a5e92f04bd2f133223506f72d09682c1df16c015172b7a
+    restart: unless-stopped
+    init: true
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 64m
+    memswap_limit: 64m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    ports:
+      - target: 12201
+        published: "12201"
+        host_ip: 127.0.0.1
+        protocol: udp
+    environment:
+      BETTERSTACK_SOURCE_TOKEN: ${BETTERSTACK_SOURCE_TOKEN:-}
+      VECTOR_CONFIG_YAML: |
+        data_dir: /var/lib/vector
+        secret:
+          local_directory:
+            type: directory
+            path: /run/vector-secrets
+            remove_trailing_whitespace: true
+        sources:
+          gelf_in:
+            type: socket
+            mode: udp
+            address: 0.0.0.0:12201
+            max_length: 262144
+            host_key: peer_addr
+            framing: { method: chunked_gelf, chunked_gelf: { decompression: Auto } }
+            decoding: { codec: gelf }
+          vector_metrics:
+            type: internal_metrics
+            scrape_interval_secs: 1
+        transforms:
+          gelf_gate:
+            type: remap
+            inputs: [gelf_in]
+            drop_on_abort: true
+            drop_on_error: true
+            source: |
+              lbl = string(get(., ["_tc.logship"]) ?? null) ?? ""
+              if lbl == "ptx-batch-api" {
+                . = {"gate_status": "accepted", "tag": "ptx-batch.api", "log": string(get(., ["message"]) ?? null) ?? ""}
+              } else if lbl == "ptx-batch-worker" {
+                . = {"gate_status": "accepted", "tag": "ptx-batch.worker", "log": string(get(., ["message"]) ?? null) ?? ""}
+              } else if lbl == "" {
+                . = {"gate_status": "dropped", "reason": "unlabelled", "count": 1}
+              } else {
+                . = {"gate_status": "unexpected", "reason": "unexpected_label", "count": 1}
+              }
+          gate_routes:
+            type: route
+            inputs: [gelf_gate]
+            route:
+              accepted: .gate_status == "accepted"
+              dropped: .gate_status == "dropped"
+              unexpected: .gate_status == "unexpected"
+          unexpected_label_throttle:
+            type: throttle
+            inputs: [gate_routes.unexpected]
+            threshold: 1
+            window_secs: 60
+            key_field: reason
+          gate_unmatched:
+            type: remap
+            inputs: [gate_routes._unmatched]
+            drop_on_error: true
+            source: |
+              . = {"reason": "route_unmatched", "count": 1}
+          partial_record_counter:
+            type: remap
+            inputs: [gate_routes.accepted]
+            drop_on_abort: true
+            drop_on_error: true
+            source: |
+              parsed, parse_err = parse_json(.log)
+              if parse_err != null || !is_object(parsed) {
+                . = {"reason": "partial_or_unparseable", "count": 1}
+              } else {
+                abort
+              }
+          gate_unexpected_event:
+            type: remap
+            inputs: [unexpected_label_throttle]
+            drop_on_error: true
+            source: |
+              . = {"event": "logship_unexpected_label", "reason": "unapproved_label"}
+          gate_counters:
+            type: log_to_metric
+            inputs: [gate_routes.dropped, gate_routes.unexpected, gate_unmatched, partial_record_counter]
+            metrics:
+              - type: counter
+                field: count
+                name: gate_dropped_total
+                namespace: logship
+                increment_by_value: true
+                tags:
+                  reason: "{{reason}}"
+          received_metrics:
+            type: filter
+            inputs: [vector_metrics]
+            condition: '.name == "component_received_events_total" && .tags.component_id == "gelf_in"'
+          allowlist:
+            type: remap
+            inputs: [gate_routes.accepted]
+            drop_on_abort: true
+            drop_on_error: true
+            source: |
+              # BEGIN GENERATED FROM fields.json
+              if !is_string(.tag) { abort }
+              tag = .tag
+              svc = if tag == "ptx-batch.api" { "api" } else if tag == "ptx-batch.worker" { "worker" } else { abort }
+              if !is_string(.log) { abort }
+              line = .log
+              j, parse_err = parse_json(line)
+              if parse_err != null || !is_object(j) { abort }
+              if !is_string(j.msg) { abort }
+              msg = j.msg
+              event = if msg == "batch artifact deletion failed" { "batch_artifact_deletion_failed" }
+              else if msg == "batch claim recovered" { "batch_claim_recovered" }
+              else if msg == "batch artifact reappeared after verified deletion" { "batch_artifact_reappeared_after_verified_deletion" }
+              else if msg == "batch transcription create" { "batch_transcription_create" }
+              else if msg == "batch transcription cancel" { "batch_transcription_cancel" }
+              else if msg == "batch transcription delete" { "batch_transcription_delete" }
+              else if msg == "batch retention lag exceeded" { "batch_retention_lag_exceeded" }
+              else if msg == "batch request failed" { "batch_request_failed" }
+              else if msg == "batch admission mode changed" { "batch_admission_mode_changed" }
+              else if msg == "batch admission stopped by disk high-water" { "batch_admission_stopped_by_disk_high_water" }
+              else if msg == "batch upload refused by disk high-water" { "batch_upload_refused_by_disk_high_water" }
+              else if msg == "batch upload accepted" { "batch_upload_accepted" }
+              else if msg == "batch upload rejected" { "batch_upload_rejected" }
+              else if msg == "batch job finished" { "batch_job_finished" }
+              else if msg == "batch claim fenced out" { "batch_claim_fenced_out" }
+              else if msg == "batch job failed unexpectedly" { "batch_job_failed_unexpectedly" }
+              else if msg == "batch VAD fell back to the floor threshold" { "batch_vad_fell_back_to_the_floor_threshold" }
+              else if msg == "batch VAD could not cover the recording" { "batch_vad_could_not_cover_the_recording" }
+              else if msg == "batch diarization failed" { "batch_diarization_failed" }
+              else if msg == "batch provider rejected the service credential or model" { "batch_provider_rejected_the_service_credential_or_model" }
+              else if msg == "batch job failed at dispatch" { "batch_job_failed_at_dispatch" }
+              else if msg == "batch worker heartbeat failed" { "batch_worker_heartbeat_failed" }
+              else if msg == "batch sweep failed" { "batch_sweep_failed" }
+              else if msg == "batch worker iteration failed" { "batch_worker_iteration_failed" }
+              else if msg == "batch worker started" { "batch_worker_started" }
+              else { abort }
+              out = {"svc": svc, "event": event}
+              value = get(j, ["level"]) ?? null
+              if !is_string(value) { abort }
+              string_value = to_string(value) ?? ""
+              if includes(["debug","info","warn","error"], string_value) { out.level = string_value } else { abort }
+              value = get(j, ["ts"]) ?? null
+              if !is_string(value) { abort }
+              string_value = to_string(value) ?? ""
+              if length(string_value) <= 24 && match(string_value, r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$$') { out.ts = string_value } else { abort }
+                value = get(j, ["correlationId"]) ?? null
+                if !is_null(value) {
+                  if is_string(value) {
+                    string_value = to_string(value) ?? ""
+                    if length(string_value) <= 36 && match(string_value, r'^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$$') { out.correlationId = string_value }
+                  }
+                }
+                value = get(j, ["transcriptionId"]) ?? null
+                if !is_null(value) {
+                  if is_string(value) {
+                    string_value = to_string(value) ?? ""
+                    if length(string_value) <= 30 && match(string_value, r'^trn_[0-9A-HJKMNP-TV-Z]{26}$$') { out.transcriptionId = string_value }
+                  }
+                }
+              if event == "batch_job_finished" {
+                value = get(j, ["job_id"]) ?? null
+                if is_null(value) { abort }
+                if !is_null(value) {
+                  if is_string(value) {
+                    string_value = to_string(value) ?? ""
+                    if length(string_value) <= 30 && match(string_value, r'^trn_[0-9A-HJKMNP-TV-Z]{26}$$') { out.job_id = string_value } else { abort }
+                  } else { abort }
+                }
+              }
+              if !(event == "batch_job_finished") {
+                value = get(j, ["stage"]) ?? null
+                if !is_null(value) {
+                  if is_string(value) {
+                    string_value = to_string(value) ?? ""
+                    if includes(["create","cancel","delete","health","api_unhandled","admission","upload","deletion","claim_recovery","reconcile","vad","diarize","pipeline","fence","dispatch","heartbeat","sweep","loop"], string_value) { out.stage = string_value }
+                  }
+                }
+              }
+                if event == "batch_job_finished" { out.code = null }
+                value = get(j, ["code"]) ?? null
+                if !is_null(value) {
+                  if is_string(value) {
+                    string_value = to_string(value) ?? ""
+                    if includes(["invalid_request","diarization_unavailable","unauthorized","insufficient_scope","idempotency_conflict","transcription_not_found","active_transcription_exists","recording_too_large","quota_exceeded","service_busy","service_paused","service_unavailable","upload_capability_limit","upload_capability_invalid","upload_capability_expired","upload_length_mismatch","unsupported_media_type","upload_in_progress","upload_interrupted","upload_rejected","transcript_expired","not_found","internal_error","upload_expired","upload_integrity_failed","invalid_audio","recording_too_long","unsupported_recording","no_speech","provider_unavailable","provider_outcome_unknown","processing_timeout","processing_failed","transcription_failed","cancelled"], string_value) { out.code = string_value }
+                  }
+                }
+                value = get(j, ["alert"]) ?? null
+                if !is_null(value) {
+                  if is_boolean(value) { out.alert = value }
+                }
+              if event == "batch_job_finished" {
+                value = get(j, ["outcome"]) ?? null
+                if is_null(value) { abort }
+                if !is_null(value) {
+                  if is_string(value) {
+                    string_value = to_string(value) ?? ""
+                    if includes(["completed","failed","no_speech"], string_value) { out.outcome = string_value } else { abort }
+                  } else { abort }
+                }
+              }
+              if event == "batch_job_finished" {
+                value = get(j, ["duration_seconds"]) ?? null
+                if is_null(value) { abort }
+                if (is_integer(value) || is_float(value)) {
+                  numeric_value, conversion_err = to_float(value)
+                  if conversion_err == null {
+                    if numeric_value >= 0 && numeric_value <= 86400 { out.duration_seconds = numeric_value } else { abort }
+                  } else { abort }
+                } else { abort }
+              }
+              if event == "batch_job_finished" {
+                if event == "batch_job_finished" { out.tinfoil_calls = null }
+                value = get(j, ["tinfoil_calls"]) ?? null
+                if is_integer(value) {
+                  numeric_value, conversion_err = to_int(value)
+                  if conversion_err == null {
+                    if numeric_value >= 0 && numeric_value <= 100000 { out.tinfoil_calls = numeric_value }
+                  }
+                }
+              }
+              if event == "batch_job_finished" {
+                if event == "batch_job_finished" { out.tinfoil_audio_seconds = null }
+                value = get(j, ["tinfoil_audio_seconds"]) ?? null
+                if (is_integer(value) || is_float(value)) {
+                  numeric_value, conversion_err = to_float(value)
+                  if conversion_err == null {
+                    if numeric_value >= 0 && numeric_value <= 7200 { out.tinfoil_audio_seconds = numeric_value }
+                  }
+                }
+              }
+              if event == "batch_job_finished" {
+                if event == "batch_job_finished" { out.voiced_seconds = null }
+                value = get(j, ["voiced_seconds"]) ?? null
+                if (is_integer(value) || is_float(value)) {
+                  numeric_value, conversion_err = to_float(value)
+                  if conversion_err == null {
+                    if numeric_value >= 0 && numeric_value <= 7200 { out.voiced_seconds = numeric_value }
+                  }
+                }
+              }
+              if event == "batch_job_finished" {
+                if event == "batch_job_finished" { out.dropped_above_floor_pct = null }
+                value = get(j, ["dropped_above_floor_pct"]) ?? null
+                if (is_integer(value) || is_float(value)) {
+                  numeric_value, conversion_err = to_float(value)
+                  if conversion_err == null {
+                    if numeric_value >= 0 && numeric_value <= 100 { out.dropped_above_floor_pct = numeric_value }
+                  }
+                }
+              }
+              if event == "batch_job_finished" {
+                if event == "batch_job_finished" { out.vad_fallback = null }
+                value = get(j, ["vad_fallback"]) ?? null
+                if !is_null(value) {
+                  if is_boolean(value) { out.vad_fallback = value }
+                }
+              }
+              if event == "batch_job_finished" {
+                if event == "batch_job_finished" { out.segments = null }
+                value = get(j, ["segments"]) ?? null
+                if is_integer(value) {
+                  numeric_value, conversion_err = to_int(value)
+                  if conversion_err == null {
+                    if numeric_value >= 0 && numeric_value <= 100000 { out.segments = numeric_value }
+                  }
+                }
+              }
+              if event == "batch_job_finished" {
+                value = get(j, ["content_type"]) ?? null
+                if is_null(value) { abort }
+                if !is_null(value) {
+                  if is_string(value) {
+                    string_value = to_string(value) ?? ""
+                    if includes(["audio/mpeg","audio/wav","audio/ogg","audio/mp4","audio/webm","audio/flac"], string_value) { out.content_type = string_value } else { abort }
+                  } else { abort }
+                }
+              }
+                value = get(j, ["retentionLagSeconds"]) ?? null
+                if (is_integer(value) || is_float(value)) {
+                  numeric_value, conversion_err = to_float(value)
+                  if conversion_err == null {
+                    if numeric_value >= 0 && numeric_value <= 31536000 { out.retentionLagSeconds = numeric_value }
+                  }
+                }
+                value = get(j, ["usedPercent"]) ?? null
+                if (is_integer(value) || is_float(value)) {
+                  numeric_value, conversion_err = to_float(value)
+                  if conversion_err == null {
+                    if numeric_value >= 0 && numeric_value <= 100 { out.usedPercent = numeric_value }
+                  }
+                }
+                value = get(j, ["mode"]) ?? null
+                if !is_null(value) {
+                  if is_string(value) {
+                    string_value = to_string(value) ?? ""
+                    if includes(["open","drain","closed"], string_value) { out.mode = string_value }
+                  }
+                }
+                value = get(j, ["created"]) ?? null
+                if !is_null(value) {
+                  if is_boolean(value) { out.created = value }
+                }
+              . = out
+              # END GENERATED FROM fields.json
+        sinks:
+          betterstack:
+            type: http
+            inputs: [allowlist, gate_unexpected_event]
+            method: post
+            uri: "https://s2795436.us-west-2a.betterstackdata.com/"
+            encoding: { codec: json }
+            compression: gzip
+            auth: { strategy: bearer, token: "SECRET[local_directory.betterstack_source_token]" }
+            batch: { max_bytes: 4000000, timeout_secs: 5 }
+            buffer: { type: memory, max_events: 1000, when_full: drop_newest }
+          gate_metrics:
+            type: prometheus_exporter
+            inputs: [gate_counters, received_metrics]
+            address: 127.0.0.1:9598
+            flush_period_secs: 86400
+    entrypoint: ["/bin/sh", "-ec"]
+    tmpfs:
+      - /var/lib/vector:uid=65532,gid=65532,mode=0700,size=8m
+      - /run/vector-secrets:uid=65532,gid=65532,mode=0700,size=1m
+    networks:
+      logship:
+        ipv4_address: 172.31.250.10
+    command:
+      - 'umask 077; printf "%s" "$${BETTERSTACK_SOURCE_TOKEN}" > /run/vector-secrets/betterstack_source_token; unset BETTERSTACK_SOURCE_TOKEN; printf "%s\n" "$${VECTOR_CONFIG_YAML}" > /var/lib/vector/vector.yaml; unset VECTOR_CONFIG_YAML; exec vector --config /var/lib/vector/vector.yaml'
+
+networks:
+  logship:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.250.0/24
 
 volumes:
   ptx-batch-data: {}

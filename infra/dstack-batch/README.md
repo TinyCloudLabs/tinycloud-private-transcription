@@ -1,8 +1,8 @@
 # ptx-batch runbook
 
 `ptx-batch` is the dedicated batch-transcription CVM (`PTX_ROLE=batch`; contract in [SPEC.md](../../SPEC.md#batch-transcription-ptx_rolebatch)).
-It runs `api`, `upload-worker` and Postgres from [`app-compose.yaml`](./app-compose.yaml): no Vexa, Redis, Signal,
-Whisper or docker.sock. It is a separate CVM with its own Tinfoil credential; **ptx-dev (the live meeting service) is
+It runs `api`, `upload-worker`, Postgres and the `log-shipper` sidecar from [`app-compose.yaml`](./app-compose.yaml): no
+Vexa, Redis, Signal, Whisper or docker.sock. It is a separate CVM with its own Tinfoil credential; **ptx-dev (the live meeting service) is
 never touched by anything here.**
 
 Deploys run only through the manual workflow [`deploy-batch.yml`](../../.github/workflows/deploy-batch.yml). Merging
@@ -44,14 +44,16 @@ that run's summary and open a PR that sets both `image:` lines to `api:<sha>@sha
 
 The first creation needs an image that contains migration 0018 (a fresh install starts with admission `closed`); the
 workflow refuses a pin whose commit lacks `src/db/migrations/0018_batch_admission_closed.sql`, because an older image
-seeds admission `open`. The order is: merge the change to `main` → `publish-image.yml` publishes that commit's image →
-re-pin PR (both `image:` lines) merged → dispatch the create.
+seeds admission `open`. The current API image pin contains migration 0018 but predates this PR's completion logging and
+shipper configuration. After merge, publish the new image and open the required re-pin PR before deployment. The order remains:
+merge → `publish-image.yml` publishes → re-pin PR merged → dispatch.
 
 ## Deploy
 
 ```bash
 gh workflow run deploy-batch.yml -R $R --ref main -f confirm=ptx-batch
 ```
+
 
 - **Tooling.** Bun is pinned, every action is SHA-pinned, and the repo's dependencies plus the Phala CLI/SDK
   ([`.github/scripts/package-lock.json`](../../.github/scripts/package-lock.json)) are installed with lifecycle scripts
@@ -75,6 +77,11 @@ gh workflow run deploy-batch.yml -R $R --ref main -f confirm=ptx-batch
   and drain to zero **before** the release window, then dispatch the update. The 4 h worker ceiling is unchanged.
 - A failure after the drain leaves admission in **drain**. Investigate, then reopen deliberately:
   `curl -X PUT $URL/v1/admin/admission -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d '{"mode":"open"}'`.
+- **Reopen only** (existing drained CVM, with operator authorization): dispatch the same manual workflow with
+  `-f confirm=ptx-batch -f reopen_only=true`. This requires `PTX_BATCH_CVM_ID` and the existing `ptx-batch` Environment
+  credentials, but does not drain, deploy, write a sealed environment or sync `allowed_envs`. It resolves the CVM,
+  waits for `running`, checks `/health/live` and upload readiness, then requires authenticated admission mode `drain`
+  with three valid zero active-job counts before opening admission. If any gate fails, it does not open admission.
 
 `$URL` is `https://<app_id>-8080.<gateway base domain>` (printed in the workflow summary). It becomes Exo's compiled-in
 PTX upload origin (P7) and TinyChat's `PRIVATE_CLOUD_TRANSCRIPTION_API_URL`.
@@ -82,24 +89,54 @@ PTX upload origin (P7) and TinyChat's `PRIVATE_CLOUD_TRANSCRIPTION_API_URL`.
 ## Sizing (tdx.small)
 
 The owner chose tdx.small for cost. Batch runs one job at a time and transcription is remote (Tinfoil), so the CVM
-only runs api + upload-worker + Postgres, and ffmpeg/VAD for the job in hand. The instance type and disk apply at
-creation only; the update path never resizes.
+runs api + upload-worker + Postgres plus the bounded Vector log sidecar; ffmpeg/VAD handle the job in hand. The instance
+type and disk apply at creation only; the update path never resizes.
 
 **Memory.** The guest of a tdx.small reports 1,853 MiB (1,942,806,528 B). A live tdx.small (dstack 0.5.5) running two
-small containers reports ~1.27 GB used, so about 1 GiB stays with the guest OS, dstack and dockerd. The compose caps the
-three services at 832 MiB together, with no swap (`memswap_limit` = `mem_limit`):
+small containers reports ~1.27 GB used, so the compose must leave at least 1,000,000,000 B to the guest OS, dstack and
+dockerd. The four service caps total 896 MiB (api 320m + worker 320m + Postgres 192m + Vector 64m):
 
 | service | `mem_limit` | `mem_reservation` | what lives there |
 |---|---|---|---|
-| api | 320m | 96m | Bun + Hono; PUT bodies stream to disk, hashed in flight; ffprobe; the healthcheck's `bun -e` |
-| upload-worker | 320m | 96m | Bun; ffmpeg (child process) decodes one channel at a time to PCM on disk |
-| postgres | 192m | 64m | `max_connections=40`, `shared_buffers=32MB`, `work_mem=2MB`, `maintenance_work_mem=16MB`, `max_wal_size=256MB` |
+| api | 320m | 96m | Bun + Hono; PUT bodies stream to disk; ffprobe; healthcheck |
+| upload-worker | 320m | 96m | Bun; ffmpeg decodes one channel at a time to PCM on disk |
+| postgres | 192m | 64m | tuned Postgres; unshipped |
+| log-shipper | 64m, 0.5 CPU | — | Vector allowlist and Better Stack HTTP sink; memory buffer capped at 1,000 events |
+
+The four service caps leave 1,003,282,432 B to the guest OS, dstack and dockerd. The Docker Fluentd queue is gone. API
+and upload-worker use GELF/UDP with `cache-disabled: "true"`, so Docker's dual-logging cache does not retain local app
+logs while Vector is down. Postgres and Vector retain capped `json-file` logs at 10m × 3 each: at most 60 MB total on
+the 20 GB disk. Vector's 1,000-event memory sink buffer remains within its 64 MiB cgroup.
+
+Vector runs as UID/GID 65532 on its isolated `logship` bridge (`172.31.250.0/24`, fixed address `172.31.250.10`);
+only `127.0.0.1:12201/udp` is published. Its root filesystem is read-only, every capability is dropped, and
+`no-new-privileges:true` is enabled. `/var/lib/vector` and `/run/vector-secrets` are bounded tmpfs mounts; Vector has no
+Docker-root bind, named data volume, or Docker socket.
+
+The batch workload and sidecar limits still total 896 MiB, preserving the ≥1,000,000,000 B guest-headroom invariant.
+The sink's 1,000-event memory buffer remains within Vector's 64 MiB cgroup; neither Fluentd queue nor GELF local cache exists.
 
 `max_connections=40` covers the Bun.SQL pools (10 each: api, its boot migrator, worker) and the 3 superuser slots. A cgroup
 limit also counts page cache, which the kernel reclaims first, so a container sitting near its limit while it writes
-PCM is normal. An OOM kill happens when what the kernel cannot reclaim fills the limit: anonymous memory, shmem
-(Postgres `shared_buffers`), kernel memory such as socket buffers, and dirty page cache that writeback has not yet
-flushed. The kill stays inside that container. The envelope therefore reports anon + shmem, not anon alone.
+PCM is normal. An OOM kill stays inside that container.
+
+**Private logs.** [`log-shipper/vector.yaml`](./log-shipper/vector.yaml) is canonical and embedded into
+`app-compose.yaml` by `bun scripts/ptx-vector-schema.ts --write-compose`; every Compose-sensitive `$` is doubled.
+CI checks the rendered bytes against `vector.yaml` and rejects repo-relative Compose files and bind sources.
+
+Only api and upload-worker have the exact `tc.logship` service label. Docker's GELF driver exposes it as
+`_tc.logship`; Postgres and Vector stay unlabelled on capped `json-file`. The socket source receives GELF/UDP on its
+isolated network, with the dockerd publish bound only to host loopback. The first transform compares `_tc.logship`
+exactly, then reconstructs an event from only the approved service tag and GELF `message`, removing every dockerd
+underscore field and all other GELF metadata. The existing `fields.json` 25-event allowlist and 11 TC-1045 completion
+fields remain unchanged. Unlabelled, unexpected-label and partial/unparseable inputs produce fixed, content-free
+counters; unexpected labels emit only a throttled fixed event. The token is written from the entrypoint environment to
+`/run/vector-secrets` tmpfs and resolved through Vector's `SECRET[]` local-directory provider. The entrypoint removes
+the config and token variables from Vector's environment; tini (PID 1, same uid) retains the initial environment,
+which is equivalent exposure to the tmpfs token file and `docker inspect`.
+
+The API image pin contains migration 0018; it predates this PR's completion logging. After merge, publish the new image
+and re-pin it before deployment.
 
 The decode path never holds a recording in memory: ffmpeg writes 16 kHz s16le PCM to disk per channel, the VAD reads
 it in 60 s slices (an 11,101 s channel is 111,010 frame energies, about 888 KB), and each dispatch reads one region of at most
@@ -115,13 +152,16 @@ for 15 s while it decoded, 4,305 GETs, all 200):
 | upload-worker | 320 MiB | 86 MiB (bun) | 47 MiB (32 MiB) | ffmpeg 46 MiB | 0 / 0 |
 | postgres | 192 MiB | 20 MiB | 71 MiB (61 MiB) | | 0 / 0 |
 
+This phase adds the capped Vector sidecar to the runtime; rerun the two-hour `batch-envelope.yml` memory proof with the
+new four-service compose before deployment. The local sidecar burst rehearsal does not replace that CVM-envelope proof.
+
 **Disk (20 GB).** The data disk holds Docker images, Postgres and the upload volume; a live tdx.small shows an
 18.87 GiB filesystem. Bounds at the accepted 11,101 s ceiling (16 kHz s16le = 32,000 B/s per channel):
 
 | item | bound |
 |---|---|
 | images (api ~0.25 GB, postgres ~0.27 GB, one update overlap; dstack prunes after `compose up`), dstack data | ≤ 2.4 GB (a live tdx.small uses 1.77 GB) |
-| container logs: json-file, `max-size: 10m`, `max-file: "3"` on each of the 3 services | ≤ 90 MB |
+| container logs: Postgres and Vector capped `json-file` (10m × 3 each); api/worker GELF cache disabled | ≤ 60 MB |
 | Postgres data + WAL (`max_wal_size=256MB`) | ≤ 0.5 GB |
 | accepted audio + in-flight `.part` files (`BATCH_MAX_RESERVED_BYTES`) | ≤ 1.865 GB |
 | PCM of the one processing job: 2 ch × 11,101 s × 32,000 B/s = 0.711 GB; ×2 while a crashed claim's work dir awaits the sweeper | ≈ 1.421 GB |
@@ -202,3 +242,39 @@ boot (the sweeper retries pending deletions and removes unauthorized files).
   80%, or `retention_lag_seconds` exceeds 300. Logs are content-free JSON; `alert: true` marks operator faults (provider
   401/403/404, failed unlink, artifact reappearing after verified deletion, disk high-water, retention lag).
 - Logs are not public (`--no-public-logs`): `phala logs ptx-batch -f`, `phala logs ptx-batch --serial --tail 200`.
+- Go-live gate: create and verify separate Better Stack silence alerts for `svc=api` and `svc=worker`; do not open
+  admission until both alerts are active.
+
+## GELF transport and isolation
+
+The api and upload-worker use Docker's GELF driver with `gelf-address=udp://127.0.0.1:12201`, `labels=tc.logship`, and
+`cache-disabled=true`. Vector is the only service on the non-internal `logship` bridge, fixed at `172.31.250.10/24`; it
+publishes UDP 12201 only on host loopback. App and Postgres containers remain on the ordinary application network and
+cannot reach the Vector address or host-published listener. Postgres and Vector use capped `json-file` logs; neither has
+a `tc.logship` label.
+
+Fluentd was rejected after run 10: Vector restart yielded zero delivered events for 150 seconds, while restarting the
+api restored delivery in six seconds. The file-source alternative was rejected because mounting Docker's root exposes
+every container's `config.v2.json`, including environment secrets, even read-only; it also requires persisted
+checkpoints.
+
+The GELF spike shipped a genuine app line, reassembled a chunked line, received/shipped zero sibling-forged packets,
+and received zero packets on external host interfaces. A 5,000-line burst sent while Vector was up lost zero; 500 lines
+took 70 ms with Vector up and 89 ms with it down, with the app still running. The first dynamic-IP restart test failed.
+With a fixed Vector IP, the restart diagnostic passed `docker restart`, crash plus restart policy, recreate, and a
+500-line burst during downtime; each next probe arrived within one second and app restart counts stayed unchanged.
+These spike results are not a substitute for the prepared five-cycle-per-path acceptance script.
+
+Vector uses a non-root UID 65532, read-only root filesystem, `cap_drop: [ALL]`, and `no-new-privileges:true`. Only the
+bounded `/var/lib/vector` data tmpfs and `/run/vector-secrets` secret tmpfs are writable. The entrypoint removes the
+config and token variables from Vector's environment; tini (PID 1, same uid) retains the initial environment, which
+is equivalent exposure to the tmpfs token file and `docker inspect`. API, upload-worker, and Postgres drop `NET_RAW`;
+they do not need raw sockets and therefore cannot forge Ethernet frames to bypass the UDP isolation. Vector's 0.59
+socket source accepts chunked GELF with a 262,144-byte source limit; the native spike reassembled 20 KiB. The shared
+batch logger caps each serialized line at 15,000 UTF-8 bytes including newline, below Docker GELF's 16 KiB split point.
+Oversized string fields are truncated with a marker; if a non-string payload still exceeds the cap, it emits a fixed
+valid-JSON marker record. API and worker fatal handlers use the same bounded logger, so neither a giant error field nor
+a runtime stack can become a valid-looking GELF tail fragment.
+The local gate-counter exporter uses an 86,400-second flush period to avoid Vector's short stale-series expiry. Its
+metrics endpoint is loopback-only inside Vector; the acceptance check verifies a counter increment and that the probe
+content is absent from the sink.

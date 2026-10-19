@@ -285,7 +285,7 @@ services:
     restart: unless-stopped
 
   minio:
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    image: ghcr.io/tinycloudlabs/mirror/minio:RELEASE.2025-09-07T16-13-09Z@sha256:25e301eb686e796ead885d0e254cc6397424df7d7a79cee48ff08b720570ced6
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
@@ -301,7 +301,7 @@ services:
     restart: unless-stopped
 
   minio-init:
-    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    image: ghcr.io/tinycloudlabs/mirror/minio-mc:RELEASE.2025-08-13T08-35-41Z@sha256:4545427b5ba8e7553be881a34db1706dc9b307cbd13e6c9fe9b58faba9d2f380
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
@@ -360,7 +360,7 @@ services:
   # image no container references. This no-op service makes compose pull the fork bot image at boot (~1.6 GB
   # compressed) and its exited container pins the image so the prune keeps it.
   bot-image-keeper:
-    image: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-e5b5307@sha256:32404172d0c843d29ec2617df52d8ca9cb09d510f6423e6aa355aac859196253}
+    image: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-63970d8@sha256:12d79f627da80833cc887a645095f6f8de61ce4925f7e7d0d02770bedbfb5236}
     entrypoint: ["/bin/true"]
     restart: "no"
     network_mode: none
@@ -406,7 +406,7 @@ services:
       BOT_JANITOR_MODE: ${BOT_JANITOR_MODE:-dry-run}
       BOT_CONTAINER_RETENTION_DAYS: ${BOT_CONTAINER_RETENTION_DAYS:-7}
       BOT_JANITOR_INTERVAL_SECONDS: "21600"
-      BOT_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-e5b5307@sha256:32404172d0c843d29ec2617df52d8ca9cb09d510f6423e6aa355aac859196253}
+      BOT_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-63970d8@sha256:12d79f627da80833cc887a645095f6f8de61ce4925f7e7d0d02770bedbfb5236}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     network_mode: none
@@ -416,7 +416,7 @@ services:
     image: ${VEXA_RUNTIME_IMAGE:-vexaai/v012-runtime:v012@sha256:a1f6448fbb380b9433364e8b572ec25a12aa4f274bf403f1d83a89cbf5812f2d}
     group_add: ["0"]
     environment:
-      BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-e5b5307@sha256:32404172d0c843d29ec2617df52d8ca9cb09d510f6423e6aa355aac859196253}
+      BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-63970d8@sha256:12d79f627da80833cc887a645095f6f8de61ce4925f7e7d0d02770bedbfb5236}
       AGENT_IMAGE: ${VEXA_AGENT_IMAGE:-vexaai/v012-agent-api:v012@sha256:6eb37574b33aab233aabbe5907e06e106bae44a403e5df781a436da8201a928d}
       AGENT_WORKER_IMAGE: ${VEXA_AGENT_WORKER_IMAGE:-vexaai/v012-agent-worker:v012@sha256:a1120b24765ff6b1c86c5f9ddee35b5e71fdbb9543a23b918b278373ad705022}
       REDIS_URL: redis://redis:6379/0
@@ -464,7 +464,7 @@ services:
     restart: unless-stopped
 
   meeting-api:
-    image: ghcr.io/tinycloudlabs/vexa/meeting-api:tc-c8d7f33@sha256:944c2c36d1ba8617d1c49eae5453750a14db2587ba53f40533f8bcfdcfa37566
+    image: ghcr.io/tinycloudlabs/vexa/meeting-api:tc-63970d8@sha256:0a976dba383951030116296c7c45e0b80b07bbd40ff4d075df5ab564ff9c845e
     environment:
       DB_HOST: vexa-postgres
       DB_PORT: "5432"
@@ -511,7 +511,7 @@ services:
     restart: unless-stopped
 
   gateway:
-    image: ghcr.io/tinycloudlabs/vexa/gateway:tc-36f0304@sha256:0e82c34a3f5838d6f592c71d6e8bebe4e79d3d0414160261def07a57971ef238
+    image: ghcr.io/tinycloudlabs/vexa/gateway:tc-63970d8@sha256:5a2542727f2f7841032f732595018711b6ee73e0f72cec704e7297532a78e7ec
     environment:
       ADMIN_API_URL: http://admin-api:8001
       MEETING_API_URL: http://meeting-api:8080

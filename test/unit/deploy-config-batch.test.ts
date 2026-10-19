@@ -26,9 +26,31 @@ const API_IMAGE = /^ghcr\.io\/tinycloudlabs\/tinycloud-private-transcription\/ap
 const POSTGRES = "postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685";
 
 type Service = {
-  image: string; build?: unknown; command?: string[]; environment: Record<string, string>; volumes?: { source?: string; target: string }[]; ports?: unknown[];
-  mem_limit?: string; memswap_limit?: string; mem_reservation?: string; cpuset?: string;
+  image: string; build?: unknown; command?: string[]; environment: Record<string, string>;
+  volumes?: { type?: string; source?: string; target: string; read_only?: boolean; bind?: { create_host_path?: boolean } }[];
+  tmpfs?: string[]; entrypoint?: string[]; labels?: Record<string, string>;
+  ports?: { target: number; published: string; host_ip: string; protocol: string; mode?: string }[];
+  networks?: Record<string, { ipv4_address?: string }>;
+  mem_limit?: string; memswap_limit?: string; mem_reservation?: string; cpuset?: string; cpus?: number;
+  read_only?: boolean; user?: string; cap_drop?: string[]; security_opt?: string[]; init?: boolean;
   logging?: { driver?: string; options?: Record<string, string> };
+};
+const vectorConfigText = read("infra/dstack-batch/log-shipper/vector.yaml");
+const vectorConfig = Bun.YAML.parse(vectorConfigText) as {
+  data_dir: string;
+  sources: {
+    gelf_in: {
+      type: string; mode: string; address: string; max_length: number; host_key: string;
+      framing: { method: string; chunked_gelf: { decompression: string } }; decoding: { codec: string };
+    };
+  };
+  transforms: Record<string, { type?: string; inputs: string[]; threshold?: number; window_secs?: number }>;
+  sinks: { gate_metrics: { flush_period_secs: number } };
+  secret: { local_directory: { type: string; path: string; remove_trailing_whitespace: boolean } };
+};
+const composeDocument = Bun.YAML.parse(composeConfig) as {
+  services: Record<string, { command?: string[]; entrypoint?: string[]; networks?: Record<string, { ipv4_address?: string }> }>;
+  networks: { logship: { ipam: { config: { subnet: string }[] } } };
 };
 
 function render(quietMode?: string): Record<string, Service> {
@@ -41,9 +63,9 @@ function render(quietMode?: string): Record<string, Service> {
 }
 
 describe("infra/dstack-batch/app-compose.yaml", () => {
-  test("is api + upload-worker + postgres only, image-only, every image digest-pinned", () => {
+  test("adds a digest-pinned Vector sidecar to api, worker and postgres", () => {
     const services = render();
-    expect(Object.keys(services).sort()).toEqual(["api", "postgres", "upload-worker"]);
+    expect(Object.keys(services).sort()).toEqual(["api", "log-shipper", "postgres", "upload-worker"]);
     for (const service of Object.values(services)) {
       expect(service.build).toBeUndefined();
       expect(service.image).toMatch(/@sha256:[0-9a-f]{64}$/);
@@ -51,9 +73,15 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(services.api!.image).toMatch(API_IMAGE);
     expect(services["upload-worker"]!.image).toBe(services.api!.image);
     expect(services.postgres!.image).toBe(POSTGRES);
+    expect(services["log-shipper"]!.ports).toHaveLength(1);
+    expect(services["log-shipper"]!.cpus).toBe(0.5);
+    expect(Number(services["log-shipper"]!.mem_limit)).toBe(64 * 1024 * 1024);
     expect(composeText).not.toMatch(/^\s+(build|context|dockerfile):/m);
-    // The image cannot be overridden from the sealed env.
     expect(composeText).not.toMatch(/image: \$\{/);
+  });
+
+  test("renders the canonical Vector config from the embedded Compose environment", () => {
+    expect(render()["log-shipper"]!.environment.VECTOR_CONFIG_YAML.replace(/\$\$/g, "$")).toBe(vectorConfigText);
   });
 
   test("runs the batch role with no meeting workload, docker socket, or fault injection", () => {
@@ -73,9 +101,9 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(workflowText).toContain("PTX_FAULT_INJECT must never appear");
   });
 
-  test("takes only the three existing sealed keys and the optional quiet-mode rollback flag", () => {
-    const sealed = [...new Set([...composeConfig.matchAll(/\$\{([A-Z0-9_]+)/g)].map((m) => m[1]))].sort();
-    expect(sealed).toEqual(["BATCH_TINFOIL_API_KEY", "BATCH_VAD_QUIET_MODE", "POSTGRES_PASSWORD", "PTX_BOOTSTRAP_KEYS"]);
+  test("takes only the expected sealed values and optional quiet-mode rollback flag", () => {
+    const sealed = [...new Set([...composeConfig.matchAll(/(?<!\$)\$\{([A-Z0-9_]+)/g)].map((m) => m[1]))].sort();
+    expect(sealed).toEqual(["BATCH_TINFOIL_API_KEY", "BATCH_VAD_QUIET_MODE", "BETTERSTACK_SOURCE_TOKEN", "POSTGRES_PASSWORD", "PTX_BOOTSTRAP_KEYS"]);
     expect([...(envExample.match(/^[A-Z0-9_]+(?==)/gm) ?? [])].sort()).toEqual(sealed.filter((key) => key !== "BATCH_VAD_QUIET_MODE"));
     const services = render();
     expect(services.api!.environment.PTX_BOOTSTRAP_KEYS).toBe("");
@@ -84,7 +112,76 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(render("false")["upload-worker"]!.environment.BATCH_VAD_QUIET_MODE).toBe("false");
   });
 
-  test("fits tdx.small: every service has a memory limit, no swap, and a reservation; ~1 GiB stays with the guest", () => {
+  test("api and worker alone ship labeled GELF logs; other services retain capped json-file logs", () => {
+    const services = render();
+    for (const [name, label] of [["api", "ptx-batch-api"], ["upload-worker", "ptx-batch-worker"]] as const) {
+      expect(services[name]!.labels?.["tc.logship"]).toBe(label);
+      expect(services[name]!.logging).toEqual({ driver: "gelf", options: {
+        "gelf-address": "udp://127.0.0.1:12201", labels: "tc.logship", "cache-disabled": "true",
+      } });
+    }
+    for (const name of ["api", "upload-worker", "postgres"] as const) {
+      expect(services[name]!.cap_drop).toEqual(["NET_RAW"]);
+    }
+    for (const name of ["postgres", "log-shipper"] as const) {
+      expect(services[name]!.labels?.["tc.logship"]).toBeUndefined();
+      expect(services[name]!.logging).toEqual({ driver: "json-file", options: { "max-size": "10m", "max-file": "3" } });
+    }
+    expect(composeConfig).not.toMatch(/driver:\s*fluentd|fluentd-address|24224/);
+  });
+
+  test("Vector receives GELF only through the loopback publish on its isolated fixed-IP network", () => {
+    const services = render();
+    const shipper = services["log-shipper"]!;
+    expect(Object.keys(vectorConfig.transforms)[0]).toBe("gelf_gate");
+    expect(vectorConfig.sources.gelf_in).toEqual({
+      type: "socket", mode: "udp", address: "0.0.0.0:12201", max_length: 262144, host_key: "peer_addr",
+      framing: { method: "chunked_gelf", chunked_gelf: { decompression: "Auto" } },
+      decoding: { codec: "gelf" },
+    });
+    expect(vectorConfig.sources).not.toHaveProperty("docker_files");
+    expect(vectorConfig.transforms.gelf_gate!.inputs).toEqual(["gelf_in"]);
+    expect(vectorConfig.secret.local_directory).toEqual({ type: "directory", path: "/run/vector-secrets", remove_trailing_whitespace: true });
+    expect(vectorConfig.sinks.gate_metrics!.flush_period_secs).toBe(86400);
+    expect(shipper.user).toBe("65532:65532");
+    expect(shipper.init).toBe(true);
+    expect(shipper.read_only).toBe(true);
+    expect(shipper.cap_drop).toEqual(["ALL"]);
+    expect(shipper.security_opt).toContain("no-new-privileges:true");
+    expect(shipper.ports).toEqual([{ target: 12201, published: "12201", host_ip: "127.0.0.1", protocol: "udp", mode: "ingress" }]);
+    expect(Object.keys(shipper.networks ?? {})).toEqual(["logship"]);
+    expect(shipper.networks).toMatchObject({ logship: { ipv4_address: "172.31.250.10" } });
+    expect(composeDocument.networks.logship.ipam.config).toEqual([{ subnet: "172.31.250.0/24" }]);
+    for (const name of ["api", "upload-worker", "postgres"] as const) {
+      expect(services[name]!.networks?.logship).toBeUndefined();
+    }
+    expect(shipper.volumes ?? []).toEqual([]);
+    expect(shipper.tmpfs).toContain("/var/lib/vector:uid=65532,gid=65532,mode=0700,size=8m");
+    expect(shipper.tmpfs).toContain("/run/vector-secrets:uid=65532,gid=65532,mode=0700,size=1m");
+    expect(shipper.environment.VECTOR_CONFIG_YAML.replace(/\$\$/g, "$")).toBe(vectorConfigText);
+    const sourceCommand = composeDocument.services["log-shipper"]!.command;
+    expect(shipper.entrypoint).toEqual(["/bin/sh", "-ec"]);
+    expect(sourceCommand).toHaveLength(1);
+    expect(shipper.command).toEqual(sourceCommand);
+    expect(shipper.command?.[0]).toContain('unset BETTERSTACK_SOURCE_TOKEN');
+    expect(shipper.command?.[0]).toContain('unset VECTOR_CONFIG_YAML');
+    expect(shipper.command?.[0]).toContain('/run/vector-secrets/betterstack_source_token');
+    expect(shipper.command?.[0].replace(/\$\$/g, "$")).toContain('printf "%s\\n" "${VECTOR_CONFIG_YAML}" > /var/lib/vector/vector.yaml');
+    expect(shipper.command?.[0].indexOf('unset VECTOR_CONFIG_YAML')).toBeGreaterThan(shipper.command?.[0].indexOf('> /var/lib/vector/vector.yaml') ?? -1);
+    expect(composeConfig).not.toContain("/var/lib/docker");
+  });
+  test("every Compose sh -ec script is one exact rendered argv element", () => {
+    const rendered = render();
+    const shellServices = Object.entries(composeDocument.services)
+      .filter(([, service]) => service.entrypoint?.[0] === "/bin/sh" && service.entrypoint?.[1] === "-ec");
+    expect(shellServices.length).toBeGreaterThan(0);
+    for (const [name, source] of shellServices) {
+      expect(source.command).toHaveLength(1);
+      expect(rendered[name]!.command).toEqual(source.command);
+    }
+  });
+
+  test("fits tdx.small: service budgets total 896 MiB and retain at least 1 GB guest headroom", () => {
     const services = render();
     const limits = { api: 320, "upload-worker": 320, postgres: 192 } as const;
     for (const [name, mib] of Object.entries(limits)) {
@@ -94,12 +191,14 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
       expect(Number(service.mem_reservation)).toBeGreaterThan(0);
       expect(Number(service.mem_reservation)).toBeLessThan(Number(service.mem_limit));
     }
-    // The guest of a live tdx.small reports 1,942,806,528 bytes; leave at least 1 GB of it to the OS, dstack and dockerd.
+    expect(Number(services["log-shipper"]!.mem_limit)).toBe(64 * 1024 * 1024);
     const total = Object.values(services).reduce((sum, service) => sum + Number(service.mem_limit), 0);
+    expect(total).toBe(896 * 1024 * 1024);
     expect(1_942_806_528 - total).toBeGreaterThanOrEqual(1_000_000_000);
-    for (const [name, service] of Object.entries(services)) {
-      expect({ name, logging: service.logging }).toEqual({ name, logging: { driver: "json-file", options: { "max-size": "10m", "max-file": "3" } } });
+    for (const name of ["postgres", "log-shipper"]) {
+      expect(services[name]!.logging).toEqual({ driver: "json-file", options: { "max-size": "10m", "max-file": "3" } });
     }
+    for (const name of ["api", "upload-worker"]) expect(services[name]!.logging?.driver).toBe("gelf");
     expect(services.postgres!.command).toEqual(["postgres", "-c", "max_connections=40", "-c", "shared_buffers=32MB", "-c", "work_mem=2MB",
       "-c", "maintenance_work_mem=16MB", "-c", "max_wal_size=256MB"]);
   });
@@ -175,7 +274,7 @@ describe(".github/workflows/deploy-batch.yml", () => {
     const order = ["Install dependencies and deploy tooling from lockfiles", "Guard inputs, secrets and the image pin", "Validate the sealed environment", "Resolve the CVM", "Drain admission and wait for zero active jobs", "Deploy", "Sync allowed_envs", "Wait for running and resolve the gateway URL", "Health gate (live, then upload_transcription.ready)", "Admission gate (the deployed service is not open)", "Open admission"].map(index);
     expect(order.every((i) => i >= 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
-    expect(steps[index("Drain admission and wait for zero active jobs")]!.if).toBe("env.MODE == 'update'");
+    expect(steps[index("Drain admission and wait for zero active jobs")]!.if).toBe("${{ env.MODE == 'update' && !inputs.reopen_only }}");
     expect(steps[index("Health gate (live, then upload_transcription.ready)")]!.run).toContain(".checks.upload_transcription.ready");
   });
 
@@ -302,6 +401,7 @@ sed -n "$((n + 1))p" "${dir}/gets"
     const validate = (admin: string, bootstrap = env, quietMode = "true") => runStep("Validate the sealed environment", {
       BATCH_POSTGRES_PASSWORD: "a".repeat(64), BATCH_TINFOIL_API_KEY: "tinfoil", PTX_BOOTSTRAP_KEYS: bootstrap, PTX_BATCH_ADMIN_KEY: admin,
       BATCH_VAD_QUIET_MODE: quietMode,
+      BETTERSTACK_SOURCE_TOKEN: "test-token",
     }, { docker: "exit 0" });
 
     const ok = validate(adminKey);
@@ -338,7 +438,7 @@ sed -n "$((n + 1))p" "${dir}/gets"
       for (const mode of ["true", "false"]) {
         const capture = join(captureDir, `sealed-${mode}.txt`);
         const run = runStep("Validate the sealed environment", {
-          BATCH_POSTGRES_PASSWORD: password, BATCH_TINFOIL_API_KEY: providerKey, PTX_BOOTSTRAP_KEYS: env,
+          BATCH_POSTGRES_PASSWORD: password, BATCH_TINFOIL_API_KEY: providerKey, PTX_BOOTSTRAP_KEYS: env, BETTERSTACK_SOURCE_TOKEN: "test-token",
           PTX_BATCH_ADMIN_KEY: keys[1]!.key, BATCH_VAD_QUIET_MODE: mode, SEALED_CAPTURE: capture,
         }, { docker: `while [ "$#" -gt 0 ]; do
   if [ "$1" = "--env-file" ]; then cp -- "$2" "$SEALED_CAPTURE"; exit; fi
@@ -349,11 +449,12 @@ exit 1` });
         // runStep has removed its temp directory; this copy contains only generated test values.
         const lines = readFileSync(capture, "utf8").trimEnd().split("\n");
         expect(lines.map((line) => line.slice(0, line.indexOf("="))).sort())
-          .toEqual(["BATCH_TINFOIL_API_KEY", "BATCH_VAD_QUIET_MODE", "POSTGRES_PASSWORD", "PTX_BOOTSTRAP_KEYS"]);
+          .toEqual(["BATCH_TINFOIL_API_KEY", "BATCH_VAD_QUIET_MODE", "BETTERSTACK_SOURCE_TOKEN", "POSTGRES_PASSWORD", "PTX_BOOTSTRAP_KEYS"]);
         expect(lines).toContain(`BATCH_VAD_QUIET_MODE=${mode}`);
         expect(lines).toContain(`POSTGRES_PASSWORD=${password}`);
         expect(lines).toContain(`BATCH_TINFOIL_API_KEY=${providerKey}`);
         expect(lines).toContain(`PTX_BOOTSTRAP_KEYS=${env}`);
+        expect(lines).toContain("BETTERSTACK_SOURCE_TOKEN=test-token");
         expect(render(mode)["upload-worker"]!.environment.BATCH_VAD_QUIET_MODE).toBe(mode);
       }
       expect(workflowText).toContain("${{ vars.BATCH_VAD_QUIET_MODE || 'true' }}");
@@ -379,6 +480,45 @@ exit 1` });
     expect(runStep("Admission gate (the deployed service is not open)", { MODE: "create", BATCH_URL: "https://batch.test", PTX_BATCH_ADMIN_KEY: "k" }, { curl: "exit 22" }).exitCode).not.toBe(0);
   });
 
+  test("reopen_only checks the existing drained CVM without deploying or accepting active jobs", () => {
+    const dispatch = workflow.on.workflow_dispatch;
+    if (!dispatch || typeof dispatch !== "object" || !("inputs" in dispatch) ||
+      !dispatch.inputs || typeof dispatch.inputs !== "object" || !("reopen_only" in dispatch.inputs)) {
+      throw new Error("Missing reopen_only workflow_dispatch input");
+    }
+    expect(dispatch.inputs.reopen_only).toEqual({ description: "Reopen admission without deploying", type: "boolean", required: false, default: false });
+    const selected = steps.filter((step) => {
+      if (!step.name) return false;
+      if (!step.if) return true;
+      const condition = step.if.replace(/^\$\{\{\s*|\s*\}\}$/g, "");
+      if (condition === "!inputs.reopen_only" || condition === "env.MODE == 'update' && !inputs.reopen_only") return false;
+      throw new Error(`Unexpected step condition: ${step.if}`);
+    }).map((step) => step.name);
+    expect(selected).toEqual([
+      "Install dependencies and deploy tooling from lockfiles", "Guard inputs, secrets and the image pin",
+      "Resolve the CVM", "Wait for running and resolve the gateway URL",
+      "Health gate (live, then upload_transcription.ready)", "Admission gate (the deployed service is not open)", "Open admission",
+    ]);
+
+    const guard = (ref: string, id: string) => runStep("Guard inputs, secrets and the image pin", {
+      CONFIRM: "ptx-batch", CVM_NAME: "ptx-batch", GITHUB_REF: ref, REOPEN_ONLY: "true", PTX_BATCH_CVM_ID: id,
+      DRAIN_TIMEOUT_MINUTES: "130",
+    });
+    expect(guard("refs/heads/main", "cvm_existing").exitCode).toBe(0);
+    expect(guard("refs/heads/other", "cvm_existing").exitCode).toBe(1);
+    expect(guard("refs/heads/main", "").exitCode).toBe(1);
+    expect(runStep("Resolve the CVM", { REOPEN_ONLY: "true", PTX_BATCH_CVM_ID: "", CVM_NAME: "ptx-batch", PHALA: "/bin/false" }).exitCode).toBe(1);
+
+    const gate = (body: string) => runStep("Admission gate (the deployed service is not open)", {
+      MODE: "update", REOPEN_ONLY: "true", ADMISSION_ACTIVE_JQ: workflow.env.ADMISSION_ACTIVE_JQ!,
+      BATCH_URL: "https://batch.test", PTX_BATCH_ADMIN_KEY: "k",
+    }, serve(body));
+    expect(gate(counts(0, 0, 0)).exitCode).toBe(0);
+    for (const body of [counts(0, 1, 0), counts(0, 0, 0, "open"), counts(0, 0, 0, "closed"), '{"mode":"drain","active":{}}']) {
+      expect({ body, exitCode: gate(body).exitCode }).toEqual({ body, exitCode: 1 });
+    }
+  });
+
   test("the guard refuses a pinned image whose commit predates migration 0018", () => {
     const migration = "src/db/migrations/0018_batch_admission_closed.sql";
     expect(existsSync(join(repo, migration))).toBe(true);
@@ -391,7 +531,8 @@ exit 1` });
 esac`;
     const guard = (has0018: string) => runStep("Guard inputs, secrets and the image pin", {
       CONFIRM: "ptx-batch", CVM_NAME: "ptx-batch", GITHUB_REF: "refs/heads/main", DRAIN_TIMEOUT_MINUTES: "130", IMAGE_REPO: workflow.env.IMAGE_REPO!,
-      PHALA_CLOUD_API_KEY: "p", BATCH_POSTGRES_PASSWORD: "b", BATCH_TINFOIL_API_KEY: "t", PTX_BOOTSTRAP_KEYS: "[]", PTX_BATCH_ADMIN_KEY: "a", HAS_0018: has0018,
+      PHALA_CLOUD_API_KEY: "p", BATCH_POSTGRES_PASSWORD: "b", BATCH_TINFOIL_API_KEY: "t", PTX_BOOTSTRAP_KEYS: "[]", PTX_BATCH_ADMIN_KEY: "a",
+      BETTERSTACK_SOURCE_TOKEN: "test-token", HAS_0018: has0018,
     }, { git, docker: `printf '{"digest":"%s"}' '${digest}'` });
     expect(guard("1")).toMatchObject({ exitCode: 0 });
     const old = guard("0");
@@ -411,8 +552,15 @@ esac`;
     expect(open(counts(0, 0, 0, "closed")).exitCode).toBe(1);
   });
 
-  test("never prints a secret", () => {
-    for (const name of ["BATCH_TINFOIL_API_KEY", "BATCH_POSTGRES_PASSWORD", "PTX_BOOTSTRAP_KEYS", "PTX_BATCH_ADMIN_KEY", "PHALA_CLOUD_API_KEY"]) {
+  test("the Better Stack token is guarded, written to the env file, and never printed", () => {
+    const guard = steps[index("Guard inputs, secrets and the image pin")]!;
+    const validate = steps[index("Validate the sealed environment")]!;
+    expect(guard.env!.BETTERSTACK_SOURCE_TOKEN).toBe("${{ secrets.BETTERSTACK_SOURCE_TOKEN }}");
+    expect(guard.run).toContain("BETTERSTACK_SOURCE_TOKEN");
+    expect(validate.env!.BETTERSTACK_SOURCE_TOKEN).toBe("${{ secrets.BETTERSTACK_SOURCE_TOKEN }}");
+    expect(validate.run).toContain("BETTERSTACK_SOURCE_TOKEN=$BETTERSTACK_SOURCE_TOKEN");
+    expect(steps[index("Sync allowed_envs")]!.run).toContain("node .github/scripts/phala-sync-allowed-envs.mjs");
+    for (const name of ["BATCH_TINFOIL_API_KEY", "BATCH_POSTGRES_PASSWORD", "PTX_BOOTSTRAP_KEYS", "PTX_BATCH_ADMIN_KEY", "PHALA_CLOUD_API_KEY", "BETTERSTACK_SOURCE_TOKEN"]) {
       expect(workflowText).not.toMatch(new RegExp(`echo[^\\n]*\\$\\{?${name}`));
     }
   });
