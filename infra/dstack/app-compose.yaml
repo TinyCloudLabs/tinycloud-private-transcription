@@ -360,7 +360,7 @@ services:
   # image no container references. This no-op service makes compose pull the fork bot image at boot (~1.6 GB
   # compressed) and its exited container pins the image so the prune keeps it.
   bot-image-keeper:
-    image: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-63970d8@sha256:12d79f627da80833cc887a645095f6f8de61ce4925f7e7d0d02770bedbfb5236}
+    image: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-60ff031@sha256:235060814ce9b32cb3132d233ec538d7433f18bb31a09a4b582aef05594c7b32}
     entrypoint: ["/bin/true"]
     restart: "no"
     network_mode: none
@@ -406,7 +406,7 @@ services:
       BOT_JANITOR_MODE: ${BOT_JANITOR_MODE:-dry-run}
       BOT_CONTAINER_RETENTION_DAYS: ${BOT_CONTAINER_RETENTION_DAYS:-7}
       BOT_JANITOR_INTERVAL_SECONDS: "21600"
-      BOT_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-63970d8@sha256:12d79f627da80833cc887a645095f6f8de61ce4925f7e7d0d02770bedbfb5236}
+      BOT_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-60ff031@sha256:235060814ce9b32cb3132d233ec538d7433f18bb31a09a4b582aef05594c7b32}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     network_mode: none
@@ -416,7 +416,7 @@ services:
     image: ${VEXA_RUNTIME_IMAGE:-vexaai/v012-runtime:v012@sha256:a1f6448fbb380b9433364e8b572ec25a12aa4f274bf403f1d83a89cbf5812f2d}
     group_add: ["0"]
     environment:
-      BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-63970d8@sha256:12d79f627da80833cc887a645095f6f8de61ce4925f7e7d0d02770bedbfb5236}
+      BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-60ff031@sha256:235060814ce9b32cb3132d233ec538d7433f18bb31a09a4b582aef05594c7b32}
       AGENT_IMAGE: ${VEXA_AGENT_IMAGE:-vexaai/v012-agent-api:v012@sha256:6eb37574b33aab233aabbe5907e06e106bae44a403e5df781a436da8201a928d}
       AGENT_WORKER_IMAGE: ${VEXA_AGENT_WORKER_IMAGE:-vexaai/v012-agent-worker:v012@sha256:a1120b24765ff6b1c86c5f9ddee35b5e71fdbb9543a23b918b278373ad705022}
       REDIS_URL: redis://redis:6379/0
