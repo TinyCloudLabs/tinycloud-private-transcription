@@ -9,7 +9,7 @@
 # (digest-pinned v012 upstream components),
 # PTX_BOT_IMAGE (fork bot image override; defaults to the pinned fork image below),
 # PTX_BOOTSTRAP_KEYS (optional hashed API keys for the api service; see .env.example),
-# DEBUG_SSH_AUTHORIZED_KEY and BETTERSTACK_SOURCE_TOKEN (debug sidecars; infra/dstack/DEBUG.md).
+# BETTERSTACK_SOURCE_TOKEN (debug-log-shipper; infra/dstack/DEBUG.md).
 # The PTX API/worker and Signal Desktop seat images are immutable production pins in this
 # file, not sealed-environment overrides. Signal profile volumes are deliberately persistent:
 # linking each Signal account is an operator action, never a deployment side effect.
@@ -588,9 +588,10 @@ services:
     restart: "no"
 
   # Key-only SSH for operators, reached through the dstack gateway's TLS-terminated route
-  # <app_id>-2222.<gateway base_domain>:443. One authorized public key comes from the sealed env;
-  # without exactly one valid key the container exits and nothing listens on 2222. The docker socket
-  # gives the session the same control over the CVM's containers as runtime and bot-janitor.
+  # <app_id>-2222.<gateway base_domain>:443. The one authorized public key is inlined below, so it is
+  # part of the measured compose; without exactly one valid key the container refuses to start (and
+  # restarts in a back-off loop), so nothing listens on 2222. The key holder is root-equivalent on the
+  # CVM: the docker socket controls every container and /dstack/.decrypted-env holds every sealed value.
   debug-ssh:
     image: ghcr.io/linuxserver/openssh-server:10.3_p1-r1-ls239@sha256:0f535b0faa7448511b23528165e9fbd4f1fe563b861b3dcaa5ddb0ddbfe2254c
     entrypoint: ["/bin/sh", "-ec"]
@@ -599,7 +600,7 @@ services:
         umask 077
         key="$$DEBUG_SSH_AUTHORIZED_KEY"
         unset DEBUG_SSH_AUTHORIZED_KEY
-        [ -n "$$key" ] || { echo "debug-ssh: DEBUG_SSH_AUTHORIZED_KEY is empty; refusing to start"; exit 1; }
+        case "$$key" in ''|REPLACE_AT_DEPLOY) echo "debug-ssh: DEBUG_SSH_AUTHORIZED_KEY is not set in app-compose.yaml; refusing to start"; exit 1;; esac
         mkdir -p /root/.ssh /etc/ssh/hostkeys
         printf '%s\n' "$$key" > /root/.ssh/authorized_keys
         if [ "$$(wc -l < /root/.ssh/authorized_keys)" -ne 1 ] || ! ssh-keygen -l -f /root/.ssh/authorized_keys; then
@@ -627,7 +628,9 @@ services:
           'MaxAuthTries 3' 'LoginGraceTime 30' 'LogLevel VERBOSE' > /etc/ssh/sshd_config.debug
         exec /usr/sbin/sshd.pam -D -e -f /etc/ssh/sshd_config.debug
     environment:
-      DEBUG_SSH_AUTHORIZED_KEY: ${DEBUG_SSH_AUTHORIZED_KEY:-}
+      # Public key only (one line: ssh-ed25519 AAAA... name). Replaced in the deploy commit; the
+      # placeholder fails closed.
+      DEBUG_SSH_AUTHORIZED_KEY: "REPLACE_AT_DEPLOY"
     ports:
       - "2222:2222"
     volumes:
@@ -641,9 +644,12 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
-  # Ships every container's stdout/stderr on the CVM (meeting bots included) to the Better Stack
-  # source ptx-dev. The ingest-only token comes from the sealed env, is written to a tmpfs file and
-  # removed from the environment before Vector starts; without it the container exits.
+  # Ships the stdout/stderr of an ALLOWLIST of containers to the Better Stack source ptx-dev: meeting
+  # bots (container name vexa-mtg-*, not compose services) and the compose services meeting-api,
+  # gateway, api, worker, probe and debug-ssh (label com.docker.compose.service). Every other container
+  # is dropped in the `allowlist` filter (DEBUG.md "What is shipped"). The ingest-only token comes from
+  # the sealed env, is written to a tmpfs file and removed from the environment before Vector starts;
+  # without it the container refuses to start (and restarts in a back-off loop).
   debug-log-shipper:
     image: timberio/vector:0.59.0-alpine@sha256:0e36bc2a290039e9b6a5e92f04bd2f133223506f72d09682c1df16c015172b7a
     init: true
@@ -667,9 +673,16 @@ services:
             type: docker_logs
             exclude_containers: [dstack-debug-log-shipper-]
         transforms:
+          allowlist:
+            type: filter
+            inputs: [containers]
+            condition: |
+              service = string(.label."com.docker.compose.service") ?? ""
+              name = string(.container_name) ?? ""
+              includes(["meeting-api", "gateway", "api", "worker", "probe", "debug-ssh"], service) || starts_with(name, "vexa-mtg-")
           shaped:
             type: remap
-            inputs: [containers]
+            inputs: [allowlist]
             source: |
               . = {"dt": .timestamp, "container": .container_name, "image": .image, "stream": .stream, "message": .message}
         sinks:
