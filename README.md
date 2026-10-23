@@ -175,6 +175,7 @@ See [TC-922 validation and limits](docs/tc-922-validation.md); hosted ASR timing
 | `JOIN_TIMEOUT_SECONDS` | `600` | join deadline, counted from the first poll that observes `joining`, `waiting_for_admission`, or `needs_help`. A meeting still open at the deadline is failed (`meeting_join_failed`/`waiting_room_timeout`), its bot stopped, and `meeting.failed` emitted |
 | `JOIN_DISPATCH_FALLBACK_SECONDS` | `900` | join deadline before any join status is observed, counted from bot dispatch |
 | `JOIN_NEEDS_HELP_MAX_SECONDS` | `1200` | while a meeting is `needs_help`, the join deadline is this many seconds after its first join observation |
+| `NEEDS_HELP_STATE_ENABLED` | `false` | when `true`, clients see the `needs_help` meeting status and capture state; when `false`, they see `waiting_for_admission`, and `needs_help` is never sent over the API or webhooks. Off by default until clients understand the state. |
 | `TRANSCRIPTION_PROVIDER` | `vexa` | Compatibility label; Vexa remains the primary provider and is reported by health. |
 | `TINFOIL_BASE_URL` | `https://inference.tinfoil.sh` | OpenAI-compatible confidential transcription endpoint used only for recovery. |
 | `TINFOIL_API_KEY` | – | bearer token; when set, enables recording retention and recovery transcription. |

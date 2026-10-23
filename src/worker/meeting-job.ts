@@ -2,7 +2,7 @@ import type { AppContext } from "../context.ts";
 import type { MeetingRow } from "../db/schema.ts";
 import { ApiError } from "../domain/errors.ts";
 import type { Platform } from "../domain/platform.ts";
-import { isTerminal, mapVexaFailure, mapVexaStatus, type MeetingStatus } from "../domain/state.ts";
+import { clientStatus, isTerminal, mapVexaFailure, mapVexaStatus, type MeetingStatus } from "../domain/state.ts";
 import { effectiveJoinDeadline, isJoinObservation, isJoinOpen, JOIN_DEADLINE_FAILURE } from "../domain/join-deadline.ts";
 import { VexaHttpError } from "../providers/vexa/client.ts";
 import { adaptVexaSegments, completionReasonOf } from "../providers/vexa/adapter.ts";
@@ -238,12 +238,13 @@ export async function handleJoinDeadline(ctx: AppContext, meetingId: string): Pr
  * left running. Shared by the job and the poll.
  */
 export async function failJoinDeadline(ctx: AppContext, meeting: MeetingRow): Promise<boolean> {
-  if (!isJoinOpen(meeting.status)) return false;
-  const f = JOIN_DEADLINE_FAILURE[meeting.status];
+  const open = clientStatus(meeting.status as MeetingStatus, ctx.config.needsHelpStateEnabled);
+  if (!isJoinOpen(open)) return false;
+  const f = JOIN_DEADLINE_FAILURE[open];
   const { meeting: failed, changed } = await failMeeting(ctx, meeting, f.code, f.message);
   if (!changed) return false;
   const stopping = await recordCapture(ctx, failed, { stop_requested_at: new Date().toISOString(), stop_requested_by: "join_deadline" });
-  ctx.log.warn("join deadline exceeded; failing meeting", { meetingId: meeting.id, status: meeting.status });
+  ctx.log.warn("join deadline exceeded; failing meeting", { meetingId: meeting.id, status: open });
   if (stopping.platform === "signal" && stopping.signalSessionId) {
     await ctx.signal.leave(stopping.signalSessionId).catch(() => {});
   } else if (stopping.vexaPlatform && stopping.vexaNativeMeetingId) {
@@ -354,7 +355,7 @@ async function pollMeeting(ctx: AppContext, meeting: MeetingRow, recoveryAttempt
 
   // completion_reason lives under `data` on transcript rows (top-level only on MeetingResponse rows).
   const reason = completionReasonOf(vexa);
-  const mapped = mapVexaStatus(vexa.status);
+  const mapped = mapVexaStatus(vexa.status, ctx.config.needsHelpStateEnabled);
 
   const failureStage = vexa.data?.failure_stage;
   // Explicit provider evidence outranks our local state. Local in_progress/processing is only a

@@ -42,8 +42,9 @@ export function canTransition(from: MeetingStatus, to: MeetingStatus): boolean {
   return RANK[to] > RANK[from];
 }
 
-/** Vexa MeetingStatus enum (lifecycle.v1): requested, joining, awaiting_admission, active, needs_help, stopping, completed, failed. */
-export function mapVexaStatus(vexa: string): MeetingStatus {
+/** Vexa MeetingStatus enum (lifecycle.v1): requested, joining, awaiting_admission, active, needs_help, stopping, completed, failed.
+ * With the needs_help state disabled, raw needs_help (and its older alias) is stored as waiting_for_admission. */
+export function mapVexaStatus(vexa: string, needsHelpEnabled: boolean): MeetingStatus {
   switch (vexa) {
     case "requested":
     case "joining":
@@ -52,7 +53,7 @@ export function mapVexaStatus(vexa: string): MeetingStatus {
       return "waiting_for_admission";
     case "needs_help": // lifecycle.v1 enum (docs/vexa-findings.md)
     case "needs_human_help": // older alias, kept for compatibility
-      return "needs_help";
+      return needsHelpEnabled ? "needs_help" : "waiting_for_admission";
     case "active":
       return "in_progress";
     case "stopping":
@@ -64,6 +65,11 @@ export function mapVexaStatus(vexa: string): MeetingStatus {
     default:
       return "joining";
   }
+}
+
+/** Status a client may see. Legacy stored needs_help rows fold to waiting_for_admission while the flag is off. */
+export function clientStatus(status: MeetingStatus, needsHelpEnabled: boolean): MeetingStatus {
+  return status === "needs_help" && !needsHelpEnabled ? "waiting_for_admission" : status;
 }
 
 export interface MappedFailure {

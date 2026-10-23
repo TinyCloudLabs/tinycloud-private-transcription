@@ -167,7 +167,7 @@ test("0004-0015 retain production retry, fallback, terminal delivery, and deleti
     `);
     expect(deletionAdmission).toEqual({ count: 1 });
 
-    const app = createApp({ db, log: silentLogger } as AppContext);
+    const app = createApp({ db, log: silentLogger, config: { needsHelpStateEnabled: false } } as AppContext);
     const response = await app.request("/v1/meetings/mtg_legacy_1", {
       headers: { Authorization: `Bearer ${apiKey}` },
     });

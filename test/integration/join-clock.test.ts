@@ -11,7 +11,7 @@ import { controlIfBotExists, startHarness, type Harness } from "./harness.ts";
 
 let h: Harness;
 beforeAll(async () => {
-  h = await startHarness({ joinTimeoutSeconds: 1.5, joinNeedsHelpMaxSeconds: 2, joinDispatchFallbackSeconds: 4 });
+  h = await startHarness({ joinTimeoutSeconds: 1.5, joinNeedsHelpMaxSeconds: 2, joinDispatchFallbackSeconds: 4, needsHelpStateEnabled: true });
 });
 afterAll(async () => {
   await h.stop();

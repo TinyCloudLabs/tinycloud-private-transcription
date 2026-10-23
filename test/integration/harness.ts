@@ -76,6 +76,8 @@ export async function startHarness(
     /** Vexa 429 retry cadence and window at bot start (TC-902 review). */
     capacityRetryIntervalMs?: number;
     capacityRetryWindowMs?: number;
+    /** NEEDS_HELP_STATE_ENABLED; defaults to false (production default). */
+    needsHelpStateEnabled?: boolean;
   } = {},
 ): Promise<Harness> {
   const vexa = startMockVexa(0, opts.vexaMaxConcurrentBots !== undefined ? { maxConcurrentBots: opts.vexaMaxConcurrentBots } : {});
@@ -97,6 +99,7 @@ export async function startHarness(
   if (opts.maxConcurrentBots !== undefined) config.vexa = { ...config.vexa, maxConcurrentBots: opts.maxConcurrentBots };
   if (opts.capacityRetryIntervalMs !== undefined) config.vexa = { ...config.vexa, capacityRetryIntervalMs: opts.capacityRetryIntervalMs };
   if (opts.capacityRetryWindowMs !== undefined) config.vexa = { ...config.vexa, capacityRetryWindowMs: opts.capacityRetryWindowMs };
+  if (opts.needsHelpStateEnabled !== undefined) config.needsHelpStateEnabled = opts.needsHelpStateEnabled;
   const db = await runMigrations(config.databaseUrl);
   // attributed_worker_readiness and tinfoil_dispatch_slots are included: a prior harness's stopped
   // worker stays "live" for the 15s staleness window and held slots would block this harness's

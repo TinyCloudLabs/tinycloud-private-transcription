@@ -106,6 +106,11 @@ export function parseRole(value: string): PtxRole {
   return value;
 }
 
+/** NEEDS_HELP_STATE_ENABLED: only the exact literal "true" enables the client-visible needs_help state. Default off. */
+export function parseNeedsHelpStateFlag(value: string): boolean {
+  return value === "true";
+}
+
 export const config = {
   role: parseRole(env("PTX_ROLE", "meeting")),
   port: Number(env("PORT", "8080")),
@@ -179,6 +184,8 @@ export const config = {
   joinDispatchFallbackSeconds: Number(env("JOIN_DISPATCH_FALLBACK_SECONDS", "900")),
   /** Maximum join-window extension from the first observation while the bot reports needs_help. */
   joinNeedsHelpMaxSeconds: Number(env("JOIN_NEEDS_HELP_MAX_SECONDS", "1200")),
+  /** Client-visible needs_help state (status, status_message, escalation_reason). Off: raw needs_help is folded to waiting_for_admission in API, webhooks, and transcript output. The join clock still honours raw needs_help. */
+  needsHelpStateEnabled: parseNeedsHelpStateFlag(env("NEEDS_HELP_STATE_ENABLED", "false")),
   transcriptionProvider: env("TRANSCRIPTION_PROVIDER", "vexa") as TranscriptionProviderName,
   tinfoil: {
     baseUrl: env("TINFOIL_BASE_URL", "https://inference.tinfoil.sh"),

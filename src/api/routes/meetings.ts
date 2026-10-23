@@ -15,6 +15,8 @@ import {
 } from "../../services/meetings.ts";
 import type { AuthEnv } from "../auth.ts";
 import { PLATFORMS } from "../../domain/platform.ts";
+import { clientCaptureView } from "../../domain/capture.ts";
+import { clientStatus, type MeetingStatus } from "../../domain/state.ts";
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const optString = (body: Record<string, unknown>, k: string) => {
@@ -66,7 +68,7 @@ export function meetingRoutes(ctx: AppContext) {
     const input = parseCreateBody(raw);
     const idem = c.req.header("idempotency-key") ?? null;
     const { meeting, created } = await createMeeting(ctx, c.get("project").id, input, idem);
-    return c.json(serializeMeeting(meeting, null), created ? 201 : 200);
+    return c.json(serializeMeeting(meeting, null, ctx.config.needsHelpStateEnabled), created ? 201 : 200);
   });
 
   r.get("/by-idempotency-key", async (c) => {
@@ -74,13 +76,13 @@ export function meetingRoutes(ctx: AppContext) {
     if (!key?.trim()) throw new ApiError("invalid_request", "Idempotency-Key header is required");
     const meeting = await getMeetingByIdempotencyKey(ctx, c.get("project").id, key);
     const transcript = meeting.status === "completed" ? await getTranscript(ctx, meeting.id) : null;
-    return c.json({ meeting: serializeMeeting(meeting, transcript), request_hash: meeting.requestHash });
+    return c.json({ meeting: serializeMeeting(meeting, transcript, ctx.config.needsHelpStateEnabled), request_hash: meeting.requestHash });
   });
 
   r.get("/:id", async (c) => {
     const meeting = await getMeeting(ctx, c.get("project").id, c.req.param("id"));
     const transcript = meeting.status === "completed" ? await getTranscript(ctx, meeting.id) : null;
-    return c.json(serializeMeeting(meeting, transcript));
+    return c.json(serializeMeeting(meeting, transcript, ctx.config.needsHelpStateEnabled));
   });
 
   r.post("/:id/stop", async (c) => {
@@ -92,17 +94,17 @@ export function meetingRoutes(ctx: AppContext) {
   r.post("/:id/recover", async (c) => {
     const meeting = await getMeeting(ctx, c.get("project").id, c.req.param("id"));
     const updated = await recoverMeeting(ctx, meeting);
-    return c.json({ id: updated.id, status: updated.status });
+    return c.json({ id: updated.id, status: clientStatus(updated.status as MeetingStatus, ctx.config.needsHelpStateEnabled) });
   });
 
   r.get("/:id/transcript", async (c) => {
     const meeting = await getMeeting(ctx, c.get("project").id, c.req.param("id"));
     if (meeting.status === "failed" || meeting.status === "cancelled") {
-      return c.json({ meeting_id: meeting.id, status: meeting.status, ...(meeting.captureDiagnostics ? { capture: meeting.captureDiagnostics } : {}) }, 200);
+      return c.json({ meeting_id: meeting.id, status: clientStatus(meeting.status as MeetingStatus, ctx.config.needsHelpStateEnabled), ...(meeting.captureDiagnostics ? { capture: clientCaptureView(meeting.captureDiagnostics, ctx.config.needsHelpStateEnabled) } : {}) }, 200);
     }
     const transcript = meeting.status === "completed" ? await getTranscript(ctx, meeting.id) : null;
-    if (!transcript) return c.json({ meeting_id: meeting.id, status: meeting.status, ...(meeting.captureDiagnostics ? { capture: meeting.captureDiagnostics } : {}) }, 202);
-    return c.json(serializeTranscript(meeting, transcript));
+    if (!transcript) return c.json({ meeting_id: meeting.id, status: clientStatus(meeting.status as MeetingStatus, ctx.config.needsHelpStateEnabled), ...(meeting.captureDiagnostics ? { capture: clientCaptureView(meeting.captureDiagnostics, ctx.config.needsHelpStateEnabled) } : {}) }, 202);
+    return c.json(serializeTranscript(meeting, transcript, ctx.config.needsHelpStateEnabled));
   });
 
   r.delete("/:id", async (c) => {

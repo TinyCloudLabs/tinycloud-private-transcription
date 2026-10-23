@@ -10,7 +10,7 @@ import { startHarness, type Harness } from "./harness.ts";
 
 let h: Harness;
 beforeAll(async () => {
-  h = await startHarness({ joinTimeoutSeconds: 60, joinNeedsHelpMaxSeconds: 3 });
+  h = await startHarness({ joinTimeoutSeconds: 60, joinNeedsHelpMaxSeconds: 3, needsHelpStateEnabled: true });
 });
 afterAll(async () => {
   await h.stop();
@@ -49,6 +49,11 @@ describe("needs_help join window", () => {
       { timeoutMs: 8000, label: `meeting ${id} -> failed` },
     );
     expect(failed.error).toMatchObject({ type: "meeting_join_failed", code: "meeting_join_failed" });
+    const hook = await h.waitFor(
+      async () => h.webhook.received.find((w) => w.body.type === "meeting.failed" && w.body.data.meeting_id === id) ?? null,
+      { timeoutMs: 10000, label: "meeting.failed webhook" },
+    );
+    expect(hook.body.data.capture.provider_status).toBe("needs_help");
     await h.waitFor(async () => (h.vexa.requests.some((q) => q.method === "DELETE" && q.path === `/bots/jitsi/${encodeURIComponent(nativeId)}`) ? true : null), { label: "bot stop request" });
   });
 });

@@ -857,7 +857,7 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
     await tx.update(attributedTranscriptionRuns).set({ status: "completed", coverageJson: json(coverage), updatedAt: new Date() }).where(eq(attributedTranscriptionRuns.meetingId, meetingId));
     // Canonical transcript, terminal state, and completion-delivery intent commit together.
     // Redis is deliberately only a wakeup; a later reconciliation safely resumes this row.
-    const intent = webhookDeliveryValues(completed, "meeting.completed", stored!);
+    const intent = webhookDeliveryValues(completed, "meeting.completed", stored!, ctx.config.needsHelpStateEnabled);
     if (intent) await tx.insert(webhookDeliveries).values(intent)
       .onConflictDoNothing({ target: [webhookDeliveries.meetingId, webhookDeliveries.eventType] });
     return { meeting: completed, version: stored!.version, webhook: true, deliveryId: intent?.id ?? null, ...(gapReport ? { gaps: gapReport } : {}), ...(unverified ? { unverifiedGapRows: unverified } : {}) } satisfies Publication;

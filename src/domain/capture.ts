@@ -104,3 +104,14 @@ export function captureObservation(vexa: VexaTranscriptionResponse, now = new Da
     })),
   };
 }
+
+/** Diagnostics a client may see. With needs_help disabled, raw needs_help is folded to awaiting_admission and escalation_reason is withheld; stored diagnostics stay raw. */
+export function clientCaptureView(diag: CaptureDiagnostics, needsHelpEnabled: boolean): CaptureDiagnostics {
+  if (needsHelpEnabled) return diag;
+  const foldRaw = <T extends string | null | undefined>(value: T): T | "awaiting_admission" =>
+    value === "needs_help" || value === "needs_human_help" ? "awaiting_admission" : value;
+  const view: CaptureDiagnostics = { ...diag, provider_status: foldRaw(diag.provider_status), failure_stage: foldRaw(diag.failure_stage) };
+  delete view.escalation_reason;
+  if (diag.transitions) view.transitions = diag.transitions.map((t) => ({ ...t, from: foldRaw(t.from), to: foldRaw(t.to) }));
+  return view;
+}
