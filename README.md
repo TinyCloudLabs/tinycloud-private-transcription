@@ -417,11 +417,19 @@ its existing `POST /v1/meetings` proxy accepts Signal URLs once production enabl
 ```bash
 phala status                                                    # confirm the intended workspace
 sudo docker compose -f infra/dstack/app-compose.yaml --env-file infra/dstack/.env config -q   # compose sanity
-phala deploy -n ptx-dev -c infra/dstack/app-compose.yaml -e infra/dstack/.env -t tdx.large --disk-size 40G --no-public-logs --no-public-sysinfo --wait
-phala cvms get ptx-dev --json | jq '{status, app_id, gateway}'
-# update in place (new image tag / env / compose):
-phala deploy --cvm-id ptx-dev -c infra/dstack/app-compose.yaml -e infra/dstack/.env --no-public-logs --no-public-sysinfo --wait
+phala deploy -n ptx-dev -c infra/dstack/app-compose.yaml -e infra/dstack/.env -t tdx.large --disk-size 40G --no-public-logs --no-public-sysinfo --no-dev-os --image dstack-0.5.12 --wait
+phala cvms get ptx-dev --json | jq '{status, app_id, gateway, os}'
+# update in place (new image tag / env / compose); refuses unless the CVM is on the production OS image:
+npm ci --ignore-scripts --no-audit --no-fund --prefix .github/scripts   # pinned phala CLI + SDK, once
+PHALA_CLOUD_API_KEY=... infra/dstack/deploy-ptx-dev.sh infra/dstack/.env
 ```
+
+`deploy-ptx-dev.sh` checks before and after the deploy that `ptx-dev` reports `.os.is_dev == false` on
+`dstack-0.5.12` (hash pinned in the script); the Phala KMS only releases the app keys to that image. It never
+changes the OS (`--image` is ignored for an existing CVM); set it by hand with
+`phala api -X PATCH /cvms/<id>/os-image -F os_image_name=dstack-0.5.12`. After the deploy it syncs the CVM's
+`allowed_envs` with the env file, since dstack drops sealed variables that are not on that list.
+Optional debug access and log shipping: [`infra/dstack/DEBUG.md`](infra/dstack/DEBUG.md).
 
 `tdx.large` (4 vCPU / 7.5 GB usable, ~$0.24/h incl. 40 GB disk) fits the control plane, one Signal seat, an
 on-demand Whisper small.en, and two Google Meet bots (`VEXA_MAX_CONCURRENT_BOTS=2`; each bot is ~1-1.2 GB). Whisper
