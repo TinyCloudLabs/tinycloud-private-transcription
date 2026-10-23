@@ -1,4 +1,4 @@
-/** Durable join-clock columns on a meeting row, plus the status that picks the window. */
+/** Durable join-clock timestamps from the meeting_join_clocks side row, plus the status that picks the window. */
 export type JoinClock = {
   status: string;
   createdAt: Date;

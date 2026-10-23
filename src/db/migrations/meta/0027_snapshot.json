@@ -1,5 +1,5 @@
 {
-  "id": "fdc3a9f3-ed71-4572-89e7-0ae9383c2eca",
+  "id": "9629e864-2be8-45fe-a20e-29046bc59716",
   "prevId": "ff1cc92a-5165-4656-9909-a933f0b0a938",
   "version": "7",
   "dialect": "postgresql",
@@ -532,6 +532,57 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
+    "public.meeting_join_clocks": {
+      "name": "meeting_join_clocks",
+      "schema": "",
+      "columns": {
+        "meeting_id": {
+          "name": "meeting_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "join_observed_at": {
+          "name": "join_observed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "join_deadline_at": {
+          "name": "join_deadline_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "dispatch_fallback_at": {
+          "name": "dispatch_fallback_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "meeting_join_clocks_meeting_id_meetings_id_fk": {
+          "name": "meeting_join_clocks_meeting_id_meetings_id_fk",
+          "tableFrom": "meeting_join_clocks",
+          "tableTo": "meetings",
+          "columnsFrom": [
+            "meeting_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
     "public.meetings": {
       "name": "meetings",
       "schema": "",
@@ -709,24 +760,6 @@
         },
         "deletion_provider_admitted_at": {
           "name": "deletion_provider_admitted_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "join_observed_at": {
-          "name": "join_observed_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "join_deadline_at": {
-          "name": "join_deadline_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "dispatch_fallback_at": {
-          "name": "dispatch_fallback_at",
           "type": "timestamp with time zone",
           "primaryKey": false,
           "notNull": false

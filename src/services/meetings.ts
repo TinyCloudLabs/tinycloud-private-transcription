@@ -1,13 +1,13 @@
 import { and, eq, inArray, isNotNull, isNull, ne, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { AppContext } from "../context.ts";
-import { attributedBatches, attributedTranscriptionRuns, meetings, transcripts, type MeetingRow, type TranscriptRow } from "../db/schema.ts";
+import { attributedBatches, attributedTranscriptionRuns, meetingJoinClocks, meetings, transcripts, type MeetingRow, type TranscriptRow } from "../db/schema.ts";
 import type { Db } from "../db/client.ts";
 import { ApiError, type ErrorCode, errorTypeFor } from "../domain/errors.ts";
 import { newMeetingId } from "../domain/ids.ts";
 import { detectPlatform, type Platform } from "../domain/platform.ts";
 import { canTransition, isTerminal, NEEDS_HELP_MESSAGE, type MeetingStatus } from "../domain/state.ts";
-import { JOIN_OPEN_STATUSES } from "../domain/join-deadline.ts";
+import type { JoinClock } from "../domain/join-deadline.ts";
 import type { NormalizedTranscript } from "../domain/transcript.ts";
 import { recordCapture } from "./capture.ts";
 import { resetRecordingRecovery } from "./recording-recovery.ts";
@@ -195,11 +195,6 @@ export async function transition(
   const now = new Date();
   const patch: Partial<typeof meetings.$inferInsert> = { status: to, ...extra };
   if (to === "in_progress" && !meeting.startedAt) patch.startedAt = now;
-  if (to === "in_progress") {
-    patch.joinObservedAt = null;
-    patch.joinDeadlineAt = null;
-    patch.dispatchFallbackAt = null;
-  }
   if ((to === "processing" || isTerminal(to)) && !meeting.endedAt) patch.endedAt = now;
   if (to === "completed") patch.completedAt = now;
   // The Signal fragment is only needed until a terminal worker result. It must not outlive capture.
@@ -216,25 +211,52 @@ export async function transition(
     .returning();
   // If another writer moved it first, re-read and report unchanged.
   if (!row) return { meeting: (await getMeetingById(ctx, meeting.id)) ?? meeting, changed: false };
+  if (to === "in_progress") {
+    // in_progress is outside the join deadline. Deleting the clock row keeps it from outliving the join.
+    await ctx.db.delete(meetingJoinClocks).where(eq(meetingJoinClocks.meetingId, meeting.id));
+  }
   ctx.log.info("meeting status changed", { meetingId: row.id, stage: "status_transition" });
   return { meeting: row, changed: true };
 }
 
+/** The join clock for a meeting. An absent side row reads as no observation yet. */
+export async function loadJoinClock(ctx: AppContext, meeting: MeetingRow): Promise<JoinClock> {
+  const [row] = await ctx.db.select().from(meetingJoinClocks).where(eq(meetingJoinClocks.meetingId, meeting.id)).limit(1);
+  return {
+    status: meeting.status,
+    createdAt: meeting.createdAt,
+    joinObservedAt: row?.joinObservedAt ?? null,
+    joinDeadlineAt: row?.joinDeadlineAt ?? null,
+    dispatchFallbackAt: row?.dispatchFallbackAt ?? null,
+  };
+}
+
+/** Sets the dispatch-time fallback. It governs only until a pre-admission state is observed. */
+export async function setDispatchFallback(ctx: AppContext, meetingId: string, dispatchFallbackAt: Date): Promise<void> {
+  await ctx.db
+    .insert(meetingJoinClocks)
+    .values({ meetingId, dispatchFallbackAt })
+    .onConflictDoUpdate({ target: meetingJoinClocks.meetingId, set: { dispatchFallbackAt } });
+}
+
 /**
- * Starts the join clock on the first observation of a pre-admission state. The guard means only
- * the first observation writes: repeated polls, restarts and lost jobs cannot move the deadline.
+ * Starts the join clock on the first observation of a pre-admission state. The conditional upsert
+ * writes only while no observation exists, so repeated polls, restarts and lost jobs cannot move the
+ * deadline. Returns true when this call started it. Callers gate on the meeting being join-open.
  */
-export async function startJoinClock(ctx: AppContext, meetingId: string, joinTimeoutSeconds: number): Promise<MeetingRow | undefined> {
+export async function startJoinClock(ctx: AppContext, meetingId: string, joinTimeoutSeconds: number): Promise<boolean> {
   const observedAt = new Date();
-  const [row] = await ctx.db
-    .update(meetings)
-    .set({
-      joinObservedAt: observedAt,
-      joinDeadlineAt: new Date(observedAt.getTime() + joinTimeoutSeconds * 1000),
+  const joinDeadlineAt = new Date(observedAt.getTime() + joinTimeoutSeconds * 1000);
+  const started = await ctx.db
+    .insert(meetingJoinClocks)
+    .values({ meetingId, joinObservedAt: observedAt, joinDeadlineAt })
+    .onConflictDoUpdate({
+      target: meetingJoinClocks.meetingId,
+      set: { joinObservedAt: observedAt, joinDeadlineAt },
+      setWhere: isNull(meetingJoinClocks.joinObservedAt),
     })
-    .where(and(eq(meetings.id, meetingId), isNull(meetings.joinObservedAt), inArray(meetings.status, [...JOIN_OPEN_STATUSES])))
-    .returning();
-  return row;
+    .returning({ meetingId: meetingJoinClocks.meetingId });
+  return started.length > 0;
 }
 
 /**
