@@ -31,7 +31,7 @@ describe("needs_help join window", () => {
     const id = (await r.json()).id;
     await h.waitFor(async () => ((await meetingOf(id)).status === "joining" ? true : null), { label: "joining" });
 
-    await h.vexa.control("jitsi", nativeId, { status: "needs_help" });
+    await h.vexa.control("jitsi", nativeId, { status: "needs_help", escalation_reason: "modal_dialog" });
     const blocked = await h.waitFor(
       async () => {
         const b = await meetingOf(id);
@@ -40,6 +40,7 @@ describe("needs_help join window", () => {
       { label: "needs_help" },
     );
     expect(blocked.status_message).toBe(NEEDS_HELP_MESSAGE);
+    expect(blocked.capture.escalation_reason).toBe("modal_dialog");
 
     const failed = await h.waitFor(
       async () => {
@@ -54,6 +55,7 @@ describe("needs_help join window", () => {
       { timeoutMs: 10000, label: "meeting.failed webhook" },
     );
     expect(hook.body.data.capture.provider_status).toBe("needs_help");
+    expect(hook.body.data.capture.escalation_reason).toBe("modal_dialog");
     await h.waitFor(async () => (h.vexa.requests.some((q) => q.method === "DELETE" && q.path === `/bots/jitsi/${encodeURIComponent(nativeId)}`) ? true : null), { label: "bot stop request" });
   });
 });
