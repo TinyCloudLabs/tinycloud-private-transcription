@@ -106,6 +106,11 @@ export function parseRole(value: string): PtxRole {
   return value;
 }
 
+/** NEEDS_HELP_STATE_ENABLED: only the exact literal "true" enables the client-visible needs_help state. Default off. */
+export function parseNeedsHelpStateFlag(value: string): boolean {
+  return value === "true";
+}
+
 export const config = {
   role: parseRole(env("PTX_ROLE", "meeting")),
   port: Number(env("PORT", "8080")),
@@ -173,8 +178,14 @@ export const config = {
   },
   /** Platforms accepted by POST /v1/meetings. Detection still recognizes all platforms; the rest are gated with 400 unsupported_platform. */
   enabledPlatforms: env("ENABLED_PLATFORMS", "jitsi").split(",").map((s) => s.trim()).filter(Boolean),
-  /** Worker-side join deadline: a meeting still joining/waiting_for_admission this long after bot dispatch is failed and its bot stopped. */
+  /** Worker-side join deadline: joinTimeoutSeconds after the first provider observation of a pre-admission state, the meeting is failed and its bot stopped. */
   joinTimeoutSeconds: Number(env("JOIN_TIMEOUT_SECONDS", "600")),
+  /** Fallback join deadline after dispatch; governs only while no pre-admission state has been observed. */
+  joinDispatchFallbackSeconds: Number(env("JOIN_DISPATCH_FALLBACK_SECONDS", "900")),
+  /** Maximum join-window extension from the first observation while the bot reports needs_help. */
+  joinNeedsHelpMaxSeconds: Number(env("JOIN_NEEDS_HELP_MAX_SECONDS", "1200")),
+  /** Client-visible needs_help state (status, status_message, escalation_reason). Off: raw needs_help is folded to waiting_for_admission in API, webhooks, and transcript output. The join clock still honours raw needs_help. */
+  needsHelpStateEnabled: parseNeedsHelpStateFlag(env("NEEDS_HELP_STATE_ENABLED", "false")),
   transcriptionProvider: env("TRANSCRIPTION_PROVIDER", "vexa") as TranscriptionProviderName,
   tinfoil: {
     baseUrl: env("TINFOIL_BASE_URL", "https://inference.tinfoil.sh"),

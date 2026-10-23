@@ -343,12 +343,14 @@ test("a lost tracked wakeup is re-pushed by the next heartbeat via orphan detect
 
   let dropContinuation = false;
   let loseWakeup = false;
+  let markerHeldAtLoss = false;
   const originalPush = h.ctx.queue.push.bind(h.ctx.queue);
   h.ctx.queue.push = async (job: Job, delayMs = 0) => {
     if (job.type === "meeting.start" && job.meetingId === meetingId) {
       if (job.startToken) {
         if (!dropContinuation) { dropContinuation = true; return; }
       } else if (job.wakeupId && !loseWakeup) {
+        markerHeldAtLoss = await h.ctx.queue.hasStartWakeup(meetingId);
         loseWakeup = true;
         return; // accepted-and-lost: marker claimed, job never lands
       }
@@ -358,7 +360,8 @@ test("a lost tracked wakeup is re-pushed by the next heartbeat via orphan detect
   try {
     await h.waitFor(async () => dropContinuation ? true : null, { timeoutMs: 3_000, label: "continuation dropped" });
     await h.waitFor(async () => loseWakeup ? true : null, { timeoutMs: 3_000, label: "wakeup lost after accept" });
-    expect(await h.ctx.queue.hasStartWakeup(meetingId)).toBe(true);
+    // Read at the loss instant: the marker is claimed before push. A later heartbeat repairs the orphan and may release it before any read here.
+    expect(markerHeldAtLoss).toBe(true);
     // Heartbeats run every 25 ms; orphan detection must re-arm the chain promptly.
     await h.waitFor(async () => (await h.ctx.queue.hasStartLease(meetingId)) ? true : null, { timeoutMs: 3_000, label: "orphan marker repaired" });
     const stopped = await h.api(`/v1/meetings/${meetingId}/stop`, { method: "POST" });

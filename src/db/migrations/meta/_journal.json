@@ -190,6 +190,13 @@
       "when": 1791949981616,
       "tag": "0026_vad_quiet_stats",
       "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1792757652192,
+      "tag": "0027_join_deadline_clock",
+      "breakpoints": true
     }
   ]
 }

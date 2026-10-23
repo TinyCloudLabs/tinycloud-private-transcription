@@ -35,6 +35,20 @@ export interface Harness {
   stop: () => Promise<void>;
 }
 
+/**
+ * Drives the mock bot once dispatch has created it. The mock bot appears asynchronously after POST, so a
+ * 404 means "not yet": returns null so waitFor retries. Any other failure is rethrown.
+ */
+export async function controlIfBotExists(h: Harness, platform: string, nativeMeetingId: string, body: Record<string, unknown>): Promise<true | null> {
+  try {
+    await h.vexa.control(platform, nativeMeetingId, body);
+    return true;
+  } catch (e) {
+    if (String(e).includes("404")) return null;
+    throw e;
+  }
+}
+
 export async function startHarness(
   opts: {
     webhookRetryDelaysMs?: number[];
@@ -43,6 +57,8 @@ export async function startHarness(
     log?: Logger;
     enabledPlatforms?: string[];
     joinTimeoutSeconds?: number;
+    joinDispatchFallbackSeconds?: number;
+    joinNeedsHelpMaxSeconds?: number;
     maxTimeLeftAloneMs?: number;
     signal?: SignalCaptureAdapter;
     signalCapabilityKey?: string;
@@ -60,6 +76,8 @@ export async function startHarness(
     /** Vexa 429 retry cadence and window at bot start (TC-902 review). */
     capacityRetryIntervalMs?: number;
     capacityRetryWindowMs?: number;
+    /** NEEDS_HELP_STATE_ENABLED; defaults to false (production default). */
+    needsHelpStateEnabled?: boolean;
   } = {},
 ): Promise<Harness> {
   const vexa = startMockVexa(0, opts.vexaMaxConcurrentBots !== undefined ? { maxConcurrentBots: opts.vexaMaxConcurrentBots } : {});
@@ -68,6 +86,8 @@ export async function startHarness(
     vexa: { ...baseConfig.vexa, baseUrl: vexa.baseUrl, apiKey: vexa.apiKey, pollIntervalMs: 50 },
     ...(opts.enabledPlatforms ? { enabledPlatforms: opts.enabledPlatforms } : {}),
     ...(opts.joinTimeoutSeconds !== undefined ? { joinTimeoutSeconds: opts.joinTimeoutSeconds } : {}),
+    ...(opts.joinDispatchFallbackSeconds !== undefined ? { joinDispatchFallbackSeconds: opts.joinDispatchFallbackSeconds } : {}),
+    ...(opts.joinNeedsHelpMaxSeconds !== undefined ? { joinNeedsHelpMaxSeconds: opts.joinNeedsHelpMaxSeconds } : {}),
     ...(opts.maxTimeLeftAloneMs !== undefined ? { vexa: { ...baseConfig.vexa, baseUrl: vexa.baseUrl, apiKey: vexa.apiKey, pollIntervalMs: 50, maxTimeLeftAloneMs: opts.maxTimeLeftAloneMs } } : {}),
     ...(opts.signalCapabilityKey || opts.signalMaxConcurrentCalls !== undefined
       ? { signal: { ...baseConfig.signal, ...(opts.signalCapabilityKey ? { capabilityKey: opts.signalCapabilityKey } : {}), ...(opts.signalMaxConcurrentCalls !== undefined ? { maxConcurrentCalls: opts.signalMaxConcurrentCalls } : {}) } }
@@ -79,6 +99,7 @@ export async function startHarness(
   if (opts.maxConcurrentBots !== undefined) config.vexa = { ...config.vexa, maxConcurrentBots: opts.maxConcurrentBots };
   if (opts.capacityRetryIntervalMs !== undefined) config.vexa = { ...config.vexa, capacityRetryIntervalMs: opts.capacityRetryIntervalMs };
   if (opts.capacityRetryWindowMs !== undefined) config.vexa = { ...config.vexa, capacityRetryWindowMs: opts.capacityRetryWindowMs };
+  if (opts.needsHelpStateEnabled !== undefined) config.needsHelpStateEnabled = opts.needsHelpStateEnabled;
   const db = await runMigrations(config.databaseUrl);
   // attributed_worker_readiness and tinfoil_dispatch_slots are included: a prior harness's stopped
   // worker stays "live" for the 15s staleness window and held slots would block this harness's
