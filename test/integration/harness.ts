@@ -43,6 +43,8 @@ export async function startHarness(
     log?: Logger;
     enabledPlatforms?: string[];
     joinTimeoutSeconds?: number;
+    joinDispatchFallbackSeconds?: number;
+    joinNeedsHelpMaxSeconds?: number;
     maxTimeLeftAloneMs?: number;
     signal?: SignalCaptureAdapter;
     signalCapabilityKey?: string;
@@ -68,6 +70,8 @@ export async function startHarness(
     vexa: { ...baseConfig.vexa, baseUrl: vexa.baseUrl, apiKey: vexa.apiKey, pollIntervalMs: 50 },
     ...(opts.enabledPlatforms ? { enabledPlatforms: opts.enabledPlatforms } : {}),
     ...(opts.joinTimeoutSeconds !== undefined ? { joinTimeoutSeconds: opts.joinTimeoutSeconds } : {}),
+    ...(opts.joinDispatchFallbackSeconds !== undefined ? { joinDispatchFallbackSeconds: opts.joinDispatchFallbackSeconds } : {}),
+    ...(opts.joinNeedsHelpMaxSeconds !== undefined ? { joinNeedsHelpMaxSeconds: opts.joinNeedsHelpMaxSeconds } : {}),
     ...(opts.maxTimeLeftAloneMs !== undefined ? { vexa: { ...baseConfig.vexa, baseUrl: vexa.baseUrl, apiKey: vexa.apiKey, pollIntervalMs: 50, maxTimeLeftAloneMs: opts.maxTimeLeftAloneMs } } : {}),
     ...(opts.signalCapabilityKey || opts.signalMaxConcurrentCalls !== undefined
       ? { signal: { ...baseConfig.signal, ...(opts.signalCapabilityKey ? { capabilityKey: opts.signalCapabilityKey } : {}), ...(opts.signalMaxConcurrentCalls !== undefined ? { maxConcurrentCalls: opts.signalMaxConcurrentCalls } : {}) } }

@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNotNull, ne, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, ne, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { AppContext } from "../context.ts";
 import { attributedBatches, attributedTranscriptionRuns, meetings, transcripts, type MeetingRow, type TranscriptRow } from "../db/schema.ts";
@@ -6,7 +6,8 @@ import type { Db } from "../db/client.ts";
 import { ApiError, type ErrorCode, errorTypeFor } from "../domain/errors.ts";
 import { newMeetingId } from "../domain/ids.ts";
 import { detectPlatform, type Platform } from "../domain/platform.ts";
-import { canTransition, isTerminal, type MeetingStatus } from "../domain/state.ts";
+import { canTransition, isTerminal, NEEDS_HELP_MESSAGE, type MeetingStatus } from "../domain/state.ts";
+import { JOIN_OPEN_STATUSES } from "../domain/join-deadline.ts";
 import type { NormalizedTranscript } from "../domain/transcript.ts";
 import { recordCapture } from "./capture.ts";
 import { resetRecordingRecovery } from "./recording-recovery.ts";
@@ -103,7 +104,7 @@ export async function createMeeting(
 }
 
 /** Statuses in which a non-Signal meeting holds, or is about to be given, a Vexa bot container. */
-const BOT_HOLDING_STATUSES = ["queued", "joining", "waiting_for_admission", "in_progress"] as const;
+const BOT_HOLDING_STATUSES = ["queued", "joining", "waiting_for_admission", "needs_help", "in_progress"] as const;
 const CAPACITY_RETRY_AFTER_SECONDS = 60;
 
 /**
@@ -194,6 +195,11 @@ export async function transition(
   const now = new Date();
   const patch: Partial<typeof meetings.$inferInsert> = { status: to, ...extra };
   if (to === "in_progress" && !meeting.startedAt) patch.startedAt = now;
+  if (to === "in_progress") {
+    patch.joinObservedAt = null;
+    patch.joinDeadlineAt = null;
+    patch.dispatchFallbackAt = null;
+  }
   if ((to === "processing" || isTerminal(to)) && !meeting.endedAt) patch.endedAt = now;
   if (to === "completed") patch.completedAt = now;
   // The Signal fragment is only needed until a terminal worker result. It must not outlive capture.
@@ -212,6 +218,23 @@ export async function transition(
   if (!row) return { meeting: (await getMeetingById(ctx, meeting.id)) ?? meeting, changed: false };
   ctx.log.info("meeting status changed", { meetingId: row.id, stage: "status_transition" });
   return { meeting: row, changed: true };
+}
+
+/**
+ * Starts the join clock on the first observation of a pre-admission state. The guard means only
+ * the first observation writes: repeated polls, restarts and lost jobs cannot move the deadline.
+ */
+export async function startJoinClock(ctx: AppContext, meetingId: string, joinTimeoutSeconds: number): Promise<MeetingRow | undefined> {
+  const observedAt = new Date();
+  const [row] = await ctx.db
+    .update(meetings)
+    .set({
+      joinObservedAt: observedAt,
+      joinDeadlineAt: new Date(observedAt.getTime() + joinTimeoutSeconds * 1000),
+    })
+    .where(and(eq(meetings.id, meetingId), isNull(meetings.joinObservedAt), inArray(meetings.status, [...JOIN_OPEN_STATUSES])))
+    .returning();
+  return row;
 }
 
 /**
@@ -261,7 +284,7 @@ export async function terminalTransition(
 }
 
 /** Statuses in which a meeting's Vexa bot is (or was just) in the call. */
-const LIVE_CAPTURE_STATUSES = ["joining", "waiting_for_admission", "in_progress", "processing"] as const;
+const LIVE_CAPTURE_STATUSES = ["joining", "waiting_for_admission", "needs_help", "in_progress", "processing"] as const;
 
 /**
  * Another meeting, in any project, that is capturing the same Vexa meeting. Vexa answers 409 when
@@ -578,6 +601,7 @@ export function serializeMeeting(m: MeetingRow, transcript: TranscriptRow | null
     completed_at: m.completedAt?.toISOString() ?? null,
     metadata: m.metadata ?? {},
     ...(m.captureDiagnostics ? { capture: m.captureDiagnostics } : {}),
+    ...(status === "needs_help" ? { status_message: NEEDS_HELP_MESSAGE } : {}),
     ...(transcript ? transcriptProviderFields(transcript) : {}),
     ...(status === "failed" && m.errorCode
       ? { error: { type: errorTypeFor(m.errorCode as ErrorCode), code: m.errorCode, message: m.errorMessage ?? "" } }

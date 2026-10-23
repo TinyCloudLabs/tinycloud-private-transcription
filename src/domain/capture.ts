@@ -13,6 +13,7 @@ export interface CaptureDiagnostics {
   completion_reason?: string | null;
   failure_stage?: string | null;
   failure_reason?: "browser_crashed" | "browser_closed";
+  needs_help_reason?: NeedsHelpReason | "unknown";
   exit_code?: number | null;
   observed_at?: string;
   started_at?: string | null;
@@ -30,8 +31,37 @@ const safeEnum = (value: unknown, allowed: Set<string>): string => typeof value 
 const reasonOf = (value: unknown): string | null => value == null ? null : safeEnum(value, reasons);
 const iso = (value: unknown): string | null => typeof value === "string" && Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : null;
 
+/** Blocking-state reasons a needs_help status may carry. Free-form provider text never passes. */
+export type NeedsHelpReason = "gemini_notice" | "unknown_blocking_dialog" | "consent_required" | "unknown_blocking_state";
+const NEEDS_HELP_REASONS: Record<NeedsHelpReason, true> = {
+  gemini_notice: true,
+  unknown_blocking_dialog: true,
+  consent_required: true,
+  unknown_blocking_state: true,
+};
+/** Provider field carrying the reason. Read defensively: absent until the Vexa side forwards it. */
+export const NEEDS_HELP_REASON_FIELD = "needs_help_reason";
+
+/** Type guard: true only for a member of the reason allowlist. */
+export function isNeedsHelpReason(value: unknown): value is NeedsHelpReason {
+  return typeof value === "string" && Object.hasOwn(NEEDS_HELP_REASONS, value);
+}
+
+/** Allowlist: any value outside NEEDS_HELP_REASONS becomes `unknown` and is never echoed. */
+export function allowlistNeedsHelpReason(value: unknown): NeedsHelpReason | "unknown" {
+  return isNeedsHelpReason(value) ? value : "unknown";
+}
+
+/** The reason only when the provider sent the field; absent means there is nothing to carry. */
+export function needsHelpReasonOf(vexa: VexaTranscriptionResponse): NeedsHelpReason | "unknown" | undefined {
+  const data: unknown = vexa.data;
+  const raw = data && typeof data === "object" && NEEDS_HELP_REASON_FIELD in data ? data[NEEDS_HELP_REASON_FIELD] : undefined;
+  return raw == null ? undefined : allowlistNeedsHelpReason(raw);
+}
+
 /** Allowlist the wire fields: data.last_error/error_details may contain private provider output. */
 export function captureObservation(vexa: VexaTranscriptionResponse, now = new Date()): CaptureDiagnostics {
+  const helpReason = vexa.status === "needs_help" || vexa.status === "needs_human_help" ? needsHelpReasonOf(vexa) : undefined;
   const code = vexa.data?.last_error?.exit_code;
   // Read the producer's discriminator only; the text after it is private provider output.
   const rawReason = vexa.data?.last_error?.reason;
@@ -44,6 +74,7 @@ export function captureObservation(vexa: VexaTranscriptionResponse, now = new Da
     completion_reason: reasonOf(completionReasonOf(vexa)),
     failure_stage: vexa.data?.failure_stage == null ? null : safeEnum(vexa.data.failure_stage, statuses),
     ...(failure && vexa.status === "failed" ? { failure_reason: failure as "browser_crashed" | "browser_closed" } : {}),
+    ...(helpReason ? { needs_help_reason: helpReason } : {}),
     exit_code: typeof code === "number" && Number.isSafeInteger(code) ? code : null,
     observed_at: now.toISOString(),
     started_at: iso(vexa.start_time),

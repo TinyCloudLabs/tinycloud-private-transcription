@@ -8,8 +8,8 @@ describe("mapVexaStatus", () => {
     expect(mapVexaStatus("awaiting_admission")).toBe("waiting_for_admission");
     expect(mapVexaStatus("active")).toBe("in_progress");
     // Real lifecycle.v1 enum value (docs/vexa-findings.md): needs_help. needs_human_help kept as alias.
-    expect(mapVexaStatus("needs_help")).toBe("waiting_for_admission");
-    expect(mapVexaStatus("needs_human_help")).toBe("waiting_for_admission");
+    expect(mapVexaStatus("needs_help")).toBe("needs_help");
+    expect(mapVexaStatus("needs_human_help")).toBe("needs_help");
     expect(mapVexaStatus("stopping")).toBe("processing");
     expect(mapVexaStatus("completed")).toBe("processing");
     expect(mapVexaStatus("failed")).toBe("failed");
@@ -27,9 +27,13 @@ describe("canTransition", () => {
     expect(canTransition("in_progress", "processing")).toBe(true);
     expect(canTransition("processing", "completed")).toBe(true);
     expect(canTransition("joining", "in_progress")).toBe(true);
+    expect(canTransition("joining", "needs_help")).toBe(true);
+    expect(canTransition("needs_help", "waiting_for_admission")).toBe(true);
+    expect(canTransition("needs_help", "in_progress")).toBe(true);
   });
   test("no regressions", () => {
     expect(canTransition("in_progress", "joining")).toBe(false);
+    expect(canTransition("needs_help", "joining")).toBe(false);
     expect(canTransition("processing", "in_progress")).toBe(false);
   });
   test("terminal states are sticky", () => {

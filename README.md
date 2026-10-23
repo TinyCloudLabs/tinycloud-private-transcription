@@ -172,7 +172,9 @@ See [TC-922 validation and limits](docs/tc-922-validation.md); hosted ASR timing
 | `SIGNAL_MAX_CONCURRENT_CALLS` | `1` | provisioned Signal Desktop seat count; production compose pins `1` |
 | `SIGNAL_PULSE_SOURCE` | `ptx_sink.monitor` in dstack | PulseAudio monitor captured by the isolated Signal seat |
 | `SIGNAL_TRANSCRIBER` | bundled dstack adapter | local WAV-to-JSON adapter using the in-CVM Whisper service |
-| `JOIN_TIMEOUT_SECONDS` | `600` | worker-side join deadline: a meeting still `joining`/`waiting_for_admission` this long after bot dispatch is failed (`meeting_join_failed`/`waiting_room_timeout`), its bot stopped, and `meeting.failed` emitted |
+| `JOIN_TIMEOUT_SECONDS` | `600` | join deadline, counted from the first poll that observes `joining`, `waiting_for_admission`, or `needs_help`. A meeting still open at the deadline is failed (`meeting_join_failed`/`waiting_room_timeout`), its bot stopped, and `meeting.failed` emitted |
+| `JOIN_DISPATCH_FALLBACK_SECONDS` | `900` | join deadline before any join status is observed, counted from bot dispatch |
+| `JOIN_NEEDS_HELP_MAX_SECONDS` | `1200` | while a meeting is `needs_help`, the join deadline is this many seconds after its first join observation |
 | `TRANSCRIPTION_PROVIDER` | `vexa` | Compatibility label; Vexa remains the primary provider and is reported by health. |
 | `TINFOIL_BASE_URL` | `https://inference.tinfoil.sh` | OpenAI-compatible confidential transcription endpoint used only for recovery. |
 | `TINFOIL_API_KEY` | – | bearer token; when set, enables recording retention and recovery transcription. |
@@ -258,7 +260,7 @@ Types in `src/providers/vexa/types.ts`; pure mapping in `src/providers/vexa/adap
   `segment_id` is `turn:N:<seq>` (confirmed; a turn can
   have several) or `turn:N:p<seq>` (draft) → drafts of a turn that has confirmed rows are dropped, ids are
   upserted (last wins), `completed:false` rows are dropped. `speaker` is the Jitsi display name.
-- Status map: `requested|joining→joining`, `awaiting_admission|needs_help→waiting_for_admission`,
+- Status map: `requested|joining→joining`, `awaiting_admission→waiting_for_admission`, `needs_help|needs_human_help→needs_help`,
   `active→in_progress`, `stopping|completed→processing` (then `completed` once our transcript is stored),
   `failed→failed`; `completion_reason` → our error codes (`src/domain/state.ts`).
 - `DELETE /bots/{p}/{id}` → 200 `{status:"stopping",meeting_id,native_meeting_id}`; 404 once no bot is active.

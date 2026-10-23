@@ -60,6 +60,12 @@ export const meetings = pgTable(
     deletionLeaseAt: timestamp("deletion_lease_at", { withTimezone: true }),
     /** Set immediately before an external delete. A replacement reconciles it, never repeats it. */
     deletionProviderAdmittedAt: timestamp("deletion_provider_admitted_at", { withTimezone: true }),
+    /** First pre-admission provider observation (or Signal dispatch). Set once; never moved by later updates. */
+    joinObservedAt: timestamp("join_observed_at", { withTimezone: true }),
+    /** Durable join deadline: joinObservedAt + JOIN_TIMEOUT_SECONDS. Survives worker restarts and lost jobs. */
+    joinDeadlineAt: timestamp("join_deadline_at", { withTimezone: true }),
+    /** Dispatch-time fallback deadline, consulted only while no join was ever observed. */
+    dispatchFallbackAt: timestamp("dispatch_fallback_at", { withTimezone: true }),
   },
   (t) => [
     uniqueIndex("meetings_project_idempotency_idx").on(t.projectId, t.idempotencyKey),
