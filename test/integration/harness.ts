@@ -35,6 +35,20 @@ export interface Harness {
   stop: () => Promise<void>;
 }
 
+/**
+ * Drives the mock bot once dispatch has created it. The mock bot appears asynchronously after POST, so a
+ * 404 means "not yet": returns null so waitFor retries. Any other failure is rethrown.
+ */
+export async function controlIfBotExists(h: Harness, platform: string, nativeMeetingId: string, body: Record<string, unknown>): Promise<true | null> {
+  try {
+    await h.vexa.control(platform, nativeMeetingId, body);
+    return true;
+  } catch (e) {
+    if (String(e).includes("404")) return null;
+    throw e;
+  }
+}
+
 export async function startHarness(
   opts: {
     webhookRetryDelaysMs?: number[];

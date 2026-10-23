@@ -49,6 +49,6 @@ describe("needs_help join window", () => {
       { timeoutMs: 8000, label: `meeting ${id} -> failed` },
     );
     expect(failed.error).toMatchObject({ type: "meeting_join_failed", code: "meeting_join_failed" });
-    expect(h.vexa.requests.some((q) => q.method === "DELETE" && q.path === `/bots/jitsi/${encodeURIComponent(nativeId)}`)).toBe(true);
+    await h.waitFor(async () => (h.vexa.requests.some((q) => q.method === "DELETE" && q.path === `/bots/jitsi/${encodeURIComponent(nativeId)}`) ? true : null), { label: "bot stop request" });
   });
 });

@@ -3,7 +3,7 @@ import type { MeetingRow } from "../db/schema.ts";
 import { ApiError } from "../domain/errors.ts";
 import type { Platform } from "../domain/platform.ts";
 import { isTerminal, mapVexaFailure, mapVexaStatus, type MeetingStatus } from "../domain/state.ts";
-import { effectiveJoinDeadline, isJoinOpen } from "../domain/join-deadline.ts";
+import { effectiveJoinDeadline, isJoinObservation, isJoinOpen, JOIN_DEADLINE_FAILURE } from "../domain/join-deadline.ts";
 import { VexaHttpError } from "../providers/vexa/client.ts";
 import { adaptVexaSegments, completionReasonOf } from "../providers/vexa/adapter.ts";
 import { toVexaPlatform } from "../providers/vexa/platform-map.ts";
@@ -231,11 +231,19 @@ export async function handleJoinDeadline(ctx: AppContext, meetingId: string): Pr
   await failJoinDeadline(ctx, meeting);
 }
 
-/** Fails a join attempt whose window has closed and stops its bot. Shared by the job and the poll. */
-async function failJoinDeadline(ctx: AppContext, meeting: MeetingRow): Promise<void> {
-  const status = meeting.status;
-  const stopping = await recordCapture(ctx, meeting, { stop_requested_at: new Date().toISOString(), stop_requested_by: "join_deadline" });
-  ctx.log.warn("join deadline exceeded; failing meeting", { meetingId: meeting.id, status });
+/**
+ * Fails a join attempt whose window has closed, then stops its bot. Returns whether this call failed
+ * the meeting. The failure runs first: its row lock re-checks that the meeting is still in the join-open
+ * status read here, and only a transition that lands stops the bot. A bot that went active in between is
+ * left running. Shared by the job and the poll.
+ */
+export async function failJoinDeadline(ctx: AppContext, meeting: MeetingRow): Promise<boolean> {
+  if (!isJoinOpen(meeting.status)) return false;
+  const f = JOIN_DEADLINE_FAILURE[meeting.status];
+  const { meeting: failed, changed } = await failMeeting(ctx, meeting, f.code, f.message);
+  if (!changed) return false;
+  const stopping = await recordCapture(ctx, failed, { stop_requested_at: new Date().toISOString(), stop_requested_by: "join_deadline" });
+  ctx.log.warn("join deadline exceeded; failing meeting", { meetingId: meeting.id, status: meeting.status });
   if (stopping.platform === "signal" && stopping.signalSessionId) {
     await ctx.signal.leave(stopping.signalSessionId).catch(() => {});
   } else if (stopping.vexaPlatform && stopping.vexaNativeMeetingId) {
@@ -243,12 +251,8 @@ async function failJoinDeadline(ctx: AppContext, meeting: MeetingRow): Promise<v
       if (!(e instanceof VexaHttpError && e.notFound)) ctx.log.warn("vexa stopBot failed at join deadline", { meetingId: meeting.id, stage: "join_deadline_stop", code: "provider_error" });
     });
   }
-  const f =
-    status === "waiting_for_admission"
-      ? { code: "waiting_room_timeout" as const, message: "The bot was not admitted to the meeting in time." }
-      : { code: "meeting_join_failed" as const, message: "The bot could not join the meeting in time." };
-  const { meeting: failed, changed } = await failMeeting(ctx, stopping, f.code, f.message);
-  if (changed) await enqueueMeetingWebhook(ctx, failed, "meeting.failed");
+  await enqueueMeetingWebhook(ctx, stopping, "meeting.failed");
+  return true;
 }
 
 /** Job: meeting.poll — sync status from Vexa; finalize when the bot has left. */
@@ -374,15 +378,15 @@ async function pollMeeting(ctx: AppContext, meeting: MeetingRow, recoveryAttempt
     const { meeting: updated } = await transition(ctx, meeting, mapped);
     meeting = updated;
     let clock = await loadJoinClock(ctx, meeting);
-    if (isJoinOpen(meeting.status) && !clock.joinObservedAt && (await startJoinClock(ctx, meeting.id, ctx.config.joinTimeoutSeconds))) {
-      // The first pre-admission observation starts the join clock. The job pushed here backstops a stalled poll chain.
+    if (isJoinOpen(meeting.status) && !clock.joinObservedAt && isJoinObservation(vexa.status) && (await startJoinClock(ctx, meeting.id, ctx.config.joinTimeoutSeconds))) {
+      // The first raw pre-admission observation starts the join clock; `requested` does not. The job pushed here backstops a stalled poll chain.
       await ctx.queue.push({ type: "meeting.join_deadline", meetingId: meeting.id }, ctx.config.joinTimeoutSeconds * 1000);
       clock = await loadJoinClock(ctx, meeting);
     }
     // The poll enforces the window as well as the job, so a return from needs_help cannot outlive it.
     if (isJoinOpen(meeting.status) && effectiveJoinDeadline(clock, ctx.config).getTime() <= Date.now()) {
-      await failJoinDeadline(ctx, meeting);
-      return;
+      // Return only when this poll failed the meeting; a meeting that moved on under the lock keeps polling.
+      if (await failJoinDeadline(ctx, meeting)) return;
     }
     await continuePoll(ctx.config.vexa.pollIntervalMs);
     return;

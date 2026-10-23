@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { effectiveJoinDeadline, isJoinOpen, type JoinClock, type JoinWindows } from "../../src/domain/join-deadline.ts";
+import { effectiveJoinDeadline, isJoinObservation, isJoinOpen, JOIN_DEADLINE_FAILURE, type JoinClock, type JoinWindows } from "../../src/domain/join-deadline.ts";
 
 // Pure function: instants are explicit, so no timers are needed.
 const windows: JoinWindows = { joinDispatchFallbackSeconds: 900, joinNeedsHelpMaxSeconds: 1200 };
@@ -67,5 +67,40 @@ describe("isJoinOpen", () => {
     expect(isJoinOpen("toString")).toBe(false);
     expect(isJoinOpen("constructor")).toBe(false);
     expect(isJoinOpen("__proto__")).toBe(false);
+  });
+});
+
+describe("isJoinObservation", () => {
+  test("raw pre-admission Vexa statuses start the join clock", () => {
+    expect(isJoinObservation("joining")).toBe(true);
+    expect(isJoinObservation("awaiting_admission")).toBe(true);
+    expect(isJoinObservation("needs_help")).toBe(true);
+    expect(isJoinObservation("needs_human_help")).toBe(true);
+  });
+
+  test("requested never starts the clock; a late-booting bot is not failed on requested", () => {
+    expect(isJoinObservation("requested")).toBe(false);
+  });
+
+  test("admitted, terminal and unknown statuses do not start the clock", () => {
+    expect(isJoinObservation("active")).toBe(false);
+    expect(isJoinObservation("completed")).toBe(false);
+    expect(isJoinObservation("unknown")).toBe(false);
+  });
+
+  test("inherited prototype keys are not observations", () => {
+    expect(isJoinObservation("toString")).toBe(false);
+    expect(isJoinObservation("__proto__")).toBe(false);
+  });
+});
+
+describe("JOIN_DEADLINE_FAILURE", () => {
+  test("waiting_for_admission times out as waiting_room_timeout", () => {
+    expect(JOIN_DEADLINE_FAILURE.waiting_for_admission.code).toBe("waiting_room_timeout");
+  });
+
+  test("joining and needs_help fail as meeting_join_failed", () => {
+    expect(JOIN_DEADLINE_FAILURE.joining.code).toBe("meeting_join_failed");
+    expect(JOIN_DEADLINE_FAILURE.needs_help.code).toBe("meeting_join_failed");
   });
 });

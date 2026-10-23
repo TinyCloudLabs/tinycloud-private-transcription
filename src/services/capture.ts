@@ -38,7 +38,7 @@ export async function observeCapture(ctx: AppContext, meeting: MeetingRow, vexa:
     || (next.failure_reason != null && previous?.failure_reason !== next.failure_reason)
     || (next.completion_reason != null && previous?.completion_reason !== next.completion_reason)
     || (next.exit_code != null && previous?.exit_code !== next.exit_code)
-    || (next.needs_help_reason != null && previous?.needs_help_reason !== next.needs_help_reason);
+    || (next.escalation_reason != null && previous?.escalation_reason !== next.escalation_reason);
   const heartbeatDue = !previous?.observed_at || Date.now() - Date.parse(previous.observed_at) >= 60_000;
   if (!changed && !heartbeatDue) return meeting;
   const updated = await recordCapture(ctx, meeting, next);

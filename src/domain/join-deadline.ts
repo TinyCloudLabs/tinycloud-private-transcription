@@ -16,14 +16,37 @@ export type JoinWindows = {
 
 /** Pre-admission statuses where the join attempt is still open and the deadline is enforceable. */
 export const JOIN_OPEN_STATUSES = ["joining", "waiting_for_admission", "needs_help"] as const;
-const JOIN_OPEN: Record<(typeof JOIN_OPEN_STATUSES)[number], true> = {
+export type JoinOpenStatus = (typeof JOIN_OPEN_STATUSES)[number];
+const JOIN_OPEN: Record<JoinOpenStatus, true> = {
   joining: true,
   waiting_for_admission: true,
   needs_help: true,
 };
 
 /** Own-property check, so inherited keys such as "toString" are not open statuses. */
-export const isJoinOpen = (status: string): boolean => Object.hasOwn(JOIN_OPEN, status);
+export const isJoinOpen = (status: string): status is JoinOpenStatus => Object.hasOwn(JOIN_OPEN, status);
+
+/**
+ * Raw Vexa statuses that prove the bot reached the join flow. These, and only these, start the join
+ * clock. `requested` is excluded: the bot has been asked to join but has not reached the meeting, so a
+ * late-booting bot must not burn the window before it does.
+ */
+const JOIN_OBSERVED_VEXA: Record<string, true> = {
+  joining: true,
+  awaiting_admission: true,
+  needs_help: true,
+  needs_human_help: true,
+};
+
+/** Own-property check on the raw Vexa status. Unknown or future values do not start the clock. */
+export const isJoinObservation = (vexaStatus: string): boolean => Object.hasOwn(JOIN_OBSERVED_VEXA, vexaStatus);
+
+/** Failure code and copy for a join window that closed while the meeting was in this state. Copy names the bot, never the host. */
+export const JOIN_DEADLINE_FAILURE: Record<JoinOpenStatus, { code: "waiting_room_timeout" | "meeting_join_failed"; message: string }> = {
+  waiting_for_admission: { code: "waiting_room_timeout", message: "The bot was not admitted to the meeting in time." },
+  joining: { code: "meeting_join_failed", message: "The bot did not finish joining the meeting in time." },
+  needs_help: { code: "meeting_join_failed", message: "The bot was blocked on a join prompt it could not clear in time." },
+};
 
 const addSeconds = (from: Date, n: number) => new Date(from.getTime() + n * 1000);
 
