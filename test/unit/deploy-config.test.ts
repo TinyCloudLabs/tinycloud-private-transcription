@@ -95,7 +95,7 @@ describe("infra/dstack/app-compose.yaml", () => {
       minio: "ghcr.io/tinycloudlabs/mirror/minio:RELEASE.2025-09-07T16-13-09Z@sha256:25e301eb686e796ead885d0e254cc6397424df7d7a79cee48ff08b720570ced6",
       "minio-init": "ghcr.io/tinycloudlabs/mirror/minio-mc:RELEASE.2025-08-13T08-35-41Z@sha256:4545427b5ba8e7553be881a34db1706dc9b307cbd13e6c9fe9b58faba9d2f380",
       "admin-api": "vexaai/v012-admin-api:v012@sha256:4c702354384eafe3a933cd537a106b7c15067cfd368a5f6da1a6e675e7e03e04",
-      "bot-image-keeper": "ghcr.io/tinycloudlabs/vexa/bot:tc-60ff031@sha256:235060814ce9b32cb3132d233ec538d7433f18bb31a09a4b582aef05594c7b32",
+      "bot-image-keeper": "ghcr.io/tinycloudlabs/vexa/bot:tc-6d44cb4@sha256:efa1e11d9fafc74fdf398a29905b96262ce91002d9d3fdac1159898017d9e8b7",
       "bot-janitor": "docker:27.5.1-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c",
       runtime: "vexaai/v012-runtime:v012@sha256:a1f6448fbb380b9433364e8b572ec25a12aa4f274bf403f1d83a89cbf5812f2d",
       whisper: "fedirz/faster-whisper-server:latest-cpu@sha256:760e5e43d427dc6cfbbc4731934b908b7de9c7e6d5309c6a1f0c8c923a5b6030",
@@ -111,7 +111,7 @@ describe("infra/dstack/app-compose.yaml", () => {
 
     const runtime = serviceEnv("runtime");
     expect(runtime).toContain(
-      "BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-60ff031@sha256:235060814ce9b32cb3132d233ec538d7433f18bb31a09a4b582aef05594c7b32}",
+      "BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-6d44cb4@sha256:efa1e11d9fafc74fdf398a29905b96262ce91002d9d3fdac1159898017d9e8b7}",
     );
     expect(runtime).toContain(
       "AGENT_IMAGE: ${VEXA_AGENT_IMAGE:-vexaai/v012-agent-api:v012@sha256:6eb37574b33aab233aabbe5907e06e106bae44a403e5df781a436da8201a928d}",
