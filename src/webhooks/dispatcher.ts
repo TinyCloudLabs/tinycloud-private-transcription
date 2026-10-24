@@ -2,6 +2,8 @@ import { and, eq, inArray, isNotNull, lte, lt } from "drizzle-orm";
 import type { AppContext } from "../context.ts";
 import { meetings, projects, webhookDeliveries, type MeetingRow, type TranscriptRow } from "../db/schema.ts";
 import { newDeliveryId, newEventId } from "../domain/ids.ts";
+import { clientCaptureView } from "../domain/capture.ts";
+import { clientStatus, type MeetingStatus } from "../domain/state.ts";
 import { getTranscript, transcriptProviderFields } from "../services/meetings.ts";
 import { signWebhookBody, WEBHOOK_SIGNATURE_HEADER } from "./signature.ts";
 
@@ -12,7 +14,7 @@ const WEBHOOK_REQUEST_TIMEOUT_MS = 10_000;
 const WEBHOOK_LEASE_MS = WEBHOOK_REQUEST_TIMEOUT_MS + 20_000;
 
 /** The immutable event is constructed before its transaction commits. */
-export function webhookDeliveryValues(meeting: MeetingRow, type: WebhookEventType, transcript: TranscriptRow | null) {
+export function webhookDeliveryValues(meeting: MeetingRow, type: WebhookEventType, transcript: TranscriptRow | null, needsHelpEnabled: boolean) {
   if (!meeting.webhookUrl) return null;
   const event = {
     id: newEventId(),
@@ -20,9 +22,9 @@ export function webhookDeliveryValues(meeting: MeetingRow, type: WebhookEventTyp
     created_at: new Date().toISOString(),
     data: {
       meeting_id: meeting.id,
-      status: meeting.status,
+      status: clientStatus(meeting.status as MeetingStatus, needsHelpEnabled),
       metadata: meeting.metadata ?? {},
-      ...(meeting.captureDiagnostics ? { capture: meeting.captureDiagnostics } : {}),
+      ...(meeting.captureDiagnostics ? { capture: clientCaptureView(meeting.captureDiagnostics, needsHelpEnabled) } : {}),
       ...(transcript ? transcriptProviderFields(transcript) : {}),
       ...(type === "meeting.failed" && meeting.errorCode
         ? { error: { code: meeting.errorCode, message: meeting.errorMessage ?? "" } }
@@ -39,7 +41,7 @@ export function webhookDeliveryValues(meeting: MeetingRow, type: WebhookEventTyp
 /** Builds the event, persists a pending delivery intent, and wakes the first attempt. No-op without webhook_url. */
 export async function enqueueMeetingWebhook(ctx: AppContext, meeting: MeetingRow, type: WebhookEventType) {
   const transcript = type === "meeting.completed" ? await getTranscript(ctx, meeting.id) : null;
-  const values = webhookDeliveryValues(meeting, type, transcript);
+  const values = webhookDeliveryValues(meeting, type, transcript, ctx.config.needsHelpStateEnabled);
   if (!values) return null;
   await ctx.db.insert(webhookDeliveries).values(values)
     .onConflictDoNothing({ target: [webhookDeliveries.meetingId, webhookDeliveries.eventType] });

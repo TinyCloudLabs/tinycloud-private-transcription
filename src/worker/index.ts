@@ -82,7 +82,7 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number; hea
   // orphaned lease expires on its own and the next heartbeat starts a fresh chain.
   const reconcileMeetingWakeups = async () => {
     const rows = await ctx.db.select().from(meetings).where(inArray(meetings.status, [
-      "queued", "joining", "waiting_for_admission", "in_progress", "processing",
+      "queued", "joining", "waiting_for_admission", "needs_help", "in_progress", "processing",
     ]));
     // Attributed Google Meet meetings that already own a run are driven by attributed batch/finalize
     // jobs and reconcileAttributedRuns. One still in staging retries has no run yet and needs this

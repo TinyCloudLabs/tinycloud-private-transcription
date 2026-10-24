@@ -203,6 +203,7 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       attributed_audio_manifest?: AttributedManifest;
       attributed_audio_base64?: Record<string, string>;
       attributed_audio_capability?: { requested_version: 1; supported_version: 1; status: "supported" };
+      escalation_reason?: string;
     };
     if (body.recording_base64 !== undefined) m.recording = { bytes: new Uint8Array(Buffer.from(body.recording_base64, "base64")), contentType: body.recording_content_type ?? "audio/wav" };
     if (body.transcript_missing !== undefined) m.transcript_missing = body.transcript_missing;
@@ -235,6 +236,7 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
     if (body.end_time !== undefined) m.end_time = body.end_time;
     if (body.attributed_audio_manifest !== undefined) m.attributed_audio_manifest = body.attributed_audio_manifest;
     if (body.attributed_audio_capability !== undefined) m.data = { ...m.data, attributed_audio_capability: body.attributed_audio_capability };
+    if (body.escalation_reason !== undefined) m.data = { ...m.data, escalation_reason: body.escalation_reason };
     if (body.attributed_audio_base64 !== undefined) {
       m.attributed_audio = new Map(Object.entries(body.attributed_audio_base64).map(([path, data]) => [path, new Uint8Array(Buffer.from(data, "base64"))]));
     }
