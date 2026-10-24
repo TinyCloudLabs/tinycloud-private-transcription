@@ -1,14 +1,15 @@
 # dstack / Phala CVM app-compose for tinycloud-private-transcription (V1).
 # ONE CVM runs: our api + worker + postgres + redis, and the pinned TinyCloud Vexa capture stack
-# (control plane + CPU whisper) that spawns meeting bots. Deploy:
-#   phala deploy -n ptx-dev -c infra/dstack/app-compose.yaml -e infra/dstack/.env -t tdx.large --disk-size 40G --no-public-logs
+# (control plane + CPU whisper) that spawns meeting bots. Update with infra/dstack/deploy-ptx-dev.sh,
+# which refuses unless the CVM runs the pinned production OS image (README "Deploy / update").
 # Encrypted env (never in this file): POSTGRES_PASSWORD, VEXA_DB_PASSWORD, VEXA_ADMIN_TOKEN,
 # VEXA_INTERNAL_API_SECRET, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD,
 # TRANSCRIPTION_PROVIDER (PTX compatibility label; does not configure Vexa's STT endpoint),
 # VEXA_ADMIN_IMAGE / VEXA_RUNTIME_IMAGE / VEXA_AGENT_IMAGE / VEXA_AGENT_WORKER_IMAGE
 # (digest-pinned v012 upstream components),
 # PTX_BOT_IMAGE (fork bot image override; defaults to the pinned fork image below),
-# PTX_BOOTSTRAP_KEYS (optional hashed API keys for the api service; see .env.example).
+# PTX_BOOTSTRAP_KEYS (optional hashed API keys for the api service; see .env.example),
+# BETTERSTACK_SOURCE_TOKEN (debug-log-shipper; infra/dstack/DEBUG.md).
 # The PTX API/worker and Signal Desktop seat images are immutable production pins in this
 # file, not sealed-environment overrides. Signal profile volumes are deliberately persistent:
 # linking each Signal account is an operator action, never a deployment side effect.
@@ -573,6 +574,189 @@ services:
     networks: [vexa]
     restart: on-failure
 
+  # ─── optional debug access and log shipping (infra/dstack/DEBUG.md) ──────────────────────────
+  # Remove these four services and their two volumes with a follow-up deploy when no longer needed.
+
+  # Copies the static docker CLI and compose plugin from the pinned docker CLI image for debug-ssh.
+  debug-ssh-tools:
+    image: docker:27.5.1-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["cp /usr/local/bin/docker /usr/local/libexec/docker/cli-plugins/docker-compose /tools/"]
+    volumes:
+      - debug-ssh-tools:/tools
+    network_mode: none
+    restart: "no"
+
+  # Key-only SSH for operators, reached through the dstack gateway's TLS-terminated route
+  # <app_id>-2222.<gateway base_domain>:443. The one authorized public key is inlined below, so it is
+  # part of the measured compose; without exactly one valid key the container refuses to start (and
+  # restarts in a back-off loop), so nothing listens on 2222. The key holder is root-equivalent on the
+  # CVM: the docker socket controls every container and /dstack/.decrypted-env holds every sealed value.
+  debug-ssh:
+    image: ghcr.io/linuxserver/openssh-server:10.3_p1-r1-ls239@sha256:0f535b0faa7448511b23528165e9fbd4f1fe563b861b3dcaa5ddb0ddbfe2254c
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        umask 077
+        key="$$DEBUG_SSH_AUTHORIZED_KEY"
+        unset DEBUG_SSH_AUTHORIZED_KEY
+        case "$$key" in ''|REPLACE_AT_DEPLOY) echo "debug-ssh: DEBUG_SSH_AUTHORIZED_KEY is not set in app-compose.yaml; refusing to start"; exit 1;; esac
+        mkdir -p /root/.ssh /etc/ssh/hostkeys
+        printf '%s\n' "$$key" > /root/.ssh/authorized_keys
+        if [ "$$(wc -l < /root/.ssh/authorized_keys)" -ne 1 ] || ! ssh-keygen -l -f /root/.ssh/authorized_keys; then
+          rm -f /root/.ssh/authorized_keys
+          echo "debug-ssh: DEBUG_SSH_AUTHORIZED_KEY must be exactly one public key; refusing to start"
+          exit 1
+        fi
+        [ -s /etc/ssh/hostkeys/ssh_host_ed25519_key ] || ssh-keygen -q -t ed25519 -N '' -f /etc/ssh/hostkeys/ssh_host_ed25519_key
+        echo "debug-ssh: host key $$(ssh-keygen -l -f /etc/ssh/hostkeys/ssh_host_ed25519_key.pub)"
+        # root has no password ("*"); a "!" lock would also refuse key logins.
+        sed -i 's/^root:!:/root:*:/' /etc/shadow
+        ln -sf /opt/debug-tools/docker /usr/local/bin/docker
+        mkdir -p /usr/local/libexec/docker/cli-plugins
+        ln -sf /opt/debug-tools/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
+        # `dstack-compose ARGS` = `docker compose ARGS` on this CVM's project, with its sealed env.
+        printf '%s\n' '#!/bin/sh' 'set -eu' 'set -a; . /dstack/.decrypted-env; set +a' \
+          'exec docker compose -p dstack -f /dstack/docker-compose.yaml "$$@"' > /usr/local/bin/dstack-compose
+        chmod 755 /usr/local/bin/dstack-compose
+        printf '%s\n' 'Port 2222' 'HostKey /etc/ssh/hostkeys/ssh_host_ed25519_key' \
+          'AllowUsers root' 'PermitRootLogin prohibit-password' 'AuthenticationMethods publickey' \
+          'PubkeyAuthentication yes' 'AuthorizedKeysFile /root/.ssh/authorized_keys' \
+          'PasswordAuthentication no' 'KbdInteractiveAuthentication no' 'PermitEmptyPasswords no' 'UsePAM no' \
+          'AllowTcpForwarding no' 'AllowAgentForwarding no' 'AllowStreamLocalForwarding no' \
+          'X11Forwarding no' 'PermitTunnel no' 'PermitUserEnvironment no' \
+          'MaxAuthTries 3' 'LoginGraceTime 30' 'LogLevel VERBOSE' > /etc/ssh/sshd_config.debug
+        exec /usr/sbin/sshd.pam -D -e -f /etc/ssh/sshd_config.debug
+    environment:
+      # Public key only (one line: ssh-ed25519 AAAA... name). Replaced in the deploy commit; the
+      # placeholder fails closed.
+      DEBUG_SSH_AUTHORIZED_KEY: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPVhzzspv9XwQOZP6hAInSomSA86ROTtVZBz2tQ9DZDv ptx-dev-debug (Amos, 2026-10-23)"
+    ports:
+      - "2222:2222"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /dstack/docker-compose.yaml:/dstack/docker-compose.yaml:ro
+      - /dstack/.host-shared/.decrypted-env:/dstack/.decrypted-env:ro
+      - debug-ssh-tools:/opt/debug-tools:ro
+      - debug-ssh-hostkeys:/etc/ssh/hostkeys
+    depends_on:
+      debug-ssh-tools:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Ships the stdout/stderr of an ALLOWLIST of containers to the Better Stack source ptx-dev: meeting
+  # bots (container name vexa-mtg-*, not compose services) and the compose services meeting-api,
+  # gateway, api, worker, probe and debug-ssh (label com.docker.compose.service). Every other container
+  # is dropped in the `allowlist` filter (DEBUG.md "What is shipped"). The ingest-only token comes from
+  # the sealed env, is written to a tmpfs file and removed from the environment before Vector starts;
+  # without it the container logs one fixed line and idles (no crash loop); log shipping stays off.
+  debug-log-shipper:
+    image: timberio/vector:0.59.0-alpine@sha256:0e36bc2a290039e9b6a5e92f04bd2f133223506f72d09682c1df16c015172b7a
+    init: true
+    user: "0:0"   # owner access to the docker socket; every capability is dropped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    memswap_limit: 128m
+    environment:
+      BETTERSTACK_SOURCE_TOKEN: ${BETTERSTACK_SOURCE_TOKEN:-}
+      VECTOR_CONFIG_YAML: |
+        data_dir: /var/lib/vector
+        secret:
+          local_directory:
+            type: directory
+            path: /run/vector-secrets
+            remove_trailing_whitespace: true
+        sources:
+          containers:
+            type: docker_logs
+            exclude_containers: [dstack-debug-log-shipper-]
+        transforms:
+          allowlist:
+            type: filter
+            inputs: [containers]
+            condition: |
+              service = string(.label."com.docker.compose.service") ?? ""
+              name = string(.container_name) ?? ""
+              includes(["meeting-api", "gateway", "api", "worker", "probe", "debug-ssh"], service) || starts_with(name, "vexa-mtg-")
+          shaped:
+            type: remap
+            inputs: [allowlist]
+            source: |
+              . = {"dt": .timestamp, "container": .container_name, "image": .image, "stream": .stream, "message": .message}
+        sinks:
+          betterstack:
+            type: http
+            inputs: [shaped]
+            method: post
+            uri: "https://s2795440.us-west-2a.betterstackdata.com/"
+            encoding: { codec: json }
+            compression: gzip
+            auth: { strategy: bearer, token: "SECRET[local_directory.betterstack_source_token]" }
+            batch: { max_bytes: 4000000, timeout_secs: 5 }
+            buffer: { type: memory, max_events: 1000, when_full: drop_newest }
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        umask 077
+        [ -n "$${BETTERSTACK_SOURCE_TOKEN}" ] || { echo 'log shipping idle: no BETTERSTACK_SOURCE_TOKEN'; while :; do sleep 86400; done; }
+        printf '%s' "$${BETTERSTACK_SOURCE_TOKEN}" > /run/vector-secrets/betterstack_source_token
+        unset BETTERSTACK_SOURCE_TOKEN
+        printf '%s\n' "$${VECTOR_CONFIG_YAML}" > /var/lib/vector/vector.yaml
+        unset VECTOR_CONFIG_YAML
+        exec vector --config /var/lib/vector/vector.yaml
+    tmpfs:
+      - /var/lib/vector:mode=0700,size=16m
+      - /run/vector-secrets:mode=0700,size=1m
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+  # Read-only status probe, run on demand only (`compose up` never starts a profile service).
+  # PROBE_MEETING_IDS = comma-separated Vexa meeting ids. Prints one JSON line per database to
+  # stdout, which debug-log-shipper carries to Better Stack. No meeting URLs or content columns.
+  probe:
+    image: postgres:17-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
+    profiles: ["probe"]
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        ids="$$PROBE_MEETING_IDS"
+        case "$$ids" in ''|,*|*,|*,,*|*[!0-9,]*) echo "probe: PROBE_MEETING_IDS must be comma-separated meeting ids" >&2; exit 2;; esac
+        export PGOPTIONS='-c default_transaction_read_only=on -c statement_timeout=5000' PGCONNECT_TIMEOUT=5
+        PGPASSWORD="$$PTX_DB_PASSWORD" psql -X -q -At -v ON_ERROR_STOP=1 -v ids="$$ids" -h postgres -U ptx -d ptx <<'SQL'
+        SELECT jsonb_build_object('probe', 'ptx', 'ids', :'ids', 'rows', COALESCE(jsonb_agg(to_jsonb(t) ORDER BY t.created_at), '[]'::jsonb))
+        FROM (
+          SELECT id, status, error_code, platform, vexa_meeting_id, created_at, started_at, ended_at,
+                 capture_diagnostics->>'provider_status'   AS provider_status,
+                 capture_diagnostics->>'completion_reason' AS completion_reason,
+                 capture_diagnostics->>'failure_stage'     AS failure_stage,
+                 capture_diagnostics->'transitions'        AS transitions,
+                 capture_diagnostics->>'stop_requested_by' AS stop_requested_by
+          FROM meetings
+          WHERE vexa_meeting_id = ANY (string_to_array(:'ids', ',')::int[])
+        ) t;
+        SQL
+        PGPASSWORD="$$VEXA_DB_PASSWORD" psql -X -q -At -v ON_ERROR_STOP=1 -v ids="$$ids" -h vexa-postgres -U postgres -d vexa <<'SQL'
+        SELECT jsonb_build_object('probe', 'vexa', 'ids', :'ids', 'rows', COALESCE(jsonb_agg(to_jsonb(t) ORDER BY t.id), '[]'::jsonb))
+        FROM (
+          SELECT id, platform, status, created_at, start_time, end_time,
+                 data->'status_transition'  AS transitions,
+                 data->>'completion_reason' AS completion_reason,
+                 data->>'failure_stage'     AS failure_stage,
+                 data->'join_evidence'      AS join_evidence
+          FROM meetings
+          WHERE id = ANY (string_to_array(:'ids', ',')::int[])
+        ) t;
+        SQL
+    environment:
+      PROBE_MEETING_IDS: ${PROBE_MEETING_IDS:-}
+      PTX_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      VEXA_DB_PASSWORD: ${VEXA_DB_PASSWORD}
+    networks: [ptx, vexa]
+    restart: "no"
+
 volumes:
   ptx-postgres:
   ptx-redis:
@@ -588,6 +772,8 @@ volumes:
   # Legacy seat-1 health volume name is retained across in-place upgrades.
   signal-health:
   signal-control-1:
+  debug-ssh-tools:
+  debug-ssh-hostkeys:
 
 networks:
   ptx: {}
@@ -607,4 +793,5 @@ networks:
 # - Disk (TC-904): GET /health → checks.disk; the worker logs "disk usage above high-water mark" at
 #   DISK_HIGH_WATER_PERCENT (80). `docker exec <worker> bun run src/cli.ts artifact-retention` prints the
 #   MinIO retention plan per Vexa meeting without deleting; the bot-janitor logs what it removes.
-# - Egress: bots join public meetings over the CVM's NAT; only :8080 (our API) is published.
+# - Egress: bots join public meetings over the CVM's NAT. Published: :8080 (our API) and, while the debug
+#   sidecars are deployed, :2222 (debug-ssh, key-only).

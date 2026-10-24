@@ -56,7 +56,7 @@ describe("infra/dstack/app-compose.yaml", () => {
     );
     expect(rendered.exitCode).toBe(0);
     const services = Object.values(JSON.parse(rendered.stdout.toString()).services) as Array<Record<string, unknown>>;
-    expect(services.length).toBe(19);
+    expect(services.length).toBe(22);
     for (const service of services) {
       expect(service.build).toBeUndefined();
       expect(service.image).toBeString();
