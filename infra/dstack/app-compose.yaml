@@ -630,7 +630,7 @@ services:
     environment:
       # Public key only (one line: ssh-ed25519 AAAA... name). Replaced in the deploy commit; the
       # placeholder fails closed.
-      DEBUG_SSH_AUTHORIZED_KEY: "REPLACE_AT_DEPLOY"
+      DEBUG_SSH_AUTHORIZED_KEY: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPVhzzspv9XwQOZP6hAInSomSA86ROTtVZBz2tQ9DZDv ptx-dev-debug (Amos, 2026-10-23)"
     ports:
       - "2222:2222"
     volumes:
@@ -732,7 +732,8 @@ services:
                  capture_diagnostics->>'provider_status'   AS provider_status,
                  capture_diagnostics->>'completion_reason' AS completion_reason,
                  capture_diagnostics->>'failure_stage'     AS failure_stage,
-                 capture_diagnostics->'transitions'        AS transitions
+                 capture_diagnostics->'transitions'        AS transitions,
+                 capture_diagnostics->>'stop_requested_by' AS stop_requested_by
           FROM meetings
           WHERE vexa_meeting_id = ANY (string_to_array(:'ids', ',')::int[])
         ) t;

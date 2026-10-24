@@ -75,15 +75,16 @@ connects to `postgres` (db `ptx`) and `vexa-postgres` (db `vexa`) with `default_
 5 s statement timeout, and prints one JSON line per database:
 
 - `{"probe": "ptx", ...}`: PTX meetings whose `vexa_meeting_id` is listed: id, status, error code, platform,
-  timestamps, and `capture_diagnostics` provider status, completion reason, failure stage and transitions.
+  timestamps, and `capture_diagnostics` provider status, completion reason, failure stage, transitions and
+  `stop_requested_by` (`user` or `join_deadline`).
 - `{"probe": "vexa", ...}`: Vexa meetings with those ids: id, platform, status, timestamps, and from `data`
   the status transitions, completion reason, failure stage and join evidence.
 
 It selects no meeting URLs, bot names, metadata, error messages or transcript content. The output goes to the
 terminal and, through `debug-log-shipper`, to Better Stack.
 
-**Accepted limit: read-only is client-side.** The probe connects as the existing owner roles: `ptx` on `ptx`
-and the superuser `postgres` on `vexa`. `default_transaction_read_only` is a setting the client chooses, so
+**Accepted limit: read-only is client-side.** The probe connects as the superuser of each database: `ptx`
+(the bootstrap superuser of the `ptx` database, `rolsuper=t`) on `ptx` and `postgres` on `vexa`. `default_transaction_read_only` is a setting the client chooses, so
 the server does not enforce it; the fixed SQL is what keeps the probe read-only. Neither database has a
 read-only role, and the stack cannot create one without a migration: `vexa-postgres` mounts no init scripts,
 and Postgres runs `docker-entrypoint-initdb.d` only on an empty data directory, so an init script would never
