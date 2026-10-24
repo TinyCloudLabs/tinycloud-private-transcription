@@ -6,7 +6,7 @@
 |---|---|---|
 | `debug-ssh` | always (refuses to start without a valid inlined key) | Key-only SSH into a container that can drive the CVM's Docker engine |
 | `debug-ssh-tools` | once per boot | Copies the pinned static `docker` CLI and compose plugin for `debug-ssh` |
-| `debug-log-shipper` | always (refuses to start without a token) | Vector: ships the logs of an allowlist of containers to Better Stack |
+| `debug-log-shipper` | always (idles with one log line when the token is empty) | Vector: ships the logs of an allowlist of containers to Better Stack |
 | `probe` | only on demand (`profiles: ["probe"]`) | Read-only status query against both Postgres databases |
 
 Every image is pinned by digest. Nothing here changes the OS image or any other service.
@@ -25,16 +25,18 @@ credentials, API bootstrap keys and the Better Stack token.
    It is not read from the sealed env; remove any `DEBUG_SSH_AUTHORIZED_KEY` line from your env file.
 2. **Better Stack token, in the sealed env.** Add `BETTERSTACK_SOURCE_TOKEN` (ingest token of the Better
    Stack source `ptx-dev`, platform Vector) to the sealed env file (`infra/dstack/.env`, never committed),
-   unquoted.
+   unquoted. Without it the shipper logs `log shipping idle: no BETTERSTACK_SOURCE_TOKEN` once and idles; no
+   logs are shipped until a deploy that carries the token.
 3. Deploy with `infra/dstack/deploy-ptx-dev.sh` (README "Deploy / update"). Its allowed_envs sync adds new
    env-file names to the CVM's `allowed_envs`; dstack drops sealed variables that are not on that list.
 
-Each sidecar fails closed, and with `restart: unless-stopped` Docker restarts it in a back-off loop while it
+`debug-ssh` fails closed, and with `restart: unless-stopped` Docker restarts it in a back-off loop while it
 is misconfigured; nothing listens in between:
 
 - `debug-ssh` logs why and stops before sshd starts when the value is empty, still `REPLACE_AT_DEPLOY`, or
   not exactly one valid public key. Nothing listens on port 2222.
-- `debug-log-shipper` logs why and stops before Vector starts when the token is empty.
+- `debug-log-shipper` with an empty token logs one line (`log shipping idle: no BETTERSTACK_SOURCE_TOKEN`)
+  and sleeps; it neither ships nor restarts. It does not read the token again until the container restarts.
 
 ## Connect
 

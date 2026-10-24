@@ -649,7 +649,7 @@ services:
   # gateway, api, worker, probe and debug-ssh (label com.docker.compose.service). Every other container
   # is dropped in the `allowlist` filter (DEBUG.md "What is shipped"). The ingest-only token comes from
   # the sealed env, is written to a tmpfs file and removed from the environment before Vector starts;
-  # without it the container refuses to start (and restarts in a back-off loop).
+  # without it the container logs one fixed line and idles (no crash loop); log shipping stays off.
   debug-log-shipper:
     image: timberio/vector:0.59.0-alpine@sha256:0e36bc2a290039e9b6a5e92f04bd2f133223506f72d09682c1df16c015172b7a
     init: true
@@ -700,7 +700,7 @@ services:
     command:
       - |
         umask 077
-        [ -n "$${BETTERSTACK_SOURCE_TOKEN}" ] || { echo "debug-log-shipper: BETTERSTACK_SOURCE_TOKEN is empty; refusing to start"; exit 1; }
+        [ -n "$${BETTERSTACK_SOURCE_TOKEN}" ] || { echo 'log shipping idle: no BETTERSTACK_SOURCE_TOKEN'; while :; do sleep 86400; done; }
         printf '%s' "$${BETTERSTACK_SOURCE_TOKEN}" > /run/vector-secrets/betterstack_source_token
         unset BETTERSTACK_SOURCE_TOKEN
         printf '%s\n' "$${VECTOR_CONFIG_YAML}" > /var/lib/vector/vector.yaml
