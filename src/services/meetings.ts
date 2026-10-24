@@ -1,12 +1,14 @@
-import { and, eq, inArray, isNotNull, ne, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, ne, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { AppContext } from "../context.ts";
-import { attributedBatches, attributedTranscriptionRuns, meetings, transcripts, type MeetingRow, type TranscriptRow } from "../db/schema.ts";
+import { attributedBatches, attributedTranscriptionRuns, meetingJoinClocks, meetings, transcripts, type MeetingRow, type TranscriptRow } from "../db/schema.ts";
 import type { Db } from "../db/client.ts";
 import { ApiError, type ErrorCode, errorTypeFor } from "../domain/errors.ts";
 import { newMeetingId } from "../domain/ids.ts";
 import { detectPlatform, type Platform } from "../domain/platform.ts";
-import { canTransition, isTerminal, type MeetingStatus } from "../domain/state.ts";
+import { canTransition, clientStatus, isTerminal, mapVexaStatus, NEEDS_HELP_MESSAGE, type MeetingStatus } from "../domain/state.ts";
+import { clientCaptureView } from "../domain/capture.ts";
+import type { JoinClock } from "../domain/join-deadline.ts";
 import type { NormalizedTranscript } from "../domain/transcript.ts";
 import { recordCapture } from "./capture.ts";
 import { resetRecordingRecovery } from "./recording-recovery.ts";
@@ -103,7 +105,7 @@ export async function createMeeting(
 }
 
 /** Statuses in which a non-Signal meeting holds, or is about to be given, a Vexa bot container. */
-const BOT_HOLDING_STATUSES = ["queued", "joining", "waiting_for_admission", "in_progress"] as const;
+const BOT_HOLDING_STATUSES = ["queued", "joining", "waiting_for_admission", "needs_help", "in_progress"] as const;
 const CAPACITY_RETRY_AFTER_SECONDS = 60;
 
 /**
@@ -210,8 +212,54 @@ export async function transition(
     .returning();
   // If another writer moved it first, re-read and report unchanged.
   if (!row) return { meeting: (await getMeetingById(ctx, meeting.id)) ?? meeting, changed: false };
+  if (to === "in_progress") {
+    // in_progress is outside the join deadline. Deleting the clock row keeps it from outliving the join.
+    await ctx.db.delete(meetingJoinClocks).where(eq(meetingJoinClocks.meetingId, meeting.id));
+  }
   ctx.log.info("meeting status changed", { meetingId: row.id, stage: "status_transition" });
   return { meeting: row, changed: true };
+}
+
+/** The join clock for a meeting. An absent side row reads as no observation yet. */
+export async function loadJoinClock(ctx: AppContext, meeting: MeetingRow): Promise<JoinClock> {
+  const [row] = await ctx.db.select().from(meetingJoinClocks).where(eq(meetingJoinClocks.meetingId, meeting.id)).limit(1);
+  // The clock reads the raw Vexa status, so the needs_help ceiling holds whatever the client flag says.
+  const raw = meeting.captureDiagnostics?.provider_status;
+  return {
+    status: raw ? mapVexaStatus(raw, true) : meeting.status,
+    createdAt: meeting.createdAt,
+    joinObservedAt: row?.joinObservedAt ?? null,
+    joinDeadlineAt: row?.joinDeadlineAt ?? null,
+    dispatchFallbackAt: row?.dispatchFallbackAt ?? null,
+  };
+}
+
+/** Sets the dispatch-time fallback. It governs only until a pre-admission state is observed. */
+export async function setDispatchFallback(ctx: AppContext, meetingId: string, dispatchFallbackAt: Date): Promise<void> {
+  await ctx.db
+    .insert(meetingJoinClocks)
+    .values({ meetingId, dispatchFallbackAt })
+    .onConflictDoUpdate({ target: meetingJoinClocks.meetingId, set: { dispatchFallbackAt } });
+}
+
+/**
+ * Starts the join clock on the first observation of a pre-admission state. The conditional upsert
+ * writes only while no observation exists, so repeated polls, restarts and lost jobs cannot move the
+ * deadline. Returns true when this call started it. Callers gate on the meeting being join-open.
+ */
+export async function startJoinClock(ctx: AppContext, meetingId: string, joinTimeoutSeconds: number): Promise<boolean> {
+  const observedAt = new Date();
+  const joinDeadlineAt = new Date(observedAt.getTime() + joinTimeoutSeconds * 1000);
+  const started = await ctx.db
+    .insert(meetingJoinClocks)
+    .values({ meetingId, joinObservedAt: observedAt, joinDeadlineAt })
+    .onConflictDoUpdate({
+      target: meetingJoinClocks.meetingId,
+      set: { joinObservedAt: observedAt, joinDeadlineAt },
+      setWhere: isNull(meetingJoinClocks.joinObservedAt),
+    })
+    .returning({ meetingId: meetingJoinClocks.meetingId });
+  return started.length > 0;
 }
 
 /**
@@ -261,7 +309,7 @@ export async function terminalTransition(
 }
 
 /** Statuses in which a meeting's Vexa bot is (or was just) in the call. */
-const LIVE_CAPTURE_STATUSES = ["joining", "waiting_for_admission", "in_progress", "processing"] as const;
+const LIVE_CAPTURE_STATUSES = ["joining", "waiting_for_admission", "needs_help", "in_progress", "processing"] as const;
 
 /**
  * Another meeting, in any project, that is capturing the same Vexa meeting. Vexa answers 409 when
@@ -328,7 +376,7 @@ export async function completeMeetingWithTranscript(
     const [completed] = await tx.update(meetings).set({ status: "completed", completedAt: new Date(), ...extra })
       .where(and(eq(meetings.id, meetingId), eq(meetings.status, "processing"))).returning();
     if (!completed) return { meeting: null, changed: false, deliveryId: null };
-    const intent = webhookDeliveryValues(completed, "meeting.completed", stored!);
+    const intent = webhookDeliveryValues(completed, "meeting.completed", stored!, ctx.config.needsHelpStateEnabled);
     if (intent) await tx.execute(sql`
       INSERT INTO webhook_deliveries (id, meeting_id, event_id, event_type, endpoint, payload, attempt, status, next_attempt_at)
       VALUES (${intent.id}, ${intent.meetingId}, ${intent.eventId}, ${intent.eventType}, ${intent.endpoint}, ${intent.payload}, 0, 'pending', ${intent.nextAttemptAt})
@@ -562,8 +610,8 @@ async function fenceAttributedDeletion(ctx: AppContext, meetingId: string): Prom
 
 // ---- serialization ----
 
-export function serializeMeeting(m: MeetingRow, transcript: TranscriptRow | null | undefined) {
-  const status = m.status as MeetingStatus;
+export function serializeMeeting(m: MeetingRow, transcript: TranscriptRow | null | undefined, needsHelpEnabled: boolean) {
+  const status = clientStatus(m.status as MeetingStatus, needsHelpEnabled);
   return {
     id: m.id,
     object: "meeting",
@@ -577,7 +625,8 @@ export function serializeMeeting(m: MeetingRow, transcript: TranscriptRow | null
     ended_at: m.endedAt?.toISOString() ?? null,
     completed_at: m.completedAt?.toISOString() ?? null,
     metadata: m.metadata ?? {},
-    ...(m.captureDiagnostics ? { capture: m.captureDiagnostics } : {}),
+    ...(m.captureDiagnostics ? { capture: clientCaptureView(m.captureDiagnostics, needsHelpEnabled) } : {}),
+    ...(status === "needs_help" ? { status_message: NEEDS_HELP_MESSAGE } : {}),
     ...(transcript ? transcriptProviderFields(transcript) : {}),
     ...(status === "failed" && m.errorCode
       ? { error: { type: errorTypeFor(m.errorCode as ErrorCode), code: m.errorCode, message: m.errorMessage ?? "" } }
@@ -606,7 +655,7 @@ function transcriptStatus(status: MeetingStatus, hasTranscript: boolean) {
   return "pending";
 }
 
-export function serializeTranscript(m: MeetingRow, t: TranscriptRow) {
+export function serializeTranscript(m: MeetingRow, t: TranscriptRow, needsHelpEnabled: boolean) {
   // jsonb drivers return objects for new rows. Earlier writers double-encoded this value, so
   // accept a legacy JSON string on reads until those rows are naturally replaced.
   const value = typeof t.segmentsJson === "string" ? JSON.parse(t.segmentsJson) : t.segmentsJson;
@@ -619,7 +668,7 @@ export function serializeTranscript(m: MeetingRow, t: TranscriptRow) {
     language: t.language,
     duration_seconds: t.durationSeconds,
     provider: t.provider,
-    ...(m.captureDiagnostics ? { capture: m.captureDiagnostics } : {}),
+    ...(m.captureDiagnostics ? { capture: clientCaptureView(m.captureDiagnostics, needsHelpEnabled) } : {}),
     speakers: body.speakers,
     segments: body.segments,
     text: body.text,

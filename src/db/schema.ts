@@ -67,6 +67,17 @@ export const meetings = pgTable(
   ],
 );
 
+/** Join clock, one row per meeting once a pre-admission state is observed. Absent means no clock yet. Additive: meetings is untouched. */
+export const meetingJoinClocks = pgTable("meeting_join_clocks", {
+  meetingId: text("meeting_id").primaryKey().references(() => meetings.id, { onDelete: "cascade" }),
+  /** First pre-admission provider observation (or Signal dispatch). Set once; never moved by later updates. */
+  joinObservedAt: timestamp("join_observed_at", { withTimezone: true }),
+  /** Durable join deadline: joinObservedAt + joinTimeoutSeconds. Survives worker restarts and lost jobs. */
+  joinDeadlineAt: timestamp("join_deadline_at", { withTimezone: true }),
+  /** Dispatch-time fallback deadline, consulted only while no join was ever observed. */
+  dispatchFallbackAt: timestamp("dispatch_fallback_at", { withTimezone: true }),
+});
+
 export const transcripts = pgTable("transcripts", {
   meetingId: text("meeting_id").primaryKey().references(() => meetings.id, { onDelete: "cascade" }),
   version: integer("version").notNull().default(1),

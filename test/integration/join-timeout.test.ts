@@ -5,7 +5,7 @@
  * The mock Vexa never admits the bot, mirroring the meet.jit.si "parked forever" case.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { startHarness, type Harness } from "./harness.ts";
+import { controlIfBotExists, startHarness, type Harness } from "./harness.ts";
 
 let h: Harness;
 beforeAll(async () => {
@@ -34,12 +34,15 @@ describe("join deadline", () => {
     });
     expect(r.status).toBe(201);
     const id = (await r.json()).id;
-    // Mock stays "requested" (mapped to joining) — never admitted.
+    // Raw "joining" is the observation that starts the clock; "requested" alone does not. Never admitted.
+    // The mock bot appears only once dispatch has run, so retry the control until it exists.
+    await h.waitFor(async () => controlIfBotExists(h, "jitsi", nativeId, { status: "joining" }), { timeoutMs: 8000, label: "mock bot exists" });
     await h.waitFor(async () => ((await meetingOf(id)).status === "joining" ? true : null), { label: "joining" });
 
     const failed = await waitFailed(id);
     expect(failed.error).toMatchObject({ type: "meeting_join_failed", code: "meeting_join_failed" });
-    expect(h.vexa.requests.some((q) => q.method === "DELETE" && q.path === `/bots/jitsi/${encodeURIComponent(nativeId)}`)).toBe(true);
+    // The stop follows the locked failure, so the request may land just after the status flips.
+    await h.waitFor(async () => (h.vexa.requests.some((q) => q.method === "DELETE" && q.path === `/bots/jitsi/${encodeURIComponent(nativeId)}`) ? true : null), { label: "bot stop request" });
     const hook = await h.waitFor(
       async () => h.webhook.received.find((w) => w.body.type === "meeting.failed" && w.body.data.meeting_id === id) ?? null,
       { label: "meeting.failed webhook" },
@@ -61,7 +64,7 @@ describe("join deadline", () => {
 
     const failed = await waitFailed(id);
     expect(failed.error).toMatchObject({ type: "meeting_join_failed", code: "waiting_room_timeout" });
-    expect(h.vexa.requests.some((q) => q.method === "DELETE" && q.path === `/bots/jitsi/${encodeURIComponent(nativeId)}`)).toBe(true);
+    await h.waitFor(async () => (h.vexa.requests.some((q) => q.method === "DELETE" && q.path === `/bots/jitsi/${encodeURIComponent(nativeId)}`) ? true : null), { label: "bot stop request" });
     const hook = await h.waitFor(
       async () => h.webhook.received.find((w) => w.body.type === "meeting.failed" && w.body.data.meeting_id === id) ?? null,
       { label: "meeting.failed webhook" },

@@ -4,6 +4,7 @@ export type MeetingStatus =
   | "queued"
   | "joining"
   | "waiting_for_admission"
+  | "needs_help"
   | "in_progress"
   | "processing"
   | "completed"
@@ -14,6 +15,7 @@ const RANK: Record<MeetingStatus, number> = {
   queued: 0,
   joining: 1,
   waiting_for_admission: 2,
+  needs_help: 2,
   in_progress: 3,
   processing: 4,
   completed: 5,
@@ -24,25 +26,34 @@ const RANK: Record<MeetingStatus, number> = {
 export const TERMINAL: ReadonlySet<MeetingStatus> = new Set(["completed", "failed", "cancelled"]);
 export const isTerminal = (s: MeetingStatus) => TERMINAL.has(s);
 
+/** Shown while the bot is blocked in needs_help; the reason code stays in diagnostics. */
+export const NEEDS_HELP_MESSAGE = "The notetaker is stuck joining";
+
+/** Vexa's needs_help is a bot-blocking dialog, not admission. It moves freely with the waiting group. */
+const PRE_ACTIVE_WAIT: Partial<Record<MeetingStatus, true>> = { waiting_for_admission: true, needs_help: true };
+
 /** Forward-only progression; failure allowed from any non-terminal; cancel only before admission. */
 export function canTransition(from: MeetingStatus, to: MeetingStatus): boolean {
   if (isTerminal(from)) return false;
   if (to === "failed") return true;
   if (to === "cancelled") return RANK[from] < RANK.in_progress;
   if (to === "completed") return from === "processing";
+  if (from !== to && PRE_ACTIVE_WAIT[from] && PRE_ACTIVE_WAIT[to]) return true;
   return RANK[to] > RANK[from];
 }
 
-/** Vexa MeetingStatus enum (lifecycle.v1): requested, joining, awaiting_admission, active, needs_help, stopping, completed, failed. */
-export function mapVexaStatus(vexa: string): MeetingStatus {
+/** Vexa MeetingStatus enum (lifecycle.v1): requested, joining, awaiting_admission, active, needs_help, stopping, completed, failed.
+ * With the needs_help state disabled, raw needs_help (and its older alias) is stored as waiting_for_admission. */
+export function mapVexaStatus(vexa: string, needsHelpEnabled: boolean): MeetingStatus {
   switch (vexa) {
     case "requested":
     case "joining":
       return "joining";
     case "awaiting_admission":
+      return "waiting_for_admission";
     case "needs_help": // lifecycle.v1 enum (docs/vexa-findings.md)
     case "needs_human_help": // older alias, kept for compatibility
-      return "waiting_for_admission";
+      return needsHelpEnabled ? "needs_help" : "waiting_for_admission";
     case "active":
       return "in_progress";
     case "stopping":
@@ -54,6 +65,11 @@ export function mapVexaStatus(vexa: string): MeetingStatus {
     default:
       return "joining";
   }
+}
+
+/** Status a client may see. Legacy stored needs_help rows fold to waiting_for_admission while the flag is off. */
+export function clientStatus(status: MeetingStatus, needsHelpEnabled: boolean): MeetingStatus {
+  return status === "needs_help" && !needsHelpEnabled ? "waiting_for_admission" : status;
 }
 
 export interface MappedFailure {

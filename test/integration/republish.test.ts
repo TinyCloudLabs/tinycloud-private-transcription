@@ -463,7 +463,7 @@ test("published_at on the non-attributed path", async () => {
   const createdAt = (await current(id)).createdAt;
   await h.ctx.db.update(transcripts).set({ publishedAt: null }).where(eq(transcripts.meetingId, id));
   const [meeting] = await h.ctx.db.select().from(meetings);
-  expect(serializeTranscript(meeting!, await current(id)).published_at).toBe(createdAt.toISOString());
+  expect(serializeTranscript(meeting!, await current(id), false).published_at).toBe(createdAt.toISOString());
   await h.ctx.db.update(meetings).set({ status: "processing" }).where(eq(meetings.id, id));
   const normalized = { language: "en", duration_seconds: 1, speakers: [], segments: [], text: "synthetic native speech" };
   // Conflict-update and fresh insert both timestamp publication without increasing version.
