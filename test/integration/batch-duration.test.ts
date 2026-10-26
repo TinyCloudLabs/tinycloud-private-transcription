@@ -147,7 +147,7 @@ describe("TC-922 consumer contract", () => {
     const id = await h.submit(await audio("stereo"));
     await h.work();
     const body = await (await h.api(`/v1/transcriptions/${id}/result`)).json();
-    expect(body).toMatchObject({ status: "completed", provider: "tinfoil", model: "voxtral-small-24b", channels: 2, stats: { tinfoil_calls: 2 } });
+    expect(body).toMatchObject({ status: "completed", provider: "tinfoil", model: "whisper-large-v3-turbo", channels: 2, stats: { tinfoil_calls: 2 } });
     expect(body.segments.map((s: any) => [s.speaker_id, s.start, s.end])).toEqual([["channel_0", 0.25, 2.75], ["channel_1", 3.25, 5.75]]);
     expect(await exists(jobDir(h.uploadDir, id))).toBe(false);
     const args = (await readFile(calls, "utf8")).trim().split("\n");

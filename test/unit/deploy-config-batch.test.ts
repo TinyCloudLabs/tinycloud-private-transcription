@@ -223,7 +223,7 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(Number(env.BATCH_MAX_CONCURRENT_UPLOADS)).toBe(defaults.limits.maxConcurrentUploads);
     expect(Number(env.BATCH_DISK_HIGH_WATER_PERCENT)).toBe(defaults.limits.diskHighWaterPercent);
     expect(Number(env.BATCH_TENANT_DAILY_BYTES)).toBe(defaults.limits.tenantDailyBytes);
-    expect(env.BATCH_TINFOIL_MODEL).toBe("voxtral-small-24b");
+    expect(env.BATCH_TINFOIL_MODEL).toBe("whisper-large-v3-turbo");
   });
 
   test("lets Exo's web, desktop and mobile origins upload, and no other site", () => {

@@ -2,7 +2,7 @@ import { and, asc, eq, gt, inArray, sql } from "drizzle-orm";
 import { mkdir, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { config as processConfig } from "../config.ts";
-import { isAssistantReply } from "../domain/hallucination.ts";
+import { isAssistantReply, isWhisperSilenceArtifact } from "../domain/hallucination.ts";
 import { installFatalLogHandlers } from "../log.ts";
 import { providerDispatchSlots, transcriptionAdmission, transcriptionAttempts, transcriptionProviderBlocks, transcriptionRegions, transcriptionResults, transcriptions, transcriptionWorkers, type TranscriptionRow } from "../db/schema.ts";
 import { pcmToWav } from "../providers/transcription/audio.ts";
@@ -13,7 +13,7 @@ import type { JobErrorCode } from "./errors.ts";
 import { isSimulatedCrash } from "./faults.ts";
 import { fenceGuard, holdFence, LostFence, type DbOrTx, type Fence } from "./fence.ts";
 import { cleanupJobFiles, recoverStaleClaims, releaseDeadSlot, runSweep, terminalize, workerLive } from "./ledger.ts";
-import type { ProviderOutcome } from "./provider.ts";
+import { isWhisperModel, type ProviderOutcome } from "./provider.ts";
 import { ensureStorageRoot, jobDir, removeJobEntry, workDirName } from "./storage.ts";
 import { detectSpeech, frameEnergies, summarizeVad, VAD, type Detection, type Region, type VadStats } from "./vad.ts";
 
@@ -512,7 +512,8 @@ async function settleDispatch(
         state.rateLimitStreak = 0;
         // An audio LLM can answer the audio like a chat assistant (TC-2119). A region that is wholly such a reply is not speech:
         // it completes with empty text, so assembly never publishes it and a job with nothing else ends no_speech.
-        const ungrounded = isAssistantReply(outcome.text);
+        // Whisper also answers silence or noise with stock captions (" you", TC-2128): whole-text matches drop the same way.
+        const ungrounded = isAssistantReply(outcome.text) || (outcome.text.trim() !== "" && isWhisperModel(ctx.provider!.model) && isWhisperSilenceArtifact(outcome.text));
         if (ungrounded) seen.droppedRegions = 1;
         await tx.update(transcriptionRegions).set({ status: "completed", text: ungrounded ? "" : outcome.text }).where(regionWhere);
         await tx.update(transcriptions).set({ tinfoilAudioSeconds: sql`${transcriptions.tinfoilAudioSeconds} + ${(region.endMs - region.startMs) / 1000}` }).where(fenceGuard(fence));
@@ -651,6 +652,46 @@ export async function recordWorkerHeartbeat(ctx: BatchContext, observedAt = new 
     .onConflictDoUpdate({ target: transcriptionWorkers.id, set: { observedAt } });
 }
 
+export interface QueueSignal {
+  queued_jobs: number;
+  processing_jobs: number;
+  awaiting_upload_jobs: number;
+  oldest_queued_age_s: number;
+}
+
+// The upper bounds of these fields in infra/dstack-batch/log-shipper/fields.json. The shipper drops a value outside
+// its range, which would blind an alert on exactly the extreme it exists to catch, so the emitter clamps to them.
+const QUEUE_COUNT_MAX = 100_000;
+const QUEUE_AGE_MAX_SECONDS = 31_536_000;
+
+/**
+ * Queue depth by status and the age of the oldest job still waiting to be claimed, in one statement. It reads only the
+ * active rows (`status in awaiting_upload|queued|processing`, served by transcriptions_status_idx; at most one per tenant
+ * by transcriptions_one_active_per_tenant_idx), never the terminal history. `queued` and its age use the claimNext
+ * basis (uploaded_at, tombstoned rows excluded) and the database clock; a job held back by a blocked provider is still
+ * queued, so its age keeps growing.
+ */
+export async function readQueueSignal(db: DbOrTx): Promise<QueueSignal> {
+  const [row] = await db.select({
+    queued: sql<number>`(count(*) filter (where ${transcriptions.status} = 'queued' and not ${transcriptions.tombstoned}))::int`,
+    processing: sql<number>`(count(*) filter (where ${transcriptions.status} = 'processing'))::int`,
+    awaiting: sql<number>`(count(*) filter (where ${transcriptions.status} = 'awaiting_upload'))::int`,
+    oldest: sql<number>`coalesce(floor(extract(epoch from now() - min(coalesce(${transcriptions.uploadedAt}, ${transcriptions.createdAt})) filter (where ${transcriptions.status} = 'queued' and not ${transcriptions.tombstoned})))::int, 0)`,
+  }).from(transcriptions).where(inArray(transcriptions.status, ["awaiting_upload", "queued", "processing"]));
+  const clamp = (value: number, max: number) => Math.min(max, Math.max(0, Number(value)));
+  return {
+    queued_jobs: clamp(row!.queued, QUEUE_COUNT_MAX),
+    processing_jobs: clamp(row!.processing, QUEUE_COUNT_MAX),
+    awaiting_upload_jobs: clamp(row!.awaiting, QUEUE_COUNT_MAX),
+    oldest_queued_age_s: clamp(row!.oldest, QUEUE_AGE_MAX_SECONDS),
+  };
+}
+
+/** The worker's periodic liveness and queue line: counts only, no ids, no content. */
+export async function logQueueSignal(ctx: Pick<BatchContext, "db" | "log">) {
+  ctx.log.info("batch worker heartbeat", { ...(await readQueueSignal(ctx.db)) });
+}
+
 export interface BatchWorkerHandle {
   stop(): Promise<void>;
 }
@@ -674,6 +715,20 @@ export function startBatchWorker(ctx: BatchContext, opts: { sweep?: boolean } = 
     }
   };
   void sweep();
+  let signalling = false;
+  const signal = async () => {
+    if (signalling) return;
+    signalling = true;
+    try {
+      await logQueueSignal(ctx);
+    } catch {
+      ctx.log.error("batch worker heartbeat failed", { stage: "heartbeat" });
+    } finally {
+      signalling = false;
+    }
+  };
+  void signal();
+  const signaller = setInterval(signal, ctx.config.worker.queueSignalSeconds * 1000);
   const sweeper = setInterval(sweep, ctx.config.retention.sweepIntervalMs);
   const loop = (async () => {
     while (running) {
@@ -698,6 +753,8 @@ export function startBatchWorker(ctx: BatchContext, opts: { sweep?: boolean } = 
       clearInterval(heartbeat);
       clearInterval(sweeper);
       while (sweeping) await Bun.sleep(10);
+      clearInterval(signaller);
+      while (signalling) await Bun.sleep(10);
       // Readiness drops immediately rather than after the stale window.
       await recordWorkerHeartbeat(ctx, new Date(0)).catch(() => {});
     },
