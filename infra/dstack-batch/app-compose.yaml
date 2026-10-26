@@ -42,7 +42,8 @@ services:
       BATCH_UPLOAD_DIR: /var/lib/ptx-batch/uploads
       BATCH_TINFOIL_BASE_URL: https://inference.tinfoil.sh
       BATCH_TINFOIL_API_KEY: ${BATCH_TINFOIL_API_KEY:-}
-      BATCH_TINFOIL_MODEL: voxtral-small-24b
+      # Same transcriber as the meeting path. Rollback: set this to voxtral-small-24b and redeploy.
+      BATCH_TINFOIL_MODEL: whisper-large-v3-turbo
       BATCH_MAX_ACTIVE_JOBS: "10"
       BATCH_MAX_RESERVED_BYTES: "1864968000"
       BATCH_MAX_CONCURRENT_UPLOADS: "3"
@@ -88,7 +89,8 @@ services:
       BATCH_UPLOAD_DIR: /var/lib/ptx-batch/uploads
       BATCH_TINFOIL_BASE_URL: https://inference.tinfoil.sh
       BATCH_TINFOIL_API_KEY: ${BATCH_TINFOIL_API_KEY:-}
-      BATCH_TINFOIL_MODEL: voxtral-small-24b
+      # Same transcriber as the meeting path. Rollback: set this to voxtral-small-24b and redeploy.
+      BATCH_TINFOIL_MODEL: whisper-large-v3-turbo
       BATCH_DIARIZATION_ENABLED: "true"
       # Runtime rollback for newly detected jobs; the sealed deploy env can override this one flag.
       BATCH_VAD_QUIET_MODE: "${BATCH_VAD_QUIET_MODE:-true}"

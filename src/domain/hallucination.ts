@@ -121,3 +121,14 @@ export function isAssistantReply(text: string): boolean {
   }
   return matched && !/[\p{L}\p{N}]/u.test(rest.replace(REPLY_CONNECTIVES, " "));
 }
+
+/**
+ * Whisper's captions on silence or noise, when they are the whole text of a piece (TC-2128). Used by the batch role for
+ * Whisper-class models only. "Thank you" alone is not listed: it can be real speech.
+ */
+const WHISPER_SILENCE_ARTIFACTS = new Set(["you", "thank you for watching", "thanks for watching", "bye", "bye bye", "subtitles by the amara org community"]);
+
+export function isWhisperSilenceArtifact(text: string): boolean {
+  const normalized = text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  return normalized === "" || WHISPER_SILENCE_ARTIFACTS.has(normalized);
+}
