@@ -121,3 +121,6 @@ export class BatchTinfoilClient {
     return { kind: "ok", text: parsed.text, ...(lang ? { language: lang } : {}) };
   }
 }
+
+/** Whisper-class models (TC-2128): the batch role applies the Whisper silence-artifact guard to their output. */
+export const isWhisperModel = (model: string) => model.toLowerCase().startsWith("whisper");

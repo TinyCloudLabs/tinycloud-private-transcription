@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { config as processConfig } from "../config.ts";
 import { installFatalLogHandlers } from "../log.ts";
 import { providerDispatchSlots, transcriptionAdmission, transcriptionAttempts, transcriptionProviderBlocks, transcriptionRegions, transcriptionResults, transcriptions, transcriptionWorkers, type TranscriptionRow } from "../db/schema.ts";
+import { isWhisperSilenceArtifact } from "../domain/hallucination.ts";
 import { pcmToWav } from "../providers/transcription/audio.ts";
 import { decodeChannelToPcm, PCM_RATE, readPcmRange } from "./audio.ts";
 import type { BatchContext } from "./context.ts";
@@ -12,7 +13,7 @@ import type { JobErrorCode } from "./errors.ts";
 import { isSimulatedCrash } from "./faults.ts";
 import { fenceGuard, holdFence, LostFence, type DbOrTx, type Fence } from "./fence.ts";
 import { cleanupJobFiles, recoverStaleClaims, releaseDeadSlot, runSweep, terminalize, workerLive } from "./ledger.ts";
-import type { ProviderOutcome } from "./provider.ts";
+import { isWhisperModel, type ProviderOutcome } from "./provider.ts";
 import { ensureStorageRoot, jobDir, removeJobEntry, workDirName } from "./storage.ts";
 import { detectSpeech, frameEnergies, summarizeVad, VAD, type Detection, type Region, type VadStats } from "./vad.ts";
 
@@ -398,6 +399,8 @@ async function dispatchRegion(
       if (isSimulatedCrash(error)) throw error;
       outcome = { kind: "ambiguous", reason: "client_error" };
     }
+    // Whisper answers silence or noise with stock captions (" you"): that region is untranscribed speech-free audio, not text.
+    if (outcome.kind === "ok" && isWhisperModel(ctx.provider!.model) && isWhisperSilenceArtifact(outcome.text)) outcome = { ...outcome, text: "" };
     await ctx.faults.hit("worker.after_response", { id: job.id });
     const settled = await settleDispatch(ctx, fence, region, admission.attemptId, outcome, state, notSent);
     if (settled === "lost") throw new LostFence(fence.id);

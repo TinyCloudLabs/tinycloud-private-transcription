@@ -112,7 +112,8 @@ export function batchConfigFromEnv(log: Pick<Logger, "warn"> = logger): BatchCon
     tinfoil: {
       baseUrl: str("BATCH_TINFOIL_BASE_URL", "https://inference.tinfoil.sh"),
       apiKey: str("BATCH_TINFOIL_API_KEY", ""),
-      model: str("BATCH_TINFOIL_MODEL", "voxtral-small-24b"),
+      // Whisper by default (the meeting path's transcriber); BATCH_TINFOIL_MODEL=voxtral-small-24b rolls back (TC-2128).
+      model: str("BATCH_TINFOIL_MODEL", "whisper-large-v3-turbo"),
       timeoutMs: positiveIntegerEnv("BATCH_TINFOIL_TIMEOUT_MS", "180000"),
     },
     corsOrigins: parseCorsOrigins(str("BATCH_CORS_ORIGINS", "")),
