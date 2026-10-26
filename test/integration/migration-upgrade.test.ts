@@ -1,6 +1,6 @@
 import { SQL } from "bun";
 import { expect, test } from "bun:test";
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,6 +17,13 @@ import { transcriptions } from "../../src/db/schema.ts";
 import { silentLogger } from "../../src/log.ts";
 
 const migrationsSource = fileURLToPath(new URL("../../src/db/migrations/", import.meta.url));
+/** Every migration file in the directory, which must also be what the journal lists; applied counts are compared to this, not to a pinned number. */
+const journalEntryCount = async () => {
+  const journal: { entries: unknown[] } = JSON.parse(await readFile(join(migrationsSource, "meta/_journal.json"), "utf8"));
+  const files = (await readdir(migrationsSource)).filter((name) => name.endsWith(".sql"));
+  expect(journal.entries.length).toBe(files.length);
+  return journal.entries.length;
+};
 
 async function productionMigrationsFixture(migrationCount = 4): Promise<string> {
   const folder = await mkdtemp(join(tmpdir(), "ptx-production-migrations-"));
@@ -157,7 +164,7 @@ test("0004-0015 retain production retry, fallback, terminal delivery, and deleti
     expect(signalColumns).toEqual({ count: 2 });
 
     const [migrationCount] = await db.execute(sql`SELECT count(*)::int AS count FROM drizzle.__drizzle_migrations`);
-    expect(migrationCount).toEqual({ count: 28 });
+    expect(migrationCount).toEqual({ count: await journalEntryCount() });
 
     const [deletionAdmission] = await db.execute(sql`
       SELECT count(*)::int AS count
@@ -418,7 +425,7 @@ test("0024 upgrades 0023 data additively and tolerates the old image after rollb
       segmentsJson: sql`'{"speakers":[],"segments":[],"text":""}'::jsonb` });
     expect(await db.execute(sql`select version, published_at from transcripts where meeting_id = 'mtg_old_insert'`))
       .toEqual([{ version: 1, published_at: null }]);
-    expect(await db.execute(sql`select count(*)::int as count from drizzle.__drizzle_migrations`)).toEqual([{ count: 28 }]);
+    expect(await db.execute(sql`select count(*)::int as count from drizzle.__drizzle_migrations`)).toEqual([{ count: await journalEntryCount() }]);
     // Generated DDL must stay additive: rollback means retaining this schema, never dropping it.
     const migration = await readFile(join(migrationsSource, "0024_transcript_versions.sql"), "utf8");
     expect(/^\s*(drop|truncate|delete)\b/im.test(migration)).toBe(false);

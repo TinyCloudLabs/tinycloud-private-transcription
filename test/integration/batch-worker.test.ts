@@ -577,12 +577,13 @@ describe("provider outcomes", () => {
     expect(statuses).toEqual(["0:rate_limited", "0:rate_limited", "0:rate_limited", "0:succeeded", "1:succeeded"]);
   }, 30_000);
 
-  test("20 consecutive 429s fail the job provider_unavailable after exactly 20 calls", async () => {
+  test("20 consecutive 429s: exactly 20 calls, then the job waits (queued, provider_delayed) instead of failing", async () => {
     h.tinfoil.handler = () => new Response("busy", { status: 429, headers: { "Retry-After": "0" } });
     const id = await h.submit(await audio("stereo"));
     await h.work();
     expect(h.tinfoil.calls.length).toBe(20);
-    expect(await h.row(id)).toMatchObject({ status: "failed", errorCode: "provider_unavailable" });
+    expect(await h.row(id)).toMatchObject({ status: "queued", errorCode: null });
+    expect(await (await h.api(`/v1/transcriptions/${id}`)).json()).toMatchObject({ status: "queued", provider_delayed: true });
   });
 
   test("pre-send failures are retried (at most 5 attempts); a provably-unsent request is not ambiguous", async () => {
@@ -604,7 +605,7 @@ describe("provider outcomes", () => {
     expect(await h.row(failing)).toMatchObject({ status: "failed", errorCode: "provider_unavailable" });
   });
 
-  test("definite rejections: 400 → transcription_failed, 401 → provider_unavailable (operator fault)", async () => {
+  test("definite rejections: 400 → transcription_failed, 401 → the job waits (provider_delayed), not failed", async () => {
     h.tinfoil.handler = () => new Response("bad", { status: 400 });
     const rejected = await h.submit(await audio("stereo"));
     await h.work();
@@ -612,7 +613,8 @@ describe("provider outcomes", () => {
     h.tinfoil.handler = () => new Response("no", { status: 401 });
     const unauthorized = await h.submit(await audio("stereo"), { tenant: TENANT_B });
     await h.work();
-    expect(await h.row(unauthorized)).toMatchObject({ status: "failed", errorCode: "provider_unavailable" });
+    expect(await h.row(unauthorized)).toMatchObject({ status: "queued", errorCode: null });
+    expect(await (await h.api(`/v1/transcriptions/${unauthorized}`, { tenant: TENANT_B })).json()).toMatchObject({ status: "queued", provider_delayed: true });
     expect(h.tinfoil.calls.length).toBe(2);
   });
 });

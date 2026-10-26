@@ -130,7 +130,7 @@ describe("provider outcome classification", () => {
     ["200 no text", () => Response.json({ language: "en" }), "ambiguous"],
     ["400", () => new Response("", { status: 400 }), "rejected"],
     ["413", () => new Response("", { status: 413 }), "rejected"],
-    ["401", () => new Response("", { status: 401 }), "misconfigured"],
+    ["401", () => new Response("", { status: 401 }), "blocked"],
     ["404", () => new Response("", { status: 404 }), "misconfigured"],
   ];
   for (const [label, respond, kind] of cases) {
