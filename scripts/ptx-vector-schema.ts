@@ -37,6 +37,7 @@ const sourceMessages: Record<string, string> = {
   "batch sweep failed": "batch_sweep_failed",
   "batch worker iteration failed": "batch_worker_iteration_failed",
   "batch worker started": "batch_worker_started",
+  "batch worker heartbeat": "batch_worker_heartbeat",
 };
 
 type FieldSpec = {
@@ -116,12 +117,17 @@ export function renderAllowlist(schema: Schema): string {
 
   const fields = Object.entries(service.fields).filter(([name]) => name !== "svc");
   const completion = "event == \"batch_job_finished\"";
+  const heartbeat = "event == \"batch_worker_heartbeat\"";
   const dispatchFailure = "event == \"batch_job_failed_at_dispatch\"";
   // Fields that only their own events may carry; everywhere else they are dropped.
   const eventScoped: Record<string, string> = {
     reason: `${dispatchFailure} || event == "batch_provider_blocked"`,
     http_status: "event == \"batch_provider_blocked\"",
     delayed_jobs: "event == \"batch_provider_recovered\"",
+    queued_jobs: heartbeat,
+    processing_jobs: heartbeat,
+    awaiting_upload_jobs: heartbeat,
+    oldest_queued_age_s: heartbeat,
     dropped_regions: "event == \"batch_region_ungrounded\"",
   };
   for (const [name, spec] of fields) {

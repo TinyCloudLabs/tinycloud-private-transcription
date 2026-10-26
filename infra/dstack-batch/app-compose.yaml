@@ -289,6 +289,7 @@ services:
               else if msg == "batch sweep failed" { "batch_sweep_failed" }
               else if msg == "batch worker iteration failed" { "batch_worker_iteration_failed" }
               else if msg == "batch worker started" { "batch_worker_started" }
+              else if msg == "batch worker heartbeat" { "batch_worker_heartbeat" }
               else { abort }
               out = {"svc": svc, "event": event}
               value = get(j, ["level"]) ?? null
@@ -368,6 +369,42 @@ services:
                   numeric_value, conversion_err = to_int(value)
                   if conversion_err == null {
                     if numeric_value >= 0 && numeric_value <= 100000 { out.delayed_jobs = numeric_value }
+                  }
+                }
+              }
+              if event == "batch_worker_heartbeat" {
+                value = get(j, ["queued_jobs"]) ?? null
+                if is_integer(value) {
+                  numeric_value, conversion_err = to_int(value)
+                  if conversion_err == null {
+                    if numeric_value >= 0 && numeric_value <= 100000 { out.queued_jobs = numeric_value }
+                  }
+                }
+              }
+              if event == "batch_worker_heartbeat" {
+                value = get(j, ["processing_jobs"]) ?? null
+                if is_integer(value) {
+                  numeric_value, conversion_err = to_int(value)
+                  if conversion_err == null {
+                    if numeric_value >= 0 && numeric_value <= 100000 { out.processing_jobs = numeric_value }
+                  }
+                }
+              }
+              if event == "batch_worker_heartbeat" {
+                value = get(j, ["awaiting_upload_jobs"]) ?? null
+                if is_integer(value) {
+                  numeric_value, conversion_err = to_int(value)
+                  if conversion_err == null {
+                    if numeric_value >= 0 && numeric_value <= 100000 { out.awaiting_upload_jobs = numeric_value }
+                  }
+                }
+              }
+              if event == "batch_worker_heartbeat" {
+                value = get(j, ["oldest_queued_age_s"]) ?? null
+                if is_integer(value) {
+                  numeric_value, conversion_err = to_int(value)
+                  if conversion_err == null {
+                    if numeric_value >= 0 && numeric_value <= 31536000 { out.oldest_queued_age_s = numeric_value }
                   }
                 }
               }
