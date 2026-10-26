@@ -2,9 +2,9 @@ import { and, asc, eq, gt, inArray, sql } from "drizzle-orm";
 import { mkdir, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { config as processConfig } from "../config.ts";
+import { isAssistantReply, isWhisperSilenceArtifact } from "../domain/hallucination.ts";
 import { installFatalLogHandlers } from "../log.ts";
 import { providerDispatchSlots, transcriptionAdmission, transcriptionAttempts, transcriptionProviderBlocks, transcriptionRegions, transcriptionResults, transcriptions, transcriptionWorkers, type TranscriptionRow } from "../db/schema.ts";
-import { isWhisperSilenceArtifact } from "../domain/hallucination.ts";
 import { pcmToWav } from "../providers/transcription/audio.ts";
 import { decodeChannelToPcm, PCM_RATE, readPcmRange } from "./audio.ts";
 import type { BatchContext } from "./context.ts";
@@ -399,8 +399,6 @@ async function dispatchRegion(
       if (isSimulatedCrash(error)) throw error;
       outcome = { kind: "ambiguous", reason: "client_error" };
     }
-    // Whisper answers silence or noise with stock captions (" you"): that region is untranscribed speech-free audio, not text.
-    if (outcome.kind === "ok" && isWhisperModel(ctx.provider!.model) && isWhisperSilenceArtifact(outcome.text)) outcome = { ...outcome, text: "" };
     await ctx.faults.hit("worker.after_response", { id: job.id });
     const settled = await settleDispatch(ctx, fence, region, admission.attemptId, outcome, state, notSent);
     if (settled === "lost") throw new LostFence(fence.id);
@@ -453,7 +451,7 @@ async function settleDispatch(
   const w = ctx.config.worker;
   const detail = outcome.kind === "ambiguous" || outcome.kind === "not_sent" ? outcome.reason
     : outcome.kind === "rejected" || outcome.kind === "misconfigured" || outcome.kind === "blocked" ? `http_${outcome.status}` : null;
-  const seen = { newlyBlockedStatus: null as number | null, recoveredJobs: 0 };
+  const seen = { newlyBlockedStatus: null as number | null, recoveredJobs: 0, droppedRegions: 0 };
   const result = await ctx.db.transaction(async (tx) => {
     let lost = false;
     try {
@@ -512,7 +510,12 @@ async function settleDispatch(
     switch (outcome.kind) {
       case "ok": {
         state.rateLimitStreak = 0;
-        await tx.update(transcriptionRegions).set({ status: "completed", text: outcome.text }).where(regionWhere);
+        // An audio LLM can answer the audio like a chat assistant (TC-2119). A region that is wholly such a reply is not speech:
+        // it completes with empty text, so assembly never publishes it and a job with nothing else ends no_speech.
+        // Whisper also answers silence or noise with stock captions (" you", TC-2128): whole-text matches drop the same way.
+        const ungrounded = isAssistantReply(outcome.text) || (outcome.text.trim() !== "" && isWhisperModel(ctx.provider!.model) && isWhisperSilenceArtifact(outcome.text));
+        if (ungrounded) seen.droppedRegions = 1;
+        await tx.update(transcriptionRegions).set({ status: "completed", text: ungrounded ? "" : outcome.text }).where(regionWhere);
         await tx.update(transcriptions).set({ tinfoilAudioSeconds: sql`${transcriptions.tinfoilAudioSeconds} + ${(region.endMs - region.startMs) / 1000}` }).where(fenceGuard(fence));
         // A successful dispatch proves the provider works again: every waiting job is released at once, logged once.
         const cleared = await tx.delete(transcriptionProviderBlocks)
@@ -546,6 +549,8 @@ async function settleDispatch(
     // Error + alert: the first occurrence is the page. Coded tokens only; the provider's response body is never read.
     ctx.log.error("batch provider blocked", { transcriptionId: fence.id, http_status: seen.newlyBlockedStatus, reason: BLOCK_REASON[seen.newlyBlockedStatus], stage: "dispatch", alert: true });
   }
+  // Count only; the dropped text is never logged.
+  if (seen.droppedRegions > 0) ctx.log.warn("batch region ungrounded", { transcriptionId: fence.id, dropped_regions: seen.droppedRegions, stage: "dispatch" });
   if (seen.recoveredJobs > 0) ctx.log.warn("batch provider recovered", { delayed_jobs: seen.recoveredJobs, stage: "dispatch" });
   if (typeof result === "object") {
     logJobFinished(ctx, result.row, "failed", result.row.errorCode, {
