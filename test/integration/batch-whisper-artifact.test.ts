@@ -15,14 +15,18 @@ if (!scratch.startsWith("/var/tmp/tc-2128.") || process.env.HOME !== scratch) th
 
 const wav = { contentType: "audio/wav" } as const;
 let h: BatchHarness;
+let logs: { message: string; fields: Record<string, unknown> }[] = [];
 beforeAll(async () => {
   h = await startBatchHarness({ config: { tinfoil: { model: "whisper-large-v3-turbo" } } });
+  const keep = (message: string, fields?: Record<string, unknown>) => void logs.push({ message, fields: fields ?? {} });
+  h.ctx.log = { debug: keep, info: keep, warn: keep, error: keep };
 });
 afterAll(async () => {
   await h.stop();
   rmSync(scratch, { recursive: true, force: true });
 });
 afterEach(async () => {
+  logs = [];
   h.tinfoil.calls = [];
   h.tinfoil.handler = (call) => Response.json({ text: `words ${call}`, language: "en" });
   await h.ctx.db.execute(sql`truncate table transcriptions, transcription_tenant_usage cascade`);
@@ -43,6 +47,18 @@ describe("Whisper-class model: silence artifacts are not speech", () => {
     expect(await h.row(id)).toMatchObject({ status: "failed", errorCode: "no_speech", tinfoilCalls: 1 });
     // The region was sent and paid for, so its seconds still count.
     expect((await h.row(id)).tinfoilAudioSeconds).toBeGreaterThan(0);
+  });
+
+  test("a dropped artifact is counted in the same 'batch region ungrounded' event as a dropped assistant reply; an empty reply is not", async () => {
+    h.tinfoil.handler = () => reply(" you");
+    const id = await h.submit(await audio("mono_wav"), wav);
+    await h.work();
+    expect(logs.filter((l) => l.message === "batch region ungrounded").map((l) => l.fields)).toEqual([{ transcriptionId: id, dropped_regions: 1, stage: "dispatch" }]);
+    logs = [];
+    h.tinfoil.handler = () => reply("");
+    await h.submit(await audio("mono_wav"), wav);
+    await h.work();
+    expect(logs.filter((l) => l.message === "batch region ungrounded")).toHaveLength(0);
   });
 
   test("artifacts are dropped region by region; real speech around them and a lone 'Thank you.' stay", async () => {
