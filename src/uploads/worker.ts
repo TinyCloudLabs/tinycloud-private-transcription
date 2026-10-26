@@ -1,9 +1,9 @@
-import { and, asc, eq, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, sql } from "drizzle-orm";
 import { mkdir, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { config as processConfig } from "../config.ts";
 import { installFatalLogHandlers } from "../log.ts";
-import { providerDispatchSlots, transcriptionAdmission, transcriptionAttempts, transcriptionRegions, transcriptionResults, transcriptions, transcriptionWorkers, type TranscriptionRow } from "../db/schema.ts";
+import { providerDispatchSlots, transcriptionAdmission, transcriptionAttempts, transcriptionProviderBlocks, transcriptionRegions, transcriptionResults, transcriptions, transcriptionWorkers, type TranscriptionRow } from "../db/schema.ts";
 import { pcmToWav } from "../providers/transcription/audio.ts";
 import { decodeChannelToPcm, PCM_RATE, readPcmRange } from "./audio.ts";
 import type { BatchContext } from "./context.ts";
@@ -34,7 +34,9 @@ export async function claimNext(ctx: BatchContext): Promise<Claim | null> {
     const [busy] = await tx.select({ id: transcriptions.id }).from(transcriptions).where(eq(transcriptions.status, "processing")).limit(1);
     if (busy) return null;
     const [next] = await tx.select({ id: transcriptions.id }).from(transcriptions)
-      .where(and(eq(transcriptions.status, "queued"), eq(transcriptions.tombstoned, false)))
+      .where(and(eq(transcriptions.status, "queued"), eq(transcriptions.tombstoned, false),
+        sql`not exists (${tx.select({ one: sql`1` }).from(transcriptionProviderBlocks)
+          .where(and(eq(transcriptionProviderBlocks.transcriptionId, transcriptions.id), gt(transcriptionProviderBlocks.nextAttemptAt, new Date())))})`))
       .orderBy(asc(transcriptions.uploadedAt), asc(transcriptions.id)).limit(1).for("update", { skipLocked: true });
     if (!next) return null;
     const token = crypto.randomUUID();
@@ -219,6 +221,12 @@ async function runPipeline(ctx: BatchContext, job: TranscriptionRow, fence: Fenc
       await cleanupJobFiles(ctx, job.id);
       return;
     }
+    if (outcome === "blocked") {
+      // Released to `queued` with a durable not-before. The audio stays (a queued job's upload is never swept); only this
+      // claim's decoded PCM goes, the next claim decodes again.
+      await removeJobEntry(ctx.config.uploadDir, job.id, workDirName(fence.generation));
+      return;
+    }
   }
 
   // 4. Assemble from the database and commit the terminal state (fenced).
@@ -369,7 +377,7 @@ async function dispatchRegion(
   pcmPath: string,
   signal: AbortSignal,
   state: { rateLimitStreak: number },
-): Promise<"done" | "terminal"> {
+): Promise<"done" | "terminal" | "blocked"> {
   const w = ctx.config.worker;
   let notSent = 0;
   for (;;) {
@@ -393,7 +401,7 @@ async function dispatchRegion(
     await ctx.faults.hit("worker.after_response", { id: job.id });
     const settled = await settleDispatch(ctx, fence, region, admission.attemptId, outcome, state, notSent);
     if (settled === "lost") throw new LostFence(fence.id);
-    if (settled === "done" || settled === "terminal") return settled;
+    if (settled === "done" || settled === "terminal" || settled === "blocked") return settled;
     if (outcome.kind === "rate_limited") {
       const seconds = Math.min(outcome.retryAfterSeconds ?? w.retryAfterDefaultSeconds, w.retryAfterMaxSeconds);
       await sleepUnless(seconds * 1000, signal);
@@ -409,9 +417,13 @@ const ATTEMPT_STATUS: Record<ProviderOutcome["kind"], string> = {
   rate_limited: "rate_limited",
   not_sent: "not_sent",
   rejected: "rejected",
+  blocked: "blocked",
   misconfigured: "rejected",
   ambiguous: "ambiguous",
 };
+
+/** Coded token per blocking status; 429 only reaches it after maxConsecutiveRateLimits consecutive rate limits. */
+const BLOCK_REASON: Record<number, string> = { 401: "unauthorized", 402: "payment_required", 403: "forbidden", 429: "rate_limited" };
 
 const LOGGABLE_REASON = /^[A-Za-z0-9_]{1,40}$/;
 
@@ -434,10 +446,11 @@ async function settleDispatch(
   outcome: ProviderOutcome,
   state: { rateLimitStreak: number },
   notSent: number,
-): Promise<"done" | "retry" | "terminal" | "lost"> {
+): Promise<"done" | "retry" | "terminal" | "blocked" | "lost"> {
   const w = ctx.config.worker;
   const detail = outcome.kind === "ambiguous" || outcome.kind === "not_sent" ? outcome.reason
-    : outcome.kind === "rejected" || outcome.kind === "misconfigured" ? `http_${outcome.status}` : null;
+    : outcome.kind === "rejected" || outcome.kind === "misconfigured" || outcome.kind === "blocked" ? `http_${outcome.status}` : null;
+  const seen = { newlyBlockedStatus: null as number | null, recoveredJobs: 0 };
   const result = await ctx.db.transaction(async (tx) => {
     let lost = false;
     try {
@@ -458,16 +471,62 @@ async function settleDispatch(
       const row = await terminalize(tx, fence.id, fenceGuard(fence), "failed", { code, message });
       return row ? { kind: "terminal" as const, row } : "lost" as const;
     };
+    /**
+     * The provider refused before processing (nothing was done or billed), so the job waits instead of failing: release
+     * the claim (back to `queued`, regions kept) with a durable not-before from the capped backoff. Neither the not-sent
+     * nor the rate-limit counter, nor the claim count, is consumed. Past the give-up window it fails provider_unavailable.
+     */
+    const block = async (status: number) => {
+      const [current] = await tx.select().from(transcriptionProviderBlocks).where(eq(transcriptionProviderBlocks.transcriptionId, fence.id));
+      const now = Date.now();
+      const since = current?.blockedSince ?? new Date(now);
+      const deadline = since.getTime() + w.providerBlockMaxSeconds * 1000;
+      if (now >= deadline) {
+        await tx.delete(transcriptionProviderBlocks).where(eq(transcriptionProviderBlocks.transcriptionId, fence.id));
+        return fail("provider_unavailable", "The transcription provider stayed unavailable for too long", "failed");
+      }
+      const schedule = w.providerBlockBackoffSeconds;
+      const attempts = current?.attempts ?? 0;
+      const delayMs = schedule[Math.min(attempts, schedule.length - 1)]! * 1000;
+      const [released] = await tx.update(transcriptions).set({
+        status: "queued",
+        claimToken: null,
+        claimOwnerId: null,
+        claimHeartbeatAt: null,
+        generation: sql`${transcriptions.generation} + 1`,
+        claimCount: sql`greatest(${transcriptions.claimCount} - 1, 0)`,
+        // The processing ceiling measures one attempt window; the next claim sets it again.
+        processingStartedAt: null,
+        updatedAt: sql`now()`,
+      }).where(fenceGuard(fence)).returning({ id: transcriptions.id });
+      if (!released) return "lost" as const;
+      const wait = { blockedSince: since, nextAttemptAt: new Date(Math.min(now + delayMs, deadline)), attempts: attempts + 1, lastStatus: status };
+      await tx.insert(transcriptionProviderBlocks).values({ transcriptionId: fence.id, ...wait })
+        .onConflictDoUpdate({ target: transcriptionProviderBlocks.transcriptionId, set: wait });
+      if (current?.lastStatus !== status) seen.newlyBlockedStatus = status;
+      return "blocked" as const;
+    };
     switch (outcome.kind) {
-      case "ok":
+      case "ok": {
         state.rateLimitStreak = 0;
         await tx.update(transcriptionRegions).set({ status: "completed", text: outcome.text }).where(regionWhere);
         await tx.update(transcriptions).set({ tinfoilAudioSeconds: sql`${transcriptions.tinfoilAudioSeconds} + ${(region.endMs - region.startMs) / 1000}` }).where(fenceGuard(fence));
+        // A successful dispatch proves the provider works again: every waiting job is released at once, logged once.
+        const cleared = await tx.delete(transcriptionProviderBlocks)
+          .where(inArray(transcriptionProviderBlocks.transcriptionId, tx.select({ id: transcriptions.id }).from(transcriptions).where(inArray(transcriptions.status, ["queued", "processing"]))))
+          .returning({ id: transcriptionProviderBlocks.transcriptionId });
+        seen.recoveredJobs = cleared.length;
         return "done" as const;
+      }
       case "rate_limited":
         state.rateLimitStreak++;
-        if (state.rateLimitStreak >= w.maxConsecutiveRateLimits) return fail("provider_unavailable", "The transcription provider kept rejecting requests (rate limited)", "failed");
+        if (state.rateLimitStreak >= w.maxConsecutiveRateLimits) {
+          state.rateLimitStreak = 0;
+          return block(429);
+        }
         return "retry" as const;
+      case "blocked":
+        return block(outcome.status);
       case "not_sent":
         if (notSent + 1 >= w.maxNotSentAttempts) return fail("provider_unavailable", "The transcription provider could not be reached", "failed");
         return "retry" as const;
@@ -480,6 +539,11 @@ async function settleDispatch(
         return fail("provider_outcome_unknown", "A transcription request had an uncertain outcome; it is not retried to avoid a duplicate paid request", "ambiguous");
     }
   });
+  if (seen.newlyBlockedStatus !== null) {
+    // Error + alert: the first occurrence is the page. Coded tokens only; the provider's response body is never read.
+    ctx.log.error("batch provider blocked", { transcriptionId: fence.id, http_status: seen.newlyBlockedStatus, reason: BLOCK_REASON[seen.newlyBlockedStatus], stage: "dispatch", alert: true });
+  }
+  if (seen.recoveredJobs > 0) ctx.log.warn("batch provider recovered", { delayed_jobs: seen.recoveredJobs, stage: "dispatch" });
   if (typeof result === "object") {
     logJobFinished(ctx, result.row, "failed", result.row.errorCode, {
       tinfoil_calls: result.row.tinfoilCalls,

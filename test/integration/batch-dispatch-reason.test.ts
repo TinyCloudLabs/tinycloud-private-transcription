@@ -101,8 +101,8 @@ describe("batch job failed at dispatch carries the coded reason", () => {
     expect(JSON.stringify(logs)).not.toContain("body-probe");
   });
 
-  test("misconfigured carries the status", async () => {
-    const { logs } = await dispatchLogs(() => new Response("body-probe", { status: 401 }));
-    expect(dispatchLine(logs).fields).toMatchObject({ outcome: "misconfigured", reason: "http_401" });
+  test("misconfigured (404) carries the status and stays terminal", async () => {
+    const { logs } = await dispatchLogs(() => new Response("body-probe", { status: 404 }));
+    expect(dispatchLine(logs).fields).toMatchObject({ outcome: "misconfigured", reason: "http_404" });
   });
 });
