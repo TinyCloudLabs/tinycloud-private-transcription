@@ -55,7 +55,8 @@ services:
       ATTRIBUTED_TRANSCRIPTION_ENABLED: "true"
       TINFOIL_BASE_URL: ${TINFOIL_BASE_URL:-https://inference.tinfoil.sh}
       TINFOIL_API_KEY: ${TINFOIL_API_KEY:-}
-      TINFOIL_MODEL: ${TINFOIL_MODEL:-voxtral-small-24b}
+      # Retained-recording recovery transcribes with Whisper too, never an audio LLM (TC-2118).
+      TINFOIL_MODEL: ${TINFOIL_MODEL:-whisper-large-v3-turbo}
       # Platforms POST /v1/meetings accepts in the production stack. Keep this explicit so a
       # stale sealed environment cannot silently disable a shipped capture backend.
       ENABLED_PLATFORMS: jitsi,google_meet,signal
@@ -99,7 +100,7 @@ services:
       ATTRIBUTED_TRANSCRIPTION_ENABLED: "true"
       TINFOIL_BASE_URL: ${TINFOIL_BASE_URL:-https://inference.tinfoil.sh}
       TINFOIL_API_KEY: ${TINFOIL_API_KEY:-}
-      TINFOIL_MODEL: ${TINFOIL_MODEL:-voxtral-small-24b}
+      TINFOIL_MODEL: ${TINFOIL_MODEL:-whisper-large-v3-turbo}
       # Attributed Google Meet batches use Whisper: it returns segment timestamps, so published
       # turns interleave on the meeting clock, and it does not answer short clips like a chatbot (TC-740).
       # It is the only model on this path: a batch Whisper cannot transcribe is listed as a gap,

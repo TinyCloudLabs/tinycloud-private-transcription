@@ -195,9 +195,8 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(env).not.toContain("EVAL_ALL_MEETINGS");
   });
 
-  test("worker retries attributed batches and falls back from empty Whisper results (TC-758)", () => {
+  test("worker retries attributed batches (TC-758)", () => {
     const env = serviceEnv("worker");
-    expect(env).toContain("TINFOIL_ATTRIBUTED_FALLBACK_MODEL: ${TINFOIL_ATTRIBUTED_FALLBACK_MODEL:-voxtral-small-24b}");
     expect(env).toContain("ATTRIBUTED_RETRY_BACKOFF_MS: ${ATTRIBUTED_RETRY_BACKOFF_MS:-30000,60000,120000,240000,480000}");
   });
 

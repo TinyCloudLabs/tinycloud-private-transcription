@@ -130,8 +130,8 @@ describe("empty results end a batch's retries (TC-2118)", () => {
 });
 
 describe("the fallback model is gone from configuration", () => {
-  test("config has no fallback model, and the attributed model defaults to Whisper rather than the voxtral base model", () => {
-    const { TINFOIL_ATTRIBUTED_MODEL: _unset, ...inherited } = process.env;
+  test("config has no fallback model, and the attributed and recovery models default to Whisper", () => {
+    const { TINFOIL_ATTRIBUTED_MODEL: _attributed, TINFOIL_MODEL: _recovery, ...inherited } = process.env;
     const proc = Bun.spawnSync([process.execPath, "-e", 'const { config } = await import("./src/config.ts"); console.log(JSON.stringify(config.tinfoil))'], {
       cwd: new URL("../..", import.meta.url).pathname,
       env: { ...inherited, TINFOIL_ATTRIBUTED_FALLBACK_MODEL: "voxtral-small-24b" },
@@ -141,11 +141,16 @@ describe("the fallback model is gone from configuration", () => {
     const tinfoil = JSON.parse(proc.stdout.toString().trim().split("\n").at(-1)!);
     expect(Object.keys(tinfoil).sort()).toEqual(["apiKey", "attributedModel", "baseUrl", "model"]);
     expect(tinfoil.attributedModel).toBe("whisper-large-v3-turbo");
+    expect(tinfoil.model).toBe("whisper-large-v3-turbo");
   });
 
   test("the meeting-service compose passes no fallback model to any service", () => {
     const compose = readFileSync(new URL("../../infra/dstack/app-compose.yaml", import.meta.url), "utf8");
     expect(compose).not.toContain("ATTRIBUTED_FALLBACK_MODEL");
     expect(compose).toContain("TINFOIL_ATTRIBUTED_MODEL: ${TINFOIL_ATTRIBUTED_MODEL:-whisper-large-v3-turbo}");
+    // Recovery (api and worker) defaults to Whisper too; only EVAL_MODELS shadow runs name voxtral.
+    const recovery = compose.match(/^\s+TINFOIL_MODEL: .*$/gm) ?? [];
+    expect(recovery).toHaveLength(2);
+    expect(recovery.every((line) => line.includes("${TINFOIL_MODEL:-whisper-large-v3-turbo}"))).toBe(true);
   });
 });

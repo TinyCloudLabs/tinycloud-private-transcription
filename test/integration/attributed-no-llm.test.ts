@@ -1,8 +1,9 @@
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { asc, eq } from "drizzle-orm";
+import { asc, eq, sql } from "drizzle-orm";
 import { TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
-import { attributedAttempts, attributedBatches } from "../../src/db/schema.ts";
+import { attributedAttempts, attributedBatches, transcripts } from "../../src/db/schema.ts";
+import { finalizeAttributedRun, reconcileAttributedRuns } from "../../src/services/attributed-transcription.ts";
 import { silentLogger } from "../../src/log.ts";
 import { startHarness, type Harness } from "./harness.ts";
 
@@ -87,4 +88,22 @@ test("an assistant-style answer from the model is rejected as speech and the bat
   expect(batches.filter((b) => b.kind === "batch").map((b) => b.status)).toEqual(["failed"]);
   expect(attempts.every((a) => a.model === WHISPER && a.outcome === "empty_transcript")).toBe(true);
   expect(requestedModels.every((model) => model === WHISPER)).toBe(true);
+}, 90_000);
+
+test("a transcript already delivered to the user is never rewritten, even if it carries a pre-fix fallback segment", async () => {
+  answer = () => ({ text: "We ship Friday.", language: "en", segments: [{ start: 0, end: 1, text: "We ship Friday.", avg_logprob: -0.2, no_speech_prob: 0.02, compression_ratio: 1.1 }] });
+  const first = await aliceMeeting("nol-ldel-ivr");
+  expect(first.transcript).toMatchObject({ text: "Alice: We ship Friday." });
+  const id = first.meeting.id as string;
+  // What a pre-fix publication looked like: a stored fallback segment, and the batch result that produced it.
+  const delivered = { speakers: [{ id: "speaker_0", name: "Alice" }], text: "Alice: Fallback words.", segments: [{ id: "seg_001", speaker_id: "speaker_0", speaker_name: "Alice", start: 0, end: 1, text: "Fallback words.", attribution: "identified", source: "fallback" }] };
+  await h.ctx.db.update(transcripts).set({ segmentsJson: sql`${JSON.stringify(delivered)}::text::jsonb` }).where(eq(transcripts.meetingId, id));
+  await h.ctx.db.update(attributedBatches).set({ resultJson: sql`${JSON.stringify({ text: "Fallback words.", fallback: true, energy_dbfs: -20 })}::text::jsonb` }).where(eq(attributedBatches.meetingId, id));
+  const before = await (await h.api(`/v1/meetings/${id}/transcript`)).json();
+  expect(before).toMatchObject({ text: "Alice: Fallback words.", segments: [{ source: "fallback" }] });
+  // Anything that re-examines the run (reconcile, a late finalize wakeup) leaves the delivered transcript alone.
+  expect(await finalizeAttributedRun(h.ctx, id)).toBe(false);
+  await reconcileAttributedRuns(h.ctx);
+  const after = await (await h.api(`/v1/meetings/${id}/transcript`)).json();
+  expect(after).toEqual(before);
 }, 90_000);
