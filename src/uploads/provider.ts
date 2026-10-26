@@ -8,7 +8,9 @@ import { safeTinfoilLanguage } from "../providers/transcription/tinfoil.ts";
  *   rate_limited  429 (definite rejection; honour Retry-After)
  *   not_sent      the request provably never left: connection refused / DNS / TLS verification failed
  *   rejected      400 / 413 / 415 / 422 (definite; the recording segment was refused)
- *   misconfigured 401 / 403 / 404 (definite; credential, model or URL is wrong: an operator fault)
+ *   blocked       402 / 401 / 403 (definite refusal before processing: the account, quota or key needs an operator;
+ *                 nothing was processed or billed, so the job waits and retries instead of failing)
+ *   misconfigured 404 (definite; model or URL is wrong: a deploy fault, terminal)
  *   ambiguous     everything else: timeout, reset, 5xx, other statuses, unparseable body
  */
 export type ProviderOutcome =
@@ -16,6 +18,7 @@ export type ProviderOutcome =
   | { kind: "rate_limited"; retryAfterSeconds: number | null }
   | { kind: "not_sent"; reason: string }
   | { kind: "rejected"; status: number }
+  | { kind: "blocked"; status: 401 | 402 | 403 }
   | { kind: "misconfigured"; status: number }
   | { kind: "ambiguous"; reason: string };
 
@@ -92,7 +95,11 @@ export class BatchTinfoilClient {
       await response.body?.cancel().catch(() => {});
       return { kind: "rejected", status: response.status };
     }
-    if ([401, 403, 404].includes(response.status)) {
+    if (response.status === 401 || response.status === 402 || response.status === 403) {
+      await response.body?.cancel().catch(() => {});
+      return { kind: "blocked", status: response.status };
+    }
+    if (response.status === 404) {
       await response.body?.cancel().catch(() => {});
       return { kind: "misconfigured", status: response.status };
     }

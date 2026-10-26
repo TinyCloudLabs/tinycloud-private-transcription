@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import {
   transcriptionAdmission,
   transcriptionCapabilities,
+  transcriptionProviderBlocks,
   transcriptionRegions,
   transcriptionResults,
   transcriptions,
@@ -330,10 +331,14 @@ export async function serializeJob(ctx: BatchContext, job: TranscriptionRow) {
   const audio = job.deletionState === "files_deleted" ? "deleted"
     : job.deletionState === "pending" ? "deletion_pending"
       : job.status === "awaiting_upload" ? "not_received" : "stored";
+  // Waiting on a blocked provider (billing, quota or key): the job is neither failed nor stuck. Absent otherwise.
+  const providerDelayed = (job.status === "queued" || job.status === "processing")
+    && (await ctx.db.select({ id: transcriptionProviderBlocks.transcriptionId }).from(transcriptionProviderBlocks).where(eq(transcriptionProviderBlocks.transcriptionId, job.id))).length > 0;
   return {
     id: job.id,
     object: "transcription",
     status: job.status,
+    ...(providerDelayed ? { provider_delayed: true } : {}),
     content_type: job.contentType,
     byte_size: job.byteSize,
     language: job.language,

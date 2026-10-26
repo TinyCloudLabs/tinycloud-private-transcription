@@ -30,6 +30,8 @@ const sourceMessages: Record<string, string> = {
   "batch diarization failed": "batch_diarization_failed",
   "batch provider rejected the service credential or model": "batch_provider_rejected_the_service_credential_or_model",
   "batch job failed at dispatch": "batch_job_failed_at_dispatch",
+  "batch provider blocked": "batch_provider_blocked",
+  "batch provider recovered": "batch_provider_recovered",
   "batch worker heartbeat failed": "batch_worker_heartbeat_failed",
   "batch sweep failed": "batch_sweep_failed",
   "batch worker iteration failed": "batch_worker_iteration_failed",
@@ -114,12 +116,18 @@ export function renderAllowlist(schema: Schema): string {
   const fields = Object.entries(service.fields).filter(([name]) => name !== "svc");
   const completion = "event == \"batch_job_finished\"";
   const dispatchFailure = "event == \"batch_job_failed_at_dispatch\"";
+  // Fields that only their own events may carry; everywhere else they are dropped.
+  const eventScoped: Record<string, string> = {
+    reason: `${dispatchFailure} || event == "batch_provider_blocked"`,
+    status: "event == \"batch_provider_blocked\"",
+    delayed_jobs: "event == \"batch_provider_recovered\"",
+  };
   for (const [name, spec] of fields) {
     const completionField = spec.nullable === true;
     const requiredCompletionField = ["job_id", "outcome", "duration_seconds", "content_type"].includes(name);
     const onlyCompletion = ["job_id", "outcome", "duration_seconds", "tinfoil_calls", "tinfoil_audio_seconds", "voiced_seconds", "dropped_above_floor_pct", "vad_fallback", "segments", "content_type"].includes(name);
     if (name === "stage") lines.push(`if !(${completion}) {`);
-    else if (name === "reason") lines.push(`if ${dispatchFailure} {`);
+    else if (eventScoped[name] !== undefined) lines.push(`if ${eventScoped[name]} {`);
     else if (onlyCompletion) lines.push(`if ${completion} {`);
     if (completionField) lines.push(`  if ${completion} { out.${name} = null }`);
     lines.push(`  value = get(j, [${quoted(name)}]) ?? null`);
@@ -145,7 +153,7 @@ export function renderAllowlist(schema: Schema): string {
       }
       lines.push("  }");
     }
-    if (name === "stage" || name === "reason" || onlyCompletion) lines.push("}");
+    if (name === "stage" || eventScoped[name] !== undefined || onlyCompletion) lines.push("}");
   }
   lines.push(". = out");
   lines.push(endMarker);

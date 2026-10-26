@@ -285,6 +285,22 @@ export const transcriptions = pgTable(
   ],
 );
 
+/**
+ * A job waiting on a blocked provider (402/401/403, or 429 past the consecutive cap): one row while it waits, deleted when
+ * the provider recovers. Additive (transcriptions is untouched). claimNext skips the job until `next_attempt_at`.
+ */
+export const transcriptionProviderBlocks = pgTable("transcription_provider_blocks", {
+  transcriptionId: text("transcription_id").primaryKey().references(() => transcriptions.id, { onDelete: "cascade" }),
+  /** First block of this waiting spell; the 24 h give-up window is measured from here. Set once. */
+  blockedSince: timestamp("blocked_since", { withTimezone: true }).notNull().defaultNow(),
+  /** Durable not-before; survives worker restarts. */
+  nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull(),
+  /** Consecutive blocked outcomes in this spell; indexes the backoff schedule. */
+  attempts: integer("attempts").notNull().default(0),
+  /** HTTP status of the latest block, so `batch_provider_blocked` is logged once per job per distinct status. */
+  lastStatus: integer("last_status").notNull(),
+});
+
 /** Job-scoped upload capabilities (sha256 only). Deleted in the same transaction that ends awaiting_upload. */
 export const transcriptionCapabilities = pgTable("transcription_capabilities", {
   id: text("id").primaryKey(),
@@ -315,7 +331,7 @@ export const transcriptionAttempts = pgTable("transcription_attempts", {
   regionOrdinal: integer("region_ordinal").notNull(),
   ordinal: integer("ordinal").notNull(),
   generation: integer("generation").notNull(),
-  status: text("status").notNull(), // started | succeeded | rate_limited | not_sent | rejected | ambiguous | discarded
+  status: text("status").notNull(), // started | succeeded | rate_limited | not_sent | rejected | blocked | ambiguous | discarded
   outcome: text("outcome"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   completedAt: timestamp("completed_at", { withTimezone: true }),
