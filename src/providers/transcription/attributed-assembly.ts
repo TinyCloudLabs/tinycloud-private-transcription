@@ -1,5 +1,5 @@
 import { normalizeSegments, type NormalizedTranscript, type SpeakerAttribution } from "../../domain/transcript.ts";
-import { hallucinated, hallucinationReason } from "../../domain/hallucination.ts";
+import { assistantReply, hallucinated, hallucinationReason, type HallucinationReason } from "../../domain/hallucination.ts";
 import type { AttributedBatch, AttributedManifest, AttributedRange } from "./attributed.ts";
 
 /**
@@ -72,7 +72,7 @@ export interface TimedPiece { start: number; end: number; text: string; avg_logp
  * TC-758; it is what lets publication find voiced audio that yielded no text.
  */
 export interface ResultWindow { from: number; to: number; status: "text" | "empty" | "silent" }
-/** `fallback` marks text from the fallback model, published with `source: "fallback"` for audit. */
+/** `fallback` is only ever read: it marks results stored by the fallback model removed in TC-2118, whose text is never published. */
 export interface AttributedResult { text: string; language?: string | null; segments?: TimedPiece[]; model?: string; energy_dbfs?: number; windows?: ResultWindow[]; fallback?: boolean }
 /** Part of one range (meeting clock) whose captured audio no attempt turned into kept text. */
 export interface GapPart { sequence: number; start_ms: number; end_ms: number }
@@ -166,7 +166,8 @@ export function inferUnresolvedSpeakers(manifest: AttributedManifest, windowMs =
 
 /**
  * `origin` marks text that did not come from the primary model on the speaker's own stream (TC-758):
- * `recording` was re-read from the retained mixed recording, `fallback` came from the fallback model.
+ * `recording` was re-read from the retained mixed recording. `fallback` was text from the fallback
+ * model removed in TC-2118; it is no longer produced, and stored results carrying it are not published.
  */
 export type RawPiece = { start: number; end: number; text: string; speaker: string | null; speakerKey: string; attribution: SpeakerAttribution; language: string | null; origin?: "recording" | "fallback" };
 
@@ -206,7 +207,7 @@ export function attributedPieces(manifest: AttributedManifest, completed: Array<
   let silentMs = 0;
   for (const { spec, result } of completed) {
     const language = typeof result.language === "string" ? result.language : null;
-    const origin = result.fallback === true ? { origin: "fallback" as const } : {};
+    const legacyFallback = result.fallback === true;
     const windows = resultWindows(result), timeline = batchTimeline(spec), total = timeline.at(-1)?.audioEnd ?? 0;
     const uncovered: Array<[number, number]> = [], silent: Array<[number, number]> = [];
     const before = raw.length;
@@ -214,21 +215,26 @@ export function attributedPieces(manifest: AttributedManifest, completed: Array<
     if (!pieces) {
       stats.untimed_batches++;
       const audioSec = spec.ranges.reduce((sum, range) => sum + range.audio_duration_ms, 0) / 1000;
+      const voicedSec = windows ? windows.reduce((sum, window) => sum + (window.status === "silent" ? 0 : window.to - window.from), 0) : audioSec;
       const energy = typeof result.energy_dbfs === "number" && Number.isFinite(result.energy_dbfs) ? { energy_dbfs: result.energy_dbfs } : {};
-      const reason = hallucinationReason(result.text, { untimed: true, audioSec, ...energy });
+      // Text from the removed fallback model was produced over audio Whisper answered empty twice:
+      // ungrounded by definition, so it is a gap, never speech (TC-2118).
+      const reason: HallucinationReason | "ungrounded" | null = legacyFallback ? "ungrounded" : hallucinationReason(result.text, { untimed: true, audioSec, voicedSec, ...energy });
       if (reason) {
         stats.dropped_hallucinations++;
         if (windows) (reason === "silent" ? silent : uncovered).push([0, total]);
-      } else raw.push({ start: spec.start_ms / 1000, end: spec.end_ms / 1000, text: result.text, ...speakerFor(spec, spec.ranges, inferred), language, ...origin });
+      } else raw.push({ start: spec.start_ms / 1000, end: spec.end_ms / 1000, text: result.text, ...speakerFor(spec, spec.ranges, inferred), language });
       if (windows && !reason) for (const window of windows) if (window.status !== "text") (window.status === "silent" ? silent : uncovered).push([window.from, window.to]);
     } else {
       stats.timed_batches++;
       const touched = new Set<number>();
+      // A reply spread over several segments is still one reply: judge the batch's whole text too.
+      const wholeReply = assistantReply(pieces.map((piece) => piece.text.trim()).join(" "));
       for (const piece of pieces) {
         if (!piece.text.trim()) continue;
         const index = windows?.findIndex((window) => piece.start >= window.from && piece.start < window.to) ?? -1;
         if (index >= 0) touched.add(index);
-        const reason = hallucinationReason(piece.text, pieceEvidence(piece));
+        const reason = wholeReply ? "assistant" : hallucinationReason(piece.text, pieceEvidence(piece));
         if (reason) {
           stats.dropped_hallucinations++;
           if (windows) (reason === "silent" ? silent : uncovered).push([piece.start, Math.max(piece.end, piece.start + MIN_DROPPED_SEC)]);
@@ -236,7 +242,7 @@ export function attributedPieces(manifest: AttributedManifest, completed: Array<
         }
         const start = meetingSeconds(timeline, piece.start), end = meetingSeconds(timeline, Math.max(piece.start, piece.end - 1e-3));
         const mid = meetingSeconds(timeline, (piece.start + piece.end) / 2);
-        raw.push({ start: start.at, end: Math.max(start.at, end.at), text: piece.text.trim(), ...speakerFor(spec, [mid.entry.range], inferred), language, ...origin });
+        raw.push({ start: start.at, end: Math.max(start.at, end.at), text: piece.text.trim(), ...speakerFor(spec, [mid.entry.range], inferred), language });
       }
       if (windows) for (const [index, window] of windows.entries()) {
         if (window.status === "silent") silent.push([window.from, window.to]);

@@ -11,8 +11,6 @@ export interface TinfoilOptions {
   model: string;
   /** Model for attributed meeting batches; defaults to `model`. Whisper models return segment timestamps. */
   attributedModel?: string;
-  /** Untimed model for an attributed batch after repeated empty Whisper results (TC-758). */
-  attributedFallbackModel?: string;
   timeoutMs?: number;
   fetch?: typeof fetch;
   ffmpegPath?: string;
@@ -155,7 +153,6 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
   }
 
   get attributedModel() { return this.opts.attributedModel || this.opts.model; }
-  get attributedFallbackModel() { return this.opts.attributedFallbackModel || this.opts.model; }
 
   /** Same configuration with its own call counter (operator evals run beside production). */
   fork(): TinfoilTranscriptionProvider { return new TinfoilTranscriptionProvider(this.opts); }
