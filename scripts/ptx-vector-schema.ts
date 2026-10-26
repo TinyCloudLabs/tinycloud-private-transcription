@@ -113,11 +113,13 @@ export function renderAllowlist(schema: Schema): string {
 
   const fields = Object.entries(service.fields).filter(([name]) => name !== "svc");
   const completion = "event == \"batch_job_finished\"";
+  const dispatchFailure = "event == \"batch_job_failed_at_dispatch\"";
   for (const [name, spec] of fields) {
     const completionField = spec.nullable === true;
     const requiredCompletionField = ["job_id", "outcome", "duration_seconds", "content_type"].includes(name);
     const onlyCompletion = ["job_id", "outcome", "duration_seconds", "tinfoil_calls", "tinfoil_audio_seconds", "voiced_seconds", "dropped_above_floor_pct", "vad_fallback", "segments", "content_type"].includes(name);
     if (name === "stage") lines.push(`if !(${completion}) {`);
+    else if (name === "reason") lines.push(`if ${dispatchFailure} {`);
     else if (onlyCompletion) lines.push(`if ${completion} {`);
     if (completionField) lines.push(`  if ${completion} { out.${name} = null }`);
     lines.push(`  value = get(j, [${quoted(name)}]) ?? null`);
@@ -143,7 +145,7 @@ export function renderAllowlist(schema: Schema): string {
       }
       lines.push("  }");
     }
-    if (name === "stage" || onlyCompletion) lines.push("}");
+    if (name === "stage" || name === "reason" || onlyCompletion) lines.push("}");
   }
   lines.push(". = out");
   lines.push(endMarker);

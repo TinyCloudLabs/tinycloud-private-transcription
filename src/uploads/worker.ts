@@ -413,6 +413,14 @@ const ATTEMPT_STATUS: Record<ProviderOutcome["kind"], string> = {
   ambiguous: "ambiguous",
 };
 
+const LOGGABLE_REASON = /^[A-Za-z0-9_]{1,40}$/;
+
+/** Only a short coded token may reach the log (`timeout`, `http_502`, `ECONNRESET`); anything free-form collapses to `other`. */
+function loggableReason(detail: string | null): string | null {
+  if (detail === null) return null;
+  return LOGGABLE_REASON.test(detail) ? detail : "other";
+}
+
 /**
  * Settles one admitted attempt. The attempt's metadata and the slot release are always recorded (no
  * content). Everything else — region text, counters, terminal transitions — is written only while the
@@ -480,7 +488,7 @@ async function settleDispatch(
       dropped_above_floor_pct: result.row.vadDroppedAboveFloorPct,
       vad_fallback: result.row.vadFallback,
     }, null);
-    ctx.log.warn("batch job failed at dispatch", { transcriptionId: fence.id, outcome: outcome.kind, stage: "dispatch" });
+    ctx.log.warn("batch job failed at dispatch", { transcriptionId: fence.id, outcome: outcome.kind, stage: "dispatch", reason: loggableReason(detail) });
     return "terminal";
   }
   return result;
