@@ -773,6 +773,45 @@ tests:
               assert!(!exists(.http_status))
               assert!(!exists(.delayed_jobs))
               assert_eq!(length(keys(.)), 7)
+  - name: "region ungrounded ships the dropped count and no text"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-26T15:01:00.000Z\",\"level\":\"warn\",\"msg\":\"batch region ungrounded\",\"transcriptionId\":\"trn_01J9ABCDEF0123456789ABCDEF\",\"dropped_regions\":1,\"stage\":\"dispatch\",\"text\":\"transcript-probe\"}"
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "batch_region_ungrounded")
+              assert_eq!(.svc, "worker")
+              assert_eq!(.level, "warn")
+              assert_eq!(.stage, "dispatch")
+              assert_eq!(.transcriptionId, "trn_01J9ABCDEF0123456789ABCDEF")
+              assert_eq!(.dropped_regions, 1)
+              assert!(!exists(.text))
+              assert!(!contains(encode_json(.), "transcript-probe"))
+              assert_eq!(length(keys(.)), 7)
+  - name: "dropped_regions out of range is dropped and only ships on its own event"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-26T15:01:00.000Z\",\"level\":\"warn\",\"msg\":\"batch region ungrounded\",\"transcriptionId\":\"trn_01J9ABCDEF0123456789ABCDEF\",\"dropped_regions\":1001,\"stage\":\"dispatch\"}"
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-26T15:01:00.000Z\",\"level\":\"warn\",\"msg\":\"batch provider recovered\",\"delayed_jobs\":3,\"dropped_regions\":2,\"stage\":\"dispatch\"}"
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert!(!exists(.dropped_regions))
   - name: "worker heartbeat ships the four queue integers and nothing else"
     inputs:
       - insert_at: allowlist

@@ -124,6 +124,7 @@ transforms:
       else if msg == "batch job failed at dispatch" { "batch_job_failed_at_dispatch" }
       else if msg == "batch provider blocked" { "batch_provider_blocked" }
       else if msg == "batch provider recovered" { "batch_provider_recovered" }
+      else if msg == "batch region ungrounded" { "batch_region_ungrounded" }
       else if msg == "batch worker heartbeat failed" { "batch_worker_heartbeat_failed" }
       else if msg == "batch sweep failed" { "batch_sweep_failed" }
       else if msg == "batch worker iteration failed" { "batch_worker_iteration_failed" }
@@ -244,6 +245,15 @@ transforms:
           numeric_value, conversion_err = to_int(value)
           if conversion_err == null {
             if numeric_value >= 0 && numeric_value <= 31536000 { out.oldest_queued_age_s = numeric_value }
+          }
+        }
+      }
+      if event == "batch_region_ungrounded" {
+        value = get(j, ["dropped_regions"]) ?? null
+        if is_integer(value) {
+          numeric_value, conversion_err = to_int(value)
+          if conversion_err == null {
+            if numeric_value >= 0 && numeric_value <= 1000 { out.dropped_regions = numeric_value }
           }
         }
       }

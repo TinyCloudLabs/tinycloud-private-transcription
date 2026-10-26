@@ -32,6 +32,7 @@ const sourceMessages: Record<string, string> = {
   "batch job failed at dispatch": "batch_job_failed_at_dispatch",
   "batch provider blocked": "batch_provider_blocked",
   "batch provider recovered": "batch_provider_recovered",
+  "batch region ungrounded": "batch_region_ungrounded",
   "batch worker heartbeat failed": "batch_worker_heartbeat_failed",
   "batch sweep failed": "batch_sweep_failed",
   "batch worker iteration failed": "batch_worker_iteration_failed",
@@ -127,6 +128,7 @@ export function renderAllowlist(schema: Schema): string {
     processing_jobs: heartbeat,
     awaiting_upload_jobs: heartbeat,
     oldest_queued_age_s: heartbeat,
+    dropped_regions: "event == \"batch_region_ungrounded\"",
   };
   for (const [name, spec] of fields) {
     const completionField = spec.nullable === true;
