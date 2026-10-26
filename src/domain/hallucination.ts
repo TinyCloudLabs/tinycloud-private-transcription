@@ -24,7 +24,7 @@ const ASSISTANT = [
  * model that cannot make out the audio answers with courtesy and requests for context:
  * "Thank you for your question. However, I'm not sure what you're referring to. Could you please
  * provide more context or clarify your request?" Rule: the text is at most REPLY_MAX_SENTENCES
- * sentences and REPLY_MAX_CHARS characters, has at least two sentences, EVERY sentence is reply
+ * sentences and REPLY_TEXT_MAX_CHARS characters, has at least two sentences, EVERY sentence is reply
  * boilerplate (courtesy or reply), and at least one is a `REPLY` sentence. A person who says
  * "thank you for your question" inside a real answer has other sentences, so the text is kept;
  * so is a lone sentence such as "I'm not sure what you're referring to." or "How can I help you?".
@@ -46,12 +46,12 @@ const COURTESY = [
   /^how can i (?:help|assist) you(?: today)?$/,
   /^(?:i(?:'m| am) here to help(?: you)?|let me know if (?:you have any (?:other |more |further )?questions|i can help(?: further)?))$/,
 ];
-const REPLY_MAX_SENTENCES = 6, REPLY_MAX_CHARS = 600, REPLY_SENTENCE_MAX_CHARS = 160;
+const REPLY_MAX_SENTENCES = 6, REPLY_TEXT_MAX_CHARS = 600, REPLY_SENTENCE_MAX_CHARS = 160;
 /** Lowercased sentence without a leading connective ("However, ...") or its closing punctuation. */
 const replySentence = (sentence: string) => sentence.toLowerCase().replace(/[’‘]/g, "'").replace(/^(?:however|but|unfortunately|sorry|well|so|and)\b,?\s+/, "").replace(/[\s.!?…]+$/, "");
 export function assistantReply(text: string): boolean {
   const trimmed = text.trim();
-  if (trimmed.length > REPLY_MAX_CHARS) return false;
+  if (trimmed.length > REPLY_TEXT_MAX_CHARS) return false;
   const sentences = trimmed.split(/(?<=[.!?…])\s+/).map(replySentence).filter(Boolean);
   if (sentences.length < 2 || sentences.length > REPLY_MAX_SENTENCES) return false;
   let reply = false;
