@@ -773,3 +773,131 @@ tests:
               assert!(!exists(.http_status))
               assert!(!exists(.delayed_jobs))
               assert_eq!(length(keys(.)), 7)
+  - name: "worker heartbeat ships the four queue integers and nothing else"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-26T18:30:00.000Z\",\"level\":\"info\",\"msg\":\"batch worker heartbeat\",\"queued_jobs\":4,\"processing_jobs\":1,\"awaiting_upload_jobs\":2,\"oldest_queued_age_s\":905,\"job_id\":\"trn_01J9ABCDEF0123456789ABCDEF\",\"ownerId\":\"owner-probe\",\"text\":\"transcript-probe\"}"
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "batch_worker_heartbeat")
+              assert_eq!(.svc, "worker")
+              assert_eq!(.level, "info")
+              assert_eq!(.queued_jobs, 4)
+              assert_eq!(.processing_jobs, 1)
+              assert_eq!(.awaiting_upload_jobs, 2)
+              assert_eq!(.oldest_queued_age_s, 905)
+              assert_eq!(length(keys(.)), 8)
+              assert!(!exists(.job_id))
+              assert!(!contains(encode_json(.), "probe"))
+  - name: "an idle worker heartbeat ships zeros"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-26T18:31:00.000Z\",\"level\":\"info\",\"msg\":\"batch worker heartbeat\",\"queued_jobs\":0,\"processing_jobs\":0,\"awaiting_upload_jobs\":0,\"oldest_queued_age_s\":0}"
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "batch_worker_heartbeat")
+              assert_eq!(.queued_jobs, 0)
+              assert_eq!(.processing_jobs, 0)
+              assert_eq!(.awaiting_upload_jobs, 0)
+              assert_eq!(.oldest_queued_age_s, 0)
+              assert_eq!(length(keys(.)), 8)
+  - name: "heartbeat values outside the strict integer ranges are dropped, the event still ships"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-26T18:32:00.000Z\",\"level\":\"info\",\"msg\":\"batch worker heartbeat\",\"queued_jobs\":100001,\"processing_jobs\":\"1\",\"awaiting_upload_jobs\":1.5,\"oldest_queued_age_s\":-1}"
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "batch_worker_heartbeat")
+              assert!(!exists(.queued_jobs))
+              assert!(!exists(.processing_jobs))
+              assert!(!exists(.awaiting_upload_jobs))
+              assert!(!exists(.oldest_queued_age_s))
+              assert_eq!(length(keys(.)), 4)
+  - name: "heartbeat range edges are accepted"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-26T18:33:00.000Z\",\"level\":\"info\",\"msg\":\"batch worker heartbeat\",\"queued_jobs\":100000,\"processing_jobs\":100000,\"awaiting_upload_jobs\":100000,\"oldest_queued_age_s\":31536000}"
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.queued_jobs, 100000)
+              assert_eq!(.processing_jobs, 100000)
+              assert_eq!(.awaiting_upload_jobs, 100000)
+              assert_eq!(.oldest_queued_age_s, 31536000)
+  - name: "the queue fields are dropped from the failed-heartbeat event"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-26T18:34:00.000Z\",\"level\":\"error\",\"msg\":\"batch worker heartbeat failed\",\"stage\":\"heartbeat\",\"queued_jobs\":4,\"processing_jobs\":1,\"awaiting_upload_jobs\":2,\"oldest_queued_age_s\":905}"
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "batch_worker_heartbeat_failed")
+              assert_eq!(.stage, "heartbeat")
+              assert!(!exists(.queued_jobs))
+              assert!(!exists(.processing_jobs))
+              assert!(!exists(.awaiting_upload_jobs))
+              assert!(!exists(.oldest_queued_age_s))
+              assert_eq!(length(keys(.)), 5)
+  - name: "the queue fields are dropped from the completion event"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-26T18:34:01.000Z\",\"level\":\"info\",\"msg\":\"batch job finished\",\"job_id\":\"trn_01J9ABCDEF0123456789ABCDEF\",\"outcome\":\"completed\",\"code\":null,\"duration_seconds\":6.5,\"content_type\":\"audio/mpeg\",\"queued_jobs\":4,\"processing_jobs\":1,\"awaiting_upload_jobs\":2,\"oldest_queued_age_s\":905}"
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "batch_job_finished")
+              assert!(!exists(.queued_jobs))
+              assert!(!exists(.processing_jobs))
+              assert!(!exists(.awaiting_upload_jobs))
+              assert!(!exists(.oldest_queued_age_s))
+  - name: "the queue fields are dropped from an api event"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.api"
+          log: "{\"ts\":\"2026-10-26T18:34:02.000Z\",\"level\":\"info\",\"msg\":\"batch admission mode changed\",\"mode\":\"open\",\"queued_jobs\":4,\"processing_jobs\":1,\"awaiting_upload_jobs\":2,\"oldest_queued_age_s\":905}"
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "batch_admission_mode_changed")
+              assert_eq!(.svc, "api")
+              assert!(!exists(.queued_jobs))
+              assert!(!exists(.processing_jobs))
+              assert!(!exists(.awaiting_upload_jobs))
+              assert!(!exists(.oldest_queued_age_s))
