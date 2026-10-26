@@ -582,3 +582,123 @@ tests:
               assert_eq!(.tags.reason, "partial_or_unparseable")
               assert!(!contains(encode_json(.), "batch transcription"))
     no_outputs_from: [allowlist, gate_unexpected_event]
+  - name: "dispatch failure ships the coded reason token"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-26T13:01:00.000Z\",\"level\":\"warn\",\"msg\":\"batch job failed at dispatch\",\"transcriptionId\":\"trn_01J9ABCDEF0123456789ABCDEF\",\"outcome\":\"ambiguous\",\"stage\":\"dispatch\",\"reason\":\"http_502\"}"
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "batch_job_failed_at_dispatch")
+              assert_eq!(.svc, "worker")
+              assert_eq!(.stage, "dispatch")
+              assert_eq!(.transcriptionId, "trn_01J9ABCDEF0123456789ABCDEF")
+              assert_eq!(.reason, "http_502")
+              assert_eq!(length(keys(.)), 7)
+  - name: "dispatch failure ships a transport error code reason"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-26T13:01:00.000Z\",\"level\":\"warn\",\"msg\":\"batch job failed at dispatch\",\"transcriptionId\":\"trn_01J9ABCDEF0123456789ABCDEF\",\"outcome\":\"ambiguous\",\"stage\":\"dispatch\",\"reason\":\"ECONNRESET\"}"
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "batch_job_failed_at_dispatch")
+              assert_eq!(.svc, "worker")
+              assert_eq!(.stage, "dispatch")
+              assert_eq!(.transcriptionId, "trn_01J9ABCDEF0123456789ABCDEF")
+              assert_eq!(.reason, "ECONNRESET")
+  - name: "dispatch failure reason that is not a coded token is dropped, the event is kept"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-26T13:01:00.000Z\",\"level\":\"warn\",\"msg\":\"batch job failed at dispatch\",\"transcriptionId\":\"trn_01J9ABCDEF0123456789ABCDEF\",\"outcome\":\"ambiguous\",\"stage\":\"dispatch\",\"reason\":\"Bearer sk-probe https://tinfoil.example/v1?key=probe\"}"
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "batch_job_failed_at_dispatch")
+              assert_eq!(.svc, "worker")
+              assert_eq!(.stage, "dispatch")
+              assert_eq!(.transcriptionId, "trn_01J9ABCDEF0123456789ABCDEF")
+              assert!(!exists(.reason))
+              assert!(!contains(encode_json(.), "sk-probe"))
+              assert_eq!(length(keys(.)), 6)
+  - name: "dispatch failure reason longer than 40 characters is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-26T13:01:00.000Z\",\"level\":\"warn\",\"msg\":\"batch job failed at dispatch\",\"transcriptionId\":\"trn_01J9ABCDEF0123456789ABCDEF\",\"outcome\":\"ambiguous\",\"stage\":\"dispatch\",\"reason\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "batch_job_failed_at_dispatch")
+              assert_eq!(.svc, "worker")
+              assert_eq!(.stage, "dispatch")
+              assert_eq!(.transcriptionId, "trn_01J9ABCDEF0123456789ABCDEF")
+              assert!(!exists(.reason))
+  - name: "dispatch failure reason of the wrong type is dropped"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-26T13:01:00.000Z\",\"level\":\"warn\",\"msg\":\"batch job failed at dispatch\",\"transcriptionId\":\"trn_01J9ABCDEF0123456789ABCDEF\",\"outcome\":\"ambiguous\",\"stage\":\"dispatch\",\"reason\":{\"body\":\"probe\"}}"
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "batch_job_failed_at_dispatch")
+              assert_eq!(.svc, "worker")
+              assert_eq!(.stage, "dispatch")
+              assert_eq!(.transcriptionId, "trn_01J9ABCDEF0123456789ABCDEF")
+              assert!(!exists(.reason))
+              assert!(!contains(encode_json(.), "probe"))
+  - name: "dispatch failure without a reason omits the field"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-26T13:01:00.000Z\",\"level\":\"warn\",\"msg\":\"batch job failed at dispatch\",\"transcriptionId\":\"trn_01J9ABCDEF0123456789ABCDEF\",\"outcome\":\"ambiguous\",\"stage\":\"dispatch\"}"
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "batch_job_failed_at_dispatch")
+              assert_eq!(.svc, "worker")
+              assert_eq!(.stage, "dispatch")
+              assert_eq!(.transcriptionId, "trn_01J9ABCDEF0123456789ABCDEF")
+              assert!(!exists(.reason))
+  - name: "reason is not shipped on any event other than the dispatch failure"
+    inputs:
+      - insert_at: allowlist
+        type: log
+        log_fields:
+          tag: "ptx-batch.worker"
+          log: "{\"ts\":\"2026-10-26T13:01:00.000Z\",\"level\":\"warn\",\"msg\":\"batch job failed unexpectedly\",\"stage\":\"pipeline\",\"reason\":\"timeout\"}"
+    outputs:
+      - extract_from: allowlist
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.event, "batch_job_failed_unexpectedly")
+              assert!(!exists(.reason))
