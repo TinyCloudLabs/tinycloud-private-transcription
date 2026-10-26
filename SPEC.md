@@ -321,6 +321,13 @@ the threshold (every non-silent stretch, merged, padded and cut at 30 s) and the
 those leave more than that unsent, the job fails `processing_failed` rather than completing with part of the recording.
 A recording too short for any region still fails `no_speech`.
 
+**Assistant-reply guard (TC-2119):** the batch model is an audio LLM and can answer a region like a chat assistant instead of
+transcribing it. A region whose whole returned text is assistant boilerplate (`isAssistantReply` in `src/domain/hallucination.ts`:
+at most 400 characters, built only from assistant phrases such as "thank you for your question", "I'm not sure what you're
+referring to", "could you please provide more context", "as an AI language model", "I cannot transcribe", plus bare
+connectives) completes with empty text, is not published, and is logged as `batch_region_ungrounded` with a count only. Text that
+holds any other word is kept. A job whose regions are all dropped ends `no_speech`.
+
 **Quiet mode:** when the median is below −50 dBFS, p99 is below −30 dBFS, and at least 1 s of 100 ms frames is
 ≥ p10 + 21 dB, build regions at min(−50, max(−65, p10 + 3)) with ±0.5 s padding. Send their exact union with the
 primary/fallback regions above, coalesced and split at 30 s, so quiet mode never removes previously selected audio.

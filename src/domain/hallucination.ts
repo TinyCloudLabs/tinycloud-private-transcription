@@ -150,3 +150,36 @@ export function hallucinationReason(text: string, evidence: HallucinationEvidenc
 }
 
 export const hallucinated = (text: string, evidence: HallucinationEvidence = {}): boolean => hallucinationReason(text, evidence) !== null;
+
+/**
+ * More chat-assistant phrasing, for output that must be a transcript in full (ptx-batch regions, TC-2119).
+ * Sentence-final tails are bounded to assistant verbs so a person saying "I'm sorry, but I can't make it" is not matched.
+ */
+const ASSISTANT_REPLY = [
+  /\bthank you for your (?:question|inquiry|message)\b/i,
+  /\bI'?m not sure (?:what|which) (?:you'?re|you are) (?:referring|talking) (?:to|about)\b/i,
+  /\b(?:could|can|would) you (?:please )?(?:provide|give|share) (?:me )?(?:with )?(?:some |a bit |a little )?(?:more|additional) (?:context|details|information)\b/i,
+  /\b(?:please )?clarify (?:your|the) (?:request|question)\b/i,
+  /\bthis will help me (?:to )?(?:give|provide) you (?:with )?(?:a )?(?:more )?(?:accurate|helpful)[a-z ,]*?\bresponse\b/i,
+  /\bhow (?:can|may) I (?:help|assist)(?: you)?(?: today)?\b/i,
+  /\bI'?m sorry,? but I (?:can(?:no|')?t|am unable to|'?m unable to|am not able to) (?:assist|help|transcribe|process|comply|provide|answer|understand)[^.!?]*/i,
+  /\bI (?:can(?:no|')?t|am unable to|'?m unable to) transcribe\b[^.!?]*/i,
+  /\bas an AI(?: language model| assistant| model)?,? I (?:don'?t|do not|can(?:no|')?t|am unable)[^.!?]*/i,
+];
+const REPLY_CONNECTIVES = /\b(?:however|but|and|or|so|well|oh|um|uh|hello|hi|hey|sorry|please|also|this|that|it)\b/gi;
+const REPLY_MAX_CHARS = 400;
+
+/**
+ * True when the WHOLE text is chat-assistant boilerplate: short, built from assistant phrases plus bare
+ * connectives, with no other word. Speech that merely contains a phrase ("Thank you for your question, the
+ * numbers are up twelve percent") leaves words over and is never matched.
+ */
+export function isAssistantReply(text: string): boolean {
+  const normalized = text.replace(/[’‘]/g, "'").replace(/\s+/g, " ").trim();
+  if (!normalized || normalized.length > REPLY_MAX_CHARS) return false;
+  let rest = normalized, matched = false;
+  for (const pattern of [...ASSISTANT, ...ASSISTANT_REPLY]) {
+    rest = rest.replace(new RegExp(pattern.source, "gi"), () => { matched = true; return " "; });
+  }
+  return matched && !/[\p{L}\p{N}]/u.test(rest.replace(REPLY_CONNECTIVES, " "));
+}
