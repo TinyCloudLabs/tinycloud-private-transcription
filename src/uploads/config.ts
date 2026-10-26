@@ -70,6 +70,8 @@ export interface BatchConfig {
   worker: {
     pollIntervalMs: number;
     heartbeatSeconds: number;
+    /** Period of the `batch worker heartbeat` log line (queue depth and oldest queued job age). */
+    queueSignalSeconds: number;
     /** API readiness and slot reclamation treat a worker process silent this long as dead. */
     workerStaleSeconds: number;
     claimRenewSeconds: number;
@@ -148,6 +150,7 @@ export function batchConfigFromEnv(log: Pick<Logger, "warn"> = logger): BatchCon
     worker: {
       pollIntervalMs: 1_000,
       heartbeatSeconds: 10,
+      queueSignalSeconds: 60,
       workerStaleSeconds: 30,
       claimRenewSeconds: 20,
       claimStaleSeconds: 60,

@@ -652,6 +652,46 @@ export async function recordWorkerHeartbeat(ctx: BatchContext, observedAt = new 
     .onConflictDoUpdate({ target: transcriptionWorkers.id, set: { observedAt } });
 }
 
+export interface QueueSignal {
+  queued_jobs: number;
+  processing_jobs: number;
+  awaiting_upload_jobs: number;
+  oldest_queued_age_s: number;
+}
+
+// The upper bounds of these fields in infra/dstack-batch/log-shipper/fields.json. The shipper drops a value outside
+// its range, which would blind an alert on exactly the extreme it exists to catch, so the emitter clamps to them.
+const QUEUE_COUNT_MAX = 100_000;
+const QUEUE_AGE_MAX_SECONDS = 31_536_000;
+
+/**
+ * Queue depth by status and the age of the oldest job still waiting to be claimed, in one statement. It reads only the
+ * active rows (`status in awaiting_upload|queued|processing`, served by transcriptions_status_idx; at most one per tenant
+ * by transcriptions_one_active_per_tenant_idx), never the terminal history. `queued` and its age use the claimNext
+ * basis (uploaded_at, tombstoned rows excluded) and the database clock; a job held back by a blocked provider is still
+ * queued, so its age keeps growing.
+ */
+export async function readQueueSignal(db: DbOrTx): Promise<QueueSignal> {
+  const [row] = await db.select({
+    queued: sql<number>`(count(*) filter (where ${transcriptions.status} = 'queued' and not ${transcriptions.tombstoned}))::int`,
+    processing: sql<number>`(count(*) filter (where ${transcriptions.status} = 'processing'))::int`,
+    awaiting: sql<number>`(count(*) filter (where ${transcriptions.status} = 'awaiting_upload'))::int`,
+    oldest: sql<number>`coalesce(floor(extract(epoch from now() - min(coalesce(${transcriptions.uploadedAt}, ${transcriptions.createdAt})) filter (where ${transcriptions.status} = 'queued' and not ${transcriptions.tombstoned})))::int, 0)`,
+  }).from(transcriptions).where(inArray(transcriptions.status, ["awaiting_upload", "queued", "processing"]));
+  const clamp = (value: number, max: number) => Math.min(max, Math.max(0, Number(value)));
+  return {
+    queued_jobs: clamp(row!.queued, QUEUE_COUNT_MAX),
+    processing_jobs: clamp(row!.processing, QUEUE_COUNT_MAX),
+    awaiting_upload_jobs: clamp(row!.awaiting, QUEUE_COUNT_MAX),
+    oldest_queued_age_s: clamp(row!.oldest, QUEUE_AGE_MAX_SECONDS),
+  };
+}
+
+/** The worker's periodic liveness and queue line: counts only, no ids, no content. */
+export async function logQueueSignal(ctx: Pick<BatchContext, "db" | "log">) {
+  ctx.log.info("batch worker heartbeat", { ...(await readQueueSignal(ctx.db)) });
+}
+
 export interface BatchWorkerHandle {
   stop(): Promise<void>;
 }
@@ -675,6 +715,20 @@ export function startBatchWorker(ctx: BatchContext, opts: { sweep?: boolean } = 
     }
   };
   void sweep();
+  let signalling = false;
+  const signal = async () => {
+    if (signalling) return;
+    signalling = true;
+    try {
+      await logQueueSignal(ctx);
+    } catch {
+      ctx.log.error("batch worker heartbeat failed", { stage: "heartbeat" });
+    } finally {
+      signalling = false;
+    }
+  };
+  void signal();
+  const signaller = setInterval(signal, ctx.config.worker.queueSignalSeconds * 1000);
   const sweeper = setInterval(sweep, ctx.config.retention.sweepIntervalMs);
   const loop = (async () => {
     while (running) {
@@ -699,6 +753,8 @@ export function startBatchWorker(ctx: BatchContext, opts: { sweep?: boolean } = 
       clearInterval(heartbeat);
       clearInterval(sweeper);
       while (sweeping) await Bun.sleep(10);
+      clearInterval(signaller);
+      while (signalling) await Bun.sleep(10);
       // Readiness drops immediately rather than after the stale window.
       await recordWorkerHeartbeat(ctx, new Date(0)).catch(() => {});
     },
