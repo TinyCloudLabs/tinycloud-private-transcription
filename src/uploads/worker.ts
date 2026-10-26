@@ -541,7 +541,7 @@ async function settleDispatch(
   });
   if (seen.newlyBlockedStatus !== null) {
     // Error + alert: the first occurrence is the page. Coded tokens only; the provider's response body is never read.
-    ctx.log.error("batch provider blocked", { transcriptionId: fence.id, status: seen.newlyBlockedStatus, reason: BLOCK_REASON[seen.newlyBlockedStatus], stage: "dispatch", alert: true });
+    ctx.log.error("batch provider blocked", { transcriptionId: fence.id, http_status: seen.newlyBlockedStatus, reason: BLOCK_REASON[seen.newlyBlockedStatus], stage: "dispatch", alert: true });
   }
   if (seen.recoveredJobs > 0) ctx.log.warn("batch provider recovered", { delayed_jobs: seen.recoveredJobs, stage: "dispatch" });
   if (typeof result === "object") {

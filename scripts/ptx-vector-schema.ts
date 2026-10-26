@@ -119,7 +119,7 @@ export function renderAllowlist(schema: Schema): string {
   // Fields that only their own events may carry; everywhere else they are dropped.
   const eventScoped: Record<string, string> = {
     reason: `${dispatchFailure} || event == "batch_provider_blocked"`,
-    status: "event == \"batch_provider_blocked\"",
+    http_status: "event == \"batch_provider_blocked\"",
     delayed_jobs: "event == \"batch_provider_recovered\"",
   };
   for (const [name, spec] of fields) {

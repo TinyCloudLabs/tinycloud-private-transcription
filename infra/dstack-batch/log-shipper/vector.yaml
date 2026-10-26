@@ -193,11 +193,11 @@ transforms:
         }
       }
       if event == "batch_provider_blocked" {
-        value = get(j, ["status"]) ?? null
+        value = get(j, ["http_status"]) ?? null
         if is_integer(value) {
           numeric_value, conversion_err = to_int(value)
           if conversion_err == null {
-            if numeric_value >= 400 && numeric_value <= 599 { out.status = numeric_value }
+            if numeric_value >= 400 && numeric_value <= 599 { out.http_status = numeric_value }
           }
         }
       }

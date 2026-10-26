@@ -359,7 +359,7 @@ request is in flight at any time. Outcomes:
 | 429 | new attempt after `Retry-After` (default 30 s, max 120 s); 20 consecutive → treated as 402 below (the job waits) |
 | provably not sent (connection refused / DNS / TLS verification) | ≤ 5 attempts with backoff → `provider_unavailable` |
 | 400 / 413 / 415 / 422 | `transcription_failed` |
-| 402 / 401 / 403 | provider refused before processing (billing, quota or key): nothing was done or billed, so the job **waits**: released to `queued` with a durable not-before (`transcription_provider_blocks.next_attempt_at`), backoff 1, 2, 5, 10, 30 min then every 30 min, at most 24 h from the first block, then `provider_unavailable`. `provider_delayed: true` on the job while it waits. No retry counter or claim is consumed. Logs `batch provider blocked` (once per job per distinct status) and `batch provider recovered` |
+| 402 / 401 / 403 | provider refused before processing (billing, quota or key): nothing was done or billed, so the job **waits**: released to `queued` with a durable not-before (`transcription_provider_blocks.next_attempt_at`), backoff 1, 2, 5, 10, 30 min then every 30 min, at most 24 h from the first block, then `provider_unavailable`. `provider_delayed: true` on the job while it waits. No retry counter or claim is consumed. Logs `batch provider blocked` (once per job per distinct HTTP status, logged as `http_status`) and `batch provider recovered` |
 | 404 | `provider_unavailable` + alert (wrong URL or model: a deploy fault) |
 | timeout, reset, 5xx, other status, unparseable body, worker died while admitted | attempt `ambiguous`, **never re-sent** → `provider_outcome_unknown` |
 

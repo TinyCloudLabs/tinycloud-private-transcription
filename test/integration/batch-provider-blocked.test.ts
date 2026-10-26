@@ -147,7 +147,7 @@ describe("a blocked provider makes the job wait", () => {
     expect(await block(id)).toMatchObject({ lastStatus: 429, attempts: 1 });
     expect(await dto(id)).toMatchObject({ status: "queued", provider_delayed: true });
     expect(events("batch provider blocked")).toHaveLength(1);
-    expect(events("batch provider blocked")[0]!.fields).toMatchObject({ status: 429, reason: "rate_limited" });
+    expect(events("batch provider blocked")[0]!.fields).toMatchObject({ http_status: 429, reason: "rate_limited" });
     // The streak is per claim: the next claim gets a fresh budget of consecutive 429s.
     await elapse(id);
     await h.work();
@@ -250,10 +250,10 @@ describe("logs", () => {
       await elapse(id);
     }
     const blocked = events("batch provider blocked");
-    expect(blocked.map((l) => l.fields.status)).toEqual([402, 403, 402]);
+    expect(blocked.map((l) => l.fields.http_status)).toEqual([402, 403, 402]);
     expect(blocked.map((l) => l.fields.reason)).toEqual(["payment_required", "forbidden", "payment_required"]);
-    expect(blocked[0]).toMatchObject({ level: "error", fields: { transcriptionId: id, status: 402, reason: "payment_required", stage: "dispatch", alert: true } });
-    expect(Object.keys(blocked[0]!.fields).sort()).toEqual(["alert", "reason", "stage", "status", "transcriptionId"]);
+    expect(blocked[0]).toMatchObject({ level: "error", fields: { transcriptionId: id, http_status: 402, reason: "payment_required", stage: "dispatch", alert: true } });
+    expect(Object.keys(blocked[0]!.fields).sort()).toEqual(["alert", "http_status", "reason", "stage", "transcriptionId"]);
     const everything = JSON.stringify(logs);
     for (const probe of ["body-probe", "sk-probe", "transcript-probe", "header-probe"]) expect(everything).not.toContain(probe);
   });
@@ -262,7 +262,7 @@ describe("logs", () => {
     h.tinfoil.handler = refuse(401);
     await h.submit(await audio("mono_wav"), wav);
     await h.work();
-    expect(events("batch provider blocked")[0]!.fields).toMatchObject({ status: 401, reason: "unauthorized" });
+    expect(events("batch provider blocked")[0]!.fields).toMatchObject({ http_status: 401, reason: "unauthorized" });
   });
 });
 
