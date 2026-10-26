@@ -78,7 +78,7 @@ describe("single-slot arbiter", () => {
     expect(body).toMatchObject({
       status: "completed",
       provider: "tinfoil",
-      model: "voxtral-small-24b",
+      model: "whisper-large-v3-turbo",
       channels: 2,
       diarized: false,
       speakers: [{ id: "channel_0", name: "Speaker 1", channel: 0 }, { id: "channel_1", name: "Speaker 2", channel: 1 }],

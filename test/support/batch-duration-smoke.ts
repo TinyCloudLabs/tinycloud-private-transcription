@@ -18,7 +18,7 @@ const provider = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request
   const form = await request.formData();
   const file = form.get("file");
   assert(file instanceof File);
-  assert.equal(form.get("model"), "voxtral-small-24b");
+  assert.equal(form.get("model"), "whisper-large-v3-turbo");
   const wav = new Uint8Array(await file.arrayBuffer());
   decoded.push([wav.byteLength, file.size]);
   return Response.json({ text: `local smoke ${decoded.length}`, language: "en" });
