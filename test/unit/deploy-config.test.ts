@@ -183,7 +183,7 @@ describe("infra/dstack/app-compose.yaml", () => {
       expect(env).toContain('ATTRIBUTED_TRANSCRIPTION_ENABLED: "true"');
       expect(env).toContain("TINFOIL_BASE_URL: ${TINFOIL_BASE_URL:-https://inference.tinfoil.sh}");
       expect(env).toContain("TINFOIL_API_KEY: ${TINFOIL_API_KEY:-}");
-      expect(env).toContain("TINFOIL_MODEL: ${TINFOIL_MODEL:-voxtral-small-24b}");
+      expect(env).toContain("TINFOIL_MODEL: ${TINFOIL_MODEL:-whisper-large-v3-turbo}");
     }
   });
 
