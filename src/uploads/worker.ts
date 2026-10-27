@@ -2,7 +2,7 @@ import { and, asc, eq, gt, inArray, sql } from "drizzle-orm";
 import { mkdir, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { config as processConfig } from "../config.ts";
-import { isAssistantReply, isWhisperSilenceArtifact } from "../domain/hallucination.ts";
+import { isAssistantReply, isWhisperSilenceArtifact, isWhisperSoundCaption } from "../domain/hallucination.ts";
 import { installFatalLogHandlers } from "../log.ts";
 import { providerDispatchSlots, transcriptionAdmission, transcriptionAttempts, transcriptionProviderBlocks, transcriptionRegions, transcriptionResults, transcriptions, transcriptionWorkers, type TranscriptionRow } from "../db/schema.ts";
 import { pcmToWav } from "../providers/transcription/audio.ts";
@@ -513,7 +513,7 @@ async function settleDispatch(
         // An audio LLM can answer the audio like a chat assistant (TC-2119). A region that is wholly such a reply is not speech:
         // it completes with empty text, so assembly never publishes it and a job with nothing else ends no_speech.
         // Whisper also answers silence or noise with stock captions (" you", TC-2128): whole-text matches drop the same way.
-        const ungrounded = isAssistantReply(outcome.text) || (outcome.text.trim() !== "" && isWhisperModel(ctx.provider!.model) && isWhisperSilenceArtifact(outcome.text));
+        const ungrounded = isAssistantReply(outcome.text) || (outcome.text.trim() !== "" && isWhisperModel(ctx.provider!.model) && (isWhisperSilenceArtifact(outcome.text) || isWhisperSoundCaption(outcome.text)));
         if (ungrounded) seen.droppedRegions = 1;
         await tx.update(transcriptionRegions).set({ status: "completed", text: ungrounded ? "" : outcome.text }).where(regionWhere);
         await tx.update(transcriptions).set({ tinfoilAudioSeconds: sql`${transcriptions.tinfoilAudioSeconds} + ${(region.endMs - region.startMs) / 1000}` }).where(fenceGuard(fence));
