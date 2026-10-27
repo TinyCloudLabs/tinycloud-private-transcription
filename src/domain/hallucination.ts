@@ -194,3 +194,22 @@ export function isWhisperSilenceArtifact(text: string): boolean {
   const normalized = text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
   return normalized === "" || WHISPER_SILENCE_ARTIFACTS.has(normalized);
 }
+
+/**
+ * Whisper's bracketed sound or music captions on non-speech audio ("*Piano music*", "[Music]", "(applause)", "♪ music ♪").
+ * Closed list, whole text only, and only when wrapped: arbitrary bracketed text, a caption inside longer text and a bare
+ * "music" are real speech and are kept. Used by the batch role for Whisper-class models only.
+ */
+const WHISPER_SOUND_CAPTIONS = new Set([
+  "music", "piano music", "soft music", "upbeat music", "instrumental", "applause", "laughter", "laughs", "silence", "noise",
+  "background noise", "static", "beep", "beeping", "tone", "humming", "sighs", "coughs", "cough", "inaudible", "blank_audio",
+  "blank audio", "no audio", "music playing", "singing",
+]);
+const SOUND_CAPTION_SHAPE = /^(?:\*([^*]*)\*|\[([^\]]*)\]|\(([^)]*)\)|♪([^♪]*)♪)$/u;
+const SOUND_CAPTION_MAX_CHARS = 40;
+
+export function isWhisperSoundCaption(text: string): boolean {
+  const match = SOUND_CAPTION_SHAPE.exec(text.replace(/\s+/g, " ").trim());
+  const inner = (match?.[1] ?? match?.[2] ?? match?.[3] ?? match?.[4])?.trim().toLowerCase();
+  return inner !== undefined && inner.length <= SOUND_CAPTION_MAX_CHARS && WHISPER_SOUND_CAPTIONS.has(inner);
+}
