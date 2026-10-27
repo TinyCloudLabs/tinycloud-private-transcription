@@ -100,7 +100,7 @@ const textCompression = (text: string) => { const bytes = Buffer.from(text); ret
  * other reason drops text over audio that may have held speech, which callers treat as
  * untranscribed rather than covered (TC-758).
  */
-export type HallucinationReason = "empty" | "silent" | "assistant" | "repetition" | "no_speech" | "stock" | "rate";
+export type HallucinationReason = "empty" | "silent" | "assistant" | "repetition" | "no_speech" | "stock" | "rate" | "caption";
 
 export interface HallucinationEvidence {
   /** Whisper segment confidence; present only for timed output. */
@@ -146,6 +146,10 @@ export function hallucinationReason(text: string, evidence: HallucinationEvidenc
     if (evidence.avg_logprob !== undefined) return evidence.avg_logprob < (speech ? SPEECH_STOCK_LOGPROB : -0.35) ? "stock" : null;
     return !speech && (audioSec === undefined || audioSec < STOCK_AUDIO_SEC) ? "stock" : null;
   }
+  // Whisper's sound or music caption ("*Piano music*") over non-speech audio (TC-2148). Checked last, so no earlier rule's
+  // result changes. Not gated on a model name: the meeting path (gap-fill, recovery, attributed batches) uses Whisper only
+  // since TC-2118, so a bracketed caption here is always an invented one. Whole text, closed list: see isWhisperSoundCaption.
+  if (isWhisperSoundCaption(trimmed)) return "caption";
   return null;
 }
 
@@ -198,7 +202,8 @@ export function isWhisperSilenceArtifact(text: string): boolean {
 /**
  * Whisper's bracketed sound or music captions on non-speech audio ("*Piano music*", "[Music]", "(applause)", "♪ music ♪").
  * Closed list, whole text only, and only when wrapped: arbitrary bracketed text, a caption inside longer text and a bare
- * "music" are real speech and are kept. Used by the batch role for Whisper-class models only.
+ * "music" are real speech and are kept. Used by the batch role for Whisper-class models only, and by hallucinationReason
+ * (the meeting path, Whisper only since TC-2118).
  */
 const WHISPER_SOUND_CAPTIONS = new Set([
   "music", "piano music", "soft music", "upbeat music", "instrumental", "applause", "laughter", "laughs", "silence", "noise",
