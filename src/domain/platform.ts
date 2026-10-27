@@ -36,6 +36,69 @@ export function isSignalCallUrl(value: string): boolean {
   }
 }
 
+const MEET_CODE = /^[a-z]{3}-[a-z]{4}-[a-z]{3}$/i;
+const BARE_CODE = /^[a-z]{10}$/i;
+const HAS_SCHEME = /^[a-z][a-z0-9+.-]*:/i;
+const BARE_HOST = /^[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:[/?#:]|$)/i;
+
+/** The canonical Meet link for a URL in one of the Meet shapes, else null. */
+function meetCanonical(url: URL): string | null {
+  if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+  const host = url.hostname.toLowerCase();
+  const segs = url.pathname.split("/").filter(Boolean);
+  const canon = (code: string | undefined, keep: boolean) =>
+    code !== undefined && MEET_CODE.test(code) ? `https://meet.google.com/${code.toLowerCase()}${keep ? url.search + url.hash : ""}` : null;
+  if (host === "meet.google.com") {
+    if (segs.length === 1) return canon(segs[0], true);
+    return segs.length === 2 && (segs[0] === "meet" || segs[0] === "_meet") ? canon(segs[1], true) : null;
+  }
+  if (host === "google.com" || host === "www.google.com" || host === "g.co") {
+    return segs.length === 2 && segs[0] === "meet" ? canon(segs[1], true) : null;
+  }
+  if (host === "tel.meet") return segs.length === 1 ? canon(segs[0], false) : null;
+  return null;
+}
+
+const parseLoose = (value: string): URL | null => {
+  const text = value.trim();
+  if (!HAS_SCHEME.test(text) && !BARE_HOST.test(text)) return null;
+  try {
+    return new URL(HAS_SCHEME.test(text) ? text : `https://${text}`);
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Rewrites a pasted Google Meet link to `https://meet.google.com/<code>` (lowercase, no trailing
+ * slash): `/meet/<code>`, `/_meet/<code>`, `google.com/meet/<code>`, `g.co/meet/<code>`,
+ * `tel.meet/<code>`, a Google redirect (`google.com/url?q=`), `accounts.google.com?continue=`,
+ * `meet.app.goo.gl?link=`, and a bare code with or without dashes. A wrapper whose target is not a
+ * Meet link throws and is never followed. Any other input, including `meet.google.com/lookup/<nick>`
+ * (which cannot be resolved offline), is returned unchanged.
+ */
+export function normalizeMeetingUrl(raw: string): string {
+  const text = raw.trim();
+  if (MEET_CODE.test(text)) return `https://meet.google.com/${text.toLowerCase()}`;
+  if (BARE_CODE.test(text)) return `https://meet.google.com/${text.slice(0, 3)}-${text.slice(3, 7)}-${text.slice(7)}`.toLowerCase();
+  const url = parseLoose(text);
+  if (!url) return raw;
+  const host = url.hostname.toLowerCase();
+  const wrapped = host === "accounts.google.com" ? url.searchParams.get("continue")
+    : host === "meet.app.goo.gl" ? url.searchParams.get("link")
+    : (host === "google.com" || host === "www.google.com") && url.pathname === "/url" ? url.searchParams.get("q") ?? url.searchParams.get("url")
+    : null;
+  if (wrapped !== null) {
+    const inner = parseLoose(wrapped);
+    const canonical = inner ? meetCanonical(inner) : null;
+    if (!canonical) throw new ApiError("invalid_meeting_url", "meeting_url redirect must point to a Google Meet link");
+    return canonical;
+  }
+  const canonical = meetCanonical(url);
+  if (!canonical) return host === "meet.google.com" && !HAS_SCHEME.test(text) ? `https://${text}` : raw;
+  return HAS_SCHEME.test(text) && url.href.replace(/^http:/, "https:") === canonical ? text : canonical;
+}
+
 export function detectPlatform(meetingUrl: string, override?: string): DetectedPlatform {
   let u: URL;
   try {
@@ -66,6 +129,8 @@ export function detectPlatform(meetingUrl: string, override?: string): DetectedP
   }
 
   if (host === "meet.google.com") {
+    // meet.google.com/lookup/<nick> cannot be resolved offline: accepted as-is, the bot resolves it.
+    if (/^\/lookup\/[^/]+\/?$/.test(u.pathname)) return { platform: "google_meet", nativeMeetingId: null };
     const code = singleSegment(u);
     if (!code) throw new ApiError("invalid_meeting_url", "Google Meet URL must contain a meeting code");
     return { platform: "google_meet", nativeMeetingId: code };
@@ -82,6 +147,8 @@ export function detectPlatform(meetingUrl: string, override?: string): DetectedP
     if (!room) throw new ApiError("invalid_meeting_url", "Jitsi URL must be https://meet.jit.si/<room>");
     return { platform: "jitsi", nativeMeetingId: room };
   }
+  // Lookalikes such as meet.google.com.evil.com or tel.meet.evil.com must not reach the self-hosted Jitsi rule below.
+  if (/(?:^|\.)(?:meet\.google\.com|tel\.meet|g\.co)(?:\.|$)/.test(host)) throw new ApiError("unsupported_platform", `Could not determine a supported meeting platform from ${host}`);
   const looksJitsi = labels.includes("jitsi") || labels.includes("meet");
   if (looksJitsi || override === "jitsi") {
     const room = singleSegment(u);
