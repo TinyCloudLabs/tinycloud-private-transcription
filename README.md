@@ -179,7 +179,7 @@ See [TC-922 validation and limits](docs/tc-922-validation.md); hosted ASR timing
 | `TRANSCRIPTION_PROVIDER` | `vexa` | Compatibility label; Vexa remains the primary provider and is reported by health. |
 | `TINFOIL_BASE_URL` | `https://inference.tinfoil.sh` | OpenAI-compatible confidential transcription endpoint used only for recovery. |
 | `TINFOIL_API_KEY` | – | bearer token; when set, enables recording retention and recovery transcription. |
-| `TINFOIL_MODEL` | `voxtral-small-24b` | recovery transcription model. |
+| `TINFOIL_MODEL` | `whisper-large-v3-turbo` | recovery transcription model (retained-recording text). Use a Whisper-class model: an audio LLM such as `voxtral-small-24b` can answer unclear audio like a chat assistant, and that reply would be published as speech (TC-2118). Recovery text also passes the assistant-reply and speaking-rate guard. |
 | `AUTO_MIGRATE` | `true` | API runs migrations at boot |
 | `PTX_BOOTSTRAP_KEYS` | unset | sealed JSON array of hashed API keys the API syncs at boot (see API-key scopes) |
 | `LOG_LEVEL` | `info` | JSON logs |

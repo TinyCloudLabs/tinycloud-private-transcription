@@ -10,8 +10,8 @@
 
 /** Publication accepts no more attempts than this, whatever the configured schedule. */
 export const MAX_VERIFIED_ATTEMPTS = 16;
-/** Empty results (voiced audio, no words) before an attempt switches to the fallback model. */
-export const EMPTY_RESULTS_BEFORE_FALLBACK = 2;
+/** Empty results (voiced audio, no kept words) after which a batch stops retrying and becomes a gap (TC-2118). */
+export const EMPTY_RESULTS_BEFORE_GAP = 2;
 
 /** Delay before the attempt that follows `failures` failed tries (1-based); the schedule's tail repeats. */
 export const retryDelayMs = (backoffMs: readonly number[], failures: number): number =>
@@ -44,7 +44,10 @@ export function attemptsVerified(status: string, attempts: number, rows: Attempt
   return false;
 }
 
-/** The fallback model takes over once the primary has returned no words twice for this batch. */
-export function attemptModel(prior: Array<{ outcome: string | null }>, primary: string, fallback: string): string {
-  return prior.filter((row) => row.outcome === "empty_transcript").length >= EMPTY_RESULTS_BEFORE_FALLBACK ? fallback : primary;
-}
+/**
+ * Whether an attempt that just returned no kept words is the last one: the same model answering
+ * empty twice will not answer differently, and no other model may invent text for the batch.
+ * Its speech is then gap-filled from the recording or listed as a gap (TC-2118).
+ */
+export const emptyResultsSpent = (prior: Array<{ outcome: string | null }>): boolean =>
+  prior.filter((row) => row.outcome === "empty_transcript").length + 1 >= EMPTY_RESULTS_BEFORE_GAP;

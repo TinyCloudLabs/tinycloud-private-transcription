@@ -1,5 +1,5 @@
 import type { SpeakerAttribution, TranscriptGap } from "../../domain/transcript.ts";
-import { hallucinationReason } from "../../domain/hallucination.ts";
+import { assistantReply, hallucinationReason } from "../../domain/hallucination.ts";
 import type { AttributedManifest, AttributedRange } from "./attributed.ts";
 import { inferUnresolvedSpeakers, nameKey, pieceEvidence, validPieces, type GapPart, type RawPiece, type TimedPiece } from "./attributed-assembly.ts";
 import { safeTinfoilLanguage } from "./tinfoil.ts";
@@ -72,6 +72,7 @@ export interface GapChunkWindow extends GapWindow { index: number; from: number;
 export interface GapChunkSpec { kind: "gap_chunk"; windows: GapChunkWindow[] }
 /** `mismatch`: the cut's audio did not match the aligned plan, so it was never sent (listed as a gap). */
 export interface GapWindowText { index: number; status: "text" | "empty" | "mismatch"; text?: string; language?: string; segments?: TimedPiece[]; energy_dbfs?: number }
+/** `fallback` is only ever read, from chunks stored before TC-2118 by the removed fallback model; it is never written. */
 export interface GapChunkResult { model?: string; fallback?: boolean; windows: GapWindowText[] }
 
 /** Named ranges keep their speaker; unresolved ones take the same-channel inference or null. */
@@ -287,18 +288,19 @@ export function windowCoverage(window: GapChunkWindow, result: GapWindowText | u
   const language = result.language ?? null, lo = window.start_ms / 1000, hi = window.end_ms / 1000;
   const timed = validPieces(result);
   if (!timed) {
-    const reason = hallucinationReason(result.text, { untimed: true, audioSec: hi - lo, ...(finite(result.energy_dbfs) ? { energy_dbfs: result.energy_dbfs } : {}) });
+    const reason = hallucinationReason(result.text, { untimed: true, audioSec: hi - lo, voicedSec: hi - lo, ...(finite(result.energy_dbfs) ? { energy_dbfs: result.energy_dbfs } : {}) });
     if (reason) return { kept: [], uncovered: reason === "silent" ? [] : whole };
     return { kept: [{ start: lo, end: hi, text: result.text.trim(), language }], uncovered: [] };
   }
   const kept: Kept[] = [], uncovered: Array<[number, number]> = [];
   let speech = false;
+  const wholeReply = assistantReply(timed.map((piece) => piece.text.trim()).join(" "));
   for (const piece of timed) {
     if (!piece.text.trim()) continue;
     speech = true;
     // Offsets are into the padded cut; the padding belongs to neighbouring speech, so clamp to the window.
     const start = Math.min(hi, Math.max(lo, window.cut_start_ms / 1000 + piece.start)), end = Math.min(hi, Math.max(start, window.cut_start_ms / 1000 + piece.end));
-    const reason = hallucinationReason(piece.text, pieceEvidence(piece));
+    const reason = wholeReply ? "assistant" : hallucinationReason(piece.text, pieceEvidence(piece));
     if (reason) { if (reason !== "silent") uncovered.push([Math.round(start * 1000), Math.round(Math.max(end, Math.min(hi, start + 0.2)) * 1000)]); continue; }
     kept.push({ start, end, text: piece.text.trim(), language });
   }
