@@ -190,11 +190,12 @@ export const config = {
   tinfoil: {
     baseUrl: env("TINFOIL_BASE_URL", "https://inference.tinfoil.sh"),
     apiKey: env("TINFOIL_API_KEY", ""),
-    model: env("TINFOIL_MODEL", "voxtral-small-24b"),
-    /** Attributed Google Meet batches (TC-741): a Whisper model returns segment timestamps for turn order. */
-    attributedModel: env("TINFOIL_ATTRIBUTED_MODEL", ""),
-    /** Used for an attributed batch after two empty Whisper results, so voiced audio is not lost (TC-758). Untimed. */
-    attributedFallbackModel: env("TINFOIL_ATTRIBUTED_FALLBACK_MODEL", "voxtral-small-24b"),
+    model: env("TINFOIL_MODEL", "whisper-large-v3-turbo"),
+    /**
+     * Attributed Google Meet batches (TC-741): a Whisper model returns segment timestamps for turn order.
+     * No other model transcribes a batch: one that returns no kept words twice becomes a gap (TC-2118).
+     */
+    attributedModel: env("TINFOIL_ATTRIBUTED_MODEL", "whisper-large-v3-turbo"),
   },
   /**
    * Attributed batches and recording gap fills whose paid call was uncertain, empty or failed are

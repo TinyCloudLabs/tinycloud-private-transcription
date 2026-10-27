@@ -1,4 +1,5 @@
 import { ApiError } from "../../domain/errors.ts";
+import { hallucinationReason } from "../../domain/hallucination.ts";
 import { normalizeSegments, type NormalizedTranscript } from "../../domain/transcript.ts";
 import { decodeToPcm, rmsDbfs, sliceToWav, pcmToWav, type Pcm16 } from "./audio.ts";
 import type { AttributedBatch } from "./attributed.ts";
@@ -11,8 +12,6 @@ export interface TinfoilOptions {
   model: string;
   /** Model for attributed meeting batches; defaults to `model`. Whisper models return segment timestamps. */
   attributedModel?: string;
-  /** Untimed model for an attributed batch after repeated empty Whisper results (TC-758). */
-  attributedFallbackModel?: string;
   timeoutMs?: number;
   fetch?: typeof fetch;
   ffmpegPath?: string;
@@ -155,7 +154,6 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
   }
 
   get attributedModel() { return this.opts.attributedModel || this.opts.model; }
-  get attributedFallbackModel() { return this.opts.attributedFallbackModel || this.opts.model; }
 
   /** Same configuration with its own call counter (operator evals run beside production). */
   fork(): TinfoilTranscriptionProvider { return new TinfoilTranscriptionProvider(this.opts); }
@@ -286,19 +284,20 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
       if (failed) throw failed.reason;
     }
 
-    const transcript = normalizeSegments(
-      bodies.map((body, index) => ({
-        start: chunks[index]!.from,
-        end: chunks[index]!.to,
-        text: body.text,
-        speaker: null,
-        speakerKey: "unknown",
-        attribution: "unknown" as const,
-        language: body.language,
-      })),
-      input.language ?? bodies.find((body) => body.language)?.language ?? null,
-    );
+    // Recovery text meets the same last-line guard as attributed output (TC-2118): an assistant-style
+    // reply, a loop, or an implausible speaking rate over the chunk's voiced seconds is not speech.
+    // A rejected chunk contributes nothing and marks the transcript partial; digital silence loses nothing.
+    let droppedSpeech = false;
+    const rate = pcm.sampleRate;
+    const kept = bodies.flatMap((body, index) => {
+      const { from, to } = chunks[index]!;
+      const reason = hallucinationReason(body.text, { untimed: true, audioSec: to - from, voicedSec: voicedSeconds(pcm, from, to), energy_dbfs: sliceDbfs(pcm.samples, from * rate, to * rate) });
+      if (reason) { if (reason !== "silent" && reason !== "empty") droppedSpeech = true; return []; }
+      return [{ start: from, end: to, text: body.text, speaker: null, speakerKey: "unknown", attribution: "unknown" as const, language: body.language }];
+    });
+    const transcript = normalizeSegments(kept, input.language ?? kept.find((segment) => segment.language)?.language ?? null);
     if (!transcript.text.trim()) throw new ApiError("transcription_failed", "Transcription provider returned no words");
+    if (droppedSpeech) transcript.partial = true;
     this.lastStats = { audio_seconds: round(pcm.durationSec), chunks: chunks.length, calls: this.calls - callsBefore };
     return { ...transcript, duration_seconds: round(pcm.durationSec) };
   }
@@ -373,6 +372,19 @@ const replaceExtension = (filename: string, extension: string) =>
   filename.includes(".") ? filename.replace(/\.[^.]+$/, `.${extension}`) : `${filename}.${extension}`;
 
 const round = (value: number) => Math.round(value * 1000) / 1000;
+
+/**
+ * Seconds of 100 ms frames of [from, to) that carry a voice: above the 10th-percentile level plus
+ * 12 dB, never below -50 dBFS (the same rule gap fill uses to find voiced frames in a recording).
+ */
+function voicedSeconds(pcm: Pcm16, from: number, to: number): number {
+  const frame = Math.round(pcm.sampleRate * 0.1), end = Math.min(pcm.samples.length, Math.ceil(to * pcm.sampleRate));
+  const levels: number[] = [];
+  for (let start = Math.floor(from * pcm.sampleRate); start + frame <= end; start += frame) levels.push(sliceDbfs(pcm.samples, start, start + frame));
+  const p10 = [...levels].sort((a, b) => a - b)[Math.floor(levels.length * 0.1)] ?? -120;
+  const threshold = Math.max(-50, p10 + 12);
+  return levels.filter((level) => level >= threshold).length * 0.1;
+}
 
 /**
  * Split at the lowest-energy 100 ms window in the two seconds before each hard limit. Chunks remain

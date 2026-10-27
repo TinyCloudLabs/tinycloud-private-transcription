@@ -99,8 +99,8 @@ a possible duplicate provider charge is accepted. Every paid try is its own dura
 same fence as before (claim token, dispatch slot, owner heartbeat). An attempt never runs past 8 min,
 so a retry after a dead worker waits out that bound and two calls for one batch never overlap; a
 worker that dies while preparing (e.g. killed during a download) spends the same six-try budget.
-After two empty results the batch uses `TINFOIL_ATTRIBUTED_FALLBACK_MODEL` (default
-`voxtral-small-24b`, untimed: one segment per batch, published with `source:"fallback"`). A row whose
+After two empty results (no kept words from voiced audio) the batch stops retrying: its speech is
+gap-filled from the recording or listed as a gap, never sent to another model (TC-2118). A row whose
 attempts already reach the limit (e.g. after the schedule was shortened) settles exhausted. Batch
 and gap-fill calls run in two background worker slots, so other meetings' jobs are never held up.
 Publication waits for scheduled retries and accepts a batch whose latest attempt succeeded after only

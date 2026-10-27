@@ -11,7 +11,7 @@ import { recordingCuts, recordingLevels, type Pcm16 } from "../providers/transcr
 import { acceptWindowText, analyzeAlignment, envelopeMatch, frameLevels, gapChunks, gapOutcome, gapSpec, planAlignment, priorOffsetMs, validAlignResult, validChunkResult, voicedFrames, type AlignmentAnalysis, type GapChunkResult, type GapChunkSpec, type GapSpec, type GapWindowText } from "../providers/transcription/gap-fill.ts";
 import { ATTEMPT_DEADLINE_MS, safeTinfoilLanguage, TinfoilTranscriptionProvider } from "../providers/transcription/tinfoil.ts";
 import type { TranscriptGap } from "../domain/transcript.ts";
-import { attemptLimit, attemptModel, attemptsVerified, retryDelayMs } from "./attributed-ledger.ts";
+import { attemptLimit, attemptsVerified, emptyResultsSpent, retryDelayMs } from "./attributed-ledger.ts";
 import { getMeetingById } from "./meetings.ts";
 import { fetchRetainedRecordingToFile } from "./recording-recovery.ts";
 import { scheduleTranscriptEval } from "./transcript-eval.ts";
@@ -221,10 +221,14 @@ async function settle(ctx: AppContext, batchId: string, token: string, status: "
 
 /**
  * A paid attempt that was uncertain, empty or rejected is re-sent behind the backoff while
- * attempts remain; the last one settles the row exhausted (TC-758).
+ * attempts remain; the last one settles the row exhausted (TC-758). A second empty answer from
+ * the same model also settles it: no other model is asked, and the speech is gap-filled from the
+ * recording or listed as a gap (TC-2118).
  */
 async function settleFailedAttempt(ctx: AppContext, meetingId: string, batchId: string, token: string, rangeSequences: number[], admission: Admitted, status: "failed" | "ambiguous", outcome: string, stage: string): Promise<void> {
-  const backoff = backoffOf(ctx), retry = admission.ordinal < attemptLimit(backoff), delay = retryDelayMs(backoff, admission.ordinal);
+  const backoff = backoffOf(ctx), delay = retryDelayMs(backoff, admission.ordinal);
+  const emptyAgain = outcome === "empty_transcript" && emptyResultsSpent(await ctx.db.select({ outcome: attributedAttempts.outcome }).from(attributedAttempts).where(eq(attributedAttempts.batchId, batchId)));
+  const retry = !emptyAgain && admission.ordinal < attemptLimit(backoff);
   const won = await settle(ctx, batchId, token, status, meetingId, rangeSequences, undefined, admission.attemptId, outcome, retry ? new Date(Date.now() + delay) : undefined);
   if (!won) return;
   if (retry) {
@@ -269,9 +273,8 @@ async function admitTinfoilDispatch(ctx: AppContext, meetingId: string, batchId:
       return { kind: "ineligible" };
     }
     // Every paid attempt is its own durable row; the model is fixed here so the ledger records
-    // which model each billed request used (fallback after repeated empty results, TC-758).
-    const prior = await tx.select({ outcome: attributedAttempts.outcome }).from(attributedAttempts).where(eq(attributedAttempts.batchId, batchId));
-    const model = attemptModel(prior, provider.attributedModel, provider.attributedFallbackModel);
+    // which model each billed request used. Only the attributed (Whisper) model transcribes a batch (TC-2118).
+    const model = provider.attributedModel;
     const attemptId = `${batchId}:attempt:${admitted.attempts}`;
     await tx.insert(attributedAttempts).values({ id: attemptId, batchId, ordinal: admitted.attempts, status: "started", model });
     return { kind: "admitted", language: meeting.language, attemptId, ordinal: admitted.attempts, model };
@@ -385,12 +388,11 @@ export async function processAttributedBatch(ctx: AppContext, meetingId: string,
     const deadline = Date.now() + ATTEMPT_DEADLINE_MS;
     try {
       // No await is permitted between the durable admission above and invoking the paid provider.
-      const response = await provider.transcribeAttributedPcm(prepared.pcm, spec, eligibility.language, eligibility.model, deadline);
-      const result: AttributedResult = eligibility.model !== provider.attributedModel ? { ...response, fallback: true } : response;
+      const result = await provider.transcribeAttributedPcm(prepared.pcm, spec, eligibility.language, eligibility.model, deadline);
       // Voiced audio that yielded no words — or only text the not-speech filter drops — is
       // evidence failure, not a silent meeting: retried, then gap-filled (TC-758). Parts of a
       // completed batch without kept text are found again at finalization and gap-filled too.
-      const kept = response.text.trim() ? attributedPieces(NO_MANIFEST, [{ spec, result }], new Map()).raw.length : 0;
+      const kept = result.text.trim() ? attributedPieces(NO_MANIFEST, [{ spec, result }], new Map()).raw.length : 0;
       if (kept) await settle(ctx, batchId, claimed.token, "completed", meetingId, rangeSequences, result, eligibility.attemptId);
       else await settleFailedAttempt(ctx, meetingId, batchId, claimed.token, rangeSequences, eligibility, "failed", "empty_transcript", "attributed_batch");
     } catch { await settleFailedAttempt(ctx, meetingId, batchId, claimed.token, rangeSequences, eligibility, "ambiguous", "external_call_uncertain", "attributed_batch"); }
@@ -551,7 +553,7 @@ async function processGapChunk(ctx: AppContext, meetingId: string, batchId: stri
     });
     if (!windows.some((window) => window.status === "text")) await settleFailedAttempt(ctx, meetingId, batchId, token, [], eligibility, "failed", "empty_transcript", "attributed_gap_fill");
     else {
-      const result: GapChunkResult = { model: eligibility.model, ...(eligibility.model !== provider.attributedModel ? { fallback: true } : {}), windows };
+      const result: GapChunkResult = { model: eligibility.model, windows };
       await settle(ctx, batchId, token, "completed", meetingId, [], result, eligibility.attemptId);
     }
   } catch { await settleFailedAttempt(ctx, meetingId, batchId, token, [], eligibility, "ambiguous", "external_call_uncertain", "attributed_gap_fill"); }
@@ -807,7 +809,8 @@ async function publish(ctx: AppContext, meetingId: string): Promise<boolean> {
           && ["completed", "failed", "ambiguous"].includes(row.status) && attemptsVerified(row.status, row.attempts, evidence(row.id));
         const result = verified && row.status === "completed" ? validChunkResult(chunk, object(row.resultJson ?? {})) : null;
         if (!verified || (row.status === "completed" && !result)) { unverified++; continue; }
-        if (result) { filled++; for (const window of result.windows) texts.set(window.index, window); }
+        // A chunk stored by the removed fallback model (`fallback: true`) is audio-LLM text over audio Whisper answered empty: never published, its windows stay gaps (TC-2118).
+        if (result && !result.fallback) { filled++; for (const window of result.windows) texts.set(window.index, window); }
       }
       chunkCount = chunks.length;
       ({ pieces: recovered, gaps, recording_ms: recordingMs, gap_ms: gapMs } = gapOutcome(spec, chunks, texts));
