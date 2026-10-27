@@ -33,7 +33,7 @@ const fetchMock = (async (_url: string, init: RequestInit) => {
 }) as unknown as typeof fetch;
 
 beforeAll(async () => {
-  const tinfoil = new TinfoilTranscriptionProvider({ baseUrl: "http://tinfoil.invalid", apiKey: "test", model: "test", attributedFallbackModel: "fallback-model", fetch: fetchMock });
+  const tinfoil = new TinfoilTranscriptionProvider({ baseUrl: "http://tinfoil.invalid", apiKey: "test", model: "test", fetch: fetchMock });
   const log = { ...silentLogger, warn: (msg: string, data?: Record<string, unknown>) => { warnings.push({ msg, data }); } };
   h = await startHarness({ attributedTranscriptionEnabled: true, enabledPlatforms: ["google_meet"], transcriptRecovery: tinfoil, log });
 });
@@ -391,13 +391,14 @@ test("an uncertain first Tinfoil call is retried and the meeting publishes compl
   expect((await transcriptEvalReport(h.ctx, id)).coverage).toMatchObject({ captured_ms: 1000, transcribed_ms: 1000 });
 }, 60_000);
 
-test("two empty Whisper results switch the batch to the fallback model (TC-758)", async () => {
-  respond = (request) => words(request.model === "fallback-model" ? "fallback words" : "");
+test("two empty results settle the batch as a gap; no fallback model is called (TC-2118)", async () => {
+  const models: string[] = [];
+  respond = (request) => { models.push(request.model); return words(""); };
   const { meeting, transcript, attempts } = await attributedMeeting("emp-tyfa-llb", [{ speaker: "Alice", channel: 0, start_ms: 0, bytes: alicePcm }]);
   expect(meeting.status).toBe("completed");
-  expect(transcript).toMatchObject({ text: "Alice: fallback words" });
-  expect(transcript.partial).toBeUndefined();
-  expect(attempts.map((a) => [a.status, a.outcome, a.model])).toEqual([["failed", "empty_transcript", "test"], ["failed", "empty_transcript", "test"], ["succeeded", null, "fallback-model"]]);
+  expect(transcript).toMatchObject({ text: "", partial: true, gaps: [{ start: 0, end: 1, speaker_name: "Alice" }] });
+  expect(models.every((model) => model === "test")).toBe(true);
+  expect(attempts.map((a) => [a.status, a.outcome, a.model])).toEqual([["failed", "empty_transcript", "test"], ["failed", "empty_transcript", "test"]]);
 }, 60_000);
 
 test("a batch exhausted after retries is filled from the retained recording on the meeting clock (TC-758)", async () => {

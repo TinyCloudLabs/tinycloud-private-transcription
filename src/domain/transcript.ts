@@ -30,7 +30,7 @@ export interface Segment {
   end: number;
   text: string;
   attribution?: SpeakerAttribution;
-  /** `recording`: re-read from the mixed recording; `fallback`: from the fallback model (TC-758). */
+  /** `recording`: re-read from the mixed recording. `fallback` is no longer produced (the fallback model was removed, TC-2118); old published versions may carry it. */
   source?: "recording" | "fallback";
 }
 export interface NormalizedTranscript {

@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acceptWindowText, alignRecording, analyzeAlignment, envelopeMatch, frameLevels, GAP_PAD_MS, gapChunks, gapOutcome, gapSpec, gapWindows, MAX_WINDOW_TEXT, priorOffsetMs, recordingCut, validChunkResult, voicedFrames, type GapAlignResult, type GapChunkSpec, type GapWindowText } from "../../src/providers/transcription/gap-fill.ts";
 import { sliceDbfs, TinfoilTranscriptionProvider } from "../../src/providers/transcription/tinfoil.ts";
-import { attemptLimit, attemptModel, attemptsVerified, retryDelayMs } from "../../src/services/attributed-ledger.ts";
+import { attemptLimit, attemptsVerified, retryDelayMs } from "../../src/services/attributed-ledger.ts";
 
 const range = (sequence: number, speaker_name: string, start_ms: number, end_ms: number, opts: { channel?: number; state?: "uploaded" | "failed"; amplitude?: number } = {}): AttributedRange => {
   const source = speaker_name ? "glow-bound" : "unresolved", channel = opts.channel ?? 0;
@@ -30,13 +30,6 @@ describe("retry scheduling (TC-758)", () => {
     expect([1, 2, 3, 4, 5].map((failures) => retryDelayMs(schedule, failures))).toEqual(schedule);
     expect(retryDelayMs(schedule, 9)).toBe(480_000);
     expect(attemptLimit(schedule)).toBe(6);
-  });
-
-  test("switches to the fallback model after two empty results, and stays there", () => {
-    expect(attemptModel([], "whisper", "voxtral")).toBe("whisper");
-    expect(attemptModel([{ outcome: "empty_transcript" }, { outcome: "external_call_uncertain" }], "whisper", "voxtral")).toBe("whisper");
-    expect(attemptModel([{ outcome: "empty_transcript" }, { outcome: "empty_transcript" }], "whisper", "voxtral")).toBe("voxtral");
-    expect(attemptModel([{ outcome: "empty_transcript" }, { outcome: "empty_transcript" }, { outcome: "external_call_uncertain" }], "whisper", "voxtral")).toBe("voxtral");
   });
 });
 
@@ -109,18 +102,6 @@ describe("Tinfoil attempt behaviour (TC-758)", () => {
     await expect(provider.transcribeAttributedPcm(new Uint8Array(new Float32Array(16_000).fill(0.1).buffer), batch!, "en", undefined, Date.now() - 1)).rejects.toThrow();
     expect(calls).toBe(0);
   });
-
-  test("the fallback model is untimed and returns the whole batch's text", async () => {
-    const [batch] = attributedBatches(manifest([range(0, "Alice", 0, 2_000)]), 1);
-    const forms: FormData[] = [];
-    const fetchImpl = (async (_url: string, init: RequestInit) => { forms.push(init.body as FormData); return new Response(JSON.stringify({ text: "words" })); }) as unknown as typeof fetch;
-    const provider = new TinfoilTranscriptionProvider({ baseUrl: "https://t", apiKey: "k", model: "x", attributedModel: "whisper-large-v3-turbo", attributedFallbackModel: "voxtral-small-24b", fetch: fetchImpl });
-    const result = await provider.transcribeAttributedPcm(new Uint8Array(new Float32Array(32_000).fill(0.1).buffer), batch!, "en", provider.attributedFallbackModel);
-    expect(forms[0]!.get("model")).toBe("voxtral-small-24b");
-    expect(forms[0]!.get("response_format")).toBe("json");
-    expect(result).toMatchObject({ text: "words", model: "voxtral-small-24b" });
-    expect(result.segments).toBeUndefined();
-  });
 });
 
 const full = (r: AttributedRange) => ({ sequence: r.sequence, start_ms: r.start_ms, end_ms: r.end_ms });
@@ -143,11 +124,11 @@ describe("untranscribed parts of completed batches (TC-758)", () => {
     expect(attributedPieces(input, [{ spec: batch!, result: { ...result, windows: undefined } }]).untranscribed).toEqual([]);
   });
 
-  test("fallback-model text publishes marked for audit and still passes the chat-reply and loop filters", () => {
+  test("text stored by the removed fallback model is never published, and still passes the chat-reply and loop filters", () => {
     const input = manifest([range(0, "Alice", 0, 20_000)]);
     const [batch] = attributedBatches(input, 1);
     const marked = (text: string) => attributedPieces(input, [{ spec: batch!, result: { text, fallback: true, energy_dbfs: -20, windows: [{ from: 0, to: 20, status: "text" }] } }]);
-    expect(assembleAttributedTranscript(input, [{ spec: batch!, result: { text: "We ship Friday.", fallback: true, energy_dbfs: -20 } }], "en").transcript.segments[0]).toMatchObject({ source: "fallback", attribution: "identified" });
+    expect(assembleAttributedTranscript(input, [{ spec: batch!, result: { text: "We ship Friday.", fallback: true, energy_dbfs: -20 } }], "en").transcript.segments).toEqual([]);
     const loop = marked("Thank you. ".repeat(40));
     expect([loop.raw.length, loop.untranscribed]).toEqual([0, [{ sequence: 0, start_ms: 0, end_ms: 20_000 }]]);
     const [short] = attributedBatches(manifest([range(0, "Alice", 0, 8_000)]), 1);
