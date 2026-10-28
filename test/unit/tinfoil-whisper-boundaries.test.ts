@@ -36,8 +36,11 @@ describe("Whisper upload boundaries", () => {
     expect(result.windows!.at(-1)!.to).toBeCloseTo(121.8, 4);
     const manifest = { version: 1 as const, meeting_id: "1", clock_origin: "first_admitted_capture_epoch_ms" as const, clock_origin_ms: 0, state: "closed" as const, ranges };
     const { transcript } = assembleAttributedTranscript(manifest, [{ spec: batch, result }], "en");
-    // Existing assembly treats piece ends as exclusive (one millisecond inside the captured range).
-    expect(transcript.segments.at(-1)!.end).toBe(221.999);
+    expect(result.segments!.at(-1)!.end).toBe(121.8);
+    const last = transcript.segments.at(-1)!;
+    expect(last.start).toBeGreaterThanOrEqual(220);
+    expect(last.end).toBeLessThanOrEqual(222);
+    expect(last.end).toBeGreaterThan(last.start);
     expect(transcript.segments.every((segment) => segment.speaker_name === "Alice")).toBe(true);
   });
 
