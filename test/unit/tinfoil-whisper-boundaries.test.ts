@@ -38,8 +38,8 @@ describe("Whisper upload boundaries", () => {
     const { transcript } = assembleAttributedTranscript(manifest, [{ spec: batch, result }], "en");
     expect(result.segments!.at(-1)!.end).toBe(121.8);
     const last = transcript.segments.at(-1)!;
-    expect(last.start).toBeGreaterThanOrEqual(220);
-    expect(last.end).toBeLessThanOrEqual(222);
+    expect(last.start).toBeGreaterThanOrEqual(ranges.at(-1)!.start_ms / 1000);
+    expect(last.end).toBeLessThan(ranges.at(-1)!.end_ms / 1000);
     expect(last.end).toBeGreaterThan(last.start);
     expect(transcript.segments.every((segment) => segment.speaker_name === "Alice")).toBe(true);
   });
