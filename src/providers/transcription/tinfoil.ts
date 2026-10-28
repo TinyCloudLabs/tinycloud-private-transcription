@@ -5,6 +5,7 @@ import { decodeToPcm, rmsDbfs, sliceToWav, pcmToWav, type Pcm16 } from "./audio.
 import type { AttributedBatch } from "./attributed.ts";
 import { batchTimeline, paddedBatchPcm, type AttributedResult, type ResultWindow, type TimedPiece, type TimelineEntry } from "./attributed-assembly.ts";
 import type { TranscriptionInput, TranscriptionProvider } from "./types.ts";
+import { appendWhisperPieces, whisperWindows, WHISPER_UPLOAD_SEC } from "./whisper-chunks.ts";
 
 export interface TinfoilOptions {
   baseUrl: string;
@@ -197,7 +198,8 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     const texts: string[] = [], segments: TimedPiece[] = [], windows: ResultWindow[] = [];
     let language_: string | undefined, untimed = false;
     const retryBudget = Math.min(deadline, Date.now() + BATCH_RETRY_BUDGET_MS);
-    for (const [index, window] of timedWindows(timeline, total).entries()) {
+    const requestWindows = timedWindows(timeline, total).flatMap((window) => whisperWindows(window.from, window.to, rate, TIMED_WINDOW_SEC));
+    for (const [index, window] of requestWindows.entries()) {
       // A window whose captured audio is digital or near silence is never sent: Whisper captions
       // silence (TC-758). Every window is recorded, so a voiced one answered empty is not lost.
       if (captured(window.from, window.to) < SILENT_WINDOW_DBFS) { windows.push({ ...window, status: "silent" }); continue; }
@@ -209,13 +211,15 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
       if (!pieces) { untimed = true; continue; }
       const length = window.to - window.from;
       // Whisper may place a trailing caption past the end of the audio; it has no audio to map to.
+      const incoming: TimedPiece[] = [];
       for (const piece of pieces) if (piece.start < length) {
         const start = piece.start + window.from, end = Math.min(Math.max(piece.end, piece.start), length) + window.from;
-        segments.push({ ...piece, start, end, energy_dbfs: captured(start - PIECE_CONTEXT_SEC, end + PIECE_CONTEXT_SEC) });
+        incoming.push({ ...piece, end: end - window.from, energy_dbfs: captured(start - PIECE_CONTEXT_SEC, end + PIECE_CONTEXT_SEC) });
       }
+      appendWhisperPieces(segments, incoming, window, requestWindows[index - 1]?.to);
     }
     // Text without usable offsets must not be published at invented times.
-    return { text: texts.join(" "), language: language_, model, ...(untimed ? {} : { segments }), windows };
+    return { text: !untimed && requestWindows.some((window, index) => index > 0 && window.from < requestWindows[index - 1]!.to) ? segments.map((piece) => piece.text).join(" ") : texts.join(" "), language: language_, model, ...(untimed ? {} : { segments }), windows };
   }
 
   /**
@@ -229,13 +233,20 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     const retryBudget = Math.min(deadline, Date.now() + BATCH_RETRY_BUDGET_MS);
     for (const [index, cut] of cuts.entries()) {
       const rate = cut.sampleRate, length = cut.samples.length / rate;
-      const body = await this.postUnlessRateLimited(pcmToWav(cut.samples, rate), `gap-${index}.wav`, language, model, retryBudget, deadline, timed);
-      const pieces = timed ? timedPieces(body.segments) : undefined;
-      out.push({ text: body.text, ...(body.language ? { language: body.language } : {}), energy_dbfs: sliceDbfs(cut.samples, 0, cut.samples.length),
-        ...(pieces ? { segments: pieces.filter((piece) => piece.start < length).map((piece) => {
-          const end = Math.min(Math.max(piece.end, piece.start), length);
-          return { ...piece, end, energy_dbfs: sliceDbfs(cut.samples, (piece.start - PIECE_CONTEXT_SEC) * rate, (end + PIECE_CONTEXT_SEC) * rate) };
-        }) } : {}) });
+      const windows = timed ? whisperWindows(0, length, rate, TIMED_WINDOW_SEC) : [{ from: 0, to: length }];
+      const segments: TimedPiece[] = [], texts: string[] = [];
+      let language_: string | undefined, untimed = false;
+      for (const [part, window] of windows.entries()) {
+        const bytes = pcmToWav(cut.samples.subarray(Math.round(window.from * rate), Math.round(window.to * rate)), rate);
+        const body = await this.postUnlessRateLimited(bytes, windows.length === 1 ? `gap-${index}.wav` : `gap-${index}-${part}.wav`, language, model, retryBudget, deadline, timed);
+        texts.push(body.text); language_ ??= body.language;
+        const pieces = timed ? timedPieces(body.segments) : undefined;
+        if (!pieces) { untimed = true; continue; }
+        appendWhisperPieces(segments, pieces, window, windows[part - 1]?.to);
+      }
+      const pieces = segments.map((piece) => ({ ...piece, energy_dbfs: sliceDbfs(cut.samples, (piece.start - PIECE_CONTEXT_SEC) * rate, (piece.end + PIECE_CONTEXT_SEC) * rate) }));
+      out.push({ text: !untimed && windows.length > 1 ? pieces.map((piece) => piece.text).join(" ") : texts.join(" "), ...(language_ ? { language: language_ } : {}), energy_dbfs: sliceDbfs(cut.samples, 0, cut.samples.length),
+        ...(!untimed ? { segments: pieces } : {}) });
     }
     return out;
   }
@@ -261,7 +272,15 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
       throw new ApiError("transcription_failed", "The retained recording contains no usable audio");
     }
 
-    const chunks = quietBoundedChunks(pcm, Math.max(1, this.opts.wholeChunkSec ?? 600));
+    const timed = timestampedModel(this.opts.model);
+    const maxSec = Math.max(1, this.opts.wholeChunkSec ?? 600);
+    const limit = timed ? Math.min(WHISPER_UPLOAD_SEC, maxSec) : maxSec;
+    const pad = timed && pcm.durationSec > limit ? Math.min(1, limit / 4) : 0;
+    const cores = quietBoundedChunks(pcm, limit - 2 * pad);
+    const chunks = timed ? cores.map(({ from, to }) => ({
+      from: Math.max(0, Math.round((from - pad) * pcm.sampleRate)) / pcm.sampleRate,
+      to: Math.min(pcm.samples.length, Math.round((to + pad) * pcm.sampleRate)) / pcm.sampleRate,
+    })) : cores;
     const bodies: TinfoilResponse[] = new Array(chunks.length);
     const concurrency = Math.max(1, Math.min(this.opts.concurrency ?? 2, chunks.length));
     const callsBefore = this.calls;
@@ -278,7 +297,8 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
       const settled = await Promise.allSettled(wave.map(async (chunk, waveIndex) => {
         const index = offset + waveIndex;
         const filename = chunks.length === 1 ? replaceExtension(audio.filename, "wav") : `chunk-${index + 1}.wav`;
-        bodies[index] = await this.postWithRetry(sliceToWav(pcm, chunk.from, chunk.to), filename, input.language);
+        const bytes = timed ? pcmToWav(pcm.samples.subarray(Math.round(chunk.from * pcm.sampleRate), Math.round(chunk.to * pcm.sampleRate)), pcm.sampleRate) : sliceToWav(pcm, chunk.from, chunk.to);
+        bodies[index] = await this.postWithRetry(bytes, filename, input.language);
       }));
       const failed = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
       if (failed) throw failed.reason;
@@ -289,13 +309,23 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     // A rejected chunk contributes nothing and marks the transcript partial; digital silence loses nothing.
     let droppedSpeech = false;
     const rate = pcm.sampleRate;
-    const kept = bodies.flatMap((body, index) => {
-      const { from, to } = chunks[index]!;
+    const kept: Array<TimedPiece & { language?: string }> = [];
+    for (const [index, body] of bodies.entries()) {
+      const window = chunks[index]!, { from, to } = window;
       const reason = hallucinationReason(body.text, { untimed: true, audioSec: to - from, voicedSec: voicedSeconds(pcm, from, to), energy_dbfs: sliceDbfs(pcm.samples, from * rate, to * rate) });
-      if (reason) { if (reason !== "silent" && reason !== "empty") droppedSpeech = true; return []; }
-      return [{ start: from, end: to, text: body.text, speaker: null, speakerKey: "unknown", attribution: "unknown" as const, language: body.language }];
-    });
-    const transcript = normalizeSegments(kept, input.language ?? kept.find((segment) => segment.language)?.language ?? null);
+      if (reason) { if (reason !== "silent" && reason !== "empty") droppedSpeech = true; continue; }
+      const pieces = timed ? timedPieces(body.segments) : undefined;
+      if (pieces?.some((piece) => piece.text.trim() && piece.start < to - from && piece.end >= 0 && piece.end >= piece.start)) {
+        const first = kept.length;
+        const previousTimed = index > 0 && timedPieces(bodies[index - 1]!.segments)?.length;
+        appendWhisperPieces(kept, pieces, window, previousTimed ? chunks[index - 1]!.to : window.from);
+        for (let i = first; i < kept.length; i++) kept[i]!.language = body.language;
+      } else {
+        // Legacy/text-only responses retain every word; no text-only guess can prove a seam duplicate.
+        kept.push({ start: from, end: to, text: body.text, language: body.language });
+      }
+    }
+    const transcript = normalizeSegments(kept.map((piece) => ({ ...piece, speaker: null, speakerKey: "unknown", attribution: "unknown" as const })), input.language ?? kept.find((segment) => segment.language)?.language ?? null);
     if (!transcript.text.trim()) throw new ApiError("transcription_failed", "Transcription provider returned no words");
     if (droppedSpeech) transcript.partial = true;
     this.lastStats = { audio_seconds: round(pcm.durationSec), chunks: chunks.length, calls: this.calls - callsBefore };
@@ -316,7 +346,7 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
     const maxRetries = Math.max(0, this.opts.maxRetries ?? 2);
     for (let attempt = 0; ; attempt++) {
       try {
-        return await this.post(bytes, filename, language);
+        return await this.post(bytes, filename, language, this.opts.model, timestampedModel(this.opts.model));
       } catch (error) {
         const retryable = error instanceof ApiError && (error.code === "provider_unavailable" || error.code === "provider_timeout");
         if (!retryable || attempt >= maxRetries) throw error;
@@ -326,6 +356,12 @@ export class TinfoilTranscriptionProvider implements TranscriptionProvider {
   }
 
   private async post(bytes: Uint8Array, filename: string, language: string | null, model = this.opts.model, timed = false, timeoutMs = this.opts.timeoutMs ?? 120_000): Promise<TinfoilResponse> {
+    if (timestampedModel(model)) {
+      const wav = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      if (bytes.byteLength < 44 || bytes.byteLength - 44 > WHISPER_UPLOAD_SEC * wav.getUint32(28, true)) {
+        throw new ApiError("transcription_failed", "Whisper audio exceeds the upload duration limit");
+      }
+    }
     const form = new FormData();
     form.set("model", model);
     form.set("response_format", timed ? "verbose_json" : "json");
