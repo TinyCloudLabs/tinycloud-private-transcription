@@ -40,6 +40,7 @@ const MEET_CODE = /^[a-z]{3}-[a-z]{4}-[a-z]{3}$/i;
 const BARE_CODE = /^[a-z]{10}$/i;
 const HAS_SCHEME = /^[a-z][a-z0-9+.-]*:/i;
 const BARE_HOST = /^[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:[/?#:]|$)/i;
+const MEET_LOOKUP_PATH = /^\/lookup\/[^/]+\/?$/;
 
 /** The canonical Meet link for a URL in one of the Meet shapes, else null. */
 function meetCanonical(url: URL): string | null {
@@ -89,7 +90,12 @@ export function normalizeMeetingUrl(raw: string): string {
     : (host === "google.com" || host === "www.google.com") && url.pathname === "/url" ? url.searchParams.get("q") ?? url.searchParams.get("url")
     : null;
   if (wrapped !== null) {
-    const inner = parseLoose(wrapped);
+    const target = wrapped.trim();
+    const inner = parseLoose(target);
+    if (inner && (inner.protocol === "https:" || inner.protocol === "http:")
+      && inner.hostname.toLowerCase() === "meet.google.com" && MEET_LOOKUP_PATH.test(inner.pathname)) {
+      return HAS_SCHEME.test(target) ? target : `https://${target}`;
+    }
     const canonical = inner ? meetCanonical(inner) : null;
     if (!canonical) throw new ApiError("invalid_meeting_url", "meeting_url redirect must point to a Google Meet link");
     return canonical;
@@ -130,7 +136,7 @@ export function detectPlatform(meetingUrl: string, override?: string): DetectedP
 
   if (host === "meet.google.com") {
     // meet.google.com/lookup/<nick> cannot be resolved offline: accepted as-is, the bot resolves it.
-    if (/^\/lookup\/[^/]+\/?$/.test(u.pathname)) return { platform: "google_meet", nativeMeetingId: null };
+    if (MEET_LOOKUP_PATH.test(u.pathname)) return { platform: "google_meet", nativeMeetingId: null };
     const code = singleSegment(u);
     if (!code) throw new ApiError("invalid_meeting_url", "Google Meet URL must contain a meeting code");
     return { platform: "google_meet", nativeMeetingId: code };

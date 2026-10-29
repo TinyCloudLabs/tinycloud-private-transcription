@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Google Meet redirect wrappers preserve validated lookup targets, including their nickname and query parameters. Integration upload-lease observations complete before fixture teardown. Details: TC-2181
+
 - Integration fixtures restore `HOME` and `TMPDIR` after their file-local scratch directories are used. Details: TC-2181
 
 - TC-2181: a Google Meet link in any pasted shape starts a meeting. `POST /v1/meetings` rewrites `meet.google.com/meet/<code>`, `/_meet/<code>`, `g.co/meet/<code>`, `google.com/meet/<code>`, `tel.meet/<code>`, a `google.com/url?q=`, `accounts.google.com?continue=` or `meet.app.goo.gl?link=` wrapper, and a bare code (with or without dashes) to `https://meet.google.com/<code>` (lowercase, no trailing slash) before the platform is detected; the stored URL and the idempotency hash use that form. Only the Google Meet hosts are recognised; a wrapper whose target is not a Meet link is refused. `meet.google.com/lookup/<nick>` is accepted and sent to the bot as pasted (no native meeting id). Other links are unchanged. Details: TC-2181
