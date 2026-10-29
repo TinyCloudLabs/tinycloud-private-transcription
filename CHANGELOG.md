@@ -6,6 +6,8 @@
 
 - Pasted Google Meet invitations select their first exact-host dashed-code or lookup target in input order, ignoring dial-in numbers and other URLs. Lookup-first inputs retain the existing HTTPS and native-nickname behavior. Meeting creation stores and dispatches the selected URL; link-only redirect handling is unchanged. Details: TC-2181
 
+- ptx-dev's bot janitor now removes finished bot containers older than 7 days (it ran in dry-run before). Old bot images are still removed by hand; BOT_JANITOR_PRUNE_IMAGES turns automatic image removal on. Details: TC-2181
+
 - ptx-dev runs the meeting service from main dfcbb499 and the hardened meeting gateway (vexa 72308da). Details: TC-2181
 
 - HTTPS Google Meet lookup URLs retain their original target and use the nickname as their native meeting identity through dispatch, polling and stop. Bare targets gain an HTTPS scheme; supported redirect wrappers preserve validated HTTPS lookup targets. Explicit HTTP lookup targets return `invalid_meeting_url` before meeting creation or dispatch. Dashed-code normalization is unchanged. Details: TC-2181
