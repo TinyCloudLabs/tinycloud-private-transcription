@@ -130,7 +130,8 @@
   },
   {
    "input": "http://meet.google.com/abc-defg-hij",
-   "outcome": "passthrough"
+   "outcome": "canonical",
+   "canonical": "https://meet.google.com/abc-defg-hij"
   },
   {
    "input": "https://meet.google.com/lookup/abc123def",

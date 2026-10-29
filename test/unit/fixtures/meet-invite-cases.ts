@@ -88,7 +88,7 @@ export const meetInviteCases = [
   {
     "name": "first HTTP dashed-code target is not skipped for a later meeting",
     "input": "Join http://meet.google.com/abc-defg-hij Backup https://meet.google.com/yas-buib-ppd",
-    "url": "http://meet.google.com/abc-defg-hij",
+    "url": "https://meet.google.com/abc-defg-hij",
     "nativeMeetingId": "abc-defg-hij"
   }
 ] as const;

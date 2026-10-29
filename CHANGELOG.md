@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Explicit HTTP meeting targets upgrade to HTTPS only for the exact `meet.google.com/xxx-xxxx-xxx` path, lowercasing the code and dropping the query before storage and dispatch. Other HTTP targets use the existing invalid-link response before meeting creation, including lookup paths and other hosts; the same policy applies to redirect targets. Existing HTTPS query handling is unchanged. Details: TC-2246
+
 - Delimited Meet targets in invitation text retain their lookup nickname and query content. The first dashed-code target is selected before its existing link-only protocol handling; a later meeting target is not substituted. Details: TC-2181
 
 - Pasted Google Meet invitations select their first exact-host dashed-code or lookup target in input order, ignoring dial-in numbers and other URLs. Lookup-first inputs retain the existing HTTPS and native-nickname behavior. Meeting creation stores and dispatches the selected URL; link-only redirect handling is unchanged. Details: TC-2181

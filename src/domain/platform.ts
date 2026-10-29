@@ -52,8 +52,13 @@ const INVITE_DELIMITERS: Readonly<Record<string, string>> = {
 
 /** The canonical Meet link for a URL in one of the Meet shapes, else null. */
 function meetCanonical(url: URL): string | null {
-  if (url.protocol !== "https:" && url.protocol !== "http:") return null;
   const host = url.hostname.toLowerCase();
+  if (url.protocol === "http:") {
+    const code = url.pathname.slice(1);
+    return host === "meet.google.com" && MEET_CODE.test(code)
+      ? `https://meet.google.com/${code.toLowerCase()}` : null;
+  }
+  if (url.protocol !== "https:") return null;
   const segs = url.pathname.split("/").filter(Boolean);
   const canon = (code: string | undefined, keep: boolean) =>
     code !== undefined && MEET_CODE.test(code) ? `https://meet.google.com/${code.toLowerCase()}${keep ? url.search + url.hash : ""}` : null;
@@ -115,6 +120,11 @@ export function normalizeMeetingUrl(raw: string): string {
     }
     throw new ApiError("invalid_meeting_url", "meeting_url is not a valid URL");
   }
+  if (url.protocol === "http:") {
+    const canonical = meetCanonical(url);
+    if (!canonical) throw new ApiError("invalid_meeting_url", "meeting_url is not a valid URL");
+    return canonical;
+  }
   const host = url.hostname.toLowerCase();
   const wrapped = host === "accounts.google.com" ? url.searchParams.get("continue")
     : host === "meet.app.goo.gl" ? url.searchParams.get("link")
@@ -133,7 +143,7 @@ export function normalizeMeetingUrl(raw: string): string {
   }
   const canonical = meetCanonical(url);
   if (!canonical) return host === "meet.google.com" && !HAS_SCHEME.test(text) ? `https://${text}` : raw;
-  return HAS_SCHEME.test(text) && url.href.replace(/^http:/, "https:") === canonical ? text : canonical;
+  return HAS_SCHEME.test(text) && url.href === canonical ? text : canonical;
 }
 
 export function detectPlatform(meetingUrl: string, override?: string): DetectedPlatform {
