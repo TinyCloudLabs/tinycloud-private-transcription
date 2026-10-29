@@ -8,6 +8,7 @@ import { audio, startBatchHarness, type BatchHarness } from "./batch-harness.ts"
 
 // TC-2082: the harness writes upload files under os.tmpdir(); keep that and HOME in a private /var/tmp dir.
 const scratch = mkdtempSync(join("/var/tmp", "tc-2082."));
+const saved = { HOME: process.env.HOME, TMPDIR: process.env.TMPDIR };
 process.env.HOME = scratch;
 process.env.TMPDIR = scratch;
 if (!scratch.startsWith("/var/tmp/tc-2082.") || process.env.HOME !== scratch) throw new Error("test scratch dir was not applied");
@@ -19,8 +20,11 @@ beforeAll(async () => {
   h = await startBatchHarness();
 });
 afterAll(async () => {
-  await h.stop();
-  rmSync(scratch, { recursive: true, force: true });
+  try { await h.stop(); }
+  finally {
+    for (const [key, value] of Object.entries(saved)) value === undefined ? delete process.env[key] : (process.env[key] = value);
+    rmSync(scratch, { recursive: true, force: true });
+  }
 });
 afterEach(async () => {
   h.tinfoil.calls = [];

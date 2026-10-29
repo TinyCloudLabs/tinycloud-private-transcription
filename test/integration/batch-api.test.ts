@@ -572,12 +572,21 @@ describe("upload contract", () => {
 
     Object.assign(h.ctx.config.upload, { maxPutSeconds: 0.3, leaseHeartbeatSeconds: 0.05 });
     const hardExpiries = new Set<number>();
-    const watcher = setInterval(async () => {
-      const row = await h.row(job.id);
-      if (row.uploadLeaseHardExpiresAt) hardExpiries.add(row.uploadLeaseHardExpiresAt.getTime());
+    // Postgres lease deadlines use wall-clock time, so this integration samples the live upload. Details: TC-2181
+    let observation = Promise.resolve();
+    const watcher = setInterval(() => {
+      observation = observation.then(async () => {
+        const row = await h.row(job.id);
+        if (row.uploadLeaseHardExpiresAt) hardExpiries.add(row.uploadLeaseHardExpiresAt.getTime());
+      });
     }, 25);
-    const long = await h.put(job.id, job.upload.capability, trickle(bytes, 40, 20), { contentLength: bytes.byteLength });
-    clearInterval(watcher);
+    let long: Response;
+    try {
+      long = await h.put(job.id, job.upload.capability, trickle(bytes, 40, 20), { contentLength: bytes.byteLength });
+    } finally {
+      clearInterval(watcher);
+      await observation;
+    }
     expect(await errorOf(long)).toMatchObject({ code: "upload_interrupted", message: "The upload exceeded its maximum duration" });
     expect(hardExpiries.size).toBe(1);
     Object.assign(h.ctx.config.upload, { maxPutSeconds: 1_800, leaseHeartbeatSeconds: 10 });
