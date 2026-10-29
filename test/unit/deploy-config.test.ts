@@ -99,7 +99,7 @@ describe("infra/dstack/app-compose.yaml", () => {
       "bot-janitor": "docker:27.5.1-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c",
       runtime: "vexaai/v012-runtime:v012@sha256:a1f6448fbb380b9433364e8b572ec25a12aa4f274bf403f1d83a89cbf5812f2d",
       whisper: "fedirz/faster-whisper-server:latest-cpu@sha256:760e5e43d427dc6cfbbc4731934b908b7de9c7e6d5309c6a1f0c8c923a5b6030",
-      "meeting-api": "ghcr.io/tinycloudlabs/vexa/meeting-api:tc-63970d8@sha256:0a976dba383951030116296c7c45e0b80b07bbd40ff4d075df5ab564ff9c845e",
+      "meeting-api": "ghcr.io/tinycloudlabs/vexa/meeting-api:tc-a4be1f0@sha256:ddf5abf00c790c880a680d1ab813a576c0811574869c920f71c68beb6c5db398",
       gateway: "ghcr.io/tinycloudlabs/vexa/gateway:tc-63970d8@sha256:5a2542727f2f7841032f732595018711b6ee73e0f72cec704e7297532a78e7ec",
       "vexa-provision": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
     } as const;
