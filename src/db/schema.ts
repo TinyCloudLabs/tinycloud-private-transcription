@@ -42,6 +42,8 @@ export const meetings = pgTable(
     /** AES-GCM encrypted Signal call fragment. Cleared as soon as capture becomes terminal. */
     signalCapability: text("signal_capability"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    maxDurationSeconds: integer("max_duration_seconds").notNull().default(3600),
+    scheduledStopAt: timestamp("scheduled_stop_at", { withTimezone: true }),
     startedAt: timestamp("started_at", { withTimezone: true }),
     endedAt: timestamp("ended_at", { withTimezone: true }),
     completedAt: timestamp("completed_at", { withTimezone: true }),

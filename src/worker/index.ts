@@ -9,6 +9,7 @@ import { MIN_RECOVERY_ACK_BUDGET_MS, recoveryAckBudgetMs } from "../services/rec
 import { handleEvalJob } from "../services/transcript-eval.ts";
 import type { Job } from "./queue.ts";
 import { startHousekeeping } from "./housekeeping.ts";
+import { stopMeetingIfDurationElapsed } from "../services/meetings.ts";
 
 export type JobOutcome = "processed" | "noop" | "deferred";
 
@@ -93,7 +94,10 @@ export function startWorker(ctx: AppContext, opts: { popTimeoutSec?: number; hea
       ? (await ctx.db.select({ meetingId: attributedTranscriptionRuns.meetingId }).from(attributedTranscriptionRuns)
         .where(inArray(attributedTranscriptionRuns.meetingId, attributedProcessing))).map((r) => r.meetingId)
       : []);
+    const now = new Date();
     for (const meeting of rows) {
+      if (meeting.status !== "processing" && meeting.scheduledStopAt && meeting.scheduledStopAt <= now
+        && await stopMeetingIfDurationElapsed(ctx, meeting.id, now)) continue;
       if (owned.has(meeting.id)) continue;
       if (meeting.status === "queued") {
         // A live start lease means a meeting.start chain (e.g. a Signal seat wait) already
