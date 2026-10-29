@@ -371,10 +371,13 @@ services:
   # TC-904: Vexa's runtime never removes a finished bot container. Each keeps its local copy of the
   # meeting's signal tapes (~250 MB, already in MinIO) and pins the bot image it ran, so superseded
   # bot images (~4.6 GB each) survive dstack's post-deploy prune too. Every 6 h this removes bot
-  # containers (label runtime.managed=true) that finished more than BOT_CONTAINER_RETENTION_DAYS
-  # ago. Bot IMAGES older than the pinned PTX_BOT_IMAGE that no container uses are removed only when
-  # BOT_JANITOR_PRUNE_IMAGES=true (default false); dry-run always logs them. The pinned image and
-  # anything newer are never touched. BOT_JANITOR_MODE=dry-run (default) only logs; apply removes.
+  # containers that finished more than BOT_CONTAINER_RETENTION_DAYS ago. A container counts as a bot
+  # only if it has runtime.managed=true (generic: agent workers have it too) AND is named vexa-mtg-*
+  # (runtime name prefix + meeting-api workload id mtg-<meeting>-<conn>) AND was created from a bot
+  # image repository. Bot IMAGES older than the pinned PTX_BOT_IMAGE that no container uses are
+  # removed only when BOT_JANITOR_PRUNE_IMAGES=true (default false); dry-run always logs them. The
+  # pinned image and anything newer are never touched. BOT_JANITOR_MODE=dry-run (default) only logs;
+  # apply removes.
   bot-janitor:
     image: docker:27.5.1-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     entrypoint: ["/bin/sh", "-c"]
@@ -391,8 +394,13 @@ services:
         sweep() {
           cutoff=$$(date -u -d "@$$(( $$(date +%s) - BOT_CONTAINER_RETENTION_DAYS * 86400 ))" +%Y-%m-%dT%H:%M:%S)
           ids=$$(docker ps -aq --filter label=runtime.managed=true --filter status=exited --filter status=dead)
-          [ -z "$$ids" ] || docker inspect -f '{{.Id}} {{.State.FinishedAt}} {{.Name}}' $$ids |
-            while read -r id finished name; do
+          [ -z "$$ids" ] || docker inspect -f '{{.Id}} {{.State.FinishedAt}} {{.Name}} {{.Config.Image}}' $$ids |
+            while read -r id finished name image; do
+              # Positive bot identity (runtime.managed=true alone also matches agent workers): the
+              # runtime names meeting bots vexa-mtg-<workload id> and creates them from a bot repository.
+              case "$$name" in /vexa-mtg-*) ;; *) continue;; esac
+              repo=$${image%@*}; repo=$${repo%:*}
+              case "$$repo" in ghcr.io/tinycloudlabs/vexa/bot|vexaai/vexa-bot) ;; *) continue;; esac
               older "$$finished" "$$cutoff" || continue
               log "remove container $$name finished $$finished"; act docker rm "$$id"
             done
