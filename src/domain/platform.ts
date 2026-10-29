@@ -42,10 +42,23 @@ const HAS_SCHEME = /^[a-z][a-z0-9+.-]*:/i;
 const BARE_HOST = /^[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:[/?#:]|$)/i;
 const MEET_LOOKUP_PATH = /^\/lookup\/([^/?#&=\s\x00-\x1f\x7f]+)\/?$/;
 
+const INVITE_DELIMITERS: Readonly<Record<string, string>> = {
+  "<": ">",
+  "(": ")",
+  "[": "]",
+  '"': '"',
+  "'": "'",
+};
+
 /** The canonical Meet link for a URL in one of the Meet shapes, else null. */
 function meetCanonical(url: URL): string | null {
-  if (url.protocol !== "https:" && url.protocol !== "http:") return null;
   const host = url.hostname.toLowerCase();
+  if (url.protocol === "http:") {
+    const code = url.pathname.slice(1);
+    return host === "meet.google.com" && MEET_CODE.test(code)
+      ? `https://meet.google.com/${code.toLowerCase()}` : null;
+  }
+  if (url.protocol !== "https:") return null;
   const segs = url.pathname.split("/").filter(Boolean);
   const canon = (code: string | undefined, keep: boolean) =>
     code !== undefined && MEET_CODE.test(code) ? `https://meet.google.com/${code.toLowerCase()}${keep ? url.search + url.hash : ""}` : null;
@@ -76,14 +89,42 @@ const parseLoose = (value: string): URL | null => {
  * `tel.meet/<code>`, a Google redirect (`google.com/url?q=`), `accounts.google.com?continue=`,
  * `meet.app.goo.gl?link=`, and a bare code with or without dashes. A wrapper whose target is not a
  * Meet link throws and is never followed. Lookup targets retain their URL and nickname identity.
- * Other inputs are returned unchanged. Details: TC-2181
+ * Free text selects its first dashed-code or lookup target on the exact Meet host.
+ * Other link-only inputs are returned unchanged. Details: TC-2181
  */
 export function normalizeMeetingUrl(raw: string): string {
   const text = raw.trim();
   if (MEET_CODE.test(text)) return `https://meet.google.com/${text.toLowerCase()}`;
   if (BARE_CODE.test(text)) return `https://meet.google.com/${text.slice(0, 3)}-${text.slice(3, 7)}-${text.slice(7)}`.toLowerCase();
   const url = parseLoose(text);
-  if (!url) return raw;
+  if (!url || !url.hostname || /\s/.test(text)) {
+    for (const match of text.matchAll(/\S+/g)) {
+      const token = match[0];
+      const schemeStart = token.search(/https?:\/\//i);
+      if (schemeStart > 0 && parseLoose(token)?.hostname) continue;
+      const start = schemeStart < 0 ? token.length - token.replace(/^[<("'[]+/, "").length : schemeStart;
+      let candidate = token.slice(start);
+      const closing = INVITE_DELIMITERS[token[start - 1] ?? ""];
+      const end = closing ? candidate.lastIndexOf(closing) : -1;
+      if (end >= 0) candidate = candidate.slice(0, end);
+      let target = parseLoose(candidate);
+      if (!target || target.hostname.toLowerCase() !== "meet.google.com") continue;
+      if (MEET_LOOKUP_PATH.test(target.pathname)) return normalizeMeetingUrl(candidate);
+      candidate = candidate.replace(/[>)"'\].,;:!?]+$/, "");
+      target = parseLoose(candidate);
+      if (!target) continue;
+      const code = singleSegment(target);
+      if (code !== null && MEET_CODE.test(code)) {
+        return normalizeMeetingUrl(candidate);
+      }
+    }
+    throw new ApiError("invalid_meeting_url", "meeting_url is not a valid URL");
+  }
+  if (url.protocol === "http:") {
+    const canonical = meetCanonical(url);
+    if (!canonical) throw new ApiError("invalid_meeting_url", "meeting_url is not a valid URL");
+    return canonical;
+  }
   const host = url.hostname.toLowerCase();
   const wrapped = host === "accounts.google.com" ? url.searchParams.get("continue")
     : host === "meet.app.goo.gl" ? url.searchParams.get("link")
@@ -102,7 +143,7 @@ export function normalizeMeetingUrl(raw: string): string {
   }
   const canonical = meetCanonical(url);
   if (!canonical) return host === "meet.google.com" && !HAS_SCHEME.test(text) ? `https://${text}` : raw;
-  return HAS_SCHEME.test(text) && url.href.replace(/^http:/, "https:") === canonical ? text : canonical;
+  return HAS_SCHEME.test(text) && url.href === canonical ? text : canonical;
 }
 
 export function detectPlatform(meetingUrl: string, override?: string): DetectedPlatform {
