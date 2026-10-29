@@ -28,7 +28,7 @@ export async function decodeToPcm(bytes: Uint8Array, opts: { ffmpegPath?: string
     const [error, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
     if (code !== 0) throw new Error(`ffmpeg decode failed (exit ${code}): ${error.trim().slice(0, 300)}`);
     const out = await Bun.file(outPath).arrayBuffer();
-    const samples = new Int16Array(out.slice(0, out.byteLength - (out.byteLength % 2)));
+    const samples = new Int16Array(out, 0, Math.floor(out.byteLength / 2));
     return { samples, sampleRate: rate, durationSec: samples.length / rate };
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
