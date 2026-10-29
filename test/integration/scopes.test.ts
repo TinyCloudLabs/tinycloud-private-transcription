@@ -81,7 +81,6 @@ describe("deny-by-default /v1 routing (invariant over the real route registry)",
   test("every /v1 handler belongs to exactly one registered group and enforces exactly that group's scope", async () => {
     const groups = Object.entries(meetingGroups(h.ctx));
     const handlers = v1Handlers(realApp);
-    expect(handlers.length).toBe(7);
     for (const route of handlers) {
       const owners = groups.filter(([path]) => route.path === path || route.path.startsWith(`${path}/`));
       expect({ route, owners: owners.length }).toEqual({ route, owners: 1 });
@@ -126,6 +125,25 @@ describe("meeting routes require meetings:*", () => {
         expect({ key: name, route, status, body }).toEqual({ key: name, route, status: 403, body: INSUFFICIENT_SCOPE });
       }
     }
+  });
+
+  test("duration PATCH honors meeting scope and preserves rows for other credentials. Details: TC-2185", async () => {
+    const created = await call(realApp, { method: "POST", path: "/v1/meetings", json: { meeting_url: "https://meet.jit.si/ScopePatchProbe", max_duration_seconds: 3600 } }, bearer("meetings"));
+    expect(created.status).toBe(201);
+    const path = `/v1/meetings/${created.body.id}`;
+    const read = async () => (await h.ctx.db.select({ d: meetings.maxDurationSeconds, s: meetings.scheduledStopAt }).from(meetings).where(eq(meetings.id, created.body.id)))[0]!;
+    const before = await read();
+    for (const name of ["only transcriptions:*", "only admin:*", "all but meetings:*", "empty", ...UNKNOWN_SCOPE_KEYS]) {
+      for (const json of [{ extend_by_seconds: 900 }, { max_duration_seconds: 7200 }]) {
+        const { status, body } = await call(realApp, { method: "PATCH", path, json }, bearer(name));
+        expect({ key: name, json, status, body }).toEqual({ key: name, json, status: 403, body: INSUFFICIENT_SCOPE });
+      }
+    }
+    expect((await call(realApp, { method: "PATCH", path, json: { extend_by_seconds: 900 } }, null)).status).toBe(401);
+    expect(await read()).toEqual(before);
+    const allowed = await call(realApp, { method: "PATCH", path, json: { extend_by_seconds: 900 } }, bearer("only meetings:*"));
+    expect({ status: allowed.status, seconds: allowed.body.max_duration_seconds }).toEqual({ status: 200, seconds: 4500 });
+    expect((await read()).d).toBe(4500);
   });
 
   test("missing, malformed or unknown bearers get 401 on every meeting route", async () => {

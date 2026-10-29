@@ -43,7 +43,7 @@ async function patch(id: string, json: unknown): Promise<MeetingView> {
 }
 
 test("create persists an explicit stop deadline, including the capped No limit choice. Details: TC-2185", async () => {
-  for (const [input, seconds] of [[{}, 3600], [{ max_duration_seconds: 1 }, 1], [{ max_duration_seconds: 14_400 }, 14_400], [{ max_duration_seconds: null }, 14_400]] as const) {
+  for (const [input, seconds] of [[{}, 14_400], [{ max_duration_seconds: 1 }, 1], [{ max_duration_seconds: 14_400 }, 14_400], [{ max_duration_seconds: null }, 14_400]] as const) {
     const meeting = await create(input);
     expect(meeting.max_duration_seconds).toBe(seconds);
     expect(Date.parse(meeting.scheduled_stop_at!) - Date.parse(meeting.created_at)).toBe(seconds * 1000);
@@ -71,7 +71,7 @@ test("create validates duration and keeps it in idempotent request identity. Det
 });
 
 test("live +15/+30 additions are atomic and No limit observes the four-hour cap. Details: TC-2185", async () => {
-  const meeting = await create();
+  const meeting = await create({ max_duration_seconds: 3600 });
   expect((await patch(meeting.id, { extend_by_seconds: 900 })).max_duration_seconds).toBe(4500);
   expect((await patch(meeting.id, { extend_by_seconds: 1800 })).max_duration_seconds).toBe(6300);
   await Promise.all([patch(meeting.id, { extend_by_seconds: 900 }), patch(meeting.id, { extend_by_seconds: 1800 })]);

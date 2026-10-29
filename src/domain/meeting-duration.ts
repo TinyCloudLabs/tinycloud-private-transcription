@@ -1,7 +1,7 @@
 import { ApiError } from "./errors.ts";
 
-export const DEFAULT_MEETING_DURATION_SECONDS = 3600;
 export const MAX_MEETING_DURATION_SECONDS = 14_400;
+export const DEFAULT_MEETING_DURATION_SECONDS = MAX_MEETING_DURATION_SECONDS;
 
 export type MeetingDurationUpdate =
   | { max_duration_seconds: number | null }

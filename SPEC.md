@@ -462,7 +462,7 @@ Summaries, chat/RAG, agents, calendar UI, user accounts, team workspaces, transc
 
 ## Meeting duration (TC-2185)
 
-`POST /v1/meetings` accepts optional `max_duration_seconds`: an integer from `1` to `14400`; omission selects `3600`, and JSON `null` selects the four-hour cap for the UI's “No limit” choice. Duration is measured from `created_at`, including admission time. Meeting objects return the effective `max_duration_seconds` and ISO `scheduled_stop_at`. Existing rows retain a null deadline until their duration is explicitly updated. This contract is separate from batch upload duration capabilities. Details: TC-2185
+`POST /v1/meetings` accepts optional `max_duration_seconds`: an integer from `1` to `14400`; omission selects `14400`, and JSON `null` selects the four-hour cap for the UI's “No limit” choice. Duration is measured from `created_at`, including admission time. Meeting objects return the effective `max_duration_seconds` and ISO `scheduled_stop_at`. Existing rows retain a null deadline until their duration is explicitly updated. This contract is separate from batch upload duration capabilities. Details: TC-2185
 
 `PATCH /v1/meetings/{id}` accepts exactly one of `{"extend_by_seconds":900}`, `{"extend_by_seconds":1800}` or `{"max_duration_seconds":<integer|null>}` and returns the updated meeting object. Extensions add to the current total duration, capped at `14400`; an explicit duration replaces that total. Updates are project-owned and serialized with expiry. Processing and terminal meetings do not accept duration changes. A replacement deadline already in the past is applied by the worker's next scan. Details: TC-2185
 

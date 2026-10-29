@@ -683,7 +683,7 @@
           "type": "integer",
           "primaryKey": false,
           "notNull": true,
-          "default": 3600
+          "default": 14400
         },
         "scheduled_stop_at": {
           "name": "scheduled_stop_at",
