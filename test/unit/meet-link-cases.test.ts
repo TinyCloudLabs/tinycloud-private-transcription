@@ -18,14 +18,7 @@ describe("normalizeMeetingUrl shared Meet cases", () => {
     });
   }
 
-  test("lookup links reach the bot without a native id", () => {
-    expect(detectPlatform("https://meet.google.com/lookup/abc123def")).toEqual({ platform: "google_meet", nativeMeetingId: null });
-  });
   test("canonical links carry the meeting code as the native id", () => {
     expect(detectPlatform(normalizeMeetingUrl("tel.meet/abc-defg-hij?pin=1"))).toEqual({ platform: "google_meet", nativeMeetingId: "abc-defg-hij" });
   });
-});
-
-test("a lookup link pasted without https:// gets the scheme only", () => {
-  expect(normalizeMeetingUrl("meet.google.com/lookup/abc123def")).toBe("https://meet.google.com/lookup/abc123def");
 });

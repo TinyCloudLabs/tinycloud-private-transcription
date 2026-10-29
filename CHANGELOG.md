@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Lookup meeting URLs return the owner guidance: "Paste the meet.google.com/abc-defg-hij link for this meeting". Dashed-code links retain their canonical normalization and dispatch behavior. Details: TC-2181
+
 - Google Meet redirect wrappers preserve validated lookup targets, including their nickname and query parameters. Integration upload-lease observations complete before fixture teardown. Details: TC-2181
 
 - Integration fixtures restore `HOME` and `TMPDIR` after their file-local scratch directories are used. Details: TC-2181

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { detectPlatform, normalizeMeetingUrl } from "../../src/domain/platform.ts";
+import { normalizeMeetingUrl } from "../../src/domain/platform.ts";
 
 const wrappers = [
   ["AccountChooser", "https://accounts.google.com/AccountChooser", "continue"],
@@ -10,16 +10,14 @@ const wrappers = [
 
 for (const [name, base, parameter] of wrappers) {
   describe(name, () => {
-    for (const [target, expected] of [
-      ["https://meet.google.com/lookup/TeamOne?authuser=1", "https://meet.google.com/lookup/TeamOne?authuser=1"],
-      ["http://meet.google.com/lookup/team-two/", "http://meet.google.com/lookup/team-two/"],
-      ["meet.google.com/lookup/third", "https://meet.google.com/lookup/third"],
+    for (const target of [
+      "https://meet.google.com/lookup/TeamOne?authuser=1",
+      "http://meet.google.com/lookup/team-two/",
+      "meet.google.com/lookup/third",
     ]) {
-      test(`preserves lookup target ${target}`, () => {
+      test(`requests a dashed-code link for ${target}`, () => {
         const input = `${base}?${new URLSearchParams({ [parameter]: target })}`;
-        const result = normalizeMeetingUrl(input);
-        expect(result).toBe(expected!);
-        expect(detectPlatform(result)).toEqual({ platform: "google_meet", nativeMeetingId: null });
+        expect(() => normalizeMeetingUrl(input)).toThrow("Paste the meet.google.com/abc-defg-hij link for this meeting");
       });
     }
 
