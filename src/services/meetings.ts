@@ -5,7 +5,7 @@ import { attributedBatches, attributedTranscriptionRuns, meetingJoinClocks, meet
 import type { Db } from "../db/client.ts";
 import { ApiError, type ErrorCode, errorTypeFor } from "../domain/errors.ts";
 import { newMeetingId } from "../domain/ids.ts";
-import { detectPlatform, type Platform } from "../domain/platform.ts";
+import { detectPlatform, normalizeMeetingUrl, type Platform } from "../domain/platform.ts";
 import { canTransition, clientStatus, isTerminal, mapVexaStatus, NEEDS_HELP_MESSAGE, type MeetingStatus } from "../domain/state.ts";
 import { clientCaptureView } from "../domain/capture.ts";
 import type { JoinClock } from "../domain/join-deadline.ts";
@@ -43,9 +43,10 @@ export const hashCreateRequest = (input: CreateMeetingInput) => createHash("sha2
 export async function createMeeting(
   ctx: AppContext,
   projectId: string,
-  input: CreateMeetingInput,
+  rawInput: CreateMeetingInput,
   idempotencyKey: string | null,
 ): Promise<{ meeting: MeetingRow; created: boolean }> {
+  const input = { ...rawInput, meeting_url: normalizeMeetingUrl(rawInput.meeting_url) };
   const detected = detectPlatform(input.meeting_url, input.platform);
   const signalUrl = detected.platform === "signal" ? new URL(input.meeting_url) : null;
   const signalCapability = signalUrl?.hash.slice(1) ?? null;

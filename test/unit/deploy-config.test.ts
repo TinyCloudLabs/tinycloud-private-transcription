@@ -83,8 +83,8 @@ describe("infra/dstack/app-compose.yaml", () => {
 
   test("pins every deploy and runtime-pulled image to an approved immutable digest", () => {
     const expected = {
-      api: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:d81cffd03efd69dc9fdf6ec0dda66072c5124156@sha256:9c25639e685e53623104d714de4b3e2c5a14a0de5b826a56e5ca7813a15aca81",
-      worker: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:d81cffd03efd69dc9fdf6ec0dda66072c5124156@sha256:9c25639e685e53623104d714de4b3e2c5a14a0de5b826a56e5ca7813a15aca81",
+      api: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:dfcbb499f6e95ec1cd5f74c0b10dd7396a6da9d8@sha256:ff568b4b9c2b9f3aac55f410a03ffd2339944486c5062ef4872b94ee6744f0bd",
+      worker: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:dfcbb499f6e95ec1cd5f74c0b10dd7396a6da9d8@sha256:ff568b4b9c2b9f3aac55f410a03ffd2339944486c5062ef4872b94ee6744f0bd",
       "signal-capture": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f",
       "signal-control-provision": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
       "signal-capability-provision": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
@@ -99,8 +99,8 @@ describe("infra/dstack/app-compose.yaml", () => {
       "bot-janitor": "docker:27.5.1-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c",
       runtime: "vexaai/v012-runtime:v012@sha256:a1f6448fbb380b9433364e8b572ec25a12aa4f274bf403f1d83a89cbf5812f2d",
       whisper: "fedirz/faster-whisper-server:latest-cpu@sha256:760e5e43d427dc6cfbbc4731934b908b7de9c7e6d5309c6a1f0c8c923a5b6030",
-      "meeting-api": "ghcr.io/tinycloudlabs/vexa/meeting-api:tc-63970d8@sha256:0a976dba383951030116296c7c45e0b80b07bbd40ff4d075df5ab564ff9c845e",
-      gateway: "ghcr.io/tinycloudlabs/vexa/gateway:tc-63970d8@sha256:5a2542727f2f7841032f732595018711b6ee73e0f72cec704e7297532a78e7ec",
+      "meeting-api": "ghcr.io/tinycloudlabs/vexa/meeting-api:tc-a4be1f0@sha256:ddf5abf00c790c880a680d1ab813a576c0811574869c920f71c68beb6c5db398",
+      gateway: "ghcr.io/tinycloudlabs/vexa/gateway:tc-72308da@sha256:598a01c13c563944ed1482fc6cdbba363dd0448adb97cc9a394a1c88d3874e2a",
       "vexa-provision": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
     } as const;
 
@@ -214,7 +214,7 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(api).not.toContain("127.0.0.1:8080/health').then");
   });
 
-  test("artifact retention and the bot janitor ship in dry-run (TC-904)", () => {
+  test("artifact retention ships in dry-run; the bot janitor applies to containers only (TC-904, TC-2181)", () => {
     const worker = serviceEnv("worker");
     expect(worker).toContain("ARTIFACT_RETENTION_MODE: ${ARTIFACT_RETENTION_MODE:-dry-run}");
     expect(worker).toContain("ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS: ${ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS:-74,84,87,88,89}");
@@ -237,7 +237,10 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(init).toContain(`printf '%s\\n%s\\n' "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" | mc alias set local http://minio:9000`);
     expect(init).not.toMatch(/mc [^\n|]*MINIO_ROOT_PASSWORD/);
     const janitor = serviceEnv("bot-janitor");
-    expect(janitor).toContain("BOT_JANITOR_MODE: ${BOT_JANITOR_MODE:-dry-run}");
+    // TC-2181: a literal apply (not a sealed ${VAR}), 7-day container retention unchanged, images not pruned by default.
+    expect(janitor).toContain("      BOT_JANITOR_MODE: apply\n");
+    expect(janitor).toContain("BOT_CONTAINER_RETENTION_DAYS: ${BOT_CONTAINER_RETENTION_DAYS:-7}");
+    expect(janitor).toContain("BOT_JANITOR_PRUNE_IMAGES: ${BOT_JANITOR_PRUNE_IMAGES:-false}");
     // Must name the same pinned bot image as the runtime, or it could treat the live pin as superseded.
     expect(janitor).toContain(`BOT_IMAGE: ${serviceEnv("runtime").match(/BROWSER_IMAGE: (\S+)/)![1]}`);
   });
