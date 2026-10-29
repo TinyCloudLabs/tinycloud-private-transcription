@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Delimited Meet targets in invitation text retain their lookup nickname and query content. The first dashed-code target is selected before its existing link-only protocol handling; a later meeting target is not substituted. Details: TC-2181
+
 - Pasted Google Meet invitations select their first exact-host dashed-code or lookup target in input order, ignoring dial-in numbers and other URLs. Lookup-first inputs retain the existing HTTPS and native-nickname behavior. Meeting creation stores and dispatches the selected URL; link-only redirect handling is unchanged. Details: TC-2181
 
 - ptx-dev runs the meeting service from main dfcbb499 and the hardened meeting gateway (vexa 72308da). Details: TC-2181

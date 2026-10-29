@@ -42,6 +42,14 @@ const HAS_SCHEME = /^[a-z][a-z0-9+.-]*:/i;
 const BARE_HOST = /^[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:[/?#:]|$)/i;
 const MEET_LOOKUP_PATH = /^\/lookup\/([^/?#&=\s\x00-\x1f\x7f]+)\/?$/;
 
+const INVITE_DELIMITERS: Readonly<Record<string, string>> = {
+  "<": ">",
+  "(": ")",
+  "[": "]",
+  '"': '"',
+  "'": "'",
+};
+
 /** The canonical Meet link for a URL in one of the Meet shapes, else null. */
 function meetCanonical(url: URL): string | null {
   if (url.protocol !== "https:" && url.protocol !== "http:") return null;
@@ -86,18 +94,22 @@ export function normalizeMeetingUrl(raw: string): string {
   const url = parseLoose(text);
   if (!url || !url.hostname || /\s/.test(text)) {
     for (const match of text.matchAll(/\S+/g)) {
-      let candidate = match[0].replace(/^[<("'[]+/, "").replace(/[>)"'\].,;:!?]+$/, "");
+      const token = match[0];
+      const schemeStart = token.search(/https?:\/\//i);
+      if (schemeStart > 0 && parseLoose(token)?.hostname) continue;
+      const start = schemeStart < 0 ? token.length - token.replace(/^[<("'[]+/, "").length : schemeStart;
+      let candidate = token.slice(start);
+      const closing = INVITE_DELIMITERS[token[start - 1] ?? ""];
+      const end = closing ? candidate.lastIndexOf(closing) : -1;
+      if (end >= 0) candidate = candidate.slice(0, end);
       let target = parseLoose(candidate);
-      if (!target?.hostname) {
-        const start = candidate.search(/https?:\/\//i);
-        if (start < 0) continue;
-        candidate = candidate.slice(start);
-        target = parseLoose(candidate);
-      }
       if (!target || target.hostname.toLowerCase() !== "meet.google.com") continue;
+      if (MEET_LOOKUP_PATH.test(target.pathname)) return normalizeMeetingUrl(candidate);
+      candidate = candidate.replace(/[>)"'\].,;:!?]+$/, "");
+      target = parseLoose(candidate);
+      if (!target) continue;
       const code = singleSegment(target);
-      if (MEET_LOOKUP_PATH.test(target.pathname)
-        || (target.protocol === "https:" && code !== null && MEET_CODE.test(code))) {
+      if (code !== null && MEET_CODE.test(code)) {
         return normalizeMeetingUrl(candidate);
       }
     }

@@ -466,3 +466,5 @@ Summaries, chat/RAG, agents, calendar UI, user accounts, team workspaces, transc
 
 The stored meeting URL, native identity and create-request hash use the selected target, not the invitation text. Text without a qualifying Meet target returns `invalid_meeting_url` before meeting creation or dispatch. Inputs containing only a link retain the existing wrapper and platform handling. Details: TC-2181
 
+External angle brackets, quotes and parentheses delimit a pasted URL without removing punctuation from its lookup nickname or query. First-target selection precedes the selected URL's existing link-only protocol handling, including when a dashed-code target precedes an HTTPS backup. Details: TC-2181
+

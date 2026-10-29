@@ -60,5 +60,35 @@ export const meetInviteCases = [
     "input": "Calendar(https://meet.google.com/yas-buib-ppd)",
     "url": "https://meet.google.com/yas-buib-ppd",
     "nativeMeetingId": "yas-buib-ppd"
+  },
+  {
+    "name": "angle-delimited lookup nickname punctuation is preserved",
+    "input": "Join <https://meet.google.com/lookup/Team!> Backup https://meet.google.com/yas-buib-ppd",
+    "url": "https://meet.google.com/lookup/Team!",
+    "nativeMeetingId": "Team!"
+  },
+  {
+    "name": "angle-delimited lookup query punctuation is preserved",
+    "input": "Join <https://meet.google.com/lookup/Team?hint=one!> Backup https://meet.google.com/yas-buib-ppd",
+    "url": "https://meet.google.com/lookup/Team?hint=one!",
+    "nativeMeetingId": "Team"
+  },
+  {
+    "name": "unquoted lookup nickname punctuation remains URL content",
+    "input": "Join https://meet.google.com/lookup/Team! Backup https://meet.google.com/yas-buib-ppd",
+    "url": "https://meet.google.com/lookup/Team!",
+    "nativeMeetingId": "Team!"
+  },
+  {
+    "name": "label parentheses preserve enclosed lookup query parentheses",
+    "input": "Join Calendar(https://meet.google.com/lookup/Team!?hint=(one)) Backup https://meet.google.com/yas-buib-ppd",
+    "url": "https://meet.google.com/lookup/Team!?hint=(one)",
+    "nativeMeetingId": "Team!"
+  },
+  {
+    "name": "first HTTP dashed-code target is not skipped for a later meeting",
+    "input": "Join http://meet.google.com/abc-defg-hij Backup https://meet.google.com/yas-buib-ppd",
+    "url": "http://meet.google.com/abc-defg-hij",
+    "nativeMeetingId": "abc-defg-hij"
   }
 ] as const;
