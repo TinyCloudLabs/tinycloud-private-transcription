@@ -459,3 +459,12 @@ Summaries, chat/RAG, agents, calendar UI, user accounts, team workspaces, transc
 
 ## Definition of done
 `curl -X POST /v1/meetings -d '{"meeting_url":"<local jitsi room>"}'` → `{"id":"mtg_…","status":"queued"}`; fake participant speaks; `GET /v1/meetings/{id}` reaches `completed`; `GET …/transcript` returns speakers/segments/text containing the expected phrase; `meeting.completed` webhook delivered and signature-verified. All exercised by an automated E2E test in the repo.
+
+## Meeting duration (TC-2185)
+
+`POST /v1/meetings` accepts optional `max_duration_seconds`: an integer from `1` to `14400`; omission selects `14400`, and JSON `null` selects the four-hour cap for the UI's “No limit” choice. Duration is measured from `created_at`, including admission time. Meeting objects return the effective `max_duration_seconds` and ISO `scheduled_stop_at`. Existing rows retain a null deadline until their duration is explicitly updated. This contract is separate from batch upload duration capabilities. Details: TC-2185
+
+`PATCH /v1/meetings/{id}` accepts exactly one of `{"extend_by_seconds":900}`, `{"extend_by_seconds":1800}` or `{"max_duration_seconds":<integer|null>}` and returns the updated meeting object. Extensions add to the current total duration, capped at `14400`; an explicit duration replaces that total. Updates are project-owned and serialized with expiry. Processing and terminal meetings do not accept duration changes. A replacement deadline already in the past is applied by the worker's next scan. Details: TC-2185
+
+The meeting worker checks persisted deadlines on its existing heartbeat, normally every five seconds, and before queued dispatch. Expiry uses the established stop path: pre-admission meetings are cancelled; admitted meetings leave capture and continue transcript finalization. The client need not remain open or send a stop request. Worker restarts resume the stored deadlines. Details: TC-2185
+

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- TC-2185: meetings accept an optional duration, defaulting to four hours and capped at four hours from creation. Live duration updates support +15 minutes, +30 minutes and the capped No limit choice; meeting responses expose `scheduled_stop_at`. The worker applies persisted stop deadlines independently of the client and resumes them after restart using the existing stop/finalization path. Details: TC-2185
+
 - ptx-dev's bot janitor now removes finished bot containers older than 7 days (it ran in dry-run before). Old bot images are still removed by hand; BOT_JANITOR_PRUNE_IMAGES turns automatic image removal on. Details: TC-2181
 
 - ptx-dev runs the meeting service from main dfcbb499 and the hardened meeting gateway (vexa 72308da). Details: TC-2181
