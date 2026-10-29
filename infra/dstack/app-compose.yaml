@@ -467,7 +467,7 @@ services:
     restart: unless-stopped
 
   meeting-api:
-    image: ghcr.io/tinycloudlabs/vexa/meeting-api:tc-63970d8@sha256:0a976dba383951030116296c7c45e0b80b07bbd40ff4d075df5ab564ff9c845e
+    image: ghcr.io/tinycloudlabs/vexa/meeting-api:tc-a4be1f0@sha256:ddf5abf00c790c880a680d1ab813a576c0811574869c920f71c68beb6c5db398
     environment:
       DB_HOST: vexa-postgres
       DB_PORT: "5432"
