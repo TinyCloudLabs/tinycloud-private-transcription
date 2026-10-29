@@ -32,7 +32,7 @@
 services:
   # ─── ours ────────────────────────────────────────────────────────────────────────────────────
   api:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:d81cffd03efd69dc9fdf6ec0dda66072c5124156@sha256:9c25639e685e53623104d714de4b3e2c5a14a0de5b826a56e5ca7813a15aca81
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:dfcbb499f6e95ec1cd5f74c0b10dd7396a6da9d8@sha256:ff568b4b9c2b9f3aac55f410a03ffd2339944486c5062ef4872b94ee6744f0bd
     # VEXA_API_KEY is minted at first boot by `vexa-provision` (below) into a shared volume.
     command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal-capability/capability-key); exec bun run src/api/server.ts"]
     restart: unless-stopped
@@ -85,7 +85,7 @@ services:
     networks: [ptx, vexa]
 
   worker:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:d81cffd03efd69dc9fdf6ec0dda66072c5124156@sha256:9c25639e685e53623104d714de4b3e2c5a14a0de5b826a56e5ca7813a15aca81
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:dfcbb499f6e95ec1cd5f74c0b10dd7396a6da9d8@sha256:ff568b4b9c2b9f3aac55f410a03ffd2339944486c5062ef4872b94ee6744f0bd
     command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && [ -s /run/signal-control-1/token ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && [ -s /run/signal-control-1/token ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal-capability/capability-key); exec bun run src/worker/index.ts"]
     restart: unless-stopped
     environment:
@@ -514,7 +514,7 @@ services:
     restart: unless-stopped
 
   gateway:
-    image: ghcr.io/tinycloudlabs/vexa/gateway:tc-63970d8@sha256:5a2542727f2f7841032f732595018711b6ee73e0f72cec704e7297532a78e7ec
+    image: ghcr.io/tinycloudlabs/vexa/gateway:tc-72308da@sha256:598a01c13c563944ed1482fc6cdbba363dd0448adb97cc9a394a1c88d3874e2a
     environment:
       ADMIN_API_URL: http://admin-api:8001
       MEETING_API_URL: http://meeting-api:8080
