@@ -459,3 +459,10 @@ Summaries, chat/RAG, agents, calendar UI, user accounts, team workspaces, transc
 
 ## Definition of done
 `curl -X POST /v1/meetings -d '{"meeting_url":"<local jitsi room>"}'` → `{"id":"mtg_…","status":"queued"}`; fake participant speaks; `GET /v1/meetings/{id}` reaches `completed`; `GET …/transcript` returns speakers/segments/text containing the expected phrase; `meeting.completed` webhook delivered and signature-verified. All exercised by an automated E2E test in the repo.
+
+## Pasted Google Meet invitations (TC-2181)
+
+`POST /v1/meetings` accepts free-form invitation text in `meeting_url`. It selects the first dashed-code or lookup URL whose host is exactly `meet.google.com`, in input order, ignoring phone numbers, `tel.meet` and other URL hosts. Dashed-code targets use the existing canonical normalization; a lookup target appearing first keeps its nickname and query rather than selecting a later dashed-code target. Schemeless Meet targets gain HTTPS. Explicit HTTP lookup targets retain the existing `invalid_meeting_url` response. Details: TC-2181
+
+The stored meeting URL, native identity and create-request hash use the selected target, not the invitation text. Text without a qualifying Meet target returns `invalid_meeting_url` before meeting creation or dispatch. Inputs containing only a link retain the existing wrapper and platform handling. Details: TC-2181
+

@@ -76,14 +76,33 @@ const parseLoose = (value: string): URL | null => {
  * `tel.meet/<code>`, a Google redirect (`google.com/url?q=`), `accounts.google.com?continue=`,
  * `meet.app.goo.gl?link=`, and a bare code with or without dashes. A wrapper whose target is not a
  * Meet link throws and is never followed. Lookup targets retain their URL and nickname identity.
- * Other inputs are returned unchanged. Details: TC-2181
+ * Free text selects its first dashed-code or lookup target on the exact Meet host.
+ * Other link-only inputs are returned unchanged. Details: TC-2181
  */
 export function normalizeMeetingUrl(raw: string): string {
   const text = raw.trim();
   if (MEET_CODE.test(text)) return `https://meet.google.com/${text.toLowerCase()}`;
   if (BARE_CODE.test(text)) return `https://meet.google.com/${text.slice(0, 3)}-${text.slice(3, 7)}-${text.slice(7)}`.toLowerCase();
   const url = parseLoose(text);
-  if (!url) return raw;
+  if (!url || !url.hostname || /\s/.test(text)) {
+    for (const match of text.matchAll(/\S+/g)) {
+      let candidate = match[0].replace(/^[<("'[]+/, "").replace(/[>)"'\].,;:!?]+$/, "");
+      let target = parseLoose(candidate);
+      if (!target?.hostname) {
+        const start = candidate.search(/https?:\/\//i);
+        if (start < 0) continue;
+        candidate = candidate.slice(start);
+        target = parseLoose(candidate);
+      }
+      if (!target || target.hostname.toLowerCase() !== "meet.google.com") continue;
+      const code = singleSegment(target);
+      if (MEET_LOOKUP_PATH.test(target.pathname)
+        || (target.protocol === "https:" && code !== null && MEET_CODE.test(code))) {
+        return normalizeMeetingUrl(candidate);
+      }
+    }
+    throw new ApiError("invalid_meeting_url", "meeting_url is not a valid URL");
+  }
   const host = url.hostname.toLowerCase();
   const wrapped = host === "accounts.google.com" ? url.searchParams.get("continue")
     : host === "meet.app.goo.gl" ? url.searchParams.get("link")

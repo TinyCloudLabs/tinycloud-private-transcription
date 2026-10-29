@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Pasted Google Meet invitations select their first exact-host dashed-code or lookup target in input order, ignoring dial-in numbers and other URLs. Lookup-first inputs retain the existing HTTPS and native-nickname behavior. Meeting creation stores and dispatches the selected URL; link-only redirect handling is unchanged. Details: TC-2181
+
 - HTTPS Google Meet lookup URLs retain their original target and use the nickname as their native meeting identity through dispatch, polling and stop. Bare targets gain an HTTPS scheme; supported redirect wrappers preserve validated HTTPS lookup targets. Explicit HTTP lookup targets return `invalid_meeting_url` before meeting creation or dispatch. Dashed-code normalization is unchanged. Details: TC-2181
 
 - Google Meet redirect wrappers preserve validated lookup targets, including their nickname and query parameters. Integration upload-lease observations complete before fixture teardown. Details: TC-2181
