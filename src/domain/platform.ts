@@ -92,7 +92,7 @@ export function normalizeMeetingUrl(raw: string): string {
   if (wrapped !== null) {
     const target = wrapped.trim();
     const inner = parseLoose(target);
-    if (inner && (inner.protocol === "https:" || inner.protocol === "http:")
+    if (inner && inner.protocol === "https:"
       && inner.hostname.toLowerCase() === "meet.google.com" && MEET_LOOKUP_PATH.test(inner.pathname)) {
       return HAS_SCHEME.test(target) ? target : `https://${target}`;
     }
@@ -136,7 +136,10 @@ export function detectPlatform(meetingUrl: string, override?: string): DetectedP
 
   if (host === "meet.google.com") {
     const lookup = MEET_LOOKUP_PATH.exec(u.pathname);
-    if (lookup) return { platform: "google_meet", nativeMeetingId: lookup[1]! };
+    if (lookup) {
+      if (u.protocol !== "https:") throw new ApiError("invalid_meeting_url", "meeting_url must use https. Details: TC-2181");
+      return { platform: "google_meet", nativeMeetingId: lookup[1]! };
+    }
     const code = singleSegment(u);
     if (!code) throw new ApiError("invalid_meeting_url", "Google Meet URL must contain a meeting code");
     return { platform: "google_meet", nativeMeetingId: code };

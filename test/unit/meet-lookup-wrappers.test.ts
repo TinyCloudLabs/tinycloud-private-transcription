@@ -12,7 +12,6 @@ for (const [name, base, parameter] of wrappers) {
   describe(name, () => {
     for (const [target, expected, nativeMeetingId] of [
       ["https://meet.google.com/lookup/TeamOne?authuser=1", "https://meet.google.com/lookup/TeamOne?authuser=1", "TeamOne"],
-      ["http://meet.google.com/lookup/team-two/", "http://meet.google.com/lookup/team-two/", "team-two"],
       ["meet.google.com/lookup/third", "https://meet.google.com/lookup/third", "third"],
     ]) {
       test(`preserves lookup target ${target} and nickname identity. Details: TC-2181`, () => {
@@ -24,6 +23,7 @@ for (const [name, base, parameter] of wrappers) {
     }
 
     for (const target of [
+      "http://meet.google.com/lookup/team-two/",
       "https://meet.google.com.evil.com/lookup/team",
       "https://evilmeet.google.com/lookup/team",
       "https://evil.com/lookup/team",
