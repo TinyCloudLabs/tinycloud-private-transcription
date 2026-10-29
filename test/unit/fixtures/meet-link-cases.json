@@ -1,5 +1,5 @@
 {
- "_doc": "Google Meet cases from tinychat with the ruled PTX lookup response. canonical resolves to canonical; passthrough is accepted as pasted; reject is refused by PTX. Details: TC-2181",
+ "_doc": "Google Meet cases shared with tinychat. canonical resolves to canonical; passthrough is accepted as pasted; reject is refused by PTX. Details: TC-2181",
  "cases": [
   {
    "input": "meet.google.com/meet/abc-defg-hij",
@@ -134,7 +134,7 @@
   },
   {
    "input": "https://meet.google.com/lookup/abc123def",
-   "outcome": "reject"
+   "outcome": "passthrough"
   },
   {
    "input": "https://meet.google.com.evil.com/abc-defg-hij",

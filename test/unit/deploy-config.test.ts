@@ -83,8 +83,8 @@ describe("infra/dstack/app-compose.yaml", () => {
 
   test("pins every deploy and runtime-pulled image to an approved immutable digest", () => {
     const expected = {
-      api: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:d81cffd03efd69dc9fdf6ec0dda66072c5124156@sha256:9c25639e685e53623104d714de4b3e2c5a14a0de5b826a56e5ca7813a15aca81",
-      worker: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:d81cffd03efd69dc9fdf6ec0dda66072c5124156@sha256:9c25639e685e53623104d714de4b3e2c5a14a0de5b826a56e5ca7813a15aca81",
+      api: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:dfcbb499f6e95ec1cd5f74c0b10dd7396a6da9d8@sha256:ff568b4b9c2b9f3aac55f410a03ffd2339944486c5062ef4872b94ee6744f0bd",
+      worker: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:dfcbb499f6e95ec1cd5f74c0b10dd7396a6da9d8@sha256:ff568b4b9c2b9f3aac55f410a03ffd2339944486c5062ef4872b94ee6744f0bd",
       "signal-capture": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f",
       "signal-control-provision": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
       "signal-capability-provision": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
@@ -100,7 +100,7 @@ describe("infra/dstack/app-compose.yaml", () => {
       runtime: "vexaai/v012-runtime:v012@sha256:a1f6448fbb380b9433364e8b572ec25a12aa4f274bf403f1d83a89cbf5812f2d",
       whisper: "fedirz/faster-whisper-server:latest-cpu@sha256:760e5e43d427dc6cfbbc4731934b908b7de9c7e6d5309c6a1f0c8c923a5b6030",
       "meeting-api": "ghcr.io/tinycloudlabs/vexa/meeting-api:tc-a4be1f0@sha256:ddf5abf00c790c880a680d1ab813a576c0811574869c920f71c68beb6c5db398",
-      gateway: "ghcr.io/tinycloudlabs/vexa/gateway:tc-63970d8@sha256:5a2542727f2f7841032f732595018711b6ee73e0f72cec704e7297532a78e7ec",
+      gateway: "ghcr.io/tinycloudlabs/vexa/gateway:tc-72308da@sha256:598a01c13c563944ed1482fc6cdbba363dd0448adb97cc9a394a1c88d3874e2a",
       "vexa-provision": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
     } as const;
 
