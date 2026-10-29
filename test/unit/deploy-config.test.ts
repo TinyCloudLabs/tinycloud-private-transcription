@@ -214,7 +214,7 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(api).not.toContain("127.0.0.1:8080/health').then");
   });
 
-  test("artifact retention and the bot janitor ship in dry-run (TC-904)", () => {
+  test("artifact retention ships in dry-run; the bot janitor applies to containers only (TC-904, TC-2181)", () => {
     const worker = serviceEnv("worker");
     expect(worker).toContain("ARTIFACT_RETENTION_MODE: ${ARTIFACT_RETENTION_MODE:-dry-run}");
     expect(worker).toContain("ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS: ${ARTIFACT_RETENTION_KEEP_VEXA_MEETING_IDS:-74,84,87,88,89}");
@@ -237,7 +237,10 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(init).toContain(`printf '%s\\n%s\\n' "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" | mc alias set local http://minio:9000`);
     expect(init).not.toMatch(/mc [^\n|]*MINIO_ROOT_PASSWORD/);
     const janitor = serviceEnv("bot-janitor");
-    expect(janitor).toContain("BOT_JANITOR_MODE: ${BOT_JANITOR_MODE:-dry-run}");
+    // TC-2181: a literal apply (not a sealed ${VAR}), 7-day container retention unchanged, images not pruned by default.
+    expect(janitor).toContain("      BOT_JANITOR_MODE: apply\n");
+    expect(janitor).toContain("BOT_CONTAINER_RETENTION_DAYS: ${BOT_CONTAINER_RETENTION_DAYS:-7}");
+    expect(janitor).toContain("BOT_JANITOR_PRUNE_IMAGES: ${BOT_JANITOR_PRUNE_IMAGES:-false}");
     // Must name the same pinned bot image as the runtime, or it could treat the live pin as superseded.
     expect(janitor).toContain(`BOT_IMAGE: ${serviceEnv("runtime").match(/BROWSER_IMAGE: (\S+)/)![1]}`);
   });

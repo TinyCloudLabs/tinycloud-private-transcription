@@ -1,7 +1,8 @@
 /**
  * TC-904: the bot-janitor compose service. Runs its exact shell script (compose `$$` unescaped)
  * against a fake `docker` CLI: dry-run never removes; apply removes only bot containers finished
- * before the cutoff, then only unused bot images older than the pinned one.
+ * before the cutoff, and unused bot images older than the pinned one only when
+ * BOT_JANITOR_PRUNE_IMAGES=true (default off).
  */
 import { afterAll, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -48,35 +49,52 @@ writeFileSync(join(dir, "sleep"), "#!/bin/sh\nkill $PPID\n");
 chmodSync(join(dir, "docker"), 0o755);
 chmodSync(join(dir, "sleep"), 0o755);
 
-function run(mode: string, days = "7") {
+function run(mode: string, days = "7", pruneImages?: string) {
   rmSync(join(dir, "calls"), { force: true });
   const proc = Bun.spawnSync(["sh", "-c", script], {
-    env: { PATH: `${dir}:/usr/bin:/bin`, BOT_JANITOR_MODE: mode, BOT_CONTAINER_RETENTION_DAYS: days, BOT_JANITOR_INTERVAL_SECONDS: "1", BOT_IMAGE: "ghcr.io/tinycloudlabs/vexa/bot:pinned" },
+    env: {
+      PATH: `${dir}:/usr/bin:/bin`, BOT_JANITOR_MODE: mode, BOT_CONTAINER_RETENTION_DAYS: days, BOT_JANITOR_INTERVAL_SECONDS: "1", BOT_IMAGE: "ghcr.io/tinycloudlabs/vexa/bot:pinned",
+      ...(pruneImages === undefined ? {} : { BOT_JANITOR_PRUNE_IMAGES: pruneImages }),
+    },
     stdout: "pipe", stderr: "pipe",
   });
   const calls = readFileSync(join(dir, "calls"), "utf8").trim().split("\n");
   return { out: proc.stdout.toString(), err: proc.stderr.toString(), removals: calls.filter((c) => /^(rm|rmi) /.test(c)) };
 }
 
-test("dry-run logs what it would remove and removes nothing", () => {
-  const { out, err, removals } = run("dry-run");
-  expect(err).toBe("");
-  expect(removals).toEqual([]);
-  expect(out).toContain("bot-janitor [dry-run] remove container /vexa-mtg-5-old");
-  expect(out).toContain("bot-janitor [dry-run] remove image sha256:old");
-  expect(out).not.toContain("vexa-mtg-95-new");
-  expect(out).not.toMatch(/sha256:(pin|used|newer|pg)/);
+test("dry-run logs what it would remove and removes nothing, whatever the image flag says", () => {
+  for (const flag of [undefined, "false", "true"]) {
+    const { out, err, removals } = run("dry-run", "7", flag);
+    expect(err).toBe("");
+    expect(removals).toEqual([]);
+    expect(out).toContain("bot-janitor [dry-run] remove container /vexa-mtg-5-old");
+    expect(out).toContain("bot-janitor [dry-run] remove image sha256:old");
+    expect(out).not.toContain("vexa-mtg-95-new");
+    expect(out).not.toMatch(/sha256:(pin|used|newer|pg)/);
+  }
 });
 
-test("apply removes old bot containers and unused superseded bot images only", () => {
-  const { removals } = run("apply");
+test("apply without BOT_JANITOR_PRUNE_IMAGES removes the old container only and never runs rmi", () => {
+  const { out, removals } = run("apply");
+  expect(removals).toEqual(["rm c_old"]);
+  expect(out).not.toContain("remove image");
+});
+
+test("any image flag other than true is off", () => {
+  for (const flag of ["false", "", "TRUE", "1", "yes"]) {
+    expect(run("apply", "7", flag).removals).toEqual(["rm c_old"]);
+  }
+});
+
+test("apply with BOT_JANITOR_PRUNE_IMAGES=true also removes the unused superseded image, keeping the pin, newer and in-use images", () => {
+  const { removals } = run("apply", "7", "true");
   expect(removals).toEqual(["rm c_old", "rmi sha256:old"]);
 });
 
 test("invalid settings fall back to dry-run and remove nothing", () => {
-  const { out, removals } = run("aply", "seven");
+  const { out, removals } = run("aply", "seven", "true");
   expect(removals).toEqual([]);
   expect(out).toContain("bot-janitor: invalid BOT_JANITOR_MODE; using dry-run");
   expect(out).toContain("bot-janitor: invalid BOT_CONTAINER_RETENTION_DAYS; using 7 in dry-run");
-  expect(run("apply", "x7").removals).toEqual([]);
+  expect(run("apply", "x7", "true").removals).toEqual([]);
 });

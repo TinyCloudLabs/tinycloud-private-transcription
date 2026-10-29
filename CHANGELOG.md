@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- ptx-dev's bot janitor now removes finished bot containers older than 7 days (it ran in dry-run before). Old bot images are still removed by hand; BOT_JANITOR_PRUNE_IMAGES turns automatic image removal on. Details: TC-2181
+
 - Lookup meeting URLs return the owner guidance: "Paste the meet.google.com/abc-defg-hij link for this meeting". Dashed-code links retain their canonical normalization and dispatch behavior. Details: TC-2181
 
 - Google Meet redirect wrappers preserve validated lookup targets, including their nickname and query parameters. Integration upload-lease observations complete before fixture teardown. Details: TC-2181
