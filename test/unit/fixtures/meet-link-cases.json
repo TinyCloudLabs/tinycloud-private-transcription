@@ -134,7 +134,7 @@
   },
   {
    "input": "https://meet.google.com/lookup/abc123def",
-   "outcome": "passthrough"
+   "outcome": "reject"
   },
   {
    "input": "https://meet.google.com.evil.com/abc-defg-hij",

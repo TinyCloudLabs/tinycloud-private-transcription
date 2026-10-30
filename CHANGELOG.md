@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `POST /v1/meetings` refuses Google Meet `meet.google.com/lookup/<nick>` links (direct, bare, wrapped or first in pasted text) with `invalid_meeting_url` before any meeting row, queue entry or bot request exists. Plain dashed-code Meet links still create and dispatch. Naomi's TC-2181 ruling; the lookup join failure's root cause is unconfirmed. Details: TC-2181
+
 - Delimited Meet targets in invitation text retain their lookup nickname and query content. The first dashed-code target is selected before its existing link-only protocol handling; a later meeting target is not substituted. Details: TC-2181
 
 - Pasted Google Meet invitations select their first exact-host dashed-code or lookup target in input order, ignoring dial-in numbers and other URLs. Lookup-first inputs retain the existing HTTPS and native-nickname behavior. Meeting creation stores and dispatches the selected URL; link-only redirect handling is unchanged. Details: TC-2181
