@@ -2,9 +2,13 @@
 
 ## Unreleased
 
+### Main
 - TC-2491: update ptx-dev's debug SSH sidecar to digest-pinned `10.3_p1-r2-ls242`, containing Alpine's OpenSSH password-authentication-bypass fix. Root access remains public-key-only; password and keyboard-interactive authentication remain disabled. Details: TC-2491
 
 - TC-2185: meetings accept an optional duration, defaulting to four hours and capped at four hours from creation. Live duration updates support +15 minutes, +30 minutes and the capped No limit choice; meeting responses expose `scheduled_stop_at`. The worker applies persisted stop deadlines independently of the client and resumes them after restart using the existing stop/finalization path. Details: TC-2185
+
+### TC-2181 (#145)
+- `POST /v1/meetings` refuses Google Meet `meet.google.com/lookup/<nick>` links (direct, bare, wrapped or first in pasted text) with `invalid_meeting_url` before any meeting row, queue entry or bot request exists. Plain dashed-code Meet links still create and dispatch. Naomi's TC-2181 ruling; the lookup join failure's root cause is unconfirmed. Details: TC-2181
 
 - Delimited Meet targets in invitation text retain their lookup nickname and query content. The first dashed-code target is selected before its existing link-only protocol handling; a later meeting target is not substituted. Details: TC-2181
 

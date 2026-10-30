@@ -83,8 +83,8 @@ const parseLoose = (value: string): URL | null => {
  * slash): `/meet/<code>`, `/_meet/<code>`, `google.com/meet/<code>`, `g.co/meet/<code>`,
  * `tel.meet/<code>`, a Google redirect (`google.com/url?q=`), `accounts.google.com?continue=`,
  * `meet.app.goo.gl?link=`, and a bare code with or without dashes. A wrapper whose target is not a
- * Meet link throws and is never followed. Lookup targets retain their URL and nickname identity.
- * Free text selects its first dashed-code or lookup target on the exact Meet host.
+ * Meet link throws and is never followed. Lookup targets keep their URL here, but `detectPlatform`
+ * refuses them. Free text selects its first dashed-code or lookup target on the exact Meet host.
  * Other link-only inputs are returned unchanged. Details: TC-2181
  */
 export function normalizeMeetingUrl(raw: string): string {
@@ -166,11 +166,8 @@ export function detectPlatform(meetingUrl: string, override?: string): DetectedP
   }
 
   if (host === "meet.google.com") {
-    const lookup = MEET_LOOKUP_PATH.exec(u.pathname);
-    if (lookup) {
-      if (u.protocol !== "https:") throw new ApiError("invalid_meeting_url", "meeting_url must use https. Details: TC-2181");
-      return { platform: "google_meet", nativeMeetingId: lookup[1]! };
-    }
+    // Lookup links (/lookup/<nick>) are refused before any row or queue entry exists. Details: TC-2181
+    if (MEET_LOOKUP_PATH.test(u.pathname)) throw new ApiError("invalid_meeting_url", "Google Meet lookup links are not supported; use the meeting code link");
     const code = singleSegment(u);
     if (!code) throw new ApiError("invalid_meeting_url", "Google Meet URL must contain a meeting code");
     return { platform: "google_meet", nativeMeetingId: code };
