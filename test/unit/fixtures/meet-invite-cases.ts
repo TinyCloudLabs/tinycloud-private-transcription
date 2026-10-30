@@ -17,10 +17,9 @@ export const meetInviteCases = [
     "nativeMeetingId": "abc-defg-hij"
   },
   {
-    "name": "first lookup retains its nickname and query instead of selecting a later code",
+    "name": "first lookup is refused, not skipped for a later code",
     "input": "Join https://meet.google.com/lookup/TeamFirst?authuser=1 Backup https://meet.google.com/yas-buib-ppd",
-    "url": "https://meet.google.com/lookup/TeamFirst?authuser=1",
-    "nativeMeetingId": "TeamFirst"
+    "error": "invalid_meeting_url"
   },
   {
     "name": "first HTTP lookup follows the existing refusal rule",
@@ -50,10 +49,9 @@ export const meetInviteCases = [
     "error": "invalid_meeting_url"
   },
   {
-    "name": "first schemeless lookup keeps the approved lookup rules",
+    "name": "first schemeless lookup is refused, not skipped for a later code",
     "input": "Join meet.google.com/lookup/TeamBareFirst?authuser=1 Backup https://meet.google.com/yas-buib-ppd",
-    "url": "https://meet.google.com/lookup/TeamBareFirst?authuser=1",
-    "nativeMeetingId": "TeamBareFirst"
+    "error": "invalid_meeting_url"
   },
   {
     "name": "a URL inside a text label without spaces is extracted",
@@ -62,28 +60,24 @@ export const meetInviteCases = [
     "nativeMeetingId": "yas-buib-ppd"
   },
   {
-    "name": "angle-delimited lookup nickname punctuation is preserved",
+    "name": "first angle-delimited lookup is refused, not skipped for a later code",
     "input": "Join <https://meet.google.com/lookup/Team!> Backup https://meet.google.com/yas-buib-ppd",
-    "url": "https://meet.google.com/lookup/Team!",
-    "nativeMeetingId": "Team!"
+    "error": "invalid_meeting_url"
   },
   {
-    "name": "angle-delimited lookup query punctuation is preserved",
+    "name": "first angle-delimited lookup with query is refused, not skipped for a later code",
     "input": "Join <https://meet.google.com/lookup/Team?hint=one!> Backup https://meet.google.com/yas-buib-ppd",
-    "url": "https://meet.google.com/lookup/Team?hint=one!",
-    "nativeMeetingId": "Team"
+    "error": "invalid_meeting_url"
   },
   {
-    "name": "unquoted lookup nickname punctuation remains URL content",
+    "name": "first unquoted lookup is refused, not skipped for a later code",
     "input": "Join https://meet.google.com/lookup/Team! Backup https://meet.google.com/yas-buib-ppd",
-    "url": "https://meet.google.com/lookup/Team!",
-    "nativeMeetingId": "Team!"
+    "error": "invalid_meeting_url"
   },
   {
-    "name": "label parentheses preserve enclosed lookup query parentheses",
+    "name": "first lookup with enclosed query parentheses is refused, not skipped for a later code",
     "input": "Join Calendar(https://meet.google.com/lookup/Team!?hint=(one)) Backup https://meet.google.com/yas-buib-ppd",
-    "url": "https://meet.google.com/lookup/Team!?hint=(one)",
-    "nativeMeetingId": "Team!"
+    "error": "invalid_meeting_url"
   },
   {
     "name": "first HTTP dashed-code target is not skipped for a later meeting",
