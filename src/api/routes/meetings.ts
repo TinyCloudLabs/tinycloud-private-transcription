@@ -12,11 +12,13 @@ import {
   serializeTranscript,
   stopMeeting,
   type CreateMeetingInput,
+  updateMeetingDuration,
 } from "../../services/meetings.ts";
 import type { AuthEnv } from "../auth.ts";
 import { PLATFORMS } from "../../domain/platform.ts";
 import { clientCaptureView } from "../../domain/capture.ts";
 import { clientStatus, type MeetingStatus } from "../../domain/state.ts";
+import { parseMeetingDuration, type MeetingDurationUpdate } from "../../domain/meeting-duration.ts";
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const optString = (body: Record<string, unknown>, k: string) => {
@@ -47,6 +49,7 @@ function parseCreateBody(raw: unknown): CreateMeetingInput {
   if (metadata !== undefined && !isRecord(metadata)) throw new ApiError("invalid_request", "metadata must be an object");
   return {
     meeting_url,
+    max_duration_seconds: parseMeetingDuration(raw.max_duration_seconds),
     bot_name: optString(raw, "bot_name"),
     language: optString(raw, "language"),
     webhook_url,
@@ -83,6 +86,31 @@ export function meetingRoutes(ctx: AppContext) {
     const meeting = await getMeeting(ctx, c.get("project").id, c.req.param("id"));
     const transcript = meeting.status === "completed" ? await getTranscript(ctx, meeting.id) : null;
     return c.json(serializeMeeting(meeting, transcript, ctx.config.needsHelpStateEnabled));
+  });
+
+  r.patch("/:id", async (c) => {
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      throw new ApiError("invalid_request", "Request body must be valid JSON. Details: TC-2185");
+    }
+    if (!isRecord(raw) || ("max_duration_seconds" in raw) === ("extend_by_seconds" in raw)) {
+      throw new ApiError("invalid_request", "Provide max_duration_seconds or extend_by_seconds. Details: TC-2185");
+    }
+    let update: MeetingDurationUpdate;
+    if ("extend_by_seconds" in raw) {
+      if (raw.extend_by_seconds !== 900 && raw.extend_by_seconds !== 1800) {
+        throw new ApiError("invalid_request", "extend_by_seconds must be 900 or 1800. Details: TC-2185");
+      }
+      update = { extend_by_seconds: raw.extend_by_seconds };
+    } else {
+      const duration = parseMeetingDuration(raw.max_duration_seconds);
+      if (duration === undefined) throw new ApiError("invalid_request", "max_duration_seconds is required. Details: TC-2185");
+      update = { max_duration_seconds: duration };
+    }
+    const meeting = await updateMeetingDuration(ctx, c.get("project").id, c.req.param("id"), update);
+    return c.json(serializeMeeting(meeting, null, ctx.config.needsHelpStateEnabled));
   });
 
   r.post("/:id/stop", async (c) => {

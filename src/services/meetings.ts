@@ -15,9 +15,11 @@ import { resetRecordingRecovery } from "./recording-recovery.ts";
 import { VexaHttpError } from "../providers/vexa/client.ts";
 import { sealSignalCapability } from "../providers/signal/capability.ts";
 import { wakeWebhookDelivery, webhookDeliveryValues } from "../webhooks/dispatcher.ts";
+import { DEFAULT_MEETING_DURATION_SECONDS, MAX_MEETING_DURATION_SECONDS, type MeetingDurationUpdate } from "../domain/meeting-duration.ts";
 
 export interface CreateMeetingInput {
   meeting_url: string;
+  max_duration_seconds?: number | null;
   bot_name?: string;
   language?: string;
   webhook_url?: string;
@@ -73,12 +75,17 @@ export async function createMeeting(
       `The ${detected.platform} platform was detected but is not enabled on this deployment.`,
     );
   }
+  const createdAt = new Date();
+  const maxDurationSeconds = input.max_duration_seconds === null ? MAX_MEETING_DURATION_SECONDS : input.max_duration_seconds ?? DEFAULT_MEETING_DURATION_SECONDS;
   const values: typeof meetings.$inferInsert = {
     id: newMeetingId(),
     projectId,
     meetingUrl: storedMeetingUrl,
     platform: detected.platform,
     status: "queued",
+    createdAt,
+    maxDurationSeconds,
+    scheduledStopAt: new Date(createdAt.getTime() + maxDurationSeconds * 1000),
     botName: input.bot_name ?? null,
     language: input.language ?? null,
     webhookUrl: input.webhook_url ?? null,
@@ -394,10 +401,10 @@ export async function completeMeetingWithTranscript(
 }
 
 /** Idempotent stop: cancels before admission, otherwise asks Vexa to leave and moves to processing. */
-export async function stopMeeting(ctx: AppContext, meeting: MeetingRow): Promise<MeetingRow> {
+export async function stopMeeting(ctx: AppContext, meeting: MeetingRow, source: "user" | "duration_limit" = "user"): Promise<MeetingRow> {
   const status = meeting.status as MeetingStatus;
   if (isTerminal(status) || status === "processing") return meeting;
-  meeting = await recordCapture(ctx, meeting, { stop_requested_at: new Date().toISOString(), stop_requested_by: "user" });
+  meeting = await recordCapture(ctx, meeting, { stop_requested_at: new Date().toISOString(), stop_requested_by: source });
   ctx.log.info("bot stop requested", { meetingId: meeting.id, stage: "stop_requested" });
   if (meeting.platform === "signal") await stopInSignal(ctx, meeting);
   else await stopInVexa(ctx, meeting);
@@ -410,6 +417,36 @@ export async function stopMeeting(ctx: AppContext, meeting: MeetingRow): Promise
   }
   const { meeting: updated } = await transition(ctx, meeting, "cancelled");
   return updated;
+}
+
+export async function updateMeetingDuration(ctx: AppContext, projectId: string, meetingId: string, update: MeetingDurationUpdate): Promise<MeetingRow> {
+  return ctx.db.transaction(async (tx) => {
+    const [meeting] = await tx.select().from(meetings)
+      .where(and(eq(meetings.id, meetingId), eq(meetings.projectId, projectId))).for("update");
+    if (!meeting) throw new ApiError("meeting_not_found", "Meeting not found. Details: TC-2185");
+    if (isTerminal(meeting.status as MeetingStatus) || meeting.status === "processing") {
+      throw new ApiError("invalid_request", "Duration can be changed while the notetaker is live. Details: TC-2185");
+    }
+    const maxDurationSeconds = "extend_by_seconds" in update
+      ? Math.min(MAX_MEETING_DURATION_SECONDS, meeting.maxDurationSeconds + update.extend_by_seconds)
+      : update.max_duration_seconds ?? MAX_MEETING_DURATION_SECONDS;
+    const [updated] = await tx.update(meetings).set({
+      maxDurationSeconds,
+      scheduledStopAt: new Date(meeting.createdAt.getTime() + maxDurationSeconds * 1000),
+    }).where(eq(meetings.id, meeting.id)).returning();
+    return updated!;
+  });
+}
+
+export async function stopMeetingIfDurationElapsed(ctx: AppContext, meetingId: string, now = new Date()): Promise<boolean> {
+  return ctx.db.transaction(async (tx) => {
+    const [meeting] = await tx.select().from(meetings).where(eq(meetings.id, meetingId)).for("update");
+    if (!meeting?.scheduledStopAt || meeting.scheduledStopAt > now
+      || isTerminal(meeting.status as MeetingStatus) || meeting.status === "processing") return false;
+    // The stop path uses the transaction's query methods, not the database client's pool. Details: TC-2185
+    await stopMeeting({ ...ctx, db: tx as unknown as Db }, meeting, "duration_limit");
+    return true;
+  });
 }
 
 /**
@@ -623,6 +660,8 @@ export function serializeMeeting(m: MeetingRow, transcript: TranscriptRow | null
     transcript: { status: transcriptStatus(status, !!transcript), ...(transcript ? { version: transcript.version } : {}) },
     created_at: m.createdAt.toISOString(),
     started_at: m.startedAt?.toISOString() ?? null,
+    max_duration_seconds: m.maxDurationSeconds,
+    scheduled_stop_at: m.scheduledStopAt?.toISOString() ?? null,
     ended_at: m.endedAt?.toISOString() ?? null,
     completed_at: m.completedAt?.toISOString() ?? null,
     metadata: m.metadata ?? {},

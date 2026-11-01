@@ -346,7 +346,10 @@ test("0017-0024 migrations are additive: every pre-existing column, row and meet
       .filter((c) => columnsBefore.has(`${c.table_name}.${c.column_name}`));
     expect(schemaAfter).toEqual(schemaBefore as never);
     expect((await columns(db)).some((c) => c.table_name === "transcript_versions")).toBe(true);
-    expect(await db.execute(sql`SELECT * FROM meetings`)).toEqual(rowsBefore);
+    const originalMeetingColumns = Object.keys(rowsBefore[0]!).map((name) => sql.identifier(name));
+    expect(await db.execute(sql`SELECT ${sql.join(originalMeetingColumns, sql`, `)} FROM meetings`)).toEqual(rowsBefore);
+    expect(await db.execute(sql`SELECT max_duration_seconds, scheduled_stop_at FROM meetings WHERE id = 'mtg_upgrade'`))
+      .toEqual([{ max_duration_seconds: 14400, scheduled_stop_at: null }]);
     expect(await db.execute(sql`SELECT id, status, attempts, fetch_attempts FROM attributed_batches`))
       .toEqual([{ id: "mtg_upgrade:batch:0", status: "pending", attempts: 0, fetch_attempts: 0 }]);
     // 0017 and 0018 applied in one run: the singleton is seeded and closed (the meeting role never reads it).

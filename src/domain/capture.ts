@@ -6,7 +6,7 @@ export interface CaptureDiagnostics {
   silence_timeout_ms?: number;
   live_transcription_requested?: boolean;
   stop_requested_at?: string;
-  stop_requested_by?: "user" | "join_deadline";
+  stop_requested_by?: "user" | "join_deadline" | "duration_limit";
   provider_record_missing_at?: string;
   provider_meeting_id?: number;
   provider_status?: string;

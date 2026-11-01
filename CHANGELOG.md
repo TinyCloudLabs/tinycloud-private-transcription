@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- TC-2185: meetings accept an optional duration, defaulting to four hours and capped at four hours from creation. Live duration updates support +15 minutes, +30 minutes and the capped No limit choice; meeting responses expose `scheduled_stop_at`. The worker applies persisted stop deadlines independently of the client and resumes them after restart using the existing stop/finalization path. Details: TC-2185
+
 - Delimited Meet targets in invitation text retain their lookup nickname and query content. The first dashed-code target is selected before its existing link-only protocol handling; a later meeting target is not substituted. Details: TC-2181
 
 - Pasted Google Meet invitations select their first exact-host dashed-code or lookup target in input order, ignoring dial-in numbers and other URLs. Lookup-first inputs retain the existing HTTPS and native-nickname behavior. Meeting creation stores and dispatches the selected URL; link-only redirect handling is unchanged. Details: TC-2181

@@ -7,7 +7,7 @@ import { effectiveJoinDeadline, isJoinObservation, isJoinOpen, JOIN_DEADLINE_FAI
 import { VexaHttpError } from "../providers/vexa/client.ts";
 import { adaptVexaSegments, completionReasonOf } from "../providers/vexa/adapter.ts";
 import { toVexaPlatform } from "../providers/vexa/platform-map.ts";
-import { completeMeetingWithTranscript, failMeeting, findLiveMeetingForNativeId, getMeetingById, loadJoinClock, setDispatchFallback, startJoinClock, transition } from "../services/meetings.ts";
+import { completeMeetingWithTranscript, failMeeting, findLiveMeetingForNativeId, getMeetingById, loadJoinClock, setDispatchFallback, startJoinClock, stopMeetingIfDurationElapsed, transition } from "../services/meetings.ts";
 import { enqueueMeetingWebhook } from "../webhooks/dispatcher.ts";
 import { observeCapture, recordCapture } from "../services/capture.ts";
 import { and, eq, isNull, sql } from "drizzle-orm";
@@ -96,8 +96,13 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
     ctx.queue.renewStartLease(meetingId, token, chainLeaseTtlMs(ctx)).catch(() => {});
   }, Math.max(10, Math.floor(chainLeaseTtlMs(ctx) / 3)));
   try {
-    const meeting = await getMeetingById(ctx, meetingId);
+    let meeting = await getMeetingById(ctx, meetingId);
     if (!meeting || meeting.status !== "queued") return;
+    if (meeting.scheduledStopAt && meeting.scheduledStopAt <= new Date()) {
+      await stopMeetingIfDurationElapsed(ctx, meeting.id);
+      meeting = await getMeetingById(ctx, meetingId);
+      if (!meeting || meeting.status !== "queued") return;
+    }
     if (meeting.platform === "signal") return await handleSignalStart(ctx, meeting, attempt, continueStart);
     const vexaPlatform = toVexaPlatform(meeting.platform as Exclude<Platform, "signal">);
     try {
