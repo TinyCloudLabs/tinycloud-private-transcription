@@ -51,7 +51,7 @@ services:
       BATCH_TENANT_DAILY_BYTES: "559490400"
       BATCH_UPLOAD_MAX_PUT_SECONDS: "1800"
       BATCH_UPLOAD_MIN_BYTES_PER_SECOND: "32768"
-      BATCH_CORS_ORIGINS: "https://tinycloud.chat,https://tinychat-4jq.pages.dev,https://*.tinychat-4jq.pages.dev,tauri://localhost,http://tauri.localhost,capacitor://localhost,https://localhost"
+      BATCH_CORS_ORIGINS: "https://tinycloud.chat,https://home.tinycloud.xyz,https://tinychat-4jq.pages.dev,https://*.tinychat-4jq.pages.dev,tauri://localhost,http://tauri.localhost,capacitor://localhost,https://localhost"
       BATCH_DIARIZATION_ENABLED: "true"
       LOG_LEVEL: info
     ports:
