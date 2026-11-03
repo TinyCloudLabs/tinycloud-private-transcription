@@ -179,11 +179,11 @@ under API/worker 320 MiB limits, but sampled `memory.current` including cache re
 
 Exo uploads the recording straight from the browser/app to `PUT /uploads/{id}`, so the service allows those origins with
 `BATCH_CORS_ORIGINS` (contract: [SPEC.md](../../SPEC.md#upload)). It is not a secret and is set on the `api` service in
-[`app-compose.yaml`](./app-compose.yaml): the web app, its Pages previews, the desktop app (macOS and Windows) and the
+[`app-compose.yaml`](./app-compose.yaml): the web app, the TinyCloud Home site, its Pages previews, the desktop app (macOS and Windows) and the
 mobile app (Android and iOS):
 
 ```
-https://tinycloud.chat,https://tinychat-4jq.pages.dev,https://*.tinychat-4jq.pages.dev,tauri://localhost,http://tauri.localhost,capacitor://localhost,https://localhost
+https://tinycloud.chat,https://home.tinycloud.xyz,https://tinychat-4jq.pages.dev,https://*.tinychat-4jq.pages.dev,tauri://localhost,http://tauri.localhost,capacitor://localhost,https://localhost
 ```
 
 Check after a deploy: `curl -si -X OPTIONS $URL/uploads/trn_01M3PQ71Q9YF7GSEFP6S19ZJPW -H 'Origin: https://tinycloud.chat'

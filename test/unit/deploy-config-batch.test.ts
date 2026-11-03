@@ -226,12 +226,12 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     expect(env.BATCH_TINFOIL_MODEL).toBe("whisper-large-v3-turbo");
   });
 
-  test("lets Exo's web, desktop and mobile origins upload, and no other site", () => {
+  test("lets Exo's web, the TinyCloud Home site, desktop and mobile origins upload, and no other site", () => {
     const allowed = corsOriginMatcher(parseCorsOrigins(render().api!.environment.BATCH_CORS_ORIGINS ?? ""));
-    for (const origin of ["https://tinycloud.chat", "https://feat-x.tinychat-4jq.pages.dev", "tauri://localhost", "http://tauri.localhost", "capacitor://localhost", "https://localhost"]) {
+    for (const origin of ["https://tinycloud.chat", "https://home.tinycloud.xyz", "https://feat-x.tinychat-4jq.pages.dev", "tauri://localhost", "http://tauri.localhost", "capacitor://localhost", "https://localhost"]) {
       expect({ origin, allowed: allowed(origin) }).toEqual({ origin, allowed: true });
     }
-    for (const origin of ["https://evil.example", "https://tinycloud.chat.evil.example", "http://tinycloud.chat"]) {
+    for (const origin of ["https://evil.example", "https://tinycloud.chat.evil.example", "http://tinycloud.chat", "https://home.tinycloud.xyz.evil.example", "https://evilhome.tinycloud.xyz", "http://home.tinycloud.xyz"]) {
       expect({ origin, allowed: allowed(origin) }).toEqual({ origin, allowed: false });
     }
     expect(render()["upload-worker"]!.environment.BATCH_CORS_ORIGINS).toBeUndefined();
