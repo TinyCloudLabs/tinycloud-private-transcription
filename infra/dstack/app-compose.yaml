@@ -607,7 +607,7 @@ services:
   # restarts in a back-off loop), so nothing listens on 2222. The key holder is root-equivalent on the
   # CVM: the docker socket controls every container and /dstack/.decrypted-env holds every sealed value.
   debug-ssh:
-    image: ghcr.io/linuxserver/openssh-server:10.3_p1-r1-ls239@sha256:0f535b0faa7448511b23528165e9fbd4f1fe563b861b3dcaa5ddb0ddbfe2254c
+    image: ghcr.io/linuxserver/openssh-server:10.3_p1-r2-ls242@sha256:aa4e1b3916e8555f24e574e6108b0b89a1b20362b0a11800a71280b45999649e
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
