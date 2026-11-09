@@ -417,7 +417,7 @@ services:
         }
         while :; do sweep; sleep "$$BOT_JANITOR_INTERVAL_SECONDS"; done
     environment:
-      BOT_JANITOR_MODE: dry-run
+      BOT_JANITOR_MODE: apply
       BOT_JANITOR_PRUNE_IMAGES: ${BOT_JANITOR_PRUNE_IMAGES:-false}
       BOT_CONTAINER_RETENTION_DAYS: ${BOT_CONTAINER_RETENTION_DAYS:-1}
       BOT_JANITOR_INTERVAL_SECONDS: "21600"
