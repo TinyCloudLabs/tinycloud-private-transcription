@@ -178,16 +178,16 @@ export async function runSweep(ctx: BatchContext): Promise<void> {
     if (row) await cleanupJobFiles(ctx, id);
   }
   // 4. Queued provider waits have an absolute deadline from the earlier of upload and first block.
-  const providerWaitCutoff = secondsAgo(ctx.config.worker.providerBlockMaxSeconds);
+  const providerWaitExpired = () => sql`least(${transcriptionProviderBlocks.blockedSince}, ${transcriptions.uploadedAt}) <= now() - ${ctx.config.worker.providerBlockMaxSeconds} * interval '1 second'`;
   const expiredProviderWaits = await ctx.db.select({ id: transcriptionProviderBlocks.transcriptionId })
     .from(transcriptionProviderBlocks)
     .innerJoin(transcriptions, eq(transcriptions.id, transcriptionProviderBlocks.transcriptionId))
-    .where(and(eq(transcriptions.status, "queued"), sql`least(${transcriptionProviderBlocks.blockedSince}, ${transcriptions.uploadedAt}) <= ${providerWaitCutoff}`));
+    .where(and(eq(transcriptions.status, "queued"), providerWaitExpired()));
   for (const { id } of expiredProviderWaits) {
     const deadlineGuard = and(eq(transcriptions.status, "queued"), inArray(transcriptions.id,
       ctx.db.select({ id: transcriptionProviderBlocks.transcriptionId }).from(transcriptionProviderBlocks)
         .innerJoin(transcriptions, eq(transcriptions.id, transcriptionProviderBlocks.transcriptionId))
-        .where(and(eq(transcriptionProviderBlocks.transcriptionId, id), eq(transcriptions.status, "queued"), sql`least(${transcriptionProviderBlocks.blockedSince}, ${transcriptions.uploadedAt}) <= ${providerWaitCutoff}`))));
+        .where(and(eq(transcriptionProviderBlocks.transcriptionId, id), eq(transcriptions.status, "queued"), providerWaitExpired()))));
     const row = await terminalize(ctx.db, id, deadlineGuard!, "failed", { code: "provider_unavailable", message: "The transcription provider stayed unavailable for too long" });
     if (row) await cleanupJobFiles(ctx, id);
   }

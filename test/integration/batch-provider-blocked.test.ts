@@ -5,7 +5,7 @@ import { eq, sql } from "drizzle-orm";
 import { transcriptionAttempts, transcriptionProviderBlocks, transcriptionRegions, transcriptions, transcriptionWorkers } from "../../src/db/schema.ts";
 import { runSweep } from "../../src/uploads/ledger.ts";
 import { jobDir } from "../../src/uploads/storage.ts";
-import { recordWorkerHeartbeat } from "../../src/uploads/worker.ts";
+import { claimNext, recordWorkerHeartbeat } from "../../src/uploads/worker.ts";
 import { audio, exists, startBatchHarness, TENANT_B, type BatchHarness } from "./batch-harness.ts";
 
 // TC-2084: the harness writes upload files under os.tmpdir(); keep that and HOME in a private /var/tmp dir.
@@ -56,6 +56,18 @@ const block = async (id: string) => (await h.ctx.db.select().from(transcriptionP
 const elapse = (id: string) => h.ctx.db.update(transcriptionProviderBlocks).set({ nextAttemptAt: new Date(Date.now() - 1_000) }).where(eq(transcriptionProviderBlocks.transcriptionId, id));
 const waitedSeconds = async (id: string) => ((await block(id))!.nextAttemptAt.getTime() - Date.now()) / 1000;
 
+const expiredWait = async () => {
+  h.tinfoil.handler = refuse(402);
+  const id = await h.submit(await audio("mono_wav"), wav);
+  await h.work();
+  await h.ctx.db.update(transcriptions).set({ uploadedAt: sql`now() - interval '73 hours'` }).where(eq(transcriptions.id, id));
+  await h.ctx.db.update(transcriptionProviderBlocks).set({
+    blockedSince: sql`now() - interval '73 hours'`,
+    nextAttemptAt: sql`now() - interval '1 second'`,
+  }).where(eq(transcriptionProviderBlocks.transcriptionId, id));
+  return { id, audioFile: (await h.row(id)).audioFile! };
+};
+
 describe("a blocked provider makes the job wait", () => {
   for (const status of [402, 401, 403]) {
     test(`${status}: the job is released to queued with a not-before; nothing fails and no counter burns`, async () => {
@@ -93,6 +105,15 @@ describe("a blocked provider makes the job wait", () => {
     expect(waiting).toMatchObject({ status: "queued", provider_delayed: true, error: null });
     const listed = (await (await h.api("/v1/transcriptions")).json()).data.find((j: { id: string }) => j.id === id);
     expect(listed.provider_delayed).toBe(true);
+  });
+
+  test("a queued job is not delayed after its not-before has passed", async () => {
+    h.tinfoil.handler = refuse(402);
+    const id = await h.submit(await audio("mono_wav"), wav);
+    await h.work();
+    await elapse(id);
+    expect(await dto(id)).toMatchObject({ status: "queued" });
+    expect(await dto(id)).not.toHaveProperty("provider_delayed");
   });
 
   test("a waiting job is not claimed before its not-before, and the provider is not called", async () => {
@@ -140,7 +161,8 @@ describe("a blocked provider makes the job wait", () => {
     await h.ctx.db.update(transcriptions).set({ uploadedAt: expiredSince }).where(eq(transcriptions.id, id));
     await h.ctx.db.update(transcriptionProviderBlocks).set({ blockedSince: expiredSince }).where(eq(transcriptionProviderBlocks.transcriptionId, id));
     await elapse(id);
-    await h.work();
+    expect(await h.work()).toBe(false);
+    await runSweep(h.ctx);
     expect(await h.row(id)).toMatchObject({ status: "failed", errorCode: "provider_unavailable", deletionState: "files_deleted" });
     expect(await dto(id)).not.toHaveProperty("provider_delayed");
   });
@@ -167,7 +189,8 @@ describe("a blocked provider makes the job wait", () => {
     await h.ctx.db.update(transcriptions).set({ uploadedAt: expiredSince }).where(eq(transcriptions.id, id));
     await h.ctx.db.update(transcriptionProviderBlocks).set({ blockedSince: expiredSince }).where(eq(transcriptionProviderBlocks.transcriptionId, id));
     await elapse(id);
-    await h.work();
+    expect(await h.work()).toBe(false);
+    await runSweep(h.ctx);
     expect(await h.row(id)).toMatchObject({ status: "failed", errorCode: "provider_unavailable", deletionState: "files_deleted" });
   });
 
@@ -192,23 +215,27 @@ describe("a blocked provider makes the job wait", () => {
 });
 
 describe("recovery", () => {
-  test("after the provider answers 200 the job completes, logged once with the count of waiting jobs", async () => {
+  test("a completed blocked job is not reported as a recovered wait while processing", async () => {
     h.tinfoil.handler = refuse(402);
-    const id = await h.submit(await audio("mono_wav"), wav);
+    const id = await h.submit(await audio("clicks_wav"), wav);
     await h.work();
     await elapse(id);
     await h.work();
     expect(events("batch provider recovered")).toHaveLength(0);
 
-    h.tinfoil.handler = (call) => Response.json({ text: `ok ${call}` });
+    let processing: { status: string; provider_delayed?: boolean } | undefined;
+    h.tinfoil.handler = async (call) => {
+      processing = await dto(id);
+      return Response.json({ text: `ok ${call}` });
+    };
     await elapse(id);
     await h.work();
     expect(await h.row(id)).toMatchObject({ status: "completed" });
     expect(await block(id)).toBeUndefined();
     expect(await dto(id)).not.toHaveProperty("provider_delayed");
-    const recovered = events("batch provider recovered");
-    expect(recovered).toHaveLength(1);
-    expect(recovered[0]).toMatchObject({ level: "warn", fields: { delayed_jobs: 1, stage: "dispatch" } });
+    expect(processing).toMatchObject({ status: "processing" });
+    expect(processing).not.toHaveProperty("provider_delayed");
+    expect(events("batch provider recovered")).toHaveLength(0);
   });
 
   test("provider recovery releases waits without resetting the 72-hour deadline", async () => {
@@ -240,7 +267,7 @@ describe("recovery", () => {
     expect(waitingA!.nextAttemptAt.getTime()).toBeLessThanOrEqual(blockedSince.getTime() + 72 * HOUR);
     expect(waitingA!.nextAttemptAt.getTime()).toBeGreaterThan(blockedSince.getTime() + 71 * HOUR + 50 * MIN - 1_000);
     expect(events("batch provider recovered")).toHaveLength(1);
-    expect(events("batch provider recovered")[0]!.fields).toMatchObject({ delayed_jobs: 2 });
+    expect(events("batch provider recovered")[0]!.fields).toMatchObject({ delayed_jobs: 1 });
   });
 
   test("a block in the middle of a job keeps the finished regions and never re-sends them", async () => {
@@ -308,6 +335,60 @@ describe("recovery", () => {
     expect((await h.row(id)).deletionState).toBe("files_deleted");
     expect(await exists(join(jobDir(h.uploadDir, id), row.audioFile!))).toBe(false);
   });
+  test("an expired wait is not claimed and is left for terminal cleanup", async () => {
+    const { id, audioFile } = await expiredWait();
+    expect(await claimNext(h.ctx)).toBeNull();
+    expect((await h.row(id)).status).toBe("queued");
+    await runSweep(h.ctx);
+    expect(await h.row(id)).toMatchObject({ status: "failed", errorCode: "provider_unavailable", deletionState: "files_deleted" });
+    expect(await exists(join(jobDir(h.uploadDir, id), audioFile))).toBe(false);
+  });
+
+  for (const gate of ["admission closed", "provider absent"] as const) {
+    test(`sweep expires overdue waits with ${gate}`, async () => {
+      const { id, audioFile } = await expiredWait();
+      const gatedContext = gate === "provider absent" ? h.withContext({ provider: null }) : h.ctx;
+      try {
+        if (gate === "admission closed") await h.ctx.db.execute(sql`update transcription_admission set mode = 'closed' where id = 1`);
+        expect(await claimNext(gatedContext)).toBeNull();
+        await runSweep(gatedContext);
+      } finally {
+        if (gate === "admission closed") await h.ctx.db.execute(sql`update transcription_admission set mode = 'open' where id = 1`);
+      }
+      expect(await h.row(id)).toMatchObject({ status: "failed", errorCode: "provider_unavailable", deletionState: "files_deleted" });
+      expect(await exists(join(jobDir(h.uploadDir, id), audioFile))).toBe(false);
+    });
+  }
+
+  test("provider block timestamp comes from the database clock", async () => {
+    const id = await h.submit(await audio("mono_wav"), wav);
+    const [clock] = await h.ctx.db.execute(sql`select now() as now`);
+    const databaseNow = new Date((clock as { now: Date }).now);
+    h.tinfoil.handler = refuse(402);
+    const originalNow = Date.now;
+    Date.now = () => originalNow() + 200 * HOUR;
+    try {
+      await h.work();
+    } finally {
+      Date.now = originalNow;
+    }
+    const blockedSince = (await block(id))!.blockedSince.getTime();
+    expect(Math.abs(blockedSince - databaseNow.getTime())).toBeLessThan(5_000);
+  });
+
+  test("provider wait sweep cutoff comes from the database clock", async () => {
+    const { id, audioFile } = await expiredWait();
+    const originalNow = Date.now;
+    Date.now = () => originalNow() - 200 * HOUR;
+    try {
+      await runSweep(h.ctx);
+    } finally {
+      Date.now = originalNow;
+    }
+    expect(await h.row(id)).toMatchObject({ status: "failed", errorCode: "provider_unavailable", deletionState: "files_deleted" });
+    expect(await exists(join(jobDir(h.uploadDir, id), audioFile))).toBe(false);
+  });
+
   for (const action of ["cancel", "delete"] as const) {
     test(`${action} during a provider wait removes the queued audio and retry marker`, async () => {
       h.tinfoil.handler = refuse(402);
