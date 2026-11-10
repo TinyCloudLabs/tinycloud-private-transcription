@@ -1,5 +1,5 @@
 import { and, asc, eq, inArray, isNotNull, isNull, lt, or, sql, type SQL } from "drizzle-orm";
-import { providerDispatchSlots, transcriptionAttempts, transcriptionCapabilities, transcriptionRegions, transcriptionResults, transcriptions, transcriptionTenantUsage, transcriptionWorkers, type TranscriptionRow } from "../db/schema.ts";
+import { providerDispatchSlots, transcriptionAttempts, transcriptionCapabilities, transcriptionProviderBlocks, transcriptionRegions, transcriptionResults, transcriptions, transcriptionTenantUsage, transcriptionWorkers, type TranscriptionRow } from "../db/schema.ts";
 import type { BatchContext } from "./context.ts";
 import { isSimulatedCrash } from "./faults.ts";
 import type { DbOrTx } from "./fence.ts";
@@ -17,12 +17,12 @@ const secondsAgo = (seconds: number) => new Date(Date.now() - seconds * 1000);
 /**
  * The only way a job becomes terminal. In one statement it records the terminal state AND
  * deletion_state='pending' (the ledger entry) before any file is unlinked, bumps the fencing generation,
- * and drops every claim and upload lease; its capabilities are deleted in the same transaction. `guard`
- * is the caller's compare-and-swap. Returns null when the guard lost.
+ * and drops every claim, upload lease and provider-retry marker. Capabilities are deleted in the same
+ * transaction. `guard` is the caller's compare-and-swap. Returns null when the guard lost.
  *
- * A failed or cancelled job has no transcript to serve, so any region text it already holds (partial
- * content) is deleted right away and transcript_deleted_at is recorded; only a completed job keeps text,
- * until DELETE or its 24 h expiry. The sweeper re-runs this for a job whose caller died in between.
+ * A failed or cancelled job has no transcript to serve, so any region text it already holds (partial content)
+ * is deleted right away and transcript_deleted_at is recorded. Completed jobs keep text until DELETE or its
+ * 24 h expiry; partial region text remains while a queued job waits for a safely retryable provider outcome.
  */
 export async function terminalize(
   tx: DbOrTx,
@@ -51,6 +51,7 @@ export async function terminalize(
   }).where(and(eq(transcriptions.id, id), inArray(transcriptions.status, [...ACTIVE_STATUSES]), guard)).returning();
   if (!row) return null;
   await tx.delete(transcriptionCapabilities).where(eq(transcriptionCapabilities.transcriptionId, id));
+  await tx.delete(transcriptionProviderBlocks).where(eq(transcriptionProviderBlocks.transcriptionId, id));
   if (status !== "completed") await deleteTranscriptContent(tx, id);
   return row;
 }
@@ -162,7 +163,7 @@ export async function runSweep(ctx: BatchContext): Promise<void> {
     const row = await terminalize(ctx.db, id, and(eq(transcriptions.status, "awaiting_upload"), lt(transcriptions.uploadDeadlineAt, now))!, "failed", { code: "upload_expired", message: "The recording was not uploaded before the upload deadline" });
     if (row) await cleanupJobFiles(ctx, id);
   }
-  // 2. Dead upload leases (their temp files are removed by step 7).
+  // 2. Dead upload leases (their temp files are removed by step 8).
   await ctx.db.update(transcriptions).set({ uploadLeaseToken: null, uploadLeaseStartedAt: null, uploadLeaseHeartbeatAt: null, uploadLeaseHardExpiresAt: null })
     .where(and(eq(transcriptions.status, "awaiting_upload"), isNotNull(transcriptions.uploadLeaseToken), or(
       lt(transcriptions.uploadLeaseHeartbeatAt, secondsAgo(ctx.config.upload.leaseStaleSeconds)),
@@ -176,13 +177,27 @@ export async function runSweep(ctx: BatchContext): Promise<void> {
     const row = await terminalize(ctx.db, id, eq(transcriptions.status, "processing"), "failed", { code: "processing_timeout", message: "Processing exceeded the maximum duration" });
     if (row) await cleanupJobFiles(ctx, id);
   }
-  // 4. Claims whose owner died.
+  // 4. Queued provider waits have an absolute deadline from the earlier of upload and first block.
+  const providerWaitCutoff = secondsAgo(ctx.config.worker.providerBlockMaxSeconds);
+  const expiredProviderWaits = await ctx.db.select({ id: transcriptionProviderBlocks.transcriptionId })
+    .from(transcriptionProviderBlocks)
+    .innerJoin(transcriptions, eq(transcriptions.id, transcriptionProviderBlocks.transcriptionId))
+    .where(and(eq(transcriptions.status, "queued"), sql`least(${transcriptionProviderBlocks.blockedSince}, ${transcriptions.uploadedAt}) <= ${providerWaitCutoff}`));
+  for (const { id } of expiredProviderWaits) {
+    const deadlineGuard = and(eq(transcriptions.status, "queued"), inArray(transcriptions.id,
+      ctx.db.select({ id: transcriptionProviderBlocks.transcriptionId }).from(transcriptionProviderBlocks)
+        .innerJoin(transcriptions, eq(transcriptions.id, transcriptionProviderBlocks.transcriptionId))
+        .where(and(eq(transcriptionProviderBlocks.transcriptionId, id), eq(transcriptions.status, "queued"), sql`least(${transcriptionProviderBlocks.blockedSince}, ${transcriptions.uploadedAt}) <= ${providerWaitCutoff}`))));
+    const row = await terminalize(ctx.db, id, deadlineGuard!, "failed", { code: "provider_unavailable", message: "The transcription provider stayed unavailable for too long" });
+    if (row) await cleanupJobFiles(ctx, id);
+  }
+  // 5. Claims whose owner died.
   await recoverStaleClaims(ctx);
-  // 5. Pending deletions (retries failed unlinks).
+  // 6. Pending deletions (retries failed unlinks).
   const pending = await ctx.db.select({ id: transcriptions.id }).from(transcriptions)
     .where(and(eq(transcriptions.deletionState, "pending"), inArray(transcriptions.status, [...TERMINAL_STATUSES]))).orderBy(asc(transcriptions.terminalAt));
   for (const { id } of pending) await cleanupJobFiles(ctx, id);
-  // 6. Transcript expiry: 24 h after completion unless deleted earlier. Failed/cancelled jobs lose any
+  // 7. Transcript expiry: 24 h after completion unless deleted earlier. Failed/cancelled jobs lose any
   //    partial text at their terminal transition; this also finishes one whose caller died in between.
   const due = await ctx.db.select({ id: transcriptions.id }).from(transcriptions).where(and(
     isNull(transcriptions.transcriptDeletedAt),
@@ -192,9 +207,9 @@ export async function runSweep(ctx: BatchContext): Promise<void> {
     ),
   ));
   for (const { id } of due) await deleteTranscriptContent(ctx.db, id);
-  // 7. Directory reconciliation: anything on disk that the ledger does not currently authorize goes.
+  // 8. Directory reconciliation: anything on disk that the ledger does not currently authorize goes.
   await reconcileDirectories(ctx);
-  // 8. Purge tombstones and finished rows 7 days after their files were verified deleted.
+  // 9. Purge tombstones and finished rows 7 days after their files were verified deleted.
   const cutoff = secondsAgo(ctx.config.retention.tombstoneRetentionSeconds);
   await ctx.db.delete(transcriptions).where(and(
     eq(transcriptions.deletionState, "files_deleted"),
@@ -218,7 +233,7 @@ async function reconcileDirectories(ctx: BatchContext) {
     // Fresh read per directory: a PUT may have taken a lease since the pass started.
     const [row] = await ctx.db.select().from(transcriptions).where(eq(transcriptions.id, id));
     if (!row || !isActive(row.status)) {
-      if (row?.deletionState === "pending") continue; // step 5 owns it
+      if (row?.deletionState === "pending") continue; // step 6 owns it
       if (row?.deletionState === "files_deleted") ctx.log.error("batch artifact reappeared after verified deletion", { transcriptionId: id, stage: "reconcile", alert: true });
       await removeJobArtifacts(root, id);
       continue;

@@ -479,11 +479,12 @@ async function settleDispatch(
      */
     const block = async (status: number | null) => {
       const [current] = await tx.select().from(transcriptionProviderBlocks).where(eq(transcriptionProviderBlocks.transcriptionId, fence.id));
+      const [job] = await tx.select({ uploadedAt: transcriptions.uploadedAt }).from(transcriptions).where(eq(transcriptions.id, fence.id));
       const now = Date.now();
       const since = current?.blockedSince ?? new Date(now);
-      const deadline = since.getTime() + w.providerBlockMaxSeconds * 1000;
+      const deadlineStart = Math.min(since.getTime(), job!.uploadedAt!.getTime());
+      const deadline = deadlineStart + w.providerBlockMaxSeconds * 1000;
       if (now >= deadline) {
-        await tx.delete(transcriptionProviderBlocks).where(eq(transcriptionProviderBlocks.transcriptionId, fence.id));
         return fail("provider_unavailable", "The transcription provider stayed unavailable for too long", "failed");
       }
       const schedule = w.providerBlockBackoffSeconds;
@@ -517,11 +518,12 @@ async function settleDispatch(
         if (ungrounded) seen.droppedRegions = 1;
         await tx.update(transcriptionRegions).set({ status: "completed", text: ungrounded ? "" : outcome.text }).where(regionWhere);
         await tx.update(transcriptions).set({ tinfoilAudioSeconds: sql`${transcriptions.tinfoilAudioSeconds} + ${(region.endMs - region.startMs) / 1000}` }).where(fenceGuard(fence));
-        // A successful dispatch proves the provider works again: every waiting job is released at once, logged once.
-        const cleared = await tx.delete(transcriptionProviderBlocks)
+        // Provider recovery wakes waiting jobs without moving their original deadline. The block row also
+        // carries the hard 72-hour bound, so only terminalize() removes it when the job actually ends.
+        const released = await tx.update(transcriptionProviderBlocks).set({ nextAttemptAt: sql`now()`, attempts: 0 })
           .where(inArray(transcriptionProviderBlocks.transcriptionId, tx.select({ id: transcriptions.id }).from(transcriptions).where(inArray(transcriptions.status, ["queued", "processing"]))))
           .returning({ id: transcriptionProviderBlocks.transcriptionId });
-        seen.recoveredJobs = cleared.length;
+        seen.recoveredJobs = released.length;
         return "done" as const;
       }
       case "rate_limited":
