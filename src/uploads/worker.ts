@@ -451,7 +451,7 @@ async function settleDispatch(
   const w = ctx.config.worker;
   const detail = outcome.kind === "ambiguous" || outcome.kind === "not_sent" ? outcome.reason
     : outcome.kind === "rejected" || outcome.kind === "misconfigured" || outcome.kind === "blocked" ? `http_${outcome.status}` : null;
-  const seen = { newlyBlockedStatus: null as number | null, recoveredJobs: 0, droppedRegions: 0 };
+  const seen = { newlyBlocked: null as { status: number | null } | null, recoveredJobs: 0, droppedRegions: 0 };
   const result = await ctx.db.transaction(async (tx) => {
     let lost = false;
     try {
@@ -473,11 +473,11 @@ async function settleDispatch(
       return row ? { kind: "terminal" as const, row } : "lost" as const;
     };
     /**
-     * The provider refused before processing (nothing was done or billed), so the job waits instead of failing: release
-     * the claim (back to `queued`, regions kept) with a durable not-before from the capped backoff. Neither the not-sent
-     * nor the rate-limit counter, nor the claim count, is consumed. Past the give-up window it fails provider_unavailable.
+     * An explicit provider refusal or request proven not sent is safe to retry: release the claim (back to `queued`,
+     * regions kept) with a durable not-before from the capped backoff. The bounded immediate not-sent retries occur
+     * before this transition. Past the give-up window, the job fails provider_unavailable.
      */
-    const block = async (status: number) => {
+    const block = async (status: number | null) => {
       const [current] = await tx.select().from(transcriptionProviderBlocks).where(eq(transcriptionProviderBlocks.transcriptionId, fence.id));
       const now = Date.now();
       const since = current?.blockedSince ?? new Date(now);
@@ -504,7 +504,7 @@ async function settleDispatch(
       const wait = { blockedSince: since, nextAttemptAt: new Date(Math.min(now + delayMs, deadline)), attempts: attempts + 1, lastStatus: status };
       await tx.insert(transcriptionProviderBlocks).values({ transcriptionId: fence.id, ...wait })
         .onConflictDoUpdate({ target: transcriptionProviderBlocks.transcriptionId, set: wait });
-      if (current?.lastStatus !== status) seen.newlyBlockedStatus = status;
+      if (current?.lastStatus !== status) seen.newlyBlocked = { status };
       return "blocked" as const;
     };
     switch (outcome.kind) {
@@ -534,7 +534,7 @@ async function settleDispatch(
       case "blocked":
         return block(outcome.status);
       case "not_sent":
-        if (notSent + 1 >= w.maxNotSentAttempts) return fail("provider_unavailable", "The transcription provider could not be reached", "failed");
+        if (notSent + 1 >= w.maxNotSentAttempts) return block(null);
         return "retry" as const;
       case "rejected":
         return fail("transcription_failed", "The transcription provider rejected a segment of the recording", "failed");
@@ -545,9 +545,12 @@ async function settleDispatch(
         return fail("provider_outcome_unknown", "A transcription request had an uncertain outcome; it is not retried to avoid a duplicate paid request", "ambiguous");
     }
   });
-  if (seen.newlyBlockedStatus !== null) {
-    // Error + alert: the first occurrence is the page. Coded tokens only; the provider's response body is never read.
-    ctx.log.error("batch provider blocked", { transcriptionId: fence.id, http_status: seen.newlyBlockedStatus, reason: BLOCK_REASON[seen.newlyBlockedStatus], stage: "dispatch", alert: true });
+  if (seen.newlyBlocked) {
+    // Coded reasons only; a provably-unsent request has no HTTP status and no provider response body.
+    const { status } = seen.newlyBlocked;
+    ctx.log.error("batch provider blocked", {
+      transcriptionId: fence.id, http_status: status, reason: status === null ? "request_not_sent" : BLOCK_REASON[status], stage: "dispatch", alert: true,
+    });
   }
   // Count only; the dropped text is never logged.
   if (seen.droppedRegions > 0) ctx.log.warn("batch region ungrounded", { transcriptionId: fence.id, dropped_regions: seen.droppedRegions, stage: "dispatch" });

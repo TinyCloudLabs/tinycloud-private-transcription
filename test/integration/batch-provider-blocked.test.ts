@@ -122,24 +122,51 @@ describe("a blocked provider makes the job wait", () => {
     expect((await h.row(id)).status).toBe("queued");
   });
 
-  test("the give-up window runs from the first block: the last wait is cut to it, then the job fails provider_unavailable", async () => {
+  test("the give-up window runs from the first block: the last wait is cut to 72 h, then the job fails provider_unavailable", async () => {
     h.tinfoil.handler = refuse(402);
     const id = await h.submit(await audio("mono_wav"), wav);
     await h.work();
-    // 23 h 50 min into the spell the next wait (30 min) is cut to the 24 h mark.
-    await h.ctx.db.update(transcriptionProviderBlocks).set({ blockedSince: new Date(Date.now() - 23 * HOUR - 50 * MIN), attempts: 6 }).where(eq(transcriptionProviderBlocks.transcriptionId, id));
+    // 71 h 50 min into the spell the next wait (30 min) is cut to the 72 h mark.
+    await h.ctx.db.update(transcriptionProviderBlocks).set({ blockedSince: new Date(Date.now() - 71 * HOUR - 50 * MIN), attempts: 6 }).where(eq(transcriptionProviderBlocks.transcriptionId, id));
     await elapse(id);
     await h.work();
     const since = (await block(id))!.blockedSince.getTime();
-    expect((await block(id))!.nextAttemptAt.getTime()).toBe(since + 24 * HOUR);
+    expect((await block(id))!.nextAttemptAt.getTime()).toBe(since + 72 * HOUR);
     expect((await h.row(id)).status).toBe("queued");
 
-    await h.ctx.db.update(transcriptionProviderBlocks).set({ blockedSince: new Date(Date.now() - 24 * HOUR - MIN) }).where(eq(transcriptionProviderBlocks.transcriptionId, id));
+    await h.ctx.db.update(transcriptionProviderBlocks).set({ blockedSince: new Date(Date.now() - 72 * HOUR - MIN) }).where(eq(transcriptionProviderBlocks.transcriptionId, id));
     await elapse(id);
     await h.work();
     expect(await h.row(id)).toMatchObject({ status: "failed", errorCode: "provider_unavailable", deletionState: "files_deleted" });
     expect(await dto(id)).not.toHaveProperty("provider_delayed");
   });
+
+  test("a provably unsent outage waits for the same 72-hour window", async () => {
+    Object.assign(h.ctx.config.worker, { maxNotSentAttempts: 1 });
+    h.tinfoil.handler = () => { const error = new Error("refused") as Error & { code: string }; error.code = "ConnectionRefused"; throw error; };
+    const id = await h.submit(await audio("mono_wav"), wav);
+    await h.work();
+    expect(await h.row(id)).toMatchObject({ status: "queued", errorCode: null, deletionState: "none" });
+    expect(await block(id)).toMatchObject({ lastStatus: null });
+    expect(events("batch provider blocked")[0]!.fields).toMatchObject({ http_status: null, reason: "request_not_sent" });
+
+    await h.ctx.db.update(transcriptionProviderBlocks).set({
+      blockedSince: new Date(Date.now() - 71 * HOUR - 50 * MIN),
+      attempts: 6,
+    }).where(eq(transcriptionProviderBlocks.transcriptionId, id));
+    await elapse(id);
+    await h.work();
+    const waiting = await block(id);
+    expect(waiting!.nextAttemptAt.getTime()).toBe(waiting!.blockedSince.getTime() + 72 * HOUR);
+    expect((await h.row(id)).status).toBe("queued");
+
+    await h.ctx.db.update(transcriptionProviderBlocks).set({ blockedSince: new Date(Date.now() - 72 * HOUR - MIN) })
+      .where(eq(transcriptionProviderBlocks.transcriptionId, id));
+    await elapse(id);
+    await h.work();
+    expect(await h.row(id)).toMatchObject({ status: "failed", errorCode: "provider_unavailable", deletionState: "files_deleted" });
+  });
+
 
   test("429 past maxConsecutiveRateLimits waits like a block instead of failing", async () => {
     Object.assign(h.ctx.config.worker, { maxConsecutiveRateLimits: 3 });
@@ -233,11 +260,11 @@ describe("recovery", () => {
     expect((await h.row(id)).status).toBe("completed");
   });
 
-  test("retention: a waiting job's upload survives the sweep and the processing ceiling", async () => {
+  test("retention: a 72-hour waiting job's upload survives the sweep and the processing ceiling", async () => {
     h.tinfoil.handler = refuse(402);
     const id = await h.submit(await audio("mono_wav"), wav);
     await h.work();
-    await h.ctx.db.update(transcriptions).set({ uploadedAt: new Date(Date.now() - 48 * HOUR), createdAt: new Date(Date.now() - 48 * HOUR) }).where(eq(transcriptions.id, id));
+    await h.ctx.db.update(transcriptions).set({ uploadedAt: new Date(Date.now() - 72 * HOUR), createdAt: new Date(Date.now() - 72 * HOUR) }).where(eq(transcriptions.id, id));
     const row = await h.row(id);
     await runSweep(h.ctx);
     expect(await h.row(id)).toMatchObject({ status: "queued", deletionState: "none" });

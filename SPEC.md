@@ -364,11 +364,13 @@ request is in flight at any time. Outcomes:
 |---|---|
 | 200 with text | region completed |
 | 429 | new attempt after `Retry-After` (default 30 s, max 120 s); 20 consecutive → treated as 402 below (the job waits) |
-| provably not sent (connection refused / DNS / TLS verification) | ≤ 5 attempts with backoff → `provider_unavailable` |
+| provably not sent (connection refused / DNS / TLS verification) | ≤ 5 immediate attempts with backoff, then the same durable queued wait as provider blocks below; at most 72 h from the first durable wait before `provider_unavailable` |
 | 400 / 413 / 415 / 422 | `transcription_failed` |
-| 402 / 401 / 403 | provider refused before processing (billing, quota or key): nothing was done or billed, so the job **waits**: released to `queued` with a durable not-before (`transcription_provider_blocks.next_attempt_at`), backoff 1, 2, 5, 10, 30 min then every 30 min, at most 24 h from the first block, then `provider_unavailable`. `provider_delayed: true` on the job while it waits. No retry counter or claim is consumed. Logs `batch provider blocked` (once per job per distinct HTTP status, logged as `http_status`) and `batch provider recovered` |
+| 402 / 401 / 403 | provider refused before processing (billing, quota or key): nothing was done or billed, so the job **waits**: released to `queued` with a durable not-before (`transcription_provider_blocks.next_attempt_at`), backoff 1, 2, 5, 10, 30 min then every 30 min, at most 72 h from the first block, then `provider_unavailable`. `provider_delayed: true` on the job while it waits. No retry counter or claim is consumed. Logs `batch provider blocked` (once per job per distinct outcome; `http_status` only for an HTTP refusal) and `batch provider recovered` |
 | 404 | `provider_unavailable` + alert (wrong URL or model: a deploy fault) |
 | timeout, reset, 5xx, other status, unparseable body, worker died while admitted | attempt `ambiguous`, **never re-sent** → `provider_outcome_unknown` |
+While a job is waiting through a provider refusal or a provably-unsent outage, its uploaded audio stays on the batch volume. A terminal failure at the 72 h deadline follows the existing cleanup path.
+
 
 A worker that dies before any admission is requeued (regions and completed results kept; ≤ 3 claims → `processing_failed`).
 A job processing longer than 4 h fails `processing_timeout`.

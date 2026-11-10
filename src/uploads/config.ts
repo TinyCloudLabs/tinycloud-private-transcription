@@ -83,9 +83,9 @@ export interface BatchConfig {
     maxNotSentAttempts: number;
     notSentBackoffMs: number;
     maxProcessingSeconds: number;
-    /** Seconds a job waits after the Nth consecutive blocked provider outcome; the last entry repeats. */
+    /** Seconds a safely retriable provider outcome waits; the last backoff entry repeats. */
     providerBlockBackoffSeconds: number[];
-    /** A job that has been blocked this long (from its first block) fails provider_unavailable. */
+    /** A safely retryable provider refusal or provably-unsent outage waits this long from its first occurrence. */
     providerBlockMaxSeconds: number;
   };
   retention: {
@@ -162,7 +162,7 @@ export function batchConfigFromEnv(log: Pick<Logger, "warn"> = logger): BatchCon
       notSentBackoffMs: 1_000,
       maxProcessingSeconds: 4 * 3_600,
       providerBlockBackoffSeconds: [60, 120, 300, 600, 1_800],
-      providerBlockMaxSeconds: 24 * 3_600,
+      providerBlockMaxSeconds: 72 * 3_600,
     },
     retention: {
       transcriptTtlSeconds: 86_400,
