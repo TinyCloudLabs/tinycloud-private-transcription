@@ -493,7 +493,7 @@ services:
       INTERNAL_API_SECRET: ${VEXA_INTERNAL_API_SECRET}
       DEFAULT_BOT_NAME: TinyCloud Notetaker
       TRANSCRIPTION_SERVICE_URL: http://whisper:8000
-      TRANSCRIPTION_SERVICE_TOKEN: local-stt        # faster-whisper-server ignores auth; non-empty marks STT "configured"
+      TRANSCRIPTION_SERVICE_TOKEN: "unused"  # not a credential: faster-whisper-server validates no token; Vexa only needs a non-empty value to mark STT configured. Details: TC-2859
       TRANSCRIPTION_MODEL: ""
       TRANSCRIBE_ENABLED: "false"
       ATTRIBUTED_AUDIO_ENABLED: "true"
