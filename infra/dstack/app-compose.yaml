@@ -32,7 +32,7 @@
 services:
   # ─── ours ────────────────────────────────────────────────────────────────────────────────────
   api:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:3732d4b5366ebc4d858a34d4cc05b7501f08653e@sha256:f8e50def29b3ee74fae3f2846e1681c50fddefd9543dc393b85329634739636e
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:d5134e77f24abcef37663ac9c9381e1eba44c44a@sha256:5d821daf9998a371b19fb5a976a7d401c10098b91ca6a624c49554bc3faf812c
     # VEXA_API_KEY is minted at first boot by `vexa-provision` (below) into a shared volume.
     command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal-capability/capability-key); exec bun run src/api/server.ts"]
     restart: unless-stopped
@@ -85,7 +85,7 @@ services:
     networks: [ptx, vexa]
 
   worker:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:3732d4b5366ebc4d858a34d4cc05b7501f08653e@sha256:f8e50def29b3ee74fae3f2846e1681c50fddefd9543dc393b85329634739636e
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:d5134e77f24abcef37663ac9c9381e1eba44c44a@sha256:5d821daf9998a371b19fb5a976a7d401c10098b91ca6a624c49554bc3faf812c
     command: ["sh", "-c", "for i in $(seq 1 60); do [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && [ -s /run/signal-control-1/token ] && break; sleep 2; done; [ -s /run/vexa/api-key ] && [ -s /run/signal-capability/capability-key ] && [ -s /run/signal-control-1/token ] || exit 1; export VEXA_API_KEY=$(cat /run/vexa/api-key) SIGNAL_CAPABILITY_KEY=$(cat /run/signal-capability/capability-key); exec bun run src/worker/index.ts"]
     restart: unless-stopped
     environment:
