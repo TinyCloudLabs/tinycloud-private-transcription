@@ -470,9 +470,9 @@ The meeting worker checks persisted deadlines on its existing heartbeat, normall
 
 ## Pasted Google Meet invitations (TC-2181)
 
-`POST /v1/meetings` accepts free-form invitation text in `meeting_url`. It selects the first dashed-code or lookup URL whose host is exactly `meet.google.com`, in input order, ignoring phone numbers, `tel.meet` and other URL hosts. Dashed-code targets use the existing canonical normalization; a lookup target appearing first keeps its nickname and query rather than selecting a later dashed-code target. Schemeless Meet targets gain HTTPS. Explicit HTTP lookup targets retain the existing `invalid_meeting_url` response. Details: TC-2181
+`POST /v1/meetings` accepts free-form invitation text in `meeting_url`. It selects the first dashed-code or lookup URL whose host is exactly `meet.google.com`, in input order, ignoring phone numbers, `tel.meet` and other URL hosts. Dashed-code targets use the existing canonical normalization. A lookup target (`meet.google.com/lookup/<nick>`), whether direct, schemeless, wrapped or appearing first in text, returns `invalid_meeting_url` before any meeting row, queue entry or bot request exists; a later dashed-code target is not substituted. Schemeless Meet targets gain HTTPS. Details: TC-2181
 
 The stored meeting URL, native identity and create-request hash use the selected target, not the invitation text. Text without a qualifying Meet target returns `invalid_meeting_url` before meeting creation or dispatch. Inputs containing only a link retain the existing wrapper and platform handling. Details: TC-2181
 
-External angle brackets, quotes and parentheses delimit a pasted URL without removing punctuation from its lookup nickname or query. First-target selection precedes the selected URL's existing link-only protocol handling, including when a dashed-code target precedes an HTTPS backup. Details: TC-2181
+External angle brackets, quotes and parentheses delimit a pasted URL without removing punctuation from the selected target's path or query. First-target selection precedes the selected URL's existing link-only protocol handling, including when a dashed-code target precedes an HTTPS backup. Details: TC-2181
 
