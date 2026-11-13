@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, lt, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, lt, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import {
   transcriptionAdmission,
@@ -332,8 +332,9 @@ export async function serializeJob(ctx: BatchContext, job: TranscriptionRow) {
     : job.deletionState === "pending" ? "deletion_pending"
       : job.status === "awaiting_upload" ? "not_received" : "stored";
   // Waiting on a blocked provider (billing, quota or key): the job is neither failed nor stuck. Absent otherwise.
-  const providerDelayed = (job.status === "queued" || job.status === "processing")
-    && (await ctx.db.select({ id: transcriptionProviderBlocks.transcriptionId }).from(transcriptionProviderBlocks).where(eq(transcriptionProviderBlocks.transcriptionId, job.id))).length > 0;
+  const providerDelayed = job.status === "queued"
+    && (await ctx.db.select({ id: transcriptionProviderBlocks.transcriptionId }).from(transcriptionProviderBlocks)
+      .where(and(eq(transcriptionProviderBlocks.transcriptionId, job.id), gt(transcriptionProviderBlocks.nextAttemptAt, sql`now()`)))).length > 0;
   return {
     id: job.id,
     object: "transcription",

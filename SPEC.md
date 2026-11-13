@@ -364,11 +364,14 @@ request is in flight at any time. Outcomes:
 |---|---|
 | 200 with text | region completed |
 | 429 | new attempt after `Retry-After` (default 30 s, max 120 s); 20 consecutive → treated as 402 below (the job waits) |
-| provably not sent (connection refused / DNS / TLS verification) | ≤ 5 attempts with backoff → `provider_unavailable` |
+| provably not sent (connection refused / DNS / TLS verification) | ≤ 5 immediate attempts with backoff, then the same durable queued wait as provider blocks below; the wait is capped at 72 h from the earlier of upload or first block before `provider_unavailable` |
 | 400 / 413 / 415 / 422 | `transcription_failed` |
-| 402 / 401 / 403 | provider refused before processing (billing, quota or key): nothing was done or billed, so the job **waits**: released to `queued` with a durable not-before (`transcription_provider_blocks.next_attempt_at`), backoff 1, 2, 5, 10, 30 min then every 30 min, at most 24 h from the first block, then `provider_unavailable`. `provider_delayed: true` on the job while it waits. No retry counter or claim is consumed. Logs `batch provider blocked` (once per job per distinct HTTP status, logged as `http_status`) and `batch provider recovered` |
+| 402 / 401 / 403 | provider refused before processing (billing, quota or key): nothing was done or billed, so the job **waits**: released to `queued` with a durable not-before (`transcription_provider_blocks.next_attempt_at`), backoff 1, 2, 5, 10, 30, then 60 min and hourly after that, capped at 72 h from the earlier of upload or first block, then `provider_unavailable`. `provider_delayed: true` appears only while the job is queued and its not-before is in the future. No retry counter or claim is consumed. Logs `batch provider blocked` (once per job per distinct outcome; `http_status` only for an HTTP refusal) and `batch provider recovered` |
 | 404 | `provider_unavailable` + alert (wrong URL or model: a deploy fault) |
 | timeout, reset, 5xx, other status, unparseable body, worker died while admitted | attempt `ambiguous`, **never re-sent** → `provider_outcome_unknown` |
+
+While a job waits after a provider refusal or provably-unsent outage, its uploaded audio stays on the batch volume. The hard 72 h deadline is measured from the earlier of upload or first block and is enforced by the sweeper even when a queued job is not claimable. At the deadline the job fails through the normal terminal cleanup path.
+
 
 A worker that dies before any admission is requeued (regions and completed results kept; ≤ 3 claims → `processing_failed`).
 A job processing longer than 4 h fails `processing_timeout`.
@@ -382,15 +385,7 @@ directories are only ever created by an upload holding a live lease and never re
 recreate deleted artifacts.
 
 ### Retention
-Every terminal transition commits `deletion_state='pending'` together with the terminal state, before any file is
-unlinked. A `failed` or `cancelled` job also loses any partial region text in that transaction (`transcript_deleted_at`
-is set); only a `completed` job keeps text, until `DELETE` or 24 h after completion; the audio, PCM and temp files are then removed and verified absent (`ENOENT`) before `files_deleted` is
-recorded. `DELETE` cancels an active job, deletes transcript content and hides the job in the same transaction, and keeps
-a content-free tombstone (ids, tenant ref, sizes, timings, codes). A sweeper (every 60 s) retries pending deletions,
-expires unaccepted uploads, times out processing, recovers dead claims, deletes transcripts 24 h after completion,
-removes any artifact the ledger does not authorize (alerting if one reappears after verified deletion), and purges
-finished rows 7 days after their files were verified deleted. `/health` reports `retention_lag_seconds` (age of the
-oldest pending deletion) and is `degraded` past 300 s. Deleted data may remain on storage media until overwritten.
+Every terminal transition commits `deletion_state='pending'` together with the terminal state, before any file is unlinked. Failed or cancelled jobs lose partial region text in that transaction (`transcript_deleted_at` is set); partial text may remain while a job waits, but the queued retry deadline is capped at 72 h from the earlier of upload or first provider block. Completed transcript text remains until `DELETE` or 24 h after completion. Audio, PCM and temp files are removed and verified absent (`ENOENT`) before `files_deleted` is recorded. `DELETE` cancels an active job, deletes transcript content and hides the job in the same transaction, and keeps a content-free tombstone (ids, tenant ref, sizes, timings, codes). A sweeper (every 60 s) retries pending deletions, expires unaccepted uploads, times out processing, expires queued provider waits at their hard deadline, recovers dead claims, deletes completed transcripts 24 h after completion, removes artifacts the ledger does not authorize (alerting if one reappears after verified deletion), and purges finished rows 7 days after their files were verified deleted. `/health` reports `retention_lag_seconds` (age of the oldest pending deletion) and is `degraded` past 300 s. Deleted data may remain on storage media until overwritten.
 
 ### Errors and correlation
 Every response has `X-Correlation-Id` (the caller's, if 1–128 of `[A-Za-z0-9._:-]`, else a new UUID). Every error body is

@@ -288,19 +288,19 @@ export const transcriptions = pgTable(
 );
 
 /**
- * A job waiting on a blocked provider (402/401/403, or 429 past the consecutive cap): one row while it waits, deleted when
- * the provider recovers. Additive (transcriptions is untouched). claimNext skips the job until `next_attempt_at`.
+ * A safely retryable provider refusal (401/402/403, capped 429) or a provably-unsent request waits in one row until
+ * the provider recovers. Additive (transcriptions is untouched). claimNext skips it until `next_attempt_at`.
  */
 export const transcriptionProviderBlocks = pgTable("transcription_provider_blocks", {
   transcriptionId: text("transcription_id").primaryKey().references(() => transcriptions.id, { onDelete: "cascade" }),
-  /** First block of this waiting spell; the 24 h give-up window is measured from here. Set once. */
+  /** First safely retryable outcome in this waiting spell; the 72 h give-up window is measured from here. Set once. */
   blockedSince: timestamp("blocked_since", { withTimezone: true }).notNull().defaultNow(),
   /** Durable not-before; survives worker restarts. */
   nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull(),
   /** Consecutive blocked outcomes in this spell; indexes the backoff schedule. */
   attempts: integer("attempts").notNull().default(0),
-  /** HTTP status of the latest block, so `batch_provider_blocked` is logged once per job per distinct status. */
-  lastStatus: integer("last_status").notNull(),
+  /** Latest blocking HTTP status, or null for a request proven not sent. */
+  lastStatus: integer("last_status"),
 });
 
 /** Job-scoped upload capabilities (sha256 only). Deleted in the same transaction that ends awaiting_upload. */
