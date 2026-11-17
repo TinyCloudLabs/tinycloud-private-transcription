@@ -214,6 +214,18 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(api).not.toContain("127.0.0.1:8080/health').then");
   });
 
+  test("the api can purge a deleted meeting's capture objects with the same least-privilege MinIO user, read-only (TC-3136)", () => {
+    const apiStart = compose.indexOf("\n  api:\n");
+    const api = compose.slice(apiStart, compose.indexOf("\n  worker:\n", apiStart));
+    expect(api).toContain("VEXA_MINIO_ENDPOINT: http://minio:9000");
+    expect(api).toContain("VEXA_MINIO_ACCESS_KEY: ptx-retention");
+    expect(api).toContain("VEXA_MINIO_SECRET_KEY_FILE: /run/minio-retention/secret-key");
+    expect(api).toContain("- minio-retention:/run/minio-retention:ro");
+    expect(api).not.toContain("MINIO_ROOT");
+    // The scheduled sweep stays with the worker, in dry-run.
+    expect(api).not.toContain("ARTIFACT_RETENTION_MODE");
+  });
+
   test("artifact retention and bot janitor ship in dry-run (TC-904). Details: TC-2181", () => {
     const worker = serviceEnv("worker");
     expect(worker).toContain("ARTIFACT_RETENTION_MODE: ${ARTIFACT_RETENTION_MODE:-dry-run}");

@@ -13,6 +13,7 @@ import type { NormalizedTranscript } from "../domain/transcript.ts";
 import { recordCapture } from "./capture.ts";
 import { resetRecordingRecovery } from "./recording-recovery.ts";
 import { VexaHttpError } from "../providers/vexa/client.ts";
+import { purgeMeetingObjects, snapshotVexaMeeting, unverified, vexaPurgeGap } from "./vexa-purge.ts";
 import { sealSignalCapability } from "../providers/signal/capability.ts";
 import { wakeWebhookDelivery, webhookDeliveryValues } from "../webhooks/dispatcher.ts";
 import { DEFAULT_MEETING_DURATION_SECONDS, MAX_MEETING_DURATION_SECONDS, type MeetingDurationUpdate } from "../domain/meeting-duration.ts";
@@ -515,9 +516,13 @@ async function stopInSignal(ctx: AppContext, meeting: MeetingRow) {
 }
 
 /**
- * Removes our record + transcript and asks Vexa to delete its meeting (404-tolerant). Vexa v0.12 only
- * deletes PLANNED rows and answers 409 for anything the bot lifecycle touched — we log that ("retained
- * by capture provider") and still remove our data; purging Vexa's copy is a documented gap.
+ * Removes our record + transcript and the capture provider's copy (TC-3136): Vexa's audio, video,
+ * attributed audio and transcript (its DELETE purges a terminal meeting and keeps a content-free
+ * tombstone), plus signal tapes under the shared object prefixes. Our row is deleted LAST, and only
+ * after the provider is read back and every object prefix lists empty; anything unconfirmed (a 409 while the
+ * bot is still stopping, a provider that kept data, an unreachable object store) throws a retryable
+ * `provider_unavailable` and keeps the row so the owner's retry resumes. Idempotent: every provider
+ * call tolerates "already gone". A 404 row (planned, or already removed) verifies as gone.
  */
 const DELETION_LEASE_MS = 15_000;
 
@@ -558,32 +563,47 @@ export async function deleteMeeting(ctx: AppContext, meeting: MeetingRow): Promi
       if (!await renewLease()) return;
       if (!isTerminal(meeting.status as MeetingStatus)) await stopInVexa(ctx, meeting);
       if (!await renewLease()) return;
-      if (!providerAlreadyAdmitted) {
-        const admitted = await admitProviderDeletion(ctx, meeting.id, deletionToken);
-        if (admitted === "lost") return;
-        if (admitted === "new") {
-          try {
-            await ctx.vexa.deleteMeeting(meeting.vexaPlatform, meeting.vexaNativeMeetingId);
-          } catch (e) {
-            if (e instanceof VexaHttpError && e.conflict && meeting.vexaMeetingId != null) {
-              // Attributed ranges are provider-owned evidence. Retain them until Vexa confirms
-              // deletion. A received conflict proves this request was rejected, so it is safe to
-              // release the admission rather than strand later attributed dispatches.
-              await releaseRejectedProviderDeletion(ctx, meeting.id, deletionToken);
-              throw new ApiError("provider_unavailable", "Could not confirm deletion from the capture provider");
-            } else if (e instanceof VexaHttpError && e.conflict) {
-              ctx.log.warn("vexa retains meeting row (409: bot lifecycle owns it)", { stage: "delete_provider", code: "provider_conflict" });
-            } else if (!(e instanceof VexaHttpError && e.notFound)) {
-              ctx.log.warn("vexa deleteMeeting failed", { stage: "delete_provider", code: "provider_unavailable" });
-              // A received non-409/404 HTTP response is an explicit rejection, unlike a timeout
-              // or transport loss. It is safe for this owner to release the unperformed delete
-              // fence so a later dispatch is not stranded.
-              if (e instanceof VexaHttpError) await releaseRejectedProviderDeletion(ctx, meeting.id, deletionToken);
-              throw new ApiError("provider_unavailable", "Could not delete the meeting from the capture provider");
-            }
+      // Read the provider's recording ids and owner BEFORE its delete: a purged tombstone no longer lists them.
+      const snapshot = await snapshotVexaMeeting(ctx, meeting);
+      if (!await renewLease()) return;
+      const admitted = providerAlreadyAdmitted ? "already" : await admitProviderDeletion(ctx, meeting.id, deletionToken);
+      if (admitted === "lost") return;
+      if (admitted === "new") {
+        try {
+          await ctx.vexa.deleteMeeting(meeting.vexaPlatform, meeting.vexaNativeMeetingId);
+        } catch (e) {
+          if (!(e instanceof VexaHttpError && e.notFound)) {
+            ctx.log.warn("vexa deleteMeeting failed", { stage: "delete_provider", code: e instanceof VexaHttpError && e.conflict ? "provider_conflict" : "provider_unavailable" });
+            // A received HTTP rejection (409: the bot lifecycle still owns the row; or a 5xx) proves the
+            // delete was not performed, so release the admission and the fence for a later attempt. A
+            // timeout or transport loss is an unknown outcome and keeps the admission (fail closed).
+            if (e instanceof VexaHttpError) await releaseRejectedProviderDeletion(ctx, meeting.id, deletionToken);
+            throw new ApiError("provider_unavailable", "Could not delete the meeting from the capture provider");
           }
         }
       }
+      if (!await renewLease()) return;
+      // The receipt is not proof, and an admitted-but-unknown earlier attempt is not proof either: read
+      // the provider back. Our row (the only handle on the owner's retry) stays until everything is gone.
+      const gap = await vexaPurgeGap(ctx, meeting, snapshot);
+      if (gap) {
+        ctx.log.warn("capture provider still holds the recording after delete", { stage: "delete_verify", code: gap });
+        // Clear the admission so the next attempt sends the (idempotent) delete again, and free the fence.
+        await releaseRejectedProviderDeletion(ctx, meeting.id, deletionToken);
+        await releaseUnadmittedDeletion(ctx, meeting.id, deletionToken);
+        throw unverified(gap);
+      }
+      try {
+        await purgeMeetingObjects(ctx, snapshot);
+      } catch (e) {
+        ctx.log.warn("capture object purge not confirmed", { stage: "delete_objects", code: e instanceof ApiError ? "objects_unverified" : "object_store_unavailable" });
+        // The provider is verified purged; only objects remain. Free the fence so the owner's retry runs at once.
+        await releaseRejectedProviderDeletion(ctx, meeting.id, deletionToken);
+        await releaseUnadmittedDeletion(ctx, meeting.id, deletionToken);
+        if (!(e instanceof ApiError)) throw unverified("object_store_unavailable");
+        throw e;
+      }
+      if (!await renewLease()) return;
     }
     await deleteLocalMeetingIfOwned(ctx, meeting.id, deletionToken);
   } catch (error) {

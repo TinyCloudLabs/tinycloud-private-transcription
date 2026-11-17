@@ -31,6 +31,8 @@ interface MockMeeting extends VexaMeetingResponse {
   attributed_audio?: Map<string, Uint8Array>;
   /** Deletable via DELETE /meetings (real Vexa: idle/scheduled rows only). */
   planned?: boolean;
+  /** Test-only: DELETE answers 200 but keeps the transcript and recording (a provider that did not purge). */
+  retain_on_delete?: boolean;
 }
 
 export interface MockVexaOptions {
@@ -173,15 +175,39 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
     return c.json({ status: "stopping", meeting_id: m.id, native_meeting_id: m.native_meeting_id });
   });
 
-  // Real v0.12: only PLANNED (idle/scheduled) rows are deletable; every row created via POST /bots is
-  // bot-lifecycle owned → 409. `/_mock/*` can flip `planned` to exercise the 200 path.
+  // Mirrors the pinned meeting-api (upstream #1293): a PLANNED (idle/scheduled) row is removed; a
+  // terminal (completed/failed) row has its recording, attributed audio and transcript purged and
+  // is kept as a tombstone (`data.artifact_deletion.state = "completed"`), idempotently; any other
+  // row the bot lifecycle still owns answers 409. `/_mock/*` can flip `planned` to exercise the
+  // planned path, and `retain_on_delete` simulates a provider that accepts the delete but keeps data.
   app.delete("/meetings/:platform/:native_meeting_id", (c) => {
     const k = key(c.req.param("platform"), c.req.param("native_meeting_id"));
     const m = meetings.get(k);
     if (!m) return c.json({ detail: `Meeting not found for platform ${c.req.param("platform")} and ID ${c.req.param("native_meeting_id")}` }, 404);
-    if (!m.planned) return c.json({ detail: "Meeting is no longer planned (bot lifecycle owns it)" }, 409);
-    meetings.delete(k);
-    return c.json({ status: "deleted", id: m.id, platform: m.platform, native_meeting_id: m.native_meeting_id });
+    if (m.planned) {
+      meetings.delete(k);
+      return c.json({ status: "deleted", id: m.id, platform: m.platform, native_meeting_id: m.native_meeting_id });
+    }
+    if (!["completed", "failed"].includes(m.status)) return c.json({ detail: "Meeting artifacts can only be deleted after the lifecycle is terminal" }, 409);
+    let objects = 0;
+    if (!m.retain_on_delete) {
+      objects = (m.recording ? 1 : 0) + (m.attributed_audio?.size ?? 0);
+      m.segments = [];
+      m.recording = undefined;
+      m.attributed_audio = undefined;
+      m.attributed_audio_manifest = undefined;
+      m.data = { ...m.data, artifact_deletion: { state: "completed", scope: "primary_transcript_and_recording_storage" } };
+    }
+    return c.json({
+      status: "deleted", id: m.id, platform: m.platform, native_meeting_id: m.native_meeting_id,
+      deleted: "completed_meeting_artifacts", objects_deleted: objects, backup_residuals: "expire_under_deployment_retention_policy",
+    });
+  });
+
+  // Row-id read (the pinned meeting-api's GET /meetings/{id}): the owner's row with its `data`.
+  app.get("/meetings/:id", (c) => {
+    const m = [...meetings.values()].find((meeting) => meeting.id === Number(c.req.param("id")));
+    return m ? c.json(strip(m)) : c.json({ detail: "Meeting not found" }, 404);
   });
 
   // ---- test control ----
@@ -198,6 +224,7 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       recording_content_type?: string;
       transcript_missing?: boolean;
       planned?: boolean;
+      retain_on_delete?: boolean;
       start_time?: string | null;
       end_time?: string | null;
       attributed_audio_manifest?: AttributedManifest;
@@ -232,6 +259,7 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
     if (body.completion_reason !== undefined) m.completion_reason = body.completion_reason;
     if (body.failure_stage !== undefined) m.failure_stage = body.failure_stage;
     if (body.planned !== undefined) m.planned = body.planned;
+    if (body.retain_on_delete !== undefined) m.retain_on_delete = body.retain_on_delete;
     if (body.start_time !== undefined) m.start_time = body.start_time;
     if (body.end_time !== undefined) m.end_time = body.end_time;
     if (body.attributed_audio_manifest !== undefined) m.attributed_audio_manifest = body.attributed_audio_manifest;
@@ -257,8 +285,8 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
   return { app, meetings, requests, apiKey };
 }
 
-function strip(m: { segments?: unknown; bot_name?: unknown; language?: unknown; meeting_url?: unknown; automatic_leave?: unknown; planned?: unknown } & VexaMeetingResponse): VexaMeetingResponse {
-  const { segments: _s, bot_name: _b, language: _l, meeting_url: _u, automatic_leave: _a, planned: _p, ...rest } = m;
+function strip(m: { segments?: unknown; bot_name?: unknown; language?: unknown; meeting_url?: unknown; automatic_leave?: unknown; planned?: unknown; retain_on_delete?: unknown } & VexaMeetingResponse): VexaMeetingResponse {
+  const { segments: _s, bot_name: _b, language: _l, meeting_url: _u, automatic_leave: _a, planned: _p, retain_on_delete: _r, ...rest } = m;
   return rest;
 }
 

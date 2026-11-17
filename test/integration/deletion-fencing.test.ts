@@ -18,20 +18,23 @@ async function started(room: string) {
   });
 }
 
-test("a stale delete owner cannot erase a successor's state or repeat an admitted provider delete", async () => {
+test("a stale delete owner cannot erase a successor's state, and a successor that cannot verify the purge resends nothing and keeps the row", async () => {
   const meeting = await started("DeleteFence");
   const a = { ...h.ctx, attributedWorkerId: "delete-owner-a" };
   const b = { ...h.ctx, attributedWorkerId: "delete-owner-b" };
+  const c = { ...h.ctx, attributedWorkerId: "delete-owner-c" };
+  await h.vexa.control(meeting.vexaPlatform!, meeting.vexaNativeMeetingId!, { planned: true });
   const original = h.ctx.vexa.deleteMeeting.bind(h.ctx.vexa);
   let calls = 0;
   let unblock: (() => void) | undefined;
   let admitted!: () => void;
   const providerAdmitted = new Promise<void>((resolve) => { admitted = resolve; });
-  h.ctx.vexa.deleteMeeting = async () => {
+  h.ctx.vexa.deleteMeeting = async (...args) => {
     calls++;
+    if (calls > 1) return original(...args);
     admitted();
     await new Promise<void>((resolve) => { unblock = resolve; });
-    return { status: "deleted" } as any;
+    return original(...args);
   };
   try {
     const deletingA = deleteMeeting(a, meeting);
@@ -39,11 +42,17 @@ test("a stale delete owner cannot erase a successor's state or repeat an admitte
     // Simulate A's lease expiring while its provider DELETE is in flight.
     await h.ctx.db.update(meetings).set({ deletionLeaseAt: new Date(Date.now() - 16_000) })
       .where(eq(meetings.id, meeting.id));
-    await deleteMeeting(b, (await getMeetingById(h.ctx, meeting.id))!);
+    // B sees an admitted delete of unknown outcome. It must not trust it (the provider still holds the
+    // row), must not send a second delete, and must not drop our row.
+    await expect(deleteMeeting(b, (await getMeetingById(h.ctx, meeting.id))!)).rejects.toMatchObject({ code: "provider_unavailable" });
+    expect(calls).toBe(1);
     unblock?.();
     await deletingA;
-    expect(calls).toBe(1);
+    // A lost its fence, so it neither erased the successor's state nor our row: the owner's retry converges.
+    expect(await getMeetingById(h.ctx, meeting.id)).not.toBeNull();
+    await deleteMeeting(c, (await getMeetingById(h.ctx, meeting.id))!);
     expect(await getMeetingById(h.ctx, meeting.id)).toBeNull();
+    expect(calls).toBe(2);
   } finally {
     h.ctx.vexa.deleteMeeting = original;
   }
@@ -75,7 +84,8 @@ test("a crash before provider admission is safely taken over with one provider d
   }).where(eq(meetings.id, meeting.id));
   const original = h.ctx.vexa.deleteMeeting.bind(h.ctx.vexa);
   let calls = 0;
-  h.ctx.vexa.deleteMeeting = async () => { calls++; return { status: "deleted" } as any; };
+  await h.vexa.control(meeting.vexaPlatform!, meeting.vexaNativeMeetingId!, { planned: true });
+  h.ctx.vexa.deleteMeeting = async (...args) => { calls++; return original(...args); };
   try {
     await deleteMeeting(successor, meeting);
     expect(calls).toBe(1);

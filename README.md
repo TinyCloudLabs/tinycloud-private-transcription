@@ -210,7 +210,7 @@ curl -s -X POST $API/v1/meetings/$ID/stop -H "Authorization: Bearer $KEY"
 # recover a failed meeting from its retained capture-provider row (idempotent)
 curl -s -X POST $API/v1/meetings/$ID/recover -H "Authorization: Bearer $KEY"
 
-# delete → 204 (asks Vexa to delete too; Vexa v0.12 keeps bot-owned rows and answers 409 — logged, see "Known gaps")
+# delete → 204 (purges Vexa's copy and reads it back; 503 provider_unavailable = retry, nothing was forgotten)
 curl -s -X DELETE $API/v1/meetings/$ID -H "Authorization: Bearer $KEY"
 
 curl -s $API/health   # {"status":"ok","checks":{postgres,redis,vexa,bot_capacity:{running,max},transcription_provider}}
@@ -282,10 +282,15 @@ transcript storage is an upsert and only the winning terminal transition emits a
   participant audio, not participant count. Five continuous silent minutes (for example, a break or
   quiet screen-share) can therefore finalize a meeting even if people remain connected. Use
   `POST /v1/meetings/{id}/stop` to end immediately; tune `VEXA_MAX_TIME_LEFT_ALONE_MS` for longer silence.
-- **Vexa data retention on DELETE**: Vexa v0.12 only deletes *planned* rows; `DELETE /meetings/{p}/{id}` on a
-  meeting the bot lifecycle touched answers `409 "Meeting is no longer planned (bot lifecycle owns it)"`.
-  Our DELETE removes our data and logs the 409; purging Vexa's copy needs an upstream route or a direct
-  DB/MinIO purge inside the CVM (follow-up).
+- **Vexa data retention on DELETE (TC-3136)**: `DELETE /v1/meetings/{id}` purges the capture provider's copy and
+  proves it before it forgets the meeting. It stops a live bot, asks Vexa to delete the meeting (a terminal row
+  keeps a content-free tombstone: platform, native id, timestamps, bot name), then reads back that the Vexa row is
+  a completed-deletion tombstone, no recordings remain, the transcript has no segments, and the recording,
+  attributed-audio and signal-tape objects (`recordings/`, `attributed-audio/`, `signal/` under the project's
+  user) list empty. Anything unconfirmed answers retryable `503 provider_unavailable`, keeps our row and frees the
+  fence so the caller's retry resends the idempotent delete; our row is deleted last. The api service needs the
+  retention MinIO user (`VEXA_MINIO_*`) for the object check; with the endpoint set but the credential
+  unprovisioned, DELETE fails retryable rather than skipping. Backups expire under the provider's retention.
 - **Jitsi live validation** is marked pending upstream; it works against docker-jitsi-meet stable-11146-2
   (bot needs `https://` + hostname + a trusted cert).
 - **Live Vexa STT backend wiring and two-speaker/late-joiner acceptance remain deferred follow-ups**:

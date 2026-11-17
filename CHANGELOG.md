@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Main
+- TC-3136: `DELETE /v1/meetings/{id}` now purges the capture provider's copy (Vexa audio, video, transcript and derived artifacts, including attributed-audio and signal-tape objects) and verifies it by read-back before the meeting row is deleted. Unconfirmed purges answer retryable `503 provider_unavailable` and keep the row; the earlier paths that only logged a Vexa 409 or trusted an already-admitted delete are gone. Vexa keeps a content-free tombstone row. The api service now carries the retention MinIO credential, which needs a deploy. The 14-day retention sweep is unchanged and stays dry-run. Details: TC-3136
 - TC-2491: update ptx-dev's debug SSH sidecar to digest-pinned `10.3_p1-r2-ls242`, containing Alpine's OpenSSH password-authentication-bypass fix. Root access remains public-key-only; password and keyboard-interactive authentication remain disabled. Details: TC-2491
 
 - TC-2185: meetings accept an optional duration, defaulting to four hours and capped at four hours from creation. Live duration updates support +15 minutes, +30 minutes and the capped No limit choice; meeting responses expose `scheduled_stop_at`. The worker applies persisted stop deadlines independently of the client and resumes them after restart using the existing stop/finalization path. Details: TC-2185

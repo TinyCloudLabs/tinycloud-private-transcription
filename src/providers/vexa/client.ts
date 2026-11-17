@@ -110,14 +110,23 @@ export class VexaClient {
   }
 
   /**
-   * DELETE /meetings/{p}/{id}. In Vexa v0.12 this only deletes PLANNED (idle/scheduled) rows;
-   * a row the bot lifecycle has touched answers 409 — callers must treat that as "retained by Vexa".
+   * DELETE /meetings/{p}/{id}. A PLANNED (idle/scheduled) row is removed; a terminal (completed/failed)
+   * row has its recordings, attributed audio and transcript purged and stays as a content-free
+   * tombstone (meeting-api, upstream #1293); a row the bot lifecycle still owns answers 409 (retry
+   * once it is terminal). The 200 receipt is not proof: callers verify with `getMeetingRow` and
+   * `listRecordings` before treating the provider copy as gone.
    */
   deleteMeeting(platform: string, nativeMeetingId: string) {
     return this.request<VexaDeleteMeetingResponse>(
       "DELETE",
       `/meetings/${encodeURIComponent(platform)}/${encodeURIComponent(nativeMeetingId)}`,
     );
+  }
+
+  /** GET /meetings/{row id} → the owner's row with its `data` (carries `artifact_deletion` once purged); 404 once the row is gone. */
+  getMeetingRow(meetingId: number) {
+    if (!Number.isSafeInteger(meetingId) || meetingId <= 0) throw new ApiError("transcription_failed", "Invalid Vexa meeting identifier");
+    return this.request<VexaMeetingResponse>("GET", `/meetings/${meetingId}`);
   }
 
   botStatus() {
