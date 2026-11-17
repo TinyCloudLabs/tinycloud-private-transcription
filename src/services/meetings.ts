@@ -14,6 +14,7 @@ import { recordCapture } from "./capture.ts";
 import { resetRecordingRecovery } from "./recording-recovery.ts";
 import { VexaHttpError } from "../providers/vexa/client.ts";
 import { providerDeleteTarget, purgeMeetingObjects, purgeObjectStore, snapshotVexaMeeting, unverified, vexaPurgeGap, type VexaPurgeSnapshot } from "./vexa-purge.ts";
+import { CodeBusyError, withVexaCodeLock } from "./vexa-code-lock.ts";
 import { sealSignalCapability } from "../providers/signal/capability.ts";
 import { wakeWebhookDelivery, webhookDeliveryValues } from "../webhooks/dispatcher.ts";
 import { DEFAULT_MEETING_DURATION_SECONDS, MAX_MEETING_DURATION_SECONDS, type MeetingDurationUpdate } from "../domain/meeting-duration.ts";
@@ -574,24 +575,30 @@ export async function deleteMeeting(ctx: AppContext, meeting: MeetingRow): Promi
       const snapshot = await snapshotVexaMeeting(ctx, meeting, saved);
       if (!await saveDeletionSnapshot(ctx, meeting.id, deletionToken, saved, snapshot)) return;
       if (!await renewLease()) return;
-      // The delete addresses a meeting by code: send it only when Vexa resolves that code to our own row.
-      const target = await providerDeleteTarget(ctx, meeting, snapshot);
-      const admitted = target === "nothing_to_delete" ? "skipped" : providerAlreadyAdmitted ? "already" : await admitProviderDeletion(ctx, meeting.id, deletionToken);
-      if (admitted === "lost") return;
-      if (admitted === "new") {
-        try {
-          await ctx.vexa.deleteMeeting(meeting.vexaPlatform, meeting.vexaNativeMeetingId);
-        } catch (e) {
-          if (!(e instanceof VexaHttpError && e.notFound)) {
-            ctx.log.warn("vexa deleteMeeting failed", { stage: "delete_provider", code: e instanceof VexaHttpError && e.conflict ? "provider_conflict" : "provider_unavailable" });
-            // A received HTTP rejection (409: the bot lifecycle still owns the row; or a 5xx) proves the
-            // delete was not performed, so release the admission and the fence for a later attempt. A
-            // timeout or transport loss is an unknown outcome and keeps the admission (fail closed).
-            if (e instanceof VexaHttpError) await releaseRejectedProviderDeletion(ctx, meeting.id, deletionToken);
-            throw new ApiError("provider_unavailable", "Could not delete the meeting from the capture provider");
+      // The delete addresses a meeting by code: send it only when Vexa resolves that code to our own row, and
+      // hold the per-code lock from that check until the delete returns, so no bot start for the same code
+      // can slip a newer row in between. A busy code aborts this attempt (retryable, nothing sent).
+      const sent = await withVexaCodeLock(ctx, meeting.vexaPlatform, meeting.vexaNativeMeetingId, "try", async () => {
+        const target = await providerDeleteTarget(ctx, meeting, snapshot);
+        const admitted = target === "nothing_to_delete" ? "skipped" : providerAlreadyAdmitted ? "already" : await admitProviderDeletion(ctx, meeting.id, deletionToken);
+        if (admitted === "lost") return "lost" as const;
+        if (admitted === "new") {
+          try {
+            await ctx.vexa.deleteMeeting(meeting.vexaPlatform!, meeting.vexaNativeMeetingId!);
+          } catch (e) {
+            if (!(e instanceof VexaHttpError && e.notFound)) {
+              ctx.log.warn("vexa deleteMeeting failed", { stage: "delete_provider", code: e instanceof VexaHttpError && e.conflict ? "provider_conflict" : "provider_unavailable" });
+              // A received HTTP rejection (409: the bot lifecycle still owns the row; or a 5xx) proves the
+              // delete was not performed, so release the admission and the fence for a later attempt. A
+              // timeout or transport loss is an unknown outcome and keeps the admission (fail closed).
+              if (e instanceof VexaHttpError) await releaseRejectedProviderDeletion(ctx, meeting.id, deletionToken);
+              throw new ApiError("provider_unavailable", "Could not delete the meeting from the capture provider");
+            }
           }
         }
-      }
+        return "sent" as const;
+      });
+      if (sent === "lost") return;
       if (!await renewLease()) return;
       // The receipt is not proof, and an admitted-but-unknown earlier attempt is not proof either: read
       // the provider back. Our row (the only handle on the owner's retry) stays until everything is gone.
@@ -620,6 +627,9 @@ export async function deleteMeeting(ctx: AppContext, meeting: MeetingRow): Promi
     // Unknown provider outcomes retain the admission marker and therefore stay fail-closed. A
     // stale owner cannot clear its successor's fence, and a later owner reconciles the admitted
     // deletion without sending it again.
+    // A busy code sent nothing: expire the lease so the owner's retry takes over at once instead of waiting
+    // it out (an admission an earlier attempt left is kept; the takeover reconciles it).
+    if (error instanceof CodeBusyError) await expireDeletionLease(ctx, meeting.id, deletionToken);
     if (!providerAlreadyAdmitted) await releaseUnadmittedDeletion(ctx, meeting.id, deletionToken);
     throw error;
   } finally {
@@ -650,6 +660,11 @@ async function saveDeletionSnapshot(ctx: AppContext, meetingId: string, token: s
     .where(and(eq(meetings.id, meetingId), eq(meetings.deletionToken, token), eq(meetings.deletionOwnerId, ctx.attributedWorkerId)))
     .returning({ id: meetings.id });
   return written.length === 1;
+}
+
+async function expireDeletionLease(ctx: AppContext, meetingId: string, token: string): Promise<void> {
+  await ctx.db.update(meetings).set({ deletionLeaseAt: new Date(0) })
+    .where(and(eq(meetings.id, meetingId), eq(meetings.deletionToken, token), eq(meetings.deletionOwnerId, ctx.attributedWorkerId)));
 }
 
 async function releaseUnadmittedDeletion(ctx: AppContext, meetingId: string, token: string): Promise<void> {

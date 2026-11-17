@@ -295,8 +295,12 @@ transcript storage is an upsert and only the winning terminal transition emits a
   first attempt (`meetings.deletion_snapshot`) so a retry still checks every object prefix. Vexa's delete
   addresses a meeting by platform + code, and one Vexa user serves every project, so a recurring code can name
   a later meeting's row: ptx sends the delete only when Vexa resolves the code to a row recorded for THIS
-  meeting, else it fails closed (`provider_row_mismatch`, `provider_row_unlinked`) and keeps our row. An
-  upstream delete-by-row-id would remove that race. Backups expire under the provider's retention.
+  meeting, else it fails closed (`provider_row_mismatch`, `provider_row_unlinked`) and keeps our row. The check
+  and the delete run under a Postgres advisory lock per platform + code that every bot start for that code
+  also takes (`withVexaCodeLock`), so a new meeting cannot start in between; a delete that finds the code busy
+  aborts retryably having sent nothing, a start waits for it. The lock covers starts and deletes made through
+  ptx; the stop call that precedes a delete of a still-running meeting is also code-addressed and not covered.
+  An upstream delete-by-row-id would remove the race entirely. Backups expire under the provider's retention.
 - **Jitsi live validation** is marked pending upstream; it works against docker-jitsi-meet stable-11146-2
   (bot needs `https://` + hostname + a trusted cert).
 - **Live Vexa STT backend wiring and two-speaker/late-joiner acceptance remain deferred follow-ups**:

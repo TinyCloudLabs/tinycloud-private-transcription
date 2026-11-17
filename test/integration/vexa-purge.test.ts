@@ -1,8 +1,10 @@
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { meetings } from "../../src/db/schema.ts";
 import type { ArtifactStore } from "../../src/services/artifact-retention.ts";
 import { deleteMeeting, getMeetingById } from "../../src/services/meetings.ts";
+import { toVexaPlatform } from "../../src/providers/vexa/platform-map.ts";
+import { withVexaCodeLock } from "../../src/services/vexa-code-lock.ts";
 import { emptyArtifactStore, startHarness, type Harness } from "./harness.ts";
 
 // TC-3136: deleting a meeting must purge the capture provider's copy and PROVE it. The mock Vexa mirrors
@@ -239,4 +241,62 @@ test("a meeting that reached Vexa but has no recorded Vexa row never deletes by 
   expect(deleteRequests()).toEqual([]);
   expect(store.deletes).toEqual([]);
   expect(await getMeetingById(h.ctx, m.id)).not.toBeNull();
+});
+
+test("a delete is refused while a bot start for the same code is in flight, and a retry then leaves the newer meeting alone (R1)", async () => {
+  const a = await completed();
+  const store = new FakeStore(new Set(objectsFor(a)));
+  h.ctx.artifactStore = store;
+  const holding = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let newerId = 0;
+  // What a start does: hold the per-code lock across the provider call that creates the newer row.
+  const start = withVexaCodeLock(h.ctx, a.platform, a.native, "wait", async () => {
+    holding.resolve();
+    await release.promise;
+    newerId = (await h.ctx.vexa.createBot({ platform: toVexaPlatform("jitsi"), native_meeting_id: a.native, meeting_url: a.meeting.meetingUrl })).id;
+  });
+  await holding.promise;
+  // Busy code: the delete aborts at once, retryably, having sent nothing (it does not race the start).
+  await expect(deleteMeeting(h.ctx, a.meeting)).rejects.toMatchObject({ code: "provider_unavailable" });
+  expect(deleteRequests()).toEqual([]);
+  release.resolve();
+  await start;
+  // The start has landed: the code now names the newer meeting's row, which is not ours to delete.
+  const retry = await deleteMeeting(h.ctx, (await getMeetingById(h.ctx, a.id))!).then(() => null, (e: unknown) => e as Error);
+  expect(retry).toMatchObject({ code: "provider_unavailable" });
+  expect(retry?.message).toContain("provider_row_mismatch");
+  expect(deleteRequests()).toEqual([]);
+  const newer = h.vexa.meetings.get(`${a.platform}/${a.native}`)!;
+  expect(newer.id).toBe(newerId);
+  expect(newer.data?.artifact_deletion).toBeUndefined();
+  expect(await getMeetingById(h.ctx, a.id)).not.toBeNull(); // our row stays
+});
+
+test("a bot start waits for an in-flight delete of the same code (R1)", async () => {
+  const holding = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const events: string[] = [];
+  const del = withVexaCodeLock(h.ctx, "google_meet", "lock-d", "try", async () => { events.push("delete in"); holding.resolve(); await release.promise; events.push("delete out"); });
+  await holding.promise;
+  const start = withVexaCodeLock(h.ctx, "google_meet", "lock-d", "wait", async () => { events.push("start in"); });
+  // Observable proof the start is queued on the lock (an ungranted advisory lock), not a guessed delay.
+  await h.waitFor(async () => (await h.ctx.db.execute(sql`select 1 from pg_locks where locktype = 'advisory' and not granted`)).length > 0);
+  expect(events).toEqual(["delete in"]); // the start has not run
+  release.resolve();
+  await Promise.all([del, start]);
+  expect(events).toEqual(["delete in", "delete out", "start in"]);
+});
+
+test("a second delete on the same code aborts, a different code is independent, and the lock is released on failure (R1)", async () => {
+  const gate = Promise.withResolvers<void>();
+  const held = Promise.withResolvers<void>();
+  const first = withVexaCodeLock(h.ctx, "google_meet", "lock-a", "try", async () => { held.resolve(); await gate.promise; });
+  await held.promise;
+  await expect(withVexaCodeLock(h.ctx, "google_meet", "lock-a", "try", async () => "never")).rejects.toMatchObject({ code: "provider_unavailable" });
+  expect(await withVexaCodeLock(h.ctx, "google_meet", "lock-b", "try", async () => "other code ran")).toBe("other code ran");
+  gate.resolve();
+  await first;
+  await expect(withVexaCodeLock(h.ctx, "google_meet", "lock-a", "try", async () => { throw new Error("boom"); })).rejects.toThrow("boom");
+  expect(await withVexaCodeLock(h.ctx, "google_meet", "lock-a", "try", async () => "after failure")).toBe("after failure");
 });
