@@ -289,8 +289,10 @@ transcript storage is an upsert and only the winning terminal transition emits a
   attributed-audio and signal-tape objects (`recordings/`, `attributed-audio/`, `signal/` under the project's
   user) list empty. Anything unconfirmed answers retryable `503 provider_unavailable`, keeps our row and frees the
   fence so the caller's retry resends the idempotent delete; our row is deleted last. The api service needs the
-  retention MinIO user (`VEXA_MINIO_*`) for the object check; an unset endpoint or an unprovisioned credential
-  makes DELETE fail retryable (`object_store_unconfigured` / `object_store_unavailable`) before anything is
+  retention MinIO user (`VEXA_MINIO_*`) for the object check and starts only after `minio-init` has provisioned it
+  (`depends_on: service_completed_successfully`); that user may list only under the three artifact prefixes
+  (`s3:prefix` condition; a bucket-wide list is denied) and delete only under them. An unset endpoint or an
+  unprovisioned credential makes DELETE fail retryable (`object_store_unconfigured` / `object_store_unavailable`) before anything is
   sent, never a skip. What Vexa held (row ids, owner, recording ids; numbers only) is saved on our row at the
   first attempt (`meetings.deletion_snapshot`) so a retry still checks every object prefix. Vexa's delete
   addresses a meeting by platform + code, and one Vexa user serves every project, so a recurring code can name
