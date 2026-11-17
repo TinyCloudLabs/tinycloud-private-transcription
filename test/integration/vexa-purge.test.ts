@@ -4,7 +4,7 @@ import { meetings } from "../../src/db/schema.ts";
 import type { ArtifactStore } from "../../src/services/artifact-retention.ts";
 import { deleteMeeting, getMeetingById } from "../../src/services/meetings.ts";
 import { toVexaPlatform } from "../../src/providers/vexa/platform-map.ts";
-import { withVexaCodeLock } from "../../src/services/vexa-code-lock.ts";
+import { meetingLockCodes, withVexaCodeLock } from "../../src/services/vexa-code-lock.ts";
 import { emptyArtifactStore, startHarness, type Harness } from "./harness.ts";
 
 // TC-3136: deleting a meeting must purge the capture provider's copy and PROVE it. The mock Vexa mirrors
@@ -299,4 +299,75 @@ test("a second delete on the same code aborts, a different code is independent, 
   await first;
   await expect(withVexaCodeLock(h.ctx, "google_meet", "lock-a", "try", async () => { throw new Error("boom"); })).rejects.toThrow("boom");
   expect(await withVexaCodeLock(h.ctx, "google_meet", "lock-a", "try", async () => "after failure")).toBe("after failure");
+});
+
+test("a delete locks the code its URL names as well as the stored provider code, so a start on the URL's code still blocks it (L1)", async () => {
+  const a = await completed();
+  const urlCode = meetingLockCodes({ meetingUrl: a.meeting.meetingUrl, vexaNativeMeetingId: null })[0]!;
+  // The provider normalised the code: Vexa's row, and so our row, store a different one than the URL (and a
+  // later start) names.
+  const stored = `${urlCode}-normalised`;
+  h.vexa.meetings.delete(`${a.platform}/${a.native}`);
+  a.vexa.native_meeting_id = stored;
+  h.vexa.meetings.set(`${a.platform}/${stored}`, a.vexa);
+  await h.ctx.db.update(meetings).set({ vexaNativeMeetingId: stored }).where(eq(meetings.id, a.id));
+  const row = (await getMeetingById(h.ctx, a.id))!;
+  expect(meetingLockCodes(row).sort()).toEqual([stored, urlCode].sort());
+  h.ctx.artifactStore = new FakeStore(new Set(objectsFor(a)));
+  const holding = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const start = withVexaCodeLock(h.ctx, a.platform, urlCode, "wait", async () => { holding.resolve(); await release.promise; });
+  await holding.promise;
+  const refused = await deleteMeeting(h.ctx, row).then(() => null, (e: unknown) => e as Error);
+  // Refused by the busy URL code (not by a later row check), having sent nothing.
+  expect(refused).toMatchObject({ code: "provider_unavailable" });
+  expect(refused?.message).toContain("Another request");
+  expect(deleteRequests()).toEqual([]);
+  release.resolve();
+  await start;
+  // With the code free the same delete goes through.
+  await deleteMeeting(h.ctx, row);
+  expect(await getMeetingById(h.ctx, a.id)).toBeNull();
+});
+
+test("locking several codes: all or none, and opposite orders never deadlock (L1)", async () => {
+  const held = Promise.withResolvers<void>();
+  const gate = Promise.withResolvers<void>();
+  const holder = withVexaCodeLock(h.ctx, "google_meet", "multi-x", "try", async () => { held.resolve(); await gate.promise; });
+  await held.promise;
+  // One of the two is busy: refused, and the free one is not left locked.
+  await expect(withVexaCodeLock(h.ctx, "google_meet", ["multi-w", "multi-x"], "try", async () => "never")).rejects.toMatchObject({ code: "provider_unavailable" });
+  expect(await withVexaCodeLock(h.ctx, "google_meet", "multi-w", "try", async () => "w was free")).toBe("w was free");
+  gate.resolve();
+  await holder;
+  const results = await Promise.all([
+    withVexaCodeLock(h.ctx, "google_meet", ["multi-p", "multi-q"], "wait", async () => "pq"),
+    withVexaCodeLock(h.ctx, "google_meet", ["multi-q", "multi-p"], "wait", async () => "qp"),
+  ]);
+  expect(results).toEqual(["pq", "qp"]);
+});
+
+test("the stop a delete sends to a live meeting is refused while a start holds its code, and nothing is sent (R3)", async () => {
+  const created = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: `https://jitsi.local/Purge${++n}` } });
+  const id = (await created.json()).id as string;
+  const live = await h.waitFor(async () => { const m = await getMeetingById(h.ctx, id); return m?.status === "joining" ? m : null; });
+  await h.vexa.control(live.vexaPlatform!, live.vexaNativeMeetingId!, { status: "active" });
+  const running = await h.waitFor(async () => { const m = await getMeetingById(h.ctx, id); return m?.status === "in_progress" ? m : null; });
+  h.vexa.requests.length = 0;
+  const holding = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const start = withVexaCodeLock(h.ctx, running.vexaPlatform!, running.vexaNativeMeetingId, "wait", async () => { holding.resolve(); await release.promise; });
+  await holding.promise;
+  await expect(deleteMeeting(h.ctx, running)).rejects.toMatchObject({ code: "provider_unavailable" });
+  // No stop (DELETE /bots/...) and no delete reached Vexa: the live bot is untouched and our row stays.
+  expect(h.vexa.requests.filter((r) => r.method === "DELETE")).toEqual([]);
+  expect(await getMeetingById(h.ctx, id)).not.toBeNull();
+  release.resolve();
+  await start;
+  // Let the meeting finish so it does not hold a bot slot for the tests that follow.
+  await h.vexa.control(running.vexaPlatform!, running.vexaNativeMeetingId!, {
+    status: "completed", completion_reason: "stopped", recording_base64: "AAAA",
+    segments: [{ start: 0, end: 2, text: "hello", language: "en", speaker: "A", completed: true }],
+  });
+  await h.waitFor(async () => (await getMeetingById(h.ctx, id))?.status === "completed");
 });

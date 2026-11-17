@@ -10,7 +10,7 @@ import { toVexaPlatform } from "../providers/vexa/platform-map.ts";
 import { completeMeetingWithTranscript, failMeeting, findLiveMeetingForNativeId, getMeetingById, loadJoinClock, setDispatchFallback, startJoinClock, stopMeetingIfDurationElapsed, transition } from "../services/meetings.ts";
 import { enqueueMeetingWebhook } from "../webhooks/dispatcher.ts";
 import { observeCapture, recordCapture } from "../services/capture.ts";
-import { withVexaCodeLock } from "../services/vexa-code-lock.ts";
+import { meetingLockCodes, withVexaCodeLock } from "../services/vexa-code-lock.ts";
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { attributedTranscriptionRuns, meetings } from "../db/schema.ts";
 import { normalizeSegments } from "../domain/transcript.ts";
@@ -110,7 +110,7 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
       // Held across the provider call: a code-addressed delete of an older meeting on the same code is
       // refused while this start is in flight, and afterwards sees the newer row instead of purging it
       // (TC-3136). A start waits behind a delete's short check-and-send.
-      const created = await withVexaCodeLock(ctx, vexaPlatform, meeting.vexaNativeMeetingId, "wait", () => ctx.vexa.createBot({
+      const created = await withVexaCodeLock(ctx, vexaPlatform, meetingLockCodes(meeting), "wait", () => ctx.vexa.createBot({
         platform: vexaPlatform,
         native_meeting_id: meeting.vexaNativeMeetingId,
         meeting_url: meeting.meetingUrl,

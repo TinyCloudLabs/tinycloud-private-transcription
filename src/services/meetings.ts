@@ -14,7 +14,7 @@ import { recordCapture } from "./capture.ts";
 import { resetRecordingRecovery } from "./recording-recovery.ts";
 import { VexaHttpError } from "../providers/vexa/client.ts";
 import { providerDeleteTarget, purgeMeetingObjects, purgeObjectStore, snapshotVexaMeeting, unverified, vexaPurgeGap, type VexaPurgeSnapshot } from "./vexa-purge.ts";
-import { CodeBusyError, withVexaCodeLock } from "./vexa-code-lock.ts";
+import { CodeBusyError, meetingLockCodes, withVexaCodeLock } from "./vexa-code-lock.ts";
 import { sealSignalCapability } from "../providers/signal/capability.ts";
 import { wakeWebhookDelivery, webhookDeliveryValues } from "../webhooks/dispatcher.ts";
 import { DEFAULT_MEETING_DURATION_SECONDS, MAX_MEETING_DURATION_SECONDS, type MeetingDurationUpdate } from "../domain/meeting-duration.ts";
@@ -567,7 +567,9 @@ export async function deleteMeeting(ctx: AppContext, meeting: MeetingRow): Promi
       // nothing is sent to the provider (no half-purged state for a delete that can only fail).
       purgeObjectStore(ctx);
       if (!await renewLease()) return;
-      if (!isTerminal(meeting.status as MeetingStatus)) await stopInVexa(ctx, meeting);
+      // The stop is code-addressed too (Vexa stops whichever bot the code names), so it takes the same lock a
+      // start holds; a busy code aborts this attempt before anything is sent.
+      if (!isTerminal(meeting.status as MeetingStatus)) await withVexaCodeLock(ctx, meeting.vexaPlatform, meetingLockCodes(meeting), "try", () => stopInVexa(ctx, meeting));
       if (!await renewLease()) return;
       // The provider's handles for THIS meeting (from ptx's own record, never from the meeting code), read
       // BEFORE its delete and saved on our row at the first attempt so every retry checks the same objects.
@@ -578,7 +580,7 @@ export async function deleteMeeting(ctx: AppContext, meeting: MeetingRow): Promi
       // The delete addresses a meeting by code: send it only when Vexa resolves that code to our own row, and
       // hold the per-code lock from that check until the delete returns, so no bot start for the same code
       // can slip a newer row in between. A busy code aborts this attempt (retryable, nothing sent).
-      const sent = await withVexaCodeLock(ctx, meeting.vexaPlatform, meeting.vexaNativeMeetingId, "try", async () => {
+      const sent = await withVexaCodeLock(ctx, meeting.vexaPlatform, meetingLockCodes(meeting), "try", async () => {
         const target = await providerDeleteTarget(ctx, meeting, snapshot);
         const admitted = target === "nothing_to_delete" ? "skipped" : providerAlreadyAdmitted ? "already" : await admitProviderDeletion(ctx, meeting.id, deletionToken);
         if (admitted === "lost") return "lost" as const;

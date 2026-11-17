@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import type { AppContext } from "../context.ts";
+import { detectPlatform } from "../domain/platform.ts";
 import { ApiError } from "../domain/errors.ts";
 
 /**
@@ -19,6 +20,9 @@ import { ApiError } from "../domain/errors.ts";
  *   retry after an unknown outcome) neither races the first nor blocks behind it; the owner's retry
  *   re-runs the whole check.
  *
+ * A meeting is addressed by TWO codes: the one stored on its row, which a start may replace with the code the
+ * provider returned, and the one its URL names (what every later start of that URL requests). `meetingLockCodes`
+ * returns both; they are locked in sorted order so two callers holding different pairs cannot deadlock.
  * The lock transaction holds one pool connection while `fn` uses others, so the number of simultaneous
  * holders in this process is capped to leave the pool free for them.
  */
@@ -51,19 +55,32 @@ function freeSlot(): void {
   else holders--;
 }
 
-export async function withVexaCodeLock<T>(ctx: AppContext, platform: string, code: string | null, mode: "wait" | "try", fn: () => Promise<T>): Promise<T> {
-  if (code === null) return fn(); // no code, nothing a code-addressed delete could resolve to
+export type LockCodes = string | null | readonly (string | null)[];
+
+/** The codes a meeting can be reached by: its stored provider code and the code its URL names. */
+export function meetingLockCodes(meeting: { meetingUrl: string; vexaNativeMeetingId: string | null }): string[] {
+  let fromUrl: string | null = null;
+  try { fromUrl = detectPlatform(meeting.meetingUrl).nativeMeetingId; } catch { /* a stored URL that no longer parses names no code */ }
+  return [meeting.vexaNativeMeetingId, fromUrl].filter((code): code is string => code !== null);
+}
+
+export async function withVexaCodeLock<T>(ctx: AppContext, platform: string, codes: LockCodes, mode: "wait" | "try", fn: () => Promise<T>): Promise<T> {
+  const list = typeof codes === "string" ? [codes] : codes ?? [];
+  const sorted = [...new Set(list.filter((code): code is string => code !== null))].sort();
+  if (sorted.length === 0) return fn(); // no code, nothing a code-addressed delete could resolve to
   await takeSlot(mode);
   try {
     return await ctx.db.transaction(async (tx) => {
-      const key = `vexa-code:${platform}:${code}`;
       try {
-        if (mode === "try") {
-          const rows = await tx.execute(sql`select pg_try_advisory_xact_lock(hashtext(${key})) as locked`);
-          if (rows[0]?.locked !== true) throw busy();
-        } else {
-          await tx.execute(sql.raw(`set local lock_timeout = ${LOCK_WAIT_MS}`));
-          await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${key}))`);
+        if (mode === "wait") await tx.execute(sql.raw(`set local lock_timeout = ${LOCK_WAIT_MS}`));
+        for (const code of sorted) {
+          const key = `vexa-code:${platform}:${code}`;
+          if (mode === "try") {
+            const rows = await tx.execute(sql`select pg_try_advisory_xact_lock(hashtext(${key})) as locked`);
+            if (rows[0]?.locked !== true) throw busy();
+          } else {
+            await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${key}))`);
+          }
         }
       } catch (error) {
         throw error instanceof ApiError ? error : busy();
