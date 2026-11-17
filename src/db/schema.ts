@@ -3,6 +3,16 @@ import type { VadStats } from "../uploads/vad.ts";
 import { sql } from "drizzle-orm";
 import { pgTable, text, timestamp, integer, bigint, jsonb, real, boolean, index, uniqueIndex, primaryKey } from "drizzle-orm/pg-core";
 
+/** Provider-side handles of one meeting, as numbers only (TC-3136). Persisted as `meetings.deletion_snapshot`. */
+export interface VexaPurgeSnapshot {
+  /** Vexa meeting row ids this ptx meeting links to. */
+  ids: number[];
+  /** Vexa user id per row id (object keys are `<kind>/<user>/<meeting|recording>/...`). */
+  users: Record<string, number>;
+  /** Recording ids per row id: recording keys do not carry the meeting id. */
+  recordings: Record<string, number[]>;
+}
+
 export const projects = pgTable("projects", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
@@ -62,6 +72,12 @@ export const meetings = pgTable(
     deletionLeaseAt: timestamp("deletion_lease_at", { withTimezone: true }),
     /** Set immediately before an external delete. A replacement reconciles it, never repeats it. */
     deletionProviderAdmittedAt: timestamp("deletion_provider_admitted_at", { withTimezone: true }),
+    /**
+     * TC-3136: what the capture provider held for this meeting (Vexa row ids, owner, recording ids), captured
+     * at the first delete attempt and reused on every retry. A purged tombstone no longer lists its
+     * recordings, so a retry after a partial failure must not re-derive them. Ids only, never content.
+     */
+    deletionSnapshot: jsonb("deletion_snapshot").$type<VexaPurgeSnapshot>(),
   },
   (t) => [
     uniqueIndex("meetings_project_idempotency_idx").on(t.projectId, t.idempotencyKey),

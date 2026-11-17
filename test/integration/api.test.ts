@@ -207,12 +207,16 @@ describe("happy path: create -> joined -> completed -> transcript + webhook", ()
     expect(await r.json()).toEqual({ id, status: "completed" });
   });
 
-  test("DELETE removes our record and asks Vexa to delete (v0.12 answers 409 for bot-owned rows: tolerated)", async () => {
+  test("DELETE purges Vexa's copy (verified read-back) and removes our record", async () => {
     const r = await h.api(`/v1/meetings/${id}`, { method: "DELETE" });
     expect(r.status).toBe(204);
     expect((await h.api(`/v1/meetings/${id}`)).status).toBe(404);
     expect(h.vexa.requests.some((q) => q.method === "DELETE" && q.path === `/meetings/jitsi/${encodeURIComponent(nativeId)}`)).toBe(true);
-    // The mock mirrors real Vexa: the completed row is retained (409). A planned row is actually removed:
+    // The completed row stays at Vexa only as a content-free tombstone: transcript and recording are gone.
+    const tombstone = h.vexa.meetings.get(`jitsi/${nativeId}`)!;
+    expect(tombstone.data?.artifact_deletion).toMatchObject({ state: "completed" });
+    expect(tombstone.segments).toEqual([]);
+    // A planned row is removed outright:
     await h.vexa.control("jitsi", nativeId, { planned: true });
     await h.ctx.vexa.deleteMeeting("jitsi", nativeId);
     expect(h.vexa.meetings.has(`jitsi/${nativeId}`)).toBe(false);

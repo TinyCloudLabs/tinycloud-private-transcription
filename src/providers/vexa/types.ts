@@ -78,6 +78,8 @@ export interface VexaMeetingData {
   last_error?: { reason?: string; exit_code?: number | null; error_details?: string } | null;
   sessions?: string[];
   attributed_audio_capability?: { requested_version: 1; supported_version?: 1; status: "pending" | "supported" | "unsupported" };
+  /** Set by DELETE on a terminal meeting; `completed` once recordings, attributed audio and transcript are purged. */
+  artifact_deletion?: { state?: "pending" | "completed"; scope?: string };
   /** v1 durable, capture-owned evidence. PTX may consume it only after closure. */
   [k: string]: unknown;
 }
@@ -172,12 +174,18 @@ export interface VexaStopBotResponse {
   native_meeting_id: string;
 }
 
-/** DELETE /meetings/{platform}/{native_meeting_id} → 200 (only for PLANNED rows; FSM rows → 409). */
+/**
+ * DELETE /meetings/{platform}/{native_meeting_id} → 200: a planned row is removed; a terminal row's
+ * artifacts are purged and the row stays as a tombstone (`deleted: "completed_meeting_artifacts"`);
+ * a row the bot lifecycle still owns → 409.
+ */
 export interface VexaDeleteMeetingResponse {
   status: "deleted";
   id: number;
   platform: string;
   native_meeting_id: string;
+  deleted?: "completed_meeting_artifacts";
+  objects_deleted?: number;
 }
 
 /** GET /meetings */

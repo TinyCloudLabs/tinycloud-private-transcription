@@ -214,6 +214,20 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(api).not.toContain("127.0.0.1:8080/health').then");
   });
 
+  test("the api can purge a deleted meeting's capture objects with the same ListBucket+DeleteObject MinIO user; only the secret file mount is :ro (TC-3136)", () => {
+    const apiStart = compose.indexOf("\n  api:\n");
+    const api = compose.slice(apiStart, compose.indexOf("\n  worker:\n", apiStart));
+    expect(api).toContain("VEXA_MINIO_ENDPOINT: http://minio:9000");
+    expect(api).toContain("VEXA_MINIO_ACCESS_KEY: ptx-retention");
+    expect(api).toContain("VEXA_MINIO_SECRET_KEY_FILE: /run/minio-retention/secret-key");
+    expect(api).toContain("- minio-retention:/run/minio-retention:ro");
+    // The ptx-retention user and its secret file come from minio-init; the api starts only after it finished.
+    expect(api).toMatch(/depends_on:[\s\S]*\n      minio-init:\n        condition: service_completed_successfully/);
+    expect(api).not.toContain("MINIO_ROOT");
+    // The scheduled sweep stays with the worker, in dry-run.
+    expect(api).not.toContain("ARTIFACT_RETENTION_MODE");
+  });
+
   test("artifact retention and bot janitor ship in dry-run (TC-904). Details: TC-2181", () => {
     const worker = serviceEnv("worker");
     expect(worker).toContain("ARTIFACT_RETENTION_MODE: ${ARTIFACT_RETENTION_MODE:-dry-run}");
@@ -226,7 +240,7 @@ describe("infra/dstack/app-compose.yaml", () => {
     const init = compose.slice(compose.indexOf("\n  minio-init:\n"), compose.indexOf("\n  admin-api:\n"));
     const policy = JSON.parse(init.match(/printf '%s' '(\{.*\})'/)![1]!);
     expect(policy.Statement).toEqual([
-      { Effect: "Allow", Action: ["s3:ListBucket"], Resource: ["arn:aws:s3:::vexa"] },
+      { Effect: "Allow", Action: ["s3:ListBucket"], Resource: ["arn:aws:s3:::vexa"], Condition: { StringLike: { "s3:prefix": ["recordings/*", "attributed-audio/*", "signal/*"] } } },
       { Effect: "Allow", Action: ["s3:DeleteObject"], Resource: ["arn:aws:s3:::vexa/recordings/*", "arn:aws:s3:::vexa/attributed-audio/*", "arn:aws:s3:::vexa/signal/*"] },
     ]);
     expect(init).toContain("- minio-retention:/run/minio-retention");

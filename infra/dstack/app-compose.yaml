@@ -70,11 +70,21 @@ services:
       VEXA_MAX_CONCURRENT_BOTS: ${VEXA_MAX_CONCURRENT_BOTS:-2}
       SIGNAL_MAX_CONCURRENT_CALLS: "1"
       SIGNAL_HEALTH_PATHS: /run/signal-health-1/health.json
+      # TC-3136: DELETE /v1/meetings/:id purges the capture provider's objects (signal tapes, anything left
+      # after Vexa's own delete) and reads them back, so the api needs the same MinIO user the worker's
+      # retention sweep uses: ListBucket + DeleteObject under the three artifact prefixes, no read or
+      # write. Only the secret FILE mount below is :ro. Unprovisioned credentials, or an unset
+      # VEXA_MINIO_ENDPOINT, fail the delete closed (retryable); it is never skipped.
+      VEXA_MINIO_ENDPOINT: http://minio:9000
+      VEXA_MINIO_ACCESS_KEY: ptx-retention
+      VEXA_MINIO_SECRET_KEY_FILE: /run/minio-retention/secret-key
+      VEXA_MINIO_BUCKET: vexa
     volumes:
       - vexa-provision:/run/vexa:ro
       # Keep the existing volume name so upgrades preserve the already-generated AES key.
       - signal-runtime:/run/signal-capability:ro
       - signal-health:/run/signal-health-1:ro
+      - minio-retention:/run/minio-retention:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -82,6 +92,11 @@ services:
         condition: service_healthy
       gateway:
         condition: service_healthy
+      # TC-3136: the delete's object check needs the ptx-retention user and its secret file, which
+      # minio-init provisions. Start the api only after that one-shot has finished, so the first
+      # delete after a first boot cannot hit an unprovisioned MinIO.
+      minio-init:
+        condition: service_completed_successfully
     networks: [ptx, vexa]
 
   worker:
@@ -315,14 +330,15 @@ services:
         # appears on a command line (ps) (TC-938).
         until printf '%s\n%s\n' "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" | mc alias set local http://minio:9000 >/dev/null; do sleep 1; done
         mc mb -p local/vexa || true
-        # TC-904: least-privilege MinIO user for ptx artifact retention: list the vexa bucket and
-        # delete under its three artifact prefixes; no read or write. The secret is generated once
+        # TC-904: least-privilege MinIO user for ptx artifact retention: list the vexa bucket only under
+        # its three artifact prefixes (s3:prefix condition; a bucket-wide or other-prefix list is denied)
+        # and delete under the same three prefixes; no read or write. The secret is generated once
         # into the minio-retention volume (never printed) and reapplied every boot. A failure here
         # only leaves retention without credentials; it never fails this init or Vexa. mc reads the
         # secret from stdin, so it never appears on a command line (ps).
         K=/run/minio-retention/secret-key
         { [ -s "$$K" ] || { head -c 20 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$$K.tmp" && chmod 0400 "$$K.tmp" && mv "$$K.tmp" "$$K"; }; } &&
-          printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:ListBucket"],"Resource":["arn:aws:s3:::vexa"]},{"Effect":"Allow","Action":["s3:DeleteObject"],"Resource":["arn:aws:s3:::vexa/recordings/*","arn:aws:s3:::vexa/attributed-audio/*","arn:aws:s3:::vexa/signal/*"]}]}' > /tmp/ptx-retention.json &&
+          printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:ListBucket"],"Resource":["arn:aws:s3:::vexa"],"Condition":{"StringLike":{"s3:prefix":["recordings/*","attributed-audio/*","signal/*"]}}},{"Effect":"Allow","Action":["s3:DeleteObject"],"Resource":["arn:aws:s3:::vexa/recordings/*","arn:aws:s3:::vexa/attributed-audio/*","arn:aws:s3:::vexa/signal/*"]}]}' > /tmp/ptx-retention.json &&
           mc admin policy create local ptx-retention /tmp/ptx-retention.json >/dev/null &&
           mc admin user add local ptx-retention < "$$K" >/dev/null &&
           { mc admin policy attach local ptx-retention --user ptx-retention >/dev/null 2>&1 || mc admin policy entities local --user ptx-retention | grep -q ptx-retention; } &&

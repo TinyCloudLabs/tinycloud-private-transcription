@@ -142,7 +142,7 @@ fill together can delay it by about 1.5–2 h.
 unknown speaker, speech filled from the recording or listed as gaps, or the mixed recording recovered
 because the attributed manifest could not be staged. `GET /v1/meetings/{id}` and `meeting.completed`
 webhooks then also carry `transcript_partial: true`.
-`speaker_id` is stable within a meeting only. `provider` is `"vexa"`: Vexa owns the transcript and speaker attribution, while TinyCloud normalizes the completed segments. `DELETE /v1/meetings/{id}` removes our record + transcript and the Vexa meeting.
+`speaker_id` is stable within a meeting only. `provider` is `"vexa"`: Vexa owns the transcript and speaker attribution, while TinyCloud normalizes the completed segments. `DELETE /v1/meetings/{id}` removes our record + transcript and purges the Vexa copy (recording, audio, signal tape, transcript), then reads each back as gone before it answers 204; an unconfirmed purge answers retryable `503 provider_unavailable` and our record stays. Idempotent: a repeat after success is 404, a repeat after a 503 resumes.
 `GET /health` → `{status:"ok","checks":{postgres,redis,vexa,bot_capacity:{running,max},transcription_provider}}` (`bot_capacity.max` from `VEXA_MAX_CONCURRENT_BOTS`).
 
 Bot cap (TC-902): `POST /v1/meetings` for any non-Signal platform answers `429 capacity_exhausted` (type

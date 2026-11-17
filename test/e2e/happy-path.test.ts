@@ -238,7 +238,7 @@ describe.skipIf(!E2E)("E2E happy path against the real capture rig", () => {
     expect((await api(`/v1/meetings/${meetingId}/transcript`)).status).toBe(404);
     const running = (await vexa.botStatus()).running.filter((m) => m.native_meeting_id === NATIVE_ID);
     expect(running).toHaveLength(0);
-    // Vexa v0.12: DELETE /meetings only removes PLANNED rows; bot-owned rows answer 409 and are retained.
+    // TC-3136: the purge leaves at most Vexa's content-free tombstone row (completed artifact_deletion), no transcript.
     let vexaRow: "removed" | "retained" = "removed";
     try {
       await vexa.getTranscript("jitsi", NATIVE_ID);
