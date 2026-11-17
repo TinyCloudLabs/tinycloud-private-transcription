@@ -302,8 +302,9 @@ transcript storage is an upsert and only the winning terminal transition emits a
   also takes (`withVexaCodeLock`), so a new meeting cannot start in between; a meeting is reachable by its stored
   provider code and by the code its URL names, so both are locked (sorted, all or none). A delete that finds a
   code busy aborts retryably having sent nothing, a start waits for it. The stop that precedes a delete of a
-  still-running meeting runs inside the same lock. The lock covers starts and deletes made through ptx; a
-  user-initiated stop is still code-addressed and outside it.
+  still-running meeting runs inside the same lock. The lock covers starts and deletes made through ptx. Other
+  code-addressed stops are NOT inside it: a user or API stop (`stopMeeting`), the cleanup stop for a meeting
+  cancelled while its bot was being dispatched, and the join-deadline stop (`meeting-job.ts`).
   An upstream delete-by-row-id would remove the race entirely. Backups expire under the provider's retention.
 - **Jitsi live validation** is marked pending upstream; it works against docker-jitsi-meet stable-11146-2
   (bot needs `https://` + hostname + a trusted cert).
