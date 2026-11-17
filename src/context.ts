@@ -31,8 +31,8 @@ export interface AppContext {
   attributedWorkerHealthy: boolean;
   /** Test seam: delays a recovery-fence heartbeat acknowledgement to exercise freshness bounds. */
   recoveryHeartbeatDelay?: (meetingId: string) => Promise<void> | void;
-  /** Test seam for the capture-object store used to purge a deleted meeting; `null` = none configured. Unset resolves from config. */
-  artifactStore?: ArtifactStore | null;
+  /** Test seam for the capture-object store used to purge a deleted meeting. Unset resolves from config (fails closed if unconfigured). */
+  artifactStore?: ArtifactStore;
 }
 
 export const DEFAULT_WEBHOOK_RETRY_DELAYS_MS = [0, 60_000, 5 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
@@ -59,6 +59,6 @@ export function createContext(overrides: Partial<AppContext> & { config?: Config
     attributedWorkerId: overrides.attributedWorkerId ?? `attributed-worker:${process.pid}:${crypto.randomUUID()}`,
     attributedWorkerHealthy: overrides.attributedWorkerHealthy ?? true,
     ...(overrides.recoveryHeartbeatDelay ? { recoveryHeartbeatDelay: overrides.recoveryHeartbeatDelay } : {}),
-    ...(overrides.artifactStore !== undefined ? { artifactStore: overrides.artifactStore } : {}),
+    ...(overrides.artifactStore ? { artifactStore: overrides.artifactStore } : {}),
   };
 }

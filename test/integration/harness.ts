@@ -14,6 +14,10 @@ import type { TranscriptionProvider } from "../../src/providers/transcription/ty
 import { Queue } from "../../src/worker/queue.ts";
 import { startWorker, type WorkerHandle } from "../../src/worker/index.ts";
 import type { SignalCaptureAdapter } from "../../src/providers/signal/adapter.ts";
+import type { ArtifactStore } from "../../src/services/artifact-retention.ts";
+
+/** A capture-object store holding nothing: meetings that delete without objects need no MinIO in tests. */
+export const emptyArtifactStore: ArtifactStore = { async *list() {}, async delete() {} };
 
 export type ApiResponse = Omit<Response, "json"> & { json(): Promise<any> };
 
@@ -73,6 +77,8 @@ export async function startHarness(
     maxConcurrentBots?: number;
     /** The mock Vexa user's own max_concurrent_bots. */
     vexaMaxConcurrentBots?: number;
+    /** The container name the mock Vexa reports for a bot (default `mtg-<row id>-bot`, like Vexa). */
+    vexaBotContainerName?: (nativeId: string, rowId: number) => string;
     /** Vexa 429 retry cadence and window at bot start (TC-902 review). */
     capacityRetryIntervalMs?: number;
     capacityRetryWindowMs?: number;
@@ -80,7 +86,10 @@ export async function startHarness(
     needsHelpStateEnabled?: boolean;
   } = {},
 ): Promise<Harness> {
-  const vexa = startMockVexa(0, opts.vexaMaxConcurrentBots !== undefined ? { maxConcurrentBots: opts.vexaMaxConcurrentBots } : {});
+  const vexa = startMockVexa(0, {
+    ...(opts.vexaMaxConcurrentBots !== undefined ? { maxConcurrentBots: opts.vexaMaxConcurrentBots } : {}),
+    ...(opts.vexaBotContainerName ? { botContainerName: opts.vexaBotContainerName } : {}),
+  });
   const config = {
     ...baseConfig,
     vexa: { ...baseConfig.vexa, baseUrl: vexa.baseUrl, apiKey: vexa.apiKey, pollIntervalMs: 50 },
@@ -113,6 +122,7 @@ export async function startHarness(
     db,
     redis,
     queue,
+    artifactStore: emptyArtifactStore,
     vexa: new VexaClient({ baseUrl: vexa.baseUrl, apiKey: vexa.apiKey }),
     transcription: opts.transcription ?? createTranscriptionProvider(config),
     ...(opts.transcriptRecovery !== undefined ? { transcriptRecovery: opts.transcriptRecovery } : {}),

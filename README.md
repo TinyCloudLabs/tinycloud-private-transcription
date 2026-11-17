@@ -289,8 +289,14 @@ transcript storage is an upsert and only the winning terminal transition emits a
   attributed-audio and signal-tape objects (`recordings/`, `attributed-audio/`, `signal/` under the project's
   user) list empty. Anything unconfirmed answers retryable `503 provider_unavailable`, keeps our row and frees the
   fence so the caller's retry resends the idempotent delete; our row is deleted last. The api service needs the
-  retention MinIO user (`VEXA_MINIO_*`) for the object check; with the endpoint set but the credential
-  unprovisioned, DELETE fails retryable rather than skipping. Backups expire under the provider's retention.
+  retention MinIO user (`VEXA_MINIO_*`) for the object check; an unset endpoint or an unprovisioned credential
+  makes DELETE fail retryable (`object_store_unconfigured` / `object_store_unavailable`) before anything is
+  sent, never a skip. What Vexa held (row ids, owner, recording ids; numbers only) is saved on our row at the
+  first attempt (`meetings.deletion_snapshot`) so a retry still checks every object prefix. Vexa's delete
+  addresses a meeting by platform + code, and one Vexa user serves every project, so a recurring code can name
+  a later meeting's row: ptx sends the delete only when Vexa resolves the code to a row recorded for THIS
+  meeting, else it fails closed (`provider_row_mismatch`, `provider_row_unlinked`) and keeps our row. An
+  upstream delete-by-row-id would remove that race. Backups expire under the provider's retention.
 - **Jitsi live validation** is marked pending upstream; it works against docker-jitsi-meet stable-11146-2
   (bot needs `https://` + hostname + a trusted cert).
 - **Live Vexa STT backend wiring and two-speaker/late-joiner acceptance remain deferred follow-ups**:

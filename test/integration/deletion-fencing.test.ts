@@ -52,7 +52,8 @@ test("a stale delete owner cannot erase a successor's state, and a successor tha
     expect(await getMeetingById(h.ctx, meeting.id)).not.toBeNull();
     await deleteMeeting(c, (await getMeetingById(h.ctx, meeting.id))!);
     expect(await getMeetingById(h.ctx, meeting.id)).toBeNull();
-    expect(calls).toBe(2);
+    // A's own in-flight delete did purge the row, so C finds nothing left at the provider and sends no more.
+    expect(calls).toBe(1);
   } finally {
     h.ctx.vexa.deleteMeeting = original;
   }

@@ -214,7 +214,7 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(api).not.toContain("127.0.0.1:8080/health').then");
   });
 
-  test("the api can purge a deleted meeting's capture objects with the same least-privilege MinIO user, read-only (TC-3136)", () => {
+  test("the api can purge a deleted meeting's capture objects with the same ListBucket+DeleteObject MinIO user; only the secret file mount is :ro (TC-3136)", () => {
     const apiStart = compose.indexOf("\n  api:\n");
     const api = compose.slice(apiStart, compose.indexOf("\n  worker:\n", apiStart));
     expect(api).toContain("VEXA_MINIO_ENDPOINT: http://minio:9000");

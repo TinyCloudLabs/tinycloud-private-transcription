@@ -71,8 +71,10 @@ services:
       SIGNAL_MAX_CONCURRENT_CALLS: "1"
       SIGNAL_HEALTH_PATHS: /run/signal-health-1/health.json
       # TC-3136: DELETE /v1/meetings/:id purges the capture provider's objects (signal tapes, anything left
-      # after Vexa's own delete) and reads them back, so the api needs the same least-privilege list+delete
-      # MinIO user the worker's retention sweep uses. Unprovisioned credentials fail the delete (retryable).
+      # after Vexa's own delete) and reads them back, so the api needs the same MinIO user the worker's
+      # retention sweep uses: ListBucket + DeleteObject under the three artifact prefixes, no read or
+      # write. Only the secret FILE mount below is :ro. Unprovisioned credentials, or an unset
+      # VEXA_MINIO_ENDPOINT, fail the delete closed (retryable); it is never skipped.
       VEXA_MINIO_ENDPOINT: http://minio:9000
       VEXA_MINIO_ACCESS_KEY: ptx-retention
       VEXA_MINIO_SECRET_KEY_FILE: /run/minio-retention/secret-key

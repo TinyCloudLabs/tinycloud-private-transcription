@@ -1,9 +1,9 @@
-import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { meetings } from "../../src/db/schema.ts";
 import type { ArtifactStore } from "../../src/services/artifact-retention.ts";
 import { deleteMeeting, getMeetingById } from "../../src/services/meetings.ts";
-import { startHarness, type Harness } from "./harness.ts";
+import { emptyArtifactStore, startHarness, type Harness } from "./harness.ts";
 
 // TC-3136: deleting a meeting must purge the capture provider's copy and PROVE it. The mock Vexa mirrors
 // the pinned meeting-api (terminal meeting -> purged tombstone, non-terminal -> 409); the object store is an
@@ -12,7 +12,10 @@ import { startHarness, type Harness } from "./harness.ts";
 let h: Harness;
 beforeAll(async () => { h = await startHarness(); });
 afterAll(async () => h.stop());
-afterEach(() => { h.ctx.artifactStore = undefined; });
+beforeEach(() => { h.vexa.requests.length = 0; });
+afterEach(() => { h.ctx.artifactStore = emptyArtifactStore; });
+/** Code-addressed deletes the mock has received (the call that can hit another meeting's row). */
+const deleteRequests = () => h.vexa.requests.filter((r) => r.method === "DELETE" && r.path.startsWith("/meetings/"));
 
 class FakeStore implements ArtifactStore {
   readonly deletes: string[] = [];
@@ -29,8 +32,7 @@ class FakeStore implements ArtifactStore {
 
 let n = 0;
 /** A completed, recorded meeting. Vexa's mock numbers rows from 1 and records under id*1000. */
-async function completed() {
-  const room = `Purge${++n}`;
+async function completed(room = `Purge${++n}`) {
   const created = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: `https://jitsi.local/${room}` } });
   const id = (await created.json()).id as string;
   const meeting = await h.waitFor(async () => { const m = await getMeetingById(h.ctx, id); return m?.status === "joining" ? m : null; });
@@ -97,7 +99,6 @@ test("a 409 (bot still stopping at the provider) is surfaced and keeps our row, 
   const m = await completed();
   h.ctx.artifactStore = new FakeStore(new Set(objectsFor(m)));
   // Our row says completed but the provider still owns the lifecycle: this was the silent-retention hole.
-  await h.ctx.db.update(meetings).set({ vexaMeetingId: null, vexaBotId: null }).where(eq(meetings.id, m.id));
   await h.vexa.control(m.platform, m.native, { status: "stopping" });
   const failed = await h.api(`/v1/meetings/${m.id}`, { method: "DELETE" });
   expect(failed.status).toBe(503);
@@ -114,22 +115,49 @@ test("an object store that is unreachable, or that keeps objects after delete, f
   h.ctx.artifactStore = new FakeStore(new Set(objectsFor(m)), { ignoreDeletes: true });
   expect((await h.api(`/v1/meetings/${m.id}`, { method: "DELETE" })).status).toBe(503);
   expect(await getMeetingById(h.ctx, m.id)).not.toBeNull();
-  // Recording objects are deleted by Vexa itself in its first (successful) delete, so a retry has none left.
-  const healthy = new FakeStore(new Set(objectsFor(m).filter((k) => !k.startsWith("recordings/"))));
+  const healthy = new FakeStore(new Set(objectsFor(m)));
   h.ctx.artifactStore = healthy;
   expect((await h.api(`/v1/meetings/${m.id}`, { method: "DELETE" })).status).toBe(204);
   expect(healthy.objects.size).toBe(0);
 });
 
-test("a configured endpoint with unprovisioned credentials is a retryable failure, not a silent skip", async () => {
+test("a retry after an object-store failure still purges the recording objects Vexa's tombstone no longer lists (F2)", async () => {
+  const m = await completed();
+  // Attempt 1: Vexa's delete succeeds (it clears the recording list), then the store is unreachable.
+  h.ctx.artifactStore = new FakeStore(new Set(objectsFor(m)), { failList: true });
+  expect((await h.api(`/v1/meetings/${m.id}`, { method: "DELETE" })).status).toBe(503);
+  expect(h.vexa.meetings.get(`${m.platform}/${m.native}`)!.data?.artifact_deletion).toMatchObject({ state: "completed" });
+  expect((await h.ctx.vexa.listRecordings({ meetingId: m.vexa.id })).recordings).toEqual([]);
+  // What the provider held was saved on our row at the first attempt: ids only.
+  const [saved] = await h.ctx.db.select({ s: meetings.deletionSnapshot }).from(meetings).where(eq(meetings.id, m.id));
+  expect(saved!.s).toEqual({ ids: [m.vexa.id], users: { [m.vexa.id]: m.vexa.user_id }, recordings: { [m.vexa.id]: [m.recordingId] } });
+  // Attempt 2: the store is back; all three prefixes, including recordings/, must be emptied before the row goes.
+  const healthy = new FakeStore(new Set(objectsFor(m)));
+  h.ctx.artifactStore = healthy;
+  expect((await h.api(`/v1/meetings/${m.id}`, { method: "DELETE" })).status).toBe(204);
+  expect([...healthy.objects]).toEqual([]);
+  expect(await getMeetingById(h.ctx, m.id)).toBeNull();
+});
+
+test("a configured endpoint with unprovisioned credentials fails the delete before anything is sent", async () => {
   const m = await completed();
   const config = { ...h.ctx.config, artifactRetention: { ...h.ctx.config.artifactRetention, s3: { ...h.ctx.config.artifactRetention.s3, endpoint: "http://127.0.0.1:1", secretAccessKey: "", accessKeyId: "ptx-retention", secretAccessKeyFile: "/nonexistent/secret-key" } } };
-  const failed = await deleteMeeting({ ...h.ctx, config }, (await getMeetingById(h.ctx, m.id))!).then(() => null, (e) => e);
+  const { artifactStore: _none, ...rest } = h.ctx;
+  const failed = await deleteMeeting({ ...rest, config }, (await getMeetingById(h.ctx, m.id))!).then(() => null, (e) => e);
   expect(failed).toMatchObject({ code: "provider_unavailable" });
   expect(await getMeetingById(h.ctx, m.id)).not.toBeNull();
-  // No store configured at all (dev/test): nothing to purge, nothing to verify.
-  h.ctx.artifactStore = null;
-  expect((await h.api(`/v1/meetings/${m.id}`, { method: "DELETE" })).status).toBe(204);
+  expect(deleteRequests()).toEqual([]);
+});
+
+test("an unset object-store endpoint fails closed on a Vexa-backed meeting: nothing is sent, our row stays (F3)", async () => {
+  const m = await completed();
+  const { artifactStore: _none, ...rest } = h.ctx;
+  expect(rest.config.artifactRetention.s3.endpoint).toBe("");
+  const failed = await deleteMeeting(rest, (await getMeetingById(h.ctx, m.id))!).then(() => null, (e) => e);
+  expect(failed).toMatchObject({ code: "provider_unavailable", message: expect.stringContaining("object_store_unconfigured") });
+  expect(await getMeetingById(h.ctx, m.id)).not.toBeNull();
+  expect(deleteRequests()).toEqual([]);
+  expect(h.vexa.meetings.get(`${m.platform}/${m.native}`)!.data?.artifact_deletion).toBeUndefined();
 });
 
 test("after an earlier attempt of unknown outcome, the retry verifies, finds the data, and sends the delete again", async () => {
@@ -145,4 +173,70 @@ test("after an earlier attempt of unknown outcome, the retry verifies, finds the
   expect(await getMeetingById(h.ctx, m.id)).not.toBeNull();
   expect((await h.api(`/v1/meetings/${m.id}`, { method: "DELETE" })).status).toBe(204);
   expect(h.vexa.meetings.get(`${m.platform}/${m.native}`)!.data?.artifact_deletion).toMatchObject({ state: "completed" });
+});
+
+// ---- F1: Vexa's delete addresses a meeting by CODE, and one Vexa user serves every project. ----
+
+/** Two projects' meetings on one recurring code: M1 is old and terminal, M2 is later, with its own user and data. */
+async function sharedCode() {
+  const room = `Shared${++n}`;
+  const m1 = await completed(room);
+  const m2 = await completed(room);
+  expect(m2.vexa.id).not.toBe(m1.vexa.id);
+  expect(h.vexa.meetings.get(`${m1.platform}/${m1.native}`)).toBe(m2.vexa); // the code now resolves to M2's row
+  expect(h.vexa.retired.get(m1.vexa.id)).toBe(m1.vexa);
+  m2.vexa.user_id = 2;
+  return { m1, m2 };
+}
+
+test("deleting an old meeting never purges a later meeting that reuses its code: fails closed, nothing is sent (F1)", async () => {
+  const { m1, m2 } = await sharedCode();
+  const store = new FakeStore(new Set([...objectsFor(m1), ...objectsFor(m2)]));
+  h.ctx.artifactStore = store;
+  const before = [...store.objects].sort();
+  const failed = await h.api(`/v1/meetings/${m1.id}`, { method: "DELETE" });
+  expect(failed.status).toBe(503);
+  expect((await failed.json()).error.message).toContain("provider_row_mismatch");
+  // M1's own row is kept for a retry; M2's Vexa row, recording, transcript and objects are untouched.
+  expect(await getMeetingById(h.ctx, m1.id)).not.toBeNull();
+  expect(await getMeetingById(h.ctx, m2.id)).not.toBeNull();
+  expect(deleteRequests()).toEqual([]);
+  expect(m2.vexa.data?.artifact_deletion).toBeUndefined();
+  expect(m2.vexa.segments.length).toBeGreaterThan(0);
+  expect(m2.vexa.recording).toBeDefined();
+  expect([...store.objects].sort()).toEqual(before);
+  // The fence is released, so the owner's retry (or Vexa gaining a row-id delete) is not blocked.
+  const [row] = await h.ctx.db.select().from(meetings).where(eq(meetings.id, m1.id));
+  expect(row).toMatchObject({ dispatchBlocked: false, deletionToken: null, deletionProviderAdmittedAt: null });
+});
+
+test("an old meeting whose own row is already purged deletes cleanly while a later meeting holds its code (F1)", async () => {
+  const room = `Shared${++n}`;
+  const m1 = await completed(room);
+  await h.ctx.vexa.deleteMeeting(m1.platform, m1.native); // M1's row is purged while the code still resolves to it
+  const m2 = await completed(room);
+  m2.vexa.user_id = 2;
+  // Vexa's own purge already removed M1's recording objects (only signal/attributed tapes are ptx's to clear).
+  const store = new FakeStore(new Set([...objectsFor(m1).filter((k) => !k.startsWith("recordings/")), ...objectsFor(m2)]));
+  h.ctx.artifactStore = store;
+  const sent = deleteRequests().length;
+  expect((await h.api(`/v1/meetings/${m1.id}`, { method: "DELETE" })).status).toBe(204);
+  expect(deleteRequests().length).toBe(sent); // nothing left to delete by code, so nothing was sent
+  expect(await getMeetingById(h.ctx, m1.id)).toBeNull();
+  expect([...store.objects].sort()).toEqual(objectsFor(m2).sort()); // only M1's objects went
+  expect(m2.vexa.data?.artifact_deletion).toBeUndefined();
+  expect(m2.vexa.segments.length).toBeGreaterThan(0);
+});
+
+test("a meeting that reached Vexa but has no recorded Vexa row never deletes by code or touches objects (F1)", async () => {
+  const m = await completed();
+  const store = new FakeStore(new Set(objectsFor(m)));
+  h.ctx.artifactStore = store;
+  await h.ctx.db.update(meetings).set({ vexaMeetingId: null, vexaBotId: null }).where(eq(meetings.id, m.id));
+  const failed = await h.api(`/v1/meetings/${m.id}`, { method: "DELETE" });
+  expect(failed.status).toBe(503);
+  expect((await failed.json()).error.message).toContain("provider_row_unlinked");
+  expect(deleteRequests()).toEqual([]);
+  expect(store.deletes).toEqual([]);
+  expect(await getMeetingById(h.ctx, m.id)).not.toBeNull();
 });
