@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { ApiError } from "../../src/domain/errors.ts";
 import { detectPlatform, normalizeMeetingUrl } from "../../src/domain/platform.ts";
 
 const wrappers = [
@@ -10,15 +11,21 @@ const wrappers = [
 
 for (const [name, base, parameter] of wrappers) {
   describe(name, () => {
-    for (const [target, expected, nativeMeetingId] of [
+    for (const [target, expected] of [
       ["https://meet.google.com/lookup/TeamOne?authuser=1", "https://meet.google.com/lookup/TeamOne?authuser=1", "TeamOne"],
       ["meet.google.com/lookup/third", "https://meet.google.com/lookup/third", "third"],
     ]) {
-      test(`preserves lookup target ${target} and nickname identity. Details: TC-2181`, () => {
+      test(`refuses lookup target ${target} with invalid_meeting_url after wrapper unwrapping. Details: TC-2181`, () => {
         const input = `${base}?${new URLSearchParams({ [parameter]: target! })}`;
         const normalized = normalizeMeetingUrl(input);
         expect(normalized).toBe(expected!);
-        expect(detectPlatform(normalized)).toEqual({ platform: "google_meet", nativeMeetingId });
+        try {
+          detectPlatform(normalized);
+          throw new Error("Expected invalid_meeting_url");
+        } catch (error) {
+          expect(error).toBeInstanceOf(ApiError);
+          expect((error as ApiError).code).toBe("invalid_meeting_url");
+        }
       });
     }
 

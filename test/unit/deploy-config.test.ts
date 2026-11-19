@@ -83,8 +83,8 @@ describe("infra/dstack/app-compose.yaml", () => {
 
   test("pins every deploy and runtime-pulled image to an approved immutable digest", () => {
     const expected = {
-      api: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:3732d4b5366ebc4d858a34d4cc05b7501f08653e@sha256:f8e50def29b3ee74fae3f2846e1681c50fddefd9543dc393b85329634739636e",
-      worker: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:3732d4b5366ebc4d858a34d4cc05b7501f08653e@sha256:f8e50def29b3ee74fae3f2846e1681c50fddefd9543dc393b85329634739636e",
+      api: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:d5134e77f24abcef37663ac9c9381e1eba44c44a@sha256:5d821daf9998a371b19fb5a976a7d401c10098b91ca6a624c49554bc3faf812c",
+      worker: "ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:d5134e77f24abcef37663ac9c9381e1eba44c44a@sha256:5d821daf9998a371b19fb5a976a7d401c10098b91ca6a624c49554bc3faf812c",
       "signal-capture": "ghcr.io/tinycloudlabs/tinycloud-private-transcription/signal-seat:c3cdff63e429720a79903384509337f3e67caf3d@sha256:1ebac9dc13cf868131abf9a1719b3a3a268058cae59e228bcddc75e51c57cf4f",
       "signal-control-provision": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
       "signal-capability-provision": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
@@ -95,7 +95,7 @@ describe("infra/dstack/app-compose.yaml", () => {
       minio: "ghcr.io/tinycloudlabs/mirror/minio:RELEASE.2025-09-07T16-13-09Z@sha256:25e301eb686e796ead885d0e254cc6397424df7d7a79cee48ff08b720570ced6",
       "minio-init": "ghcr.io/tinycloudlabs/mirror/minio-mc:RELEASE.2025-08-13T08-35-41Z@sha256:4545427b5ba8e7553be881a34db1706dc9b307cbd13e6c9fe9b58faba9d2f380",
       "admin-api": "vexaai/v012-admin-api:v012@sha256:4c702354384eafe3a933cd537a106b7c15067cfd368a5f6da1a6e675e7e03e04",
-      "bot-image-keeper": "ghcr.io/tinycloudlabs/vexa/bot:tc-efa6d4c@sha256:21ee97b6d1ff59a7b8770b5bc72760146acfee8270874542fa5aab6c2a3dd85f",
+      "bot-image-keeper": "ghcr.io/tinycloudlabs/vexa/bot:tc-5bd4c13@sha256:8aa1be48c30096a9a1cce0173497f47539ad8cd504a311a773fd1ec87c6a0baf",
       "bot-janitor": "docker:27.5.1-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c",
       runtime: "vexaai/v012-runtime:v012@sha256:a1f6448fbb380b9433364e8b572ec25a12aa4f274bf403f1d83a89cbf5812f2d",
       whisper: "fedirz/faster-whisper-server:latest-cpu@sha256:760e5e43d427dc6cfbbc4731934b908b7de9c7e6d5309c6a1f0c8c923a5b6030",
@@ -111,7 +111,7 @@ describe("infra/dstack/app-compose.yaml", () => {
 
     const runtime = serviceEnv("runtime");
     expect(runtime).toContain(
-      "BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-efa6d4c@sha256:21ee97b6d1ff59a7b8770b5bc72760146acfee8270874542fa5aab6c2a3dd85f}",
+      "BROWSER_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-5bd4c13@sha256:8aa1be48c30096a9a1cce0173497f47539ad8cd504a311a773fd1ec87c6a0baf}",
     );
     expect(runtime).toContain(
       "AGENT_IMAGE: ${VEXA_AGENT_IMAGE:-vexaai/v012-agent-api:v012@sha256:6eb37574b33aab233aabbe5907e06e106bae44a403e5df781a436da8201a928d}",
@@ -214,6 +214,20 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(api).not.toContain("127.0.0.1:8080/health').then");
   });
 
+  test("the api can purge a deleted meeting's capture objects with the same ListBucket+DeleteObject MinIO user; only the secret file mount is :ro (TC-3136)", () => {
+    const apiStart = compose.indexOf("\n  api:\n");
+    const api = compose.slice(apiStart, compose.indexOf("\n  worker:\n", apiStart));
+    expect(api).toContain("VEXA_MINIO_ENDPOINT: http://minio:9000");
+    expect(api).toContain("VEXA_MINIO_ACCESS_KEY: ptx-retention");
+    expect(api).toContain("VEXA_MINIO_SECRET_KEY_FILE: /run/minio-retention/secret-key");
+    expect(api).toContain("- minio-retention:/run/minio-retention:ro");
+    // The ptx-retention user and its secret file come from minio-init; the api starts only after it finished.
+    expect(api).toMatch(/depends_on:[\s\S]*\n      minio-init:\n        condition: service_completed_successfully/);
+    expect(api).not.toContain("MINIO_ROOT");
+    // The scheduled sweep stays with the worker, in dry-run.
+    expect(api).not.toContain("ARTIFACT_RETENTION_MODE");
+  });
+
   test("artifact retention and bot janitor ship in dry-run (TC-904). Details: TC-2181", () => {
     const worker = serviceEnv("worker");
     expect(worker).toContain("ARTIFACT_RETENTION_MODE: ${ARTIFACT_RETENTION_MODE:-dry-run}");
@@ -226,7 +240,7 @@ describe("infra/dstack/app-compose.yaml", () => {
     const init = compose.slice(compose.indexOf("\n  minio-init:\n"), compose.indexOf("\n  admin-api:\n"));
     const policy = JSON.parse(init.match(/printf '%s' '(\{.*\})'/)![1]!);
     expect(policy.Statement).toEqual([
-      { Effect: "Allow", Action: ["s3:ListBucket"], Resource: ["arn:aws:s3:::vexa"] },
+      { Effect: "Allow", Action: ["s3:ListBucket"], Resource: ["arn:aws:s3:::vexa"], Condition: { StringLike: { "s3:prefix": ["recordings/*", "attributed-audio/*", "signal/*"] } } },
       { Effect: "Allow", Action: ["s3:DeleteObject"], Resource: ["arn:aws:s3:::vexa/recordings/*", "arn:aws:s3:::vexa/attributed-audio/*", "arn:aws:s3:::vexa/signal/*"] },
     ]);
     expect(init).toContain("- minio-retention:/run/minio-retention");

@@ -31,17 +31,25 @@ interface MockMeeting extends VexaMeetingResponse {
   attributed_audio?: Map<string, Uint8Array>;
   /** Deletable via DELETE /meetings (real Vexa: idle/scheduled rows only). */
   planned?: boolean;
+  /** Test-only: DELETE answers 200 but keeps the transcript and recording (a provider that did not purge). */
+  retain_on_delete?: boolean;
 }
 
 export interface MockVexaOptions {
   apiKey?: string;
   /** The user's max_concurrent_bots: POST /bots answers 429 at the cap, like meeting-api (TC-902). */
   maxConcurrentBots?: number;
+  /** Overrides the container name Vexa reports (a name that embeds meeting text, for the privacy test). */
+  botContainerName?: (nativeId: string, rowId: number) => string;
 }
 
 export function createMockVexa(opts: MockVexaOptions = {}) {
   const apiKey = opts.apiKey ?? "vxa_mock";
+  /** The newest row per code, which is what Vexa's code-addressed routes resolve. */
   const meetings = new Map<string, MockMeeting>();
+  /** Older rows whose code was reused: still readable by row id, never reached by code. */
+  const retired = new Map<number, MockMeeting>();
+  const allRows = () => [...meetings.values(), ...retired.values()];
   const requests: { method: string; path: string; body?: unknown }[] = [];
   let nextId = 1;
   const key = (p: string, n: string) => `${p}/${n}`;
@@ -78,14 +86,19 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
     if (opts.maxConcurrentBots !== undefined && live >= opts.maxConcurrentBots) {
       return c.json({ detail: `User has reached the maximum concurrent bot limit (${opts.maxConcurrentBots}).` }, 429);
     }
+    const id = nextId++;
+    // A terminal row stays in Vexa when its code is reused: the new meeting is a NEW row, and the code
+    // (platform + native id) resolves to the newest one. Row-id reads still reach the old row.
+    if (existing) retired.set(existing.id, existing);
     const m: MockMeeting = {
-      id: nextId++,
+      id,
       user_id: 1,
       platform: body.platform,
       native_meeting_id: nativeId,
       constructed_meeting_url: body.meeting_url ?? null,
       status: "requested",
-      bot_container_id: `mtg-${nativeId}-bot`,
+      // Vexa's container name embeds the row id (`mtg-<id>-<suffix>`), which ptx reads it back from.
+      bot_container_id: opts.botContainerName?.(nativeId, id) ?? `mtg-${id}-bot`,
       start_time: null,
       end_time: null,
       completion_reason: null,
@@ -117,11 +130,11 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
   app.get("/meetings", (c) => c.json({ meetings: [...meetings.values()].map(strip) }));
 
   app.get("/meetings/:id/attributed-audio", (c) => {
-    const m = [...meetings.values()].find((meeting) => meeting.id === Number(c.req.param("id")));
+    const m = allRows().find((meeting) => meeting.id === Number(c.req.param("id")));
     return m?.attributed_audio_manifest ? c.json(m.attributed_audio_manifest) : c.json({ detail: "Attributed audio not found" }, 404);
   });
   app.get("/meetings/:id/attributed-audio/ranges/:sequence", (c) => {
-    const m = [...meetings.values()].find((meeting) => meeting.id === Number(c.req.param("id")));
+    const m = allRows().find((meeting) => meeting.id === Number(c.req.param("id")));
     const path = c.req.path;
     const bytes = m?.attributed_audio?.get(path);
     return bytes ? new Response(bytes as unknown as ArrayBuffer, { headers: { "content-type": "application/octet-stream" } }) : c.json({ detail: "range not found" }, 404);
@@ -150,18 +163,18 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
     const limit = Math.min(Number(c.req.query("limit") ?? 50), 200);
     const offset = Number(c.req.query("offset") ?? 0);
     const meetingId = c.req.query("meeting_id");
-    const all = [...meetings.values()].flatMap(recordingsOf)
+    const all = allRows().flatMap(recordingsOf)
       .filter((r) => meetingId === undefined || r.meeting_id === Number(meetingId))
       .sort((a, b) => b.id - a.id);
     const page = all.slice(offset, offset + limit);
     return c.json({ recordings: page, total: all.length, limit, offset, has_more: offset + page.length < all.length });
   });
   app.get("/recordings/:id/master", (c) => {
-    const m = [...meetings.values()].find((meeting) => meeting.id * 1000 === Number(c.req.param("id")));
+    const m = allRows().find((meeting) => meeting.id * 1000 === Number(c.req.param("id")));
     return m?.recording ? c.json({ raw_url: `/recordings/${m.id * 1000}/raw` }) : c.json({ detail: "Recording not found" }, 404);
   });
   app.get("/recordings/:id/raw", (c) => {
-    const m = [...meetings.values()].find((meeting) => meeting.id * 1000 === Number(c.req.param("id")));
+    const m = allRows().find((meeting) => meeting.id * 1000 === Number(c.req.param("id")));
     return m?.recording ? new Response(m.recording.bytes as unknown as ArrayBuffer, { headers: { "content-type": m.recording.contentType } }) : c.json({ detail: "Recording not found" }, 404);
   });
 
@@ -173,15 +186,39 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
     return c.json({ status: "stopping", meeting_id: m.id, native_meeting_id: m.native_meeting_id });
   });
 
-  // Real v0.12: only PLANNED (idle/scheduled) rows are deletable; every row created via POST /bots is
-  // bot-lifecycle owned → 409. `/_mock/*` can flip `planned` to exercise the 200 path.
+  // Mirrors the pinned meeting-api (upstream #1293): a PLANNED (idle/scheduled) row is removed; a
+  // terminal (completed/failed) row has its recording, attributed audio and transcript purged and
+  // is kept as a tombstone (`data.artifact_deletion.state = "completed"`), idempotently; any other
+  // row the bot lifecycle still owns answers 409. `/_mock/*` can flip `planned` to exercise the
+  // planned path, and `retain_on_delete` simulates a provider that accepts the delete but keeps data.
   app.delete("/meetings/:platform/:native_meeting_id", (c) => {
     const k = key(c.req.param("platform"), c.req.param("native_meeting_id"));
     const m = meetings.get(k);
     if (!m) return c.json({ detail: `Meeting not found for platform ${c.req.param("platform")} and ID ${c.req.param("native_meeting_id")}` }, 404);
-    if (!m.planned) return c.json({ detail: "Meeting is no longer planned (bot lifecycle owns it)" }, 409);
-    meetings.delete(k);
-    return c.json({ status: "deleted", id: m.id, platform: m.platform, native_meeting_id: m.native_meeting_id });
+    if (m.planned) {
+      meetings.delete(k);
+      return c.json({ status: "deleted", id: m.id, platform: m.platform, native_meeting_id: m.native_meeting_id });
+    }
+    if (!["completed", "failed"].includes(m.status)) return c.json({ detail: "Meeting artifacts can only be deleted after the lifecycle is terminal" }, 409);
+    let objects = 0;
+    if (!m.retain_on_delete) {
+      objects = (m.recording ? 1 : 0) + (m.attributed_audio?.size ?? 0);
+      m.segments = [];
+      m.recording = undefined;
+      m.attributed_audio = undefined;
+      m.attributed_audio_manifest = undefined;
+      m.data = { ...m.data, artifact_deletion: { state: "completed", scope: "primary_transcript_and_recording_storage" } };
+    }
+    return c.json({
+      status: "deleted", id: m.id, platform: m.platform, native_meeting_id: m.native_meeting_id,
+      deleted: "completed_meeting_artifacts", objects_deleted: objects, backup_residuals: "expire_under_deployment_retention_policy",
+    });
+  });
+
+  // Row-id read (the pinned meeting-api's GET /meetings/{id}): the owner's row with its `data`.
+  app.get("/meetings/:id", (c) => {
+    const m = allRows().find((meeting) => meeting.id === Number(c.req.param("id")));
+    return m ? c.json(strip(m)) : c.json({ detail: "Meeting not found" }, 404);
   });
 
   // ---- test control ----
@@ -198,6 +235,8 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
       recording_content_type?: string;
       transcript_missing?: boolean;
       planned?: boolean;
+      retain_on_delete?: boolean;
+      user_id?: number;
       start_time?: string | null;
       end_time?: string | null;
       attributed_audio_manifest?: AttributedManifest;
@@ -232,6 +271,8 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
     if (body.completion_reason !== undefined) m.completion_reason = body.completion_reason;
     if (body.failure_stage !== undefined) m.failure_stage = body.failure_stage;
     if (body.planned !== undefined) m.planned = body.planned;
+    if (body.retain_on_delete !== undefined) m.retain_on_delete = body.retain_on_delete;
+    if (body.user_id !== undefined) m.user_id = body.user_id;
     if (body.start_time !== undefined) m.start_time = body.start_time;
     if (body.end_time !== undefined) m.end_time = body.end_time;
     if (body.attributed_audio_manifest !== undefined) m.attributed_audio_manifest = body.attributed_audio_manifest;
@@ -250,15 +291,16 @@ export function createMockVexa(opts: MockVexaOptions = {}) {
   app.get("/_mock/requests", (c) => c.json(requests));
   app.post("/_mock/reset", (c) => {
     meetings.clear();
+    retired.clear();
     requests.length = 0;
     return c.json({ ok: true });
   });
 
-  return { app, meetings, requests, apiKey };
+  return { app, meetings, retired, requests, apiKey };
 }
 
-function strip(m: { segments?: unknown; bot_name?: unknown; language?: unknown; meeting_url?: unknown; automatic_leave?: unknown; planned?: unknown } & VexaMeetingResponse): VexaMeetingResponse {
-  const { segments: _s, bot_name: _b, language: _l, meeting_url: _u, automatic_leave: _a, planned: _p, ...rest } = m;
+function strip(m: { segments?: unknown; bot_name?: unknown; language?: unknown; meeting_url?: unknown; automatic_leave?: unknown; planned?: unknown; retain_on_delete?: unknown } & VexaMeetingResponse): VexaMeetingResponse {
+  const { segments: _s, bot_name: _b, language: _l, meeting_url: _u, automatic_leave: _a, planned: _p, retain_on_delete: _r, ...rest } = m;
   return rest;
 }
 

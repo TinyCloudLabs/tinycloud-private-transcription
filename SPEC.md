@@ -142,7 +142,7 @@ fill together can delay it by about 1.5–2 h.
 unknown speaker, speech filled from the recording or listed as gaps, or the mixed recording recovered
 because the attributed manifest could not be staged. `GET /v1/meetings/{id}` and `meeting.completed`
 webhooks then also carry `transcript_partial: true`.
-`speaker_id` is stable within a meeting only. `provider` is `"vexa"`: Vexa owns the transcript and speaker attribution, while TinyCloud normalizes the completed segments. `DELETE /v1/meetings/{id}` removes our record + transcript and the Vexa meeting.
+`speaker_id` is stable within a meeting only. `provider` is `"vexa"`: Vexa owns the transcript and speaker attribution, while TinyCloud normalizes the completed segments. `DELETE /v1/meetings/{id}` removes our record + transcript and purges the Vexa copy (recording, audio, signal tape, transcript), then reads each back as gone before it answers 204; an unconfirmed purge answers retryable `503 provider_unavailable` and our record stays. Idempotent: a repeat after success is 404, a repeat after a 503 resumes.
 `GET /health` → `{status:"ok","checks":{postgres,redis,vexa,bot_capacity:{running,max},transcription_provider}}` (`bot_capacity.max` from `VEXA_MAX_CONCURRENT_BOTS`).
 
 Bot cap (TC-902): `POST /v1/meetings` for any non-Signal platform answers `429 capacity_exhausted` (type
@@ -465,9 +465,9 @@ The meeting worker checks persisted deadlines on its existing heartbeat, normall
 
 ## Pasted Google Meet invitations (TC-2181)
 
-`POST /v1/meetings` accepts free-form invitation text in `meeting_url`. It selects the first dashed-code or lookup URL whose host is exactly `meet.google.com`, in input order, ignoring phone numbers, `tel.meet` and other URL hosts. Dashed-code targets use the existing canonical normalization; a lookup target appearing first keeps its nickname and query rather than selecting a later dashed-code target. Schemeless Meet targets gain HTTPS. Explicit HTTP lookup targets retain the existing `invalid_meeting_url` response. Details: TC-2181
+`POST /v1/meetings` accepts free-form invitation text in `meeting_url`. It selects the first dashed-code or lookup URL whose host is exactly `meet.google.com`, in input order, ignoring phone numbers, `tel.meet` and other URL hosts. Dashed-code targets use the existing canonical normalization. A lookup target (`meet.google.com/lookup/<nick>`), whether direct, schemeless, wrapped or appearing first in text, returns `invalid_meeting_url` before any meeting row, queue entry or bot request exists; a later dashed-code target is not substituted. Schemeless Meet targets gain HTTPS. Details: TC-2181
 
 The stored meeting URL, native identity and create-request hash use the selected target, not the invitation text. Text without a qualifying Meet target returns `invalid_meeting_url` before meeting creation or dispatch. Inputs containing only a link retain the existing wrapper and platform handling. Details: TC-2181
 
-External angle brackets, quotes and parentheses delimit a pasted URL without removing punctuation from its lookup nickname or query. First-target selection precedes the selected URL's existing link-only protocol handling, including when a dashed-code target precedes an HTTPS backup. Details: TC-2181
+External angle brackets, quotes and parentheses delimit a pasted URL without removing punctuation from the selected target's path or query. First-target selection precedes the selected URL's existing link-only protocol handling, including when a dashed-code target precedes an HTTPS backup. Details: TC-2181
 

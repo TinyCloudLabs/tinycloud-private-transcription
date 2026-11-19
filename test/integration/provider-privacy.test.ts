@@ -4,7 +4,8 @@ import { meetings } from "../../src/db/schema.ts";
 import { startHarness, type Harness } from "./harness.ts";
 
 let h: Harness;
-beforeAll(async () => { h = await startHarness(); });
+// A container name that embeds the meeting code (not Vexa's `mtg-<row id>-…` shape) must never be persisted.
+beforeAll(async () => { h = await startHarness({ vexaBotContainerName: (nativeId) => `mtg-${nativeId}-bot` }); });
 afterAll(async () => { await h.stop(); });
 
 test("provider bot identifiers containing private text are omitted from persisted operational fields", async () => {

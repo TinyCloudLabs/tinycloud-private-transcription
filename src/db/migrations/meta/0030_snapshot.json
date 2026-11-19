@@ -1,5 +1,5 @@
 {
-  "id": "167259ad-4eda-4e59-9d57-083f92501e0b",
+  "id": "0aa776ed-2477-4b42-abed-703b9b894bf6",
   "prevId": "e0fbcf0a-eabe-4e24-aac4-f1a8cd531401",
   "version": "7",
   "dialect": "postgresql",
@@ -774,6 +774,12 @@
         "deletion_provider_admitted_at": {
           "name": "deletion_provider_admitted_at",
           "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "deletion_snapshot": {
+          "name": "deletion_snapshot",
+          "type": "jsonb",
           "primaryKey": false,
           "notNull": false
         }
@@ -1589,7 +1595,7 @@
           "name": "last_status",
           "type": "integer",
           "primaryKey": false,
-          "notNull": false
+          "notNull": true
         }
       },
       "indexes": {},

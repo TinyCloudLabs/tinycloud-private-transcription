@@ -10,6 +10,7 @@ import { toVexaPlatform } from "../providers/vexa/platform-map.ts";
 import { completeMeetingWithTranscript, failMeeting, findLiveMeetingForNativeId, getMeetingById, loadJoinClock, setDispatchFallback, startJoinClock, stopMeetingIfDurationElapsed, transition } from "../services/meetings.ts";
 import { enqueueMeetingWebhook } from "../webhooks/dispatcher.ts";
 import { observeCapture, recordCapture } from "../services/capture.ts";
+import { meetingLockCodes, withVexaCodeLock } from "../services/vexa-code-lock.ts";
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { attributedTranscriptionRuns, meetings } from "../db/schema.ts";
 import { normalizeSegments } from "../domain/transcript.ts";
@@ -106,7 +107,10 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
     if (meeting.platform === "signal") return await handleSignalStart(ctx, meeting, attempt, continueStart);
     const vexaPlatform = toVexaPlatform(meeting.platform as Exclude<Platform, "signal">);
     try {
-      const created = await ctx.vexa.createBot({
+      // Held across the provider call: a code-addressed delete of an older meeting on the same code is
+      // refused while this start is in flight, and afterwards sees the newer row instead of purging it
+      // (TC-3136). A start waits behind a delete's short check-and-send.
+      const created = await withVexaCodeLock(ctx, vexaPlatform, meetingLockCodes(meeting), "wait", () => ctx.vexa.createBot({
         platform: vexaPlatform,
         native_meeting_id: meeting.vexaNativeMeetingId,
         meeting_url: meeting.meetingUrl,
@@ -121,7 +125,7 @@ export async function handleMeetingStart(ctx: AppContext, meetingId: string, att
         // our configurable audio-silence window. This can expire with humans still connected;
         // participant presence does not veto Vexa's silence verdict.
         automatic_leave: { max_time_left_alone: ctx.config.vexa.maxTimeLeftAloneMs },
-      });
+      }));
       // Prefer our already-validated, request-derived identity. A provider-derived replacement is
       // retained only when it is a narrow opaque identifier, never arbitrary returned text/URLs.
       const vexaNativeMeetingId = created.native_meeting_id === meeting.vexaNativeMeetingId

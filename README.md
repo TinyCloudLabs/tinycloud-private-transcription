@@ -210,7 +210,7 @@ curl -s -X POST $API/v1/meetings/$ID/stop -H "Authorization: Bearer $KEY"
 # recover a failed meeting from its retained capture-provider row (idempotent)
 curl -s -X POST $API/v1/meetings/$ID/recover -H "Authorization: Bearer $KEY"
 
-# delete → 204 (asks Vexa to delete too; Vexa v0.12 keeps bot-owned rows and answers 409 — logged, see "Known gaps")
+# delete → 204 (purges Vexa's copy and reads it back; 503 provider_unavailable = retry, nothing was forgotten)
 curl -s -X DELETE $API/v1/meetings/$ID -H "Authorization: Bearer $KEY"
 
 curl -s $API/health   # {"status":"ok","checks":{postgres,redis,vexa,bot_capacity:{running,max},transcription_provider}}
@@ -282,10 +282,30 @@ transcript storage is an upsert and only the winning terminal transition emits a
   participant audio, not participant count. Five continuous silent minutes (for example, a break or
   quiet screen-share) can therefore finalize a meeting even if people remain connected. Use
   `POST /v1/meetings/{id}/stop` to end immediately; tune `VEXA_MAX_TIME_LEFT_ALONE_MS` for longer silence.
-- **Vexa data retention on DELETE**: Vexa v0.12 only deletes *planned* rows; `DELETE /meetings/{p}/{id}` on a
-  meeting the bot lifecycle touched answers `409 "Meeting is no longer planned (bot lifecycle owns it)"`.
-  Our DELETE removes our data and logs the 409; purging Vexa's copy needs an upstream route or a direct
-  DB/MinIO purge inside the CVM (follow-up).
+- **Vexa data retention on DELETE (TC-3136)**: `DELETE /v1/meetings/{id}` purges the capture provider's copy and
+  proves it before it forgets the meeting. It stops a live bot, asks Vexa to delete the meeting (a terminal row
+  keeps a content-free tombstone: platform, native id, timestamps, bot name), then reads back that the Vexa row is
+  a completed-deletion tombstone, no recordings remain, the transcript has no segments, and the recording,
+  attributed-audio and signal-tape objects (`recordings/`, `attributed-audio/`, `signal/` under the project's
+  user) list empty. Anything unconfirmed answers retryable `503 provider_unavailable`, keeps our row and frees the
+  fence so the caller's retry resends the idempotent delete; our row is deleted last. The api service needs the
+  retention MinIO user (`VEXA_MINIO_*`) for the object check and starts only after `minio-init` has provisioned it
+  (`depends_on: service_completed_successfully`); that user may list only under the three artifact prefixes
+  (`s3:prefix` condition; a bucket-wide list is denied) and delete only under them. An unset endpoint or an
+  unprovisioned credential makes DELETE fail retryable (`object_store_unconfigured` / `object_store_unavailable`) before anything is
+  sent, never a skip. What Vexa held (row ids, owner, recording ids; numbers only) is saved on our row at the
+  first attempt (`meetings.deletion_snapshot`) so a retry still checks every object prefix. Vexa's delete
+  addresses a meeting by platform + code, and one Vexa user serves every project, so a recurring code can name
+  a later meeting's row: ptx sends the delete only when Vexa resolves the code to a row recorded for THIS
+  meeting, else it fails closed (`provider_row_mismatch`, `provider_row_unlinked`) and keeps our row. The check
+  and the delete run under a Postgres advisory lock per platform + code that every bot start for that code
+  also takes (`withVexaCodeLock`), so a new meeting cannot start in between; a meeting is reachable by its stored
+  provider code and by the code its URL names, so both are locked (sorted, all or none). A delete that finds a
+  code busy aborts retryably having sent nothing, a start waits for it. The stop that precedes a delete of a
+  still-running meeting runs inside the same lock. The lock covers starts and deletes made through ptx. Other
+  code-addressed stops are NOT inside it: a user or API stop (`stopMeeting`), the cleanup stop for a meeting
+  cancelled while its bot was being dispatched, and the join-deadline stop (`meeting-job.ts`).
+  An upstream delete-by-row-id would remove the race entirely. Backups expire under the provider's retention.
 - **Jitsi live validation** is marked pending upstream; it works against docker-jitsi-meet stable-11146-2
   (bot needs `https://` + hostname + a trusted cert).
 - **Live Vexa STT backend wiring and two-speaker/late-joiner acceptance remain deferred follow-ups**:
