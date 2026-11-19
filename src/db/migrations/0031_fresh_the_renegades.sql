@@ -1,0 +1,1 @@
+ALTER TABLE "transcription_provider_blocks" ALTER COLUMN "last_status" DROP NOT NULL;

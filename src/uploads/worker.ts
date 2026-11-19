@@ -1,4 +1,4 @@
-import { and, asc, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, ne, sql } from "drizzle-orm";
 import { mkdir, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { config as processConfig } from "../config.ts";
@@ -25,6 +25,10 @@ export interface Claim {
 /**
  * Claims the oldest queued job, but only while no job is processing: one job end-to-end at a time,
  * service-wide. Serialized on the admission row; `closed` admission stops new claims.
+ *
+ * A job whose provider wait has ended is still queued, and holds no service-wide slot while parked. It is claimable
+ * only when it fits under maxActiveJobs and maxReservedBytes alongside the jobs that do hold one (admission uses the
+ * same definition), so a wake never takes the service past either bound; until then it stays queued.
  */
 export async function claimNext(ctx: BatchContext): Promise<Claim | null> {
   if (!ctx.provider) return null;
@@ -37,7 +41,15 @@ export async function claimNext(ctx: BatchContext): Promise<Claim | null> {
     const [next] = await tx.select({ id: transcriptions.id }).from(transcriptions)
       .where(and(eq(transcriptions.status, "queued"), eq(transcriptions.tombstoned, false),
         sql`not exists (${tx.select({ one: sql`1` }).from(transcriptionProviderBlocks)
-          .where(and(eq(transcriptionProviderBlocks.transcriptionId, transcriptions.id), gt(transcriptionProviderBlocks.nextAttemptAt, new Date())))})`))
+          .where(and(eq(transcriptionProviderBlocks.transcriptionId, transcriptions.id), gt(transcriptionProviderBlocks.nextAttemptAt, sql`now()`)))})`,
+        sql`(not exists (select 1 from transcription_provider_blocks pb where pb.transcription_id = ${transcriptions.id}) or (
+          (select count(*) from transcriptions t2 where t2.status in ('awaiting_upload', 'queued', 'processing')
+            and not (t2.status = 'queued' and exists (select 1 from transcription_provider_blocks b2 where b2.transcription_id = t2.id))) < ${ctx.config.limits.maxActiveJobs}
+          and (select coalesce(sum(t3.byte_size), 0) from transcriptions t3 where t3.status in ('awaiting_upload', 'queued', 'processing')
+            and not (t3.status = 'queued' and exists (select 1 from transcription_provider_blocks b3 where b3.transcription_id = t3.id))) + ${transcriptions.byteSize} <= ${ctx.config.limits.maxReservedBytes}))`,
+        sql`not exists (${tx.select({ one: sql`1` }).from(transcriptionProviderBlocks)
+          .where(and(eq(transcriptionProviderBlocks.transcriptionId, transcriptions.id),
+            sql`least(${transcriptionProviderBlocks.blockedSince}, ${transcriptions.uploadedAt}) <= now() - ${ctx.config.worker.providerBlockMaxSeconds} * interval '1 second'`))})`))
       .orderBy(asc(transcriptions.uploadedAt), asc(transcriptions.id)).limit(1).for("update", { skipLocked: true });
     if (!next) return null;
     const token = crypto.randomUUID();
@@ -451,7 +463,7 @@ async function settleDispatch(
   const w = ctx.config.worker;
   const detail = outcome.kind === "ambiguous" || outcome.kind === "not_sent" ? outcome.reason
     : outcome.kind === "rejected" || outcome.kind === "misconfigured" || outcome.kind === "blocked" ? `http_${outcome.status}` : null;
-  const seen = { newlyBlockedStatus: null as number | null, recoveredJobs: 0, droppedRegions: 0 };
+  const seen = { newlyBlocked: null as { status: number | null } | null, recoveredJobs: 0, droppedRegions: 0 };
   const result = await ctx.db.transaction(async (tx) => {
     let lost = false;
     try {
@@ -473,21 +485,39 @@ async function settleDispatch(
       return row ? { kind: "terminal" as const, row } : "lost" as const;
     };
     /**
-     * The provider refused before processing (nothing was done or billed), so the job waits instead of failing: release
-     * the claim (back to `queued`, regions kept) with a durable not-before from the capped backoff. Neither the not-sent
-     * nor the rate-limit counter, nor the claim count, is consumed. Past the give-up window it fails provider_unavailable.
+     * An explicit provider refusal or request proven not sent is safe to retry: release the claim (back to `queued`,
+     * regions kept) with a durable not-before from the capped backoff. The bounded immediate not-sent retries occur
+     * before this transition. Past the give-up window, the job fails provider_unavailable.
      */
-    const block = async (status: number) => {
-      const [current] = await tx.select().from(transcriptionProviderBlocks).where(eq(transcriptionProviderBlocks.transcriptionId, fence.id));
-      const now = Date.now();
-      const since = current?.blockedSince ?? new Date(now);
-      const deadline = since.getTime() + w.providerBlockMaxSeconds * 1000;
-      if (now >= deadline) {
-        await tx.delete(transcriptionProviderBlocks).where(eq(transcriptionProviderBlocks.transcriptionId, fence.id));
-        return fail("provider_unavailable", "The transcription provider stayed unavailable for too long", "failed");
+    const block = async (status: number | null) => {
+      const deadlineAt = () => sql`least(coalesce(${transcriptionProviderBlocks.blockedSince}, now()), ${transcriptions.uploadedAt}) + ${w.providerBlockMaxSeconds} * interval '1 second'`;
+      const [state] = await tx.select({
+        blockedSince: transcriptionProviderBlocks.blockedSince,
+        attempts: transcriptionProviderBlocks.attempts,
+        lastStatus: transcriptionProviderBlocks.lastStatus,
+        uploadedAt: transcriptions.uploadedAt,
+        byteSize: transcriptions.byteSize,
+        databaseNow: sql<Date>`now()`.mapWith(transcriptions.uploadedAt),
+        deadlineAt: deadlineAt().mapWith(transcriptions.uploadedAt),
+        deadlineExpired: sql<boolean>`now() >= ${deadlineAt()}`,
+      }).from(transcriptions).leftJoin(transcriptionProviderBlocks, eq(transcriptionProviderBlocks.transcriptionId, transcriptions.id))
+        .where(eq(transcriptions.id, fence.id));
+      if (!state?.uploadedAt) return "lost" as const;
+      if (state.deadlineExpired) {
+        return fail("provider_unavailable", "The transcription provider was unavailable for 72 hours, so this recording wasn't transcribed. Upload it again to try again.", "failed");
+      }
+      if (state.blockedSince === null) {
+        // A job entering the wait must fit in the waiting-audio budget (jobs already waiting or being retried hold theirs).
+        // When it does not, the outage fails it and its audio is deleted.
+        const [held] = await tx.select({ bytes: sql<string>`coalesce(sum(${transcriptions.byteSize}), 0)::text` }).from(transcriptions)
+          .innerJoin(transcriptionProviderBlocks, eq(transcriptionProviderBlocks.transcriptionId, transcriptions.id))
+          .where(and(inArray(transcriptions.status, ["queued", "processing"]), ne(transcriptions.id, fence.id)));
+        if (Number(held!.bytes) + state.byteSize > ctx.config.limits.maxWaitingBytes) {
+          return fail("provider_unavailable", "The transcription provider is unavailable", "failed");
+        }
       }
       const schedule = w.providerBlockBackoffSeconds;
-      const attempts = current?.attempts ?? 0;
+      const attempts = state.attempts ?? 0;
       const delayMs = schedule[Math.min(attempts, schedule.length - 1)]! * 1000;
       const [released] = await tx.update(transcriptions).set({
         status: "queued",
@@ -501,10 +531,15 @@ async function settleDispatch(
         updatedAt: sql`now()`,
       }).where(fenceGuard(fence)).returning({ id: transcriptions.id });
       if (!released) return "lost" as const;
-      const wait = { blockedSince: since, nextAttemptAt: new Date(Math.min(now + delayMs, deadline)), attempts: attempts + 1, lastStatus: status };
+      const wait = {
+        blockedSince: state.blockedSince ?? state.databaseNow,
+        nextAttemptAt: new Date(Math.min(state.databaseNow.getTime() + delayMs, state.deadlineAt.getTime())),
+        attempts: attempts + 1,
+        lastStatus: status,
+      };
       await tx.insert(transcriptionProviderBlocks).values({ transcriptionId: fence.id, ...wait })
         .onConflictDoUpdate({ target: transcriptionProviderBlocks.transcriptionId, set: wait });
-      if (current?.lastStatus !== status) seen.newlyBlockedStatus = status;
+      if (state.blockedSince === null || state.lastStatus !== status) seen.newlyBlocked = { status };
       return "blocked" as const;
     };
     switch (outcome.kind) {
@@ -517,11 +552,14 @@ async function settleDispatch(
         if (ungrounded) seen.droppedRegions = 1;
         await tx.update(transcriptionRegions).set({ status: "completed", text: ungrounded ? "" : outcome.text }).where(regionWhere);
         await tx.update(transcriptions).set({ tinfoilAudioSeconds: sql`${transcriptions.tinfoilAudioSeconds} + ${(region.endMs - region.startMs) / 1000}` }).where(fenceGuard(fence));
-        // A successful dispatch proves the provider works again: every waiting job is released at once, logged once.
-        const cleared = await tx.delete(transcriptionProviderBlocks)
-          .where(inArray(transcriptionProviderBlocks.transcriptionId, tx.select({ id: transcriptions.id }).from(transcriptions).where(inArray(transcriptions.status, ["queued", "processing"]))))
+        // Provider recovery wakes waiting jobs without moving their original deadline. The block row also
+        // carries the hard 72-hour bound, so only terminalize() removes it when the job actually ends.
+        const released = await tx.update(transcriptionProviderBlocks).set({ nextAttemptAt: sql`now()`, attempts: 0 })
+          .where(and(inArray(transcriptionProviderBlocks.transcriptionId,
+            tx.select({ id: transcriptions.id }).from(transcriptions).where(eq(transcriptions.status, "queued"))),
+          gt(transcriptionProviderBlocks.nextAttemptAt, sql`now()`)))
           .returning({ id: transcriptionProviderBlocks.transcriptionId });
-        seen.recoveredJobs = cleared.length;
+        seen.recoveredJobs = released.length;
         return "done" as const;
       }
       case "rate_limited":
@@ -534,7 +572,7 @@ async function settleDispatch(
       case "blocked":
         return block(outcome.status);
       case "not_sent":
-        if (notSent + 1 >= w.maxNotSentAttempts) return fail("provider_unavailable", "The transcription provider could not be reached", "failed");
+        if (notSent + 1 >= w.maxNotSentAttempts) return block(null);
         return "retry" as const;
       case "rejected":
         return fail("transcription_failed", "The transcription provider rejected a segment of the recording", "failed");
@@ -545,9 +583,12 @@ async function settleDispatch(
         return fail("provider_outcome_unknown", "A transcription request had an uncertain outcome; it is not retried to avoid a duplicate paid request", "ambiguous");
     }
   });
-  if (seen.newlyBlockedStatus !== null) {
-    // Error + alert: the first occurrence is the page. Coded tokens only; the provider's response body is never read.
-    ctx.log.error("batch provider blocked", { transcriptionId: fence.id, http_status: seen.newlyBlockedStatus, reason: BLOCK_REASON[seen.newlyBlockedStatus], stage: "dispatch", alert: true });
+  if (seen.newlyBlocked) {
+    // Coded reasons only; a provably-unsent request has no HTTP status and no provider response body.
+    const { status } = seen.newlyBlocked;
+    ctx.log.error("batch provider blocked", {
+      transcriptionId: fence.id, http_status: status, reason: status === null ? "request_not_sent" : BLOCK_REASON[status], stage: "dispatch", alert: true,
+    });
   }
   // Count only; the dropped text is never logged.
   if (seen.droppedRegions > 0) ctx.log.warn("batch region ungrounded", { transcriptionId: fence.id, dropped_regions: seen.droppedRegions, stage: "dispatch" });

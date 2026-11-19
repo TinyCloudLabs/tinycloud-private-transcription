@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test
 import { mkdir, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { eq, sql } from "drizzle-orm";
-import { providerDispatchSlots, transcriptionAttempts, transcriptionRegions, transcriptionResults, transcriptions, transcriptionWorkers } from "../../src/db/schema.ts";
+import { providerDispatchSlots, transcriptionAttempts, transcriptionProviderBlocks, transcriptionRegions, transcriptionResults, transcriptions, transcriptionWorkers } from "../../src/db/schema.ts";
 import { runSweep, retentionLagSeconds } from "../../src/uploads/ledger.ts";
 import type { FaultPoint } from "../../src/uploads/faults.ts";
 import { jobDir, jobsRoot } from "../../src/uploads/storage.ts";
@@ -586,7 +586,7 @@ describe("provider outcomes", () => {
     expect(await (await h.api(`/v1/transcriptions/${id}`)).json()).toMatchObject({ status: "queued", provider_delayed: true });
   });
 
-  test("pre-send failures are retried (at most 5 attempts); a provably-unsent request is not ambiguous", async () => {
+  test("pre-send failures retry immediately, then wait durably instead of failing", async () => {
     let n = 0;
     h.tinfoil.handler = () => {
       if (++n <= 2) { const e = new Error("refused") as Error & { code: string }; e.code = "ConnectionRefused"; throw e; }
@@ -599,10 +599,11 @@ describe("provider outcomes", () => {
 
     h.tinfoil.calls = [];
     h.tinfoil.handler = () => { const e = new Error("refused") as Error & { code: string }; e.code = "ConnectionRefused"; throw e; };
-    const failing = await h.submit(await audio("stereo"), { tenant: TENANT_B });
+    const waiting = await h.submit(await audio("stereo"), { tenant: TENANT_B });
     await h.work();
     expect(h.tinfoil.calls.length).toBe(5);
-    expect(await h.row(failing)).toMatchObject({ status: "failed", errorCode: "provider_unavailable" });
+    expect(await h.row(waiting)).toMatchObject({ status: "queued", errorCode: null });
+    expect(await h.ctx.db.select().from(transcriptionProviderBlocks).where(eq(transcriptionProviderBlocks.transcriptionId, waiting))).toMatchObject([{ lastStatus: null }]);
   });
 
   test("definite rejections: 400 → transcription_failed, 401 → the job waits (provider_delayed), not failed", async () => {

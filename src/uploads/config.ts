@@ -44,6 +44,8 @@ export interface BatchConfig {
     maxActiveJobs: number;
     /** Service-wide sum of declared byte_size over the same active set. Bounds temp + accepted audio on disk. */
     maxReservedBytes: number;
+    /** Service-wide sum of declared byte_size over jobs waiting on a provider outage (retryable, up to 72 h). They hold no slot under maxActiveJobs/maxReservedBytes; a job that would enter the wait past this bound fails provider_unavailable. */
+    maxWaitingBytes: number;
     /** Service-wide PUTs holding a live upload lease. */
     maxConcurrentUploads: number;
     /** Creates and PUTs are refused while the upload volume is at or above this used percentage. */
@@ -83,9 +85,9 @@ export interface BatchConfig {
     maxNotSentAttempts: number;
     notSentBackoffMs: number;
     maxProcessingSeconds: number;
-    /** Seconds a job waits after the Nth consecutive blocked provider outcome; the last entry repeats. */
+    /** Seconds a safely retriable provider outcome waits; the last backoff entry repeats. */
     providerBlockBackoffSeconds: number[];
-    /** A job that has been blocked this long (from its first block) fails provider_unavailable. */
+    /** Seconds from the earlier of upload or first provider block that a safely retryable job may wait. */
     providerBlockMaxSeconds: number;
   };
   retention: {
@@ -132,6 +134,7 @@ export function batchConfigFromEnv(log: Pick<Logger, "warn"> = logger): BatchCon
       durationScanSeconds: 45,
       maxActiveJobs: positiveIntegerEnv("BATCH_MAX_ACTIVE_JOBS", "10"),
       maxReservedBytes: positiveIntegerEnv("BATCH_MAX_RESERVED_BYTES", String(10 * MAX_UPLOAD_BYTES)),
+      maxWaitingBytes: positiveIntegerEnv("BATCH_MAX_WAITING_BYTES", String(10 * MAX_UPLOAD_BYTES)),
       maxConcurrentUploads: positiveIntegerEnv("BATCH_MAX_CONCURRENT_UPLOADS", "3"),
       diskHighWaterPercent: percent,
       tenantDailyBytes: positiveIntegerEnv("BATCH_TENANT_DAILY_BYTES", String(3 * MAX_UPLOAD_BYTES)),
@@ -161,8 +164,8 @@ export function batchConfigFromEnv(log: Pick<Logger, "warn"> = logger): BatchCon
       maxNotSentAttempts: 5,
       notSentBackoffMs: 1_000,
       maxProcessingSeconds: 4 * 3_600,
-      providerBlockBackoffSeconds: [60, 120, 300, 600, 1_800],
-      providerBlockMaxSeconds: 24 * 3_600,
+      providerBlockBackoffSeconds: [60, 120, 300, 600, 1_800, 3_600],
+      providerBlockMaxSeconds: 72 * 3_600,
     },
     retention: {
       transcriptTtlSeconds: 86_400,

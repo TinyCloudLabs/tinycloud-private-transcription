@@ -92,11 +92,15 @@ describe("batch job failed at dispatch carries the coded reason", () => {
     for (const probe of ["sk-probe", "message-probe", "tinfoil.test/v1"]) expect(everything).not.toContain(probe);
   });
 
-  test("not_sent after the last allowed attempt", async () => {
+  test("not_sent after the last immediate attempt enters the durable waiting window", async () => {
     Object.assign(h.ctx.config.worker, { maxNotSentAttempts: 2 });
     const { id, logs } = await dispatchLogs(() => { const e = new Error("refused") as Error & { code: string }; e.code = "ConnectionRefused"; throw e; });
     expect(h.tinfoil.calls).toHaveLength(2);
-    expect(dispatchLine(logs).fields).toEqual({ transcriptionId: id, outcome: "not_sent", stage: "dispatch", reason: "ConnectionRefused" });
+    expect(await h.row(id)).toMatchObject({ status: "queued", errorCode: null });
+    expect(logs.find((line) => line.message === "batch provider blocked")).toMatchObject({
+      level: "error",
+      fields: { transcriptionId: id, http_status: null, reason: "request_not_sent", stage: "dispatch", alert: true },
+    });
   });
 
   test("rejected carries the status", async () => {

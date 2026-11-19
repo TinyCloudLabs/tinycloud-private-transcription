@@ -165,7 +165,8 @@ new four-service compose before deployment. The local sidecar burst rehearsal do
 | Postgres data + WAL (`max_wal_size=256MB`) | ≤ 0.5 GB |
 | accepted audio + in-flight `.part` files (`BATCH_MAX_RESERVED_BYTES`) | ≤ 1.865 GB |
 | PCM of the one processing job: 2 ch × 11,101 s × 32,000 B/s = 0.711 GB; ×2 while a crashed claim's work dir awaits the sweeper | ≈ 1.421 GB |
-| **total** | **≈ 6.3 GB ≈ 32% of 20 GB** |
+| audio of jobs waiting on a provider outage (`BATCH_MAX_WAITING_BYTES`, outside the reserved bytes above) | ≤ 1.865 GB |
+| **total** | **≈ 8.2 GB ≈ 41% of 20 GB** |
 
 These sizing estimates remain below the unchanged 80% high-water (`BATCH_DISK_HIGH_WATER_PERCENT`), which stays
 fail-closed for leaks. At 80%, creates and PUTs are refused; the conservative remaining writes (3 in-flight PUTs,

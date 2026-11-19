@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, lt, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, lt, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import {
   transcriptionAdmission,
@@ -154,8 +154,9 @@ export interface CreateResult {
  * transcription_admission row lock, so concurrent creates are serialized and every bound is exact:
  *   - admission mode must be open
  *   - one active job per (project, tenant_ref) (also a partial unique index)
- *   - service-wide active jobs (awaiting_upload + queued + processing) <= maxActiveJobs
+ *   - service-wide active jobs (awaiting_upload + queued + processing), excluding jobs waiting on a provider block, <= maxActiveJobs
  *   - service-wide declared bytes of those jobs + byte_size <= maxReservedBytes
+ *   - declared bytes of jobs waiting on a provider block + byte_size <= maxWaitingBytes
  *   - tenant daily bytes (conditional UPDATE) <= tenantDailyBytes
  * The reservation is the job row itself: it is released only by a terminal transition (terminalize).
  */
@@ -199,8 +200,15 @@ export async function createTranscription(
         .where(and(eq(transcriptions.projectId, projectId), eq(transcriptions.tenantRef, tenantRef), inArray(transcriptions.status, [...ACTIVE_STATUSES]))).limit(1);
       if (active) throw new BatchError("active_transcription_exists", "This account already has a transcription in progress", { id: active.id });
 
-      const [totals] = await tx.select({ jobs: sql<number>`count(*)::int`, bytes: sql<string>`coalesce(sum(${transcriptions.byteSize}), 0)::text` })
-        .from(transcriptions).where(inArray(transcriptions.status, [...ACTIVE_STATUSES]));
+      // A job parked behind a provider outage (queued, with a transcription_provider_blocks row) keeps its per-tenant slot
+      // above but holds no service-wide slot, so one provider outage cannot turn every create into service_busy for 72 h.
+      // When its wait ends it takes a slot again before it is claimed (claimNext applies the same bounds). The audio parked
+      // jobs hold is bounded separately by maxWaitingBytes, applied when a job would enter the wait.
+      const parked = sql`(${transcriptions.status} = 'queued' and exists (select 1 from ${transcriptionProviderBlocks} where ${transcriptionProviderBlocks.transcriptionId} = ${transcriptions.id}))`;
+      const [totals] = await tx.select({
+        jobs: sql<number>`(count(*) filter (where not ${parked}))::int`,
+        bytes: sql<string>`coalesce(sum(${transcriptions.byteSize}) filter (where not ${parked}), 0)::text`,
+      }).from(transcriptions).where(inArray(transcriptions.status, [...ACTIVE_STATUSES]));
       const limits = ctx.config.limits;
       if (Number(totals!.jobs) >= limits.maxActiveJobs || Number(totals!.bytes) + input.byte_size > limits.maxReservedBytes) {
         throw new BatchError("service_busy", "The service is at capacity; try again later", { retry_after_seconds: 60 });
@@ -332,8 +340,9 @@ export async function serializeJob(ctx: BatchContext, job: TranscriptionRow) {
     : job.deletionState === "pending" ? "deletion_pending"
       : job.status === "awaiting_upload" ? "not_received" : "stored";
   // Waiting on a blocked provider (billing, quota or key): the job is neither failed nor stuck. Absent otherwise.
-  const providerDelayed = (job.status === "queued" || job.status === "processing")
-    && (await ctx.db.select({ id: transcriptionProviderBlocks.transcriptionId }).from(transcriptionProviderBlocks).where(eq(transcriptionProviderBlocks.transcriptionId, job.id))).length > 0;
+  const providerDelayed = job.status === "queued"
+    && (await ctx.db.select({ id: transcriptionProviderBlocks.transcriptionId }).from(transcriptionProviderBlocks)
+      .where(and(eq(transcriptionProviderBlocks.transcriptionId, job.id), gt(transcriptionProviderBlocks.nextAttemptAt, sql`now()`)))).length > 0;
   return {
     id: job.id,
     object: "transcription",
