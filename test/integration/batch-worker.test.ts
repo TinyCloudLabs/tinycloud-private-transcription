@@ -592,14 +592,14 @@ describe("provider outcomes", () => {
       if (++n <= 2) { const e = new Error("refused") as Error & { code: string }; e.code = "ConnectionRefused"; throw e; }
       return Response.json({ text: "ok" });
     };
-    const id = await h.submit(await audio("mono_wav"), { contentType: "audio/wav" });
+    const id = await h.submit(await audio("stereo"));
     await h.work();
     expect((await h.row(id)).status).toBe("completed");
     expect((await attempts(id)).filter((a) => a.status === "not_sent").length).toBe(2);
 
     h.tinfoil.calls = [];
     h.tinfoil.handler = () => { const e = new Error("refused") as Error & { code: string }; e.code = "ConnectionRefused"; throw e; };
-    const waiting = await h.submit(await audio("mono_wav"), { tenant: TENANT_B, contentType: "audio/wav" });
+    const waiting = await h.submit(await audio("stereo"), { tenant: TENANT_B });
     await h.work();
     expect(h.tinfoil.calls.length).toBe(5);
     expect(await h.row(waiting)).toMatchObject({ status: "queued", errorCode: null });
