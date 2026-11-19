@@ -64,10 +64,10 @@ gh workflow run deploy-batch.yml -R $R --ref main -f confirm=ptx-batch
   admission `closed` (migration 0018) and must report `closed` to the admin key before `{"mode":"open"}`. A failed
   create leaves admission closed. Record the CVM id it prints:
   `gh variable set PTX_BATCH_CVM_ID --env ptx-batch -R $R --body <id>`.
-- **Update**: `PUT /v1/admin/admission {"mode":"drain"}` → wait until `awaiting_upload + queued + processing = 0` →
-  `phala deploy --cvm-id … --wait` → allowed_envs sync → health gate (`/health/live`, then
-  `checks.upload_transcription.ready`) → admission gate (reports `drain`) → `{"mode":"open"}`. A drain response without
-  three non-negative integer counts fails the run (never read as drained).
+- **Update**: destructive-migration gate (below) → `PUT /v1/admin/admission {"mode":"drain"}` → wait until
+  `awaiting_upload + queued + processing = 0` → `phala deploy --cvm-id … --wait` → allowed_envs sync → health gate
+  (`/health/live`, then `checks.upload_transcription.ready`) → admission gate (reports `drain`) → `{"mode":"open"}`. A
+  drain response without three non-negative integer counts fails the run (never read as drained).
 - **Sizing `drain_timeout_minutes`** (1–300, default 130): an accepted create may upload for up to 120 min, then jobs
   process one at a time, each bounded by the 240-min processing ceiling but typically far shorter. The worst case is
   `120 + (awaiting_upload + queued + processing) × 240` minutes; the run prints it at drain start and warns when the
@@ -236,6 +236,55 @@ only changes the admission default (and closes a fresh install's seed row), so a
 newer schema. **Never purge the volumes** while any job has
 `deletion_state='pending'` or is still active: the deletion ledger lives in that Postgres and reconciles on the next
 boot (the sweeper retries pending deletions and removes unauthorized files).
+
+## Destructive migrations (TC-3490)
+
+ptx-batch keeps no database backup (next section), so the gate is what stops a migration that destroys data. It covers
+ptx-dev too: both run the same `src/db/migrations` at api boot.
+
+- **CI** (`bun scripts/migration-gate.ts check`): a migration from 0032 on fails the build unless it carries the line
+  `-- destructive: TC-NNNN` when it contains any of: DROP (TABLE, COLUMN, INDEX, CONSTRAINT or any other object;
+  DROP NOT NULL and DROP DEFAULT are fine), TRUNCATE, DELETE, UPDATE (with or without WHERE), RENAME (column, table,
+  constraint), a column type change, or SET NOT NULL. The marker only flags the migration; it never lets it deploy.
+- **Deploy**: before the drain, the workflow reads the api image commit the CVM runs now
+  (`.github/scripts/phala-live-image.mjs`) and refuses to deploy if the pinned commit adds a destructive (scanned or
+  marked) migration over it. The only bypass is the `destructive_migration_ack` input, set to exactly those migration
+  names, comma-separated, and it needs its own GO:
+  `gh workflow run deploy-batch.yml -R $R --ref main -f confirm=ptx-batch -f destructive_migration_ack=0034_drop_x`.
+  Before asking for that GO, drain until no completed transcript is waiting to be fetched: the migration may destroy
+  it, and nothing restores it. ptx-dev's `infra/dstack/deploy-ptx-dev.sh` runs the same gate; its ack is
+  `DESTRUCTIVE_MIGRATION_ACK=0034_drop_x`.
+
+## Recovering from a lost database (TC-3490)
+
+Everything ptx-batch needs to serve comes from its sealed environment and its image, not from its Postgres, so there
+is no database backup to restore. These statements are about the batch role and the ptx-batch CVM only (ptx-dev holds
+user recordings and transcripts and has its own backup plan under TC-3490):
+
+- Projects and API keys: every boot upserts each `PTX_BOOTSTRAP_KEYS` entry and its project, and deletes every
+  bootstrap-managed key not listed (`src/api/bootstrap-keys.ts` `syncBootstrapKeys`). **Keys made with `create-key` are
+  not rebuilt**: they exist only in the lost database. ptx-batch has no SSH, so it normally has none; any that did
+  exist must be minted again.
+- Admission starts `closed` on a fresh database (migration 0018); the deploy's final gate opens it.
+- Migrations seed the singleton rows (`transcription_admission`, `provider_dispatch_slots`, `tinfoil_dispatch_slots`).
+- `projects.webhook_secret` is regenerated; the batch role never sends webhooks.
+- **Lost for good, by design**: every job record, any completed transcript not yet fetched, and the per-day usage
+  counts. A `GET` on a job id from before the loss returns 404 `transcription_not_found`; callers resubmit.
+
+`test/integration/batch-empty-db-recovery.test.ts` runs that boot against an empty database.
+
+1. Close admission if the API still answers (`PUT /v1/admin/admission {"mode":"closed"}`); otherwise go to step 2.
+2. Get a GO to replace the Postgres volume. If the upload volume survives, keep it: at boot the sweeper removes every
+   audio file with no ledger row, so no recording outlives its job.
+3. Decide whether to rotate the keys. If the old database may have leaked, mint new ones
+   (`bun scripts/mint-bootstrap-keys.ts`, see Setup), update `PTX_BOOTSTRAP_KEYS` and `PTX_BATCH_ADMIN_KEY` in the
+   `ptx-batch` Environment, and give TinyChat its new key. The next boot deletes every bootstrap key not listed.
+4. Recreate the CVM with an empty volume: delete it (owner GO), unset `PTX_BATCH_CVM_ID`, and dispatch the deploy
+   workflow; the create path deploys, health-gates, checks admission reports `closed`, and opens it. Record the new id
+   (`gh variable set PTX_BATCH_CVM_ID …`).
+5. A `create-key` key the old database held is gone. Replace it with a `PTX_BOOTSTRAP_KEYS` entry (step 3) and hand
+   the new key to its owner.
+6. Verify (plan V3), and record in the incident ticket what was lost: job count, if known, and the time window.
 
 ## Monitoring
 

@@ -4,6 +4,10 @@
 #   npm ci --ignore-scripts --no-audit --no-fund --prefix .github/scripts   # pinned phala CLI + SDK, once
 #   PHALA_CLOUD_API_KEY=... infra/dstack/deploy-ptx-dev.sh [env-file]          # default infra/dstack/.env
 #
+# Before any change it refuses an api image whose migrations include a destructive one ptx-dev has not run (TC-3490;
+# scripts/migration-gate.ts), unless DESTRUCTIVE_MIGRATION_ACK names exactly those migrations, comma-separated. That
+# ack needs its own GO: ptx-dev holds user recordings and transcripts. The live commit must be in this checkout.
+#
 # Fails closed, before any change, unless the CVM runs the pinned production OS image. The same check runs
 # again, against the resolved CVM id, right after `phala deploy` and after the allowed_envs sync (even if
 # either failed); any failure exits non-zero. The Phala KMS only releases the app keys to that image. This
@@ -47,6 +51,14 @@ require_production_os() {
 CVM_ID=
 require_production_os "$CVM_NAME" "before deploy"
 docker compose -f "$COMPOSE" --env-file "$ENV_FILE" config --quiet
+
+IMAGE_REPO=ghcr.io/tinycloudlabs/tinycloud-private-transcription/api
+pinned="$(grep -E "^ +image: ${IMAGE_REPO}:[0-9a-f]{40}@sha256:[0-9a-f]{64}$" "$COMPOSE" | sed -E 's/.*:([0-9a-f]{40})@.*/\1/' | sort -u)"
+[[ "$pinned" =~ ^[0-9a-f]{40}$ ]] || fail "$COMPOSE must pin every $IMAGE_REPO image to one commit and digest"
+live="$(PHALA_CVM_ID="$CVM_ID" IMAGE_REPO="$IMAGE_REPO" node .github/scripts/phala-live-image.mjs)" \
+  || fail "could not read the live api image of $CVM_NAME"
+env -u PHALA_CLOUD_API_KEY bun scripts/migration-gate.ts deploy "$live" "$pinned" "${DESTRUCTIVE_MIGRATION_ACK:-}" \
+  || fail "destructive-migration gate refused the deploy (TC-3490); nothing was changed"
 
 rc=0
 "$PHALA" deploy --cvm-id "$CVM_ID" -c "$COMPOSE" -e "$ENV_FILE" \
