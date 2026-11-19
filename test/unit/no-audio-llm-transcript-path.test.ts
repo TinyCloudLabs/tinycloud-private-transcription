@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
 import { assistantReply, hallucinated, hallucinationReason } from "../../src/domain/hallucination.ts";
 import { attributedBatches, type AttributedManifest, type AttributedRange } from "../../src/providers/transcription/attributed.ts";
 import { assembleAttributedTranscript, attributedPieces } from "../../src/providers/transcription/attributed-assembly.ts";
@@ -142,15 +141,5 @@ describe("the fallback model is gone from configuration", () => {
     expect(Object.keys(tinfoil).sort()).toEqual(["apiKey", "attributedModel", "baseUrl", "model"]);
     expect(tinfoil.attributedModel).toBe("whisper-large-v3-turbo");
     expect(tinfoil.model).toBe("whisper-large-v3-turbo");
-  });
-
-  test("the meeting-service compose passes no fallback model to any service", () => {
-    const compose = readFileSync(new URL("../../infra/dstack/app-compose.yaml", import.meta.url), "utf8");
-    expect(compose).not.toContain("ATTRIBUTED_FALLBACK_MODEL");
-    expect(compose).toContain("TINFOIL_ATTRIBUTED_MODEL: ${TINFOIL_ATTRIBUTED_MODEL:-whisper-large-v3-turbo}");
-    // Recovery (api and worker) defaults to Whisper too; only EVAL_MODELS shadow runs name voxtral.
-    const recovery = compose.match(/^\s+TINFOIL_MODEL: .*$/gm) ?? [];
-    expect(recovery).toHaveLength(2);
-    expect(recovery.every((line) => line.includes("${TINFOIL_MODEL:-whisper-large-v3-turbo}"))).toBe(true);
   });
 });

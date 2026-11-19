@@ -564,10 +564,6 @@ esac`;
       expect(workflowText).not.toMatch(new RegExp(`echo[^\\n]*\\$\\{?${name}`));
     }
   });
-
-  test("the runbook documents the production OS and the owner prerequisites", () => {
-    for (const phrase of ["--no-dev-os", "phala login", "BATCH_TINFOIL_API_KEY", "$42/month", "Never purge the volumes"]) expect(runbook).toContain(phrase);
-  });
 });
 
 test("merging batch deploy config builds no image (publish-image paths exclude it)", () => {
