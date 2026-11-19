@@ -117,6 +117,8 @@ production window. Green 2/2 on 2026-08-17 (~2 min each; evidence in `tmp/e2e-<r
 It needs only Postgres, ffmpeg and (for `diarize: true`) the bundled sherpa-onnx diarization program; it never talks to Vexa,
 Redis or Signal, and it mounts no meeting route. The meeting role (default) mounts none of its routes.
 
+A recording still queued 72 hours after upload expires, even if transcription never started. The cleanup sweep deletes its audio and retries any deletion that fails.
+
 ```bash
 export PTX_ROLE=batch BATCH_UPLOAD_DIR=$PWD/tmp/uploads BATCH_TINFOIL_API_KEY=…   # a dedicated batch credential
 bun run api                       # migrates; serves /health, /v1/transcriptions*, /v1/admin/*, PUT /uploads/{id}
