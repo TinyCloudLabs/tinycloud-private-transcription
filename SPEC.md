@@ -376,7 +376,7 @@ request is in flight at any time. Outcomes:
 | 404 | `provider_unavailable` + alert (wrong URL or model: a deploy fault) |
 | timeout, reset, 5xx, other status, unparseable body, worker died while admitted | attempt `ambiguous`, **never re-sent** → `provider_outcome_unknown` |
 
-While a job waits after a provider refusal or provably-unsent outage, its uploaded audio stays on the batch volume. The hard 72 h deadline is measured from the earlier of upload or first block and is enforced by the sweeper even when a queued job is not claimable. At the deadline the job fails through the normal terminal cleanup path.
+While a job waits after a provider refusal or provably-unsent outage, its uploaded audio stays on the batch volume. The hard 72 h deadline is measured from the earlier of upload or first block and is enforced by the sweeper even when a queued job is not claimable, and also ends a woken wait that is still processing at the deadline (its processing ceiling never extends it). At the deadline the job fails through the normal terminal cleanup path.
 
 
 A worker that dies before any admission is requeued (regions and completed results kept; ≤ 3 claims → `processing_failed`).
