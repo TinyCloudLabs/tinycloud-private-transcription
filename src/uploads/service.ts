@@ -215,7 +215,7 @@ export async function createTranscription(
       }
       // Any new job may end up waiting, so admission requires room for it in the waiting budget too.
       if (Number(totals!.waitingBytes) + input.byte_size > limits.maxWaitingBytes) {
-        throw new BatchError("service_busy", "The service is holding the maximum audio for a provider outage; try again later", { retry_after_seconds: 300 });
+        throw new BatchError("service_busy", "The service is busy during a provider outage. Try again in 5 minutes.", { retry_after_seconds: 300 });
       }
 
       const day = utcDay();

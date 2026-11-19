@@ -494,7 +494,7 @@ async function settleDispatch(
         .where(eq(transcriptions.id, fence.id));
       if (!state?.uploadedAt) return "lost" as const;
       if (state.deadlineExpired) {
-        return fail("provider_unavailable", "The transcription provider stayed unavailable for too long", "failed");
+        return fail("provider_unavailable", "The transcription provider was unavailable for 72 hours, so this recording wasn't transcribed. Upload it again to try again.", "failed");
       }
       const schedule = w.providerBlockBackoffSeconds;
       const attempts = state.attempts ?? 0;

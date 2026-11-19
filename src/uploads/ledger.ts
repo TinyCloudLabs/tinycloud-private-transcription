@@ -188,7 +188,7 @@ export async function runSweep(ctx: BatchContext): Promise<void> {
       ctx.db.select({ id: transcriptionProviderBlocks.transcriptionId }).from(transcriptionProviderBlocks)
         .innerJoin(transcriptions, eq(transcriptions.id, transcriptionProviderBlocks.transcriptionId))
         .where(and(eq(transcriptionProviderBlocks.transcriptionId, id), eq(transcriptions.status, "queued"), providerWaitExpired()))));
-    const row = await terminalize(ctx.db, id, deadlineGuard!, "failed", { code: "provider_unavailable", message: "The transcription provider stayed unavailable for too long" });
+    const row = await terminalize(ctx.db, id, deadlineGuard!, "failed", { code: "provider_unavailable", message: "The transcription provider was unavailable for 72 hours, so this recording wasn't transcribed. Upload it again to try again." });
     if (row) await cleanupJobFiles(ctx, id);
   }
   // 5. Claims whose owner died.

@@ -80,7 +80,7 @@ describe("jobs waiting on a provider outage and the service-wide capacity", () =
     // Two waiting jobs hold exactly the budget; the global job and byte limits are untouched.
     const full = await h.create(bytes, { tenant: tenant(3), ...wav });
     expect(full.status).toBe(429);
-    expect((await full.json()).error.code).toBe("service_busy");
+    expect((await full.json()).error).toMatchObject({ code: "service_busy", message: "The service is busy during a provider outage. Try again in 5 minutes.", retry_after_seconds: 300 });
 
     h.ctx.config.limits.maxWaitingBytes = bytes.byteLength * 3;
     expect((await h.create(bytes, { tenant: tenant(3), ...wav })).status).toBe(201);
