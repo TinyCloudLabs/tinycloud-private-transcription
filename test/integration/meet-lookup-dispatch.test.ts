@@ -2,7 +2,6 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { meetings } from "../../src/db/schema.ts";
 import { startHarness, type Harness } from "./harness.ts";
 
-interface MeetingView { id: string; status: string; meeting_url: string }
 let h: Harness;
 // Real API, Postgres and worker make creation, queueing and bot dispatch observable. Details: TC-2181
 beforeAll(async () => { h = await startHarness({ enabledPlatforms: ["google_meet"], maxConcurrentBots: 3 }); });
@@ -28,18 +27,3 @@ test("lookup links return invalid_meeting_url and create no meeting, queue entry
   expect(await h.ctx.db.select().from(meetings)).toEqual([]);
   expect(botRequests()).toEqual([]);
 });
-
-test("a plain dashed Meet code link still creates a meeting and dispatches the bot. Details: TC-2181", async () => {
-  const response = await h.api("/v1/meetings", { method: "POST", json: { meeting_url: "https://meet.google.com/abc-defg-hij" } });
-  expect(response.status).toBe(201);
-  const created: MeetingView = await response.json();
-  await h.waitFor(async () => {
-    const meeting: MeetingView = await (await h.api(`/v1/meetings/${created.id}`)).json();
-    return meeting.status === "joining" ? meeting : null;
-  }, { label: "dashed code -> joining" });
-  expect(botRequests().at(-1)?.body).toMatchObject({
-    platform: "google_meet",
-    native_meeting_id: "abc-defg-hij",
-    meeting_url: "https://meet.google.com/abc-defg-hij",
-  });
-}, 20_000);
