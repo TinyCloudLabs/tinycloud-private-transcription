@@ -5,14 +5,18 @@
 # that loader. Nothing else uses it.
 FROM oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f AS sherpa-onnx
 WORKDIR /build
+# onnxruntime.LICENSE and onnxruntime.ThirdPartyNotices.txt are vendored in third_party/onnxruntime and verified by the sha256 check
+# below; the build makes no network fetch for them.
+# notices taken from onnxruntime 1.28.0 wheel https://files.pythonhosted.org/packages/95/df/5486ab03e9be288d5268867054c8b04bebcf95bfd12e801c05cc67703dab/onnxruntime-1.28.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl 0a83bdb70d143cede762b677789bf2a7acca54b3fb82565601d5c30695aa933c; the bundled binary is 1.28.2; the upstream repo was unreachable on 2026-11-19
+# sha256 identical to the previous v1.28.2 pins (Dockerfile:22-23 on main), so the content is the same as the v1.28.2 files.
+COPY third_party/onnxruntime/LICENSE ./onnxruntime.LICENSE
+COPY third_party/onnxruntime/ThirdPartyNotices.txt ./onnxruntime.ThirdPartyNotices.txt
 RUN set -eu; \
     release=https://github.com/k2-fsa/sherpa-onnx/releases/download; \
     wget -q -O sherpa-onnx.tar.bz2 "$release/v1.13.8/sherpa-onnx-v1.13.8-linux-x64-shared-no-tts.tar.bz2"; \
     wget -q -O segmentation.tar.bz2 "$release/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"; \
     wget -q -O embedding.onnx "$release/speaker-recongition-models/nemo_en_titanet_small.onnx"; \
     wget -q -O sherpa-onnx.LICENSE https://raw.githubusercontent.com/k2-fsa/sherpa-onnx/v1.13.8/LICENSE; \
-    wget -q -O onnxruntime.LICENSE https://raw.githubusercontent.com/microsoft/onnxruntime/v1.28.2/LICENSE; \
-    wget -q -O onnxruntime.ThirdPartyNotices.txt https://raw.githubusercontent.com/microsoft/onnxruntime/v1.28.2/ThirdPartyNotices.txt; \
     wget -q -O NeMo.LICENSE https://raw.githubusercontent.com/NVIDIA/NeMo/v1.19.0/LICENSE; \
     printf '%s  %s\n' \
       d0f96c8b65c6cd0974fada22737e337de81bc8cd2abbec2e39caf358b1eec5fc sherpa-onnx.tar.bz2 \
