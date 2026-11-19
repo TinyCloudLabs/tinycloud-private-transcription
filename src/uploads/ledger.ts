@@ -177,21 +177,24 @@ export async function runSweep(ctx: BatchContext): Promise<void> {
     const row = await terminalize(ctx.db, id, eq(transcriptions.status, "processing"), "failed", { code: "processing_timeout", message: "Processing exceeded the maximum duration" });
     if (row) await cleanupJobFiles(ctx, id);
   }
-  // 4. Provider waits have an absolute deadline from the earlier of upload and first block. It also ends a woken
-  //    wait that is processing (its block row stays until it ends), so audio is never kept past the deadline while
-  //    a late claim runs toward the processing ceiling. The generation bump fences out that worker.
-  const providerWaitExpired = () => sql`least(${transcriptionProviderBlocks.blockedSince}, ${transcriptions.uploadedAt}) <= now() - ${ctx.config.worker.providerBlockMaxSeconds} * interval '1 second'`;
-  const waitStatuses = ["queued", "processing"] as const;
-  const expiredProviderWaits = await ctx.db.select({ id: transcriptionProviderBlocks.transcriptionId })
-    .from(transcriptionProviderBlocks)
-    .innerJoin(transcriptions, eq(transcriptions.id, transcriptionProviderBlocks.transcriptionId))
-    .where(and(inArray(transcriptions.status, [...waitStatuses]), providerWaitExpired()));
-  for (const { id } of expiredProviderWaits) {
-    const deadlineGuard = and(inArray(transcriptions.status, [...waitStatuses]), inArray(transcriptions.id,
-      ctx.db.select({ id: transcriptionProviderBlocks.transcriptionId }).from(transcriptionProviderBlocks)
-        .innerJoin(transcriptions, eq(transcriptions.id, transcriptionProviderBlocks.transcriptionId))
-        .where(and(eq(transcriptionProviderBlocks.transcriptionId, id), inArray(transcriptions.status, [...waitStatuses]), providerWaitExpired()))));
-    const row = await terminalize(ctx.db, id, deadlineGuard!, "failed", { code: "provider_unavailable", message: "The transcription provider was unavailable for 72 hours, so this recording wasn't transcribed. Upload it again to try again." });
+  // 4. Every queued job expires 72 h after upload, even without a provider block. Provider waits also
+  //    expire from an earlier first block, including woken waits that are processing. Recheck the same
+  //    predicate at terminalization so a concurrent claim/cancel cannot be overwritten.
+  const retentionExpired = or(
+    and(eq(transcriptions.status, "queued"), sql`${transcriptions.uploadedAt} <= now() - ${ctx.config.worker.providerBlockMaxSeconds} * interval '1 second'`),
+    and(inArray(transcriptions.status, ["queued", "processing"]), sql`exists (
+      select 1 from transcription_provider_blocks b where b.transcription_id = ${transcriptions.id}
+        and least(b.blocked_since, ${transcriptions.uploadedAt}) <= now() - ${ctx.config.worker.providerBlockMaxSeconds} * interval '1 second'
+    )`),
+  )!;
+  const expiredQueued = await ctx.db.select({
+    id: transcriptions.id,
+    providerBlocked: sql<boolean>`exists (select 1 from transcription_provider_blocks b where b.transcription_id = ${transcriptions.id})`,
+  }).from(transcriptions).where(retentionExpired);
+  for (const { id, providerBlocked } of expiredQueued) {
+    const row = await terminalize(ctx.db, id, retentionExpired, "failed", providerBlocked
+      ? { code: "provider_unavailable", message: "The transcription provider was unavailable for 72 hours, so this recording wasn't transcribed. Upload it again to try again." }
+      : { code: "processing_timeout", message: "This recording wasn't transcribed within 72 hours of upload. Upload it again to transcribe it." });
     if (row) await cleanupJobFiles(ctx, id);
   }
   // 5. Claims whose owner died.

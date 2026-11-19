@@ -40,6 +40,7 @@ export async function claimNext(ctx: BatchContext): Promise<Claim | null> {
     if (busy) return null;
     const [next] = await tx.select({ id: transcriptions.id }).from(transcriptions)
       .where(and(eq(transcriptions.status, "queued"), eq(transcriptions.tombstoned, false),
+        sql`${transcriptions.uploadedAt} > now() - ${ctx.config.worker.providerBlockMaxSeconds} * interval '1 second'`,
         sql`not exists (${tx.select({ one: sql`1` }).from(transcriptionProviderBlocks)
           .where(and(eq(transcriptionProviderBlocks.transcriptionId, transcriptions.id), gt(transcriptionProviderBlocks.nextAttemptAt, sql`now()`)))})`,
         sql`(not exists (select 1 from transcription_provider_blocks pb where pb.transcription_id = ${transcriptions.id}) or (
@@ -62,7 +63,8 @@ export async function claimNext(ctx: BatchContext): Promise<Claim | null> {
       claimCount: sql`${transcriptions.claimCount} + 1`,
       processingStartedAt: sql`coalesce(${transcriptions.processingStartedAt}, now())`,
       updatedAt: sql`now()`,
-    }).where(and(eq(transcriptions.id, next.id), eq(transcriptions.status, "queued"), eq(transcriptions.tombstoned, false))).returning();
+    }).where(and(eq(transcriptions.id, next.id), eq(transcriptions.status, "queued"), eq(transcriptions.tombstoned, false),
+      sql`${transcriptions.uploadedAt} > now() - ${ctx.config.worker.providerBlockMaxSeconds} * interval '1 second'`)).returning();
     if (!job) return null;
     return { job, fence: { id: job.id, token, generation: job.generation } };
   });
