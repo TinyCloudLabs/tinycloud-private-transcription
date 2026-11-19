@@ -133,6 +133,7 @@ bun run cli create-key --project tinychat --scopes 'transcriptions:*'
 | `BATCH_VAD_QUIET_MODE` | `true` | trimmed, case-insensitive `false` rolls back quiet detection to TC-1090's primary/−57 dBFS fallback paths; unknown non-empty values enable quiet mode with a warning naming the variable; set on the batch worker |
 | `BATCH_MAX_ACTIVE_JOBS` | `10` | service-wide awaiting_upload + queued + processing |
 | `BATCH_MAX_RESERVED_BYTES` | `1864968000` | service-wide declared bytes of those jobs (10 × the 186,496,800-byte cap) |
+| `BATCH_MAX_WAITING_BYTES` | `1864968000` | service-wide declared bytes of jobs waiting on a provider outage (retryable up to 72 h). Those jobs leave the two limits above and keep their per-tenant slot; a create is refused `service_busy` when its bytes would not fit under this cap |
 | `BATCH_MAX_CONCURRENT_UPLOADS` | `3` | service-wide live PUTs |
 | `BATCH_DISK_HIGH_WATER_PERCENT` | `80` | creates and PUTs refused at or above this volume usage |
 | `BATCH_TENANT_DAILY_BYTES` | `559490400` | per tenant per UTC day (3 × cap) |

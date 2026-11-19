@@ -154,8 +154,9 @@ export interface CreateResult {
  * transcription_admission row lock, so concurrent creates are serialized and every bound is exact:
  *   - admission mode must be open
  *   - one active job per (project, tenant_ref) (also a partial unique index)
- *   - service-wide active jobs (awaiting_upload + queued + processing) <= maxActiveJobs
+ *   - service-wide active jobs (awaiting_upload + queued + processing), excluding jobs waiting on a provider block, <= maxActiveJobs
  *   - service-wide declared bytes of those jobs + byte_size <= maxReservedBytes
+ *   - declared bytes of jobs waiting on a provider block + byte_size <= maxWaitingBytes
  *   - tenant daily bytes (conditional UPDATE) <= tenantDailyBytes
  * The reservation is the job row itself: it is released only by a terminal transition (terminalize).
  */
@@ -199,11 +200,22 @@ export async function createTranscription(
         .where(and(eq(transcriptions.projectId, projectId), eq(transcriptions.tenantRef, tenantRef), inArray(transcriptions.status, [...ACTIVE_STATUSES]))).limit(1);
       if (active) throw new BatchError("active_transcription_exists", "This account already has a transcription in progress", { id: active.id });
 
-      const [totals] = await tx.select({ jobs: sql<number>`count(*)::int`, bytes: sql<string>`coalesce(sum(${transcriptions.byteSize}), 0)::text` })
-        .from(transcriptions).where(inArray(transcriptions.status, [...ACTIVE_STATUSES]));
+      // A job parked behind a provider outage (it has a transcription_provider_blocks row) keeps its per-tenant slot above but
+      // leaves the service-wide job and reserved-byte bounds, so one provider outage cannot turn every create into service_busy
+      // for 72 h. The audio such jobs hold on disk is bounded separately by maxWaitingBytes.
+      const waiting = sql`exists (select 1 from ${transcriptionProviderBlocks} where ${transcriptionProviderBlocks.transcriptionId} = ${transcriptions.id})`;
+      const [totals] = await tx.select({
+        jobs: sql<number>`(count(*) filter (where not ${waiting}))::int`,
+        bytes: sql<string>`coalesce(sum(${transcriptions.byteSize}) filter (where not ${waiting}), 0)::text`,
+        waitingBytes: sql<string>`coalesce(sum(${transcriptions.byteSize}) filter (where ${waiting}), 0)::text`,
+      }).from(transcriptions).where(inArray(transcriptions.status, [...ACTIVE_STATUSES]));
       const limits = ctx.config.limits;
       if (Number(totals!.jobs) >= limits.maxActiveJobs || Number(totals!.bytes) + input.byte_size > limits.maxReservedBytes) {
         throw new BatchError("service_busy", "The service is at capacity; try again later", { retry_after_seconds: 60 });
+      }
+      // Any new job may end up waiting, so admission requires room for it in the waiting budget too.
+      if (Number(totals!.waitingBytes) + input.byte_size > limits.maxWaitingBytes) {
+        throw new BatchError("service_busy", "The service is holding the maximum audio for a provider outage; try again later", { retry_after_seconds: 300 });
       }
 
       const day = utcDay();
