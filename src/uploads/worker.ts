@@ -508,7 +508,7 @@ async function settleDispatch(
       }
       if (state.blockedSince === null) {
         // A job entering the wait must fit in the waiting-audio budget (jobs already waiting or being retried hold theirs).
-        // When it does not, the outage fails it as it did before waits existed, and its audio is deleted.
+        // When it does not, the outage fails it and its audio is deleted.
         const [held] = await tx.select({ bytes: sql<string>`coalesce(sum(${transcriptions.byteSize}), 0)::text` }).from(transcriptions)
           .innerJoin(transcriptionProviderBlocks, eq(transcriptionProviderBlocks.transcriptionId, transcriptions.id))
           .where(and(inArray(transcriptions.status, ["queued", "processing"]), ne(transcriptions.id, fence.id)));
