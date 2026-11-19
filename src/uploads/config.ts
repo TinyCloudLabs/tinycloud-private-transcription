@@ -44,7 +44,7 @@ export interface BatchConfig {
     maxActiveJobs: number;
     /** Service-wide sum of declared byte_size over the same active set. Bounds temp + accepted audio on disk. */
     maxReservedBytes: number;
-    /** Service-wide sum of declared byte_size over jobs waiting on a provider outage (retryable, up to 72 h). They are not in maxActiveJobs/maxReservedBytes; this bounds the audio they hold on disk. */
+    /** Service-wide sum of declared byte_size over jobs waiting on a provider outage (retryable, up to 72 h). They hold no slot under maxActiveJobs/maxReservedBytes; a job that would enter the wait past this bound fails provider_unavailable. */
     maxWaitingBytes: number;
     /** Service-wide PUTs holding a live upload lease. */
     maxConcurrentUploads: number;

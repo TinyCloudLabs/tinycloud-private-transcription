@@ -1,4 +1,4 @@
-import { and, asc, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, ne, sql } from "drizzle-orm";
 import { mkdir, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { config as processConfig } from "../config.ts";
@@ -25,6 +25,10 @@ export interface Claim {
 /**
  * Claims the oldest queued job, but only while no job is processing: one job end-to-end at a time,
  * service-wide. Serialized on the admission row; `closed` admission stops new claims.
+ *
+ * A job whose provider wait has ended is still queued, and holds no service-wide slot while parked. It is claimable
+ * only when it fits under maxActiveJobs and maxReservedBytes alongside the jobs that do hold one (admission uses the
+ * same definition), so a wake never takes the service past either bound; until then it stays queued.
  */
 export async function claimNext(ctx: BatchContext): Promise<Claim | null> {
   if (!ctx.provider) return null;
@@ -38,6 +42,11 @@ export async function claimNext(ctx: BatchContext): Promise<Claim | null> {
       .where(and(eq(transcriptions.status, "queued"), eq(transcriptions.tombstoned, false),
         sql`not exists (${tx.select({ one: sql`1` }).from(transcriptionProviderBlocks)
           .where(and(eq(transcriptionProviderBlocks.transcriptionId, transcriptions.id), gt(transcriptionProviderBlocks.nextAttemptAt, sql`now()`)))})`,
+        sql`(not exists (select 1 from transcription_provider_blocks pb where pb.transcription_id = ${transcriptions.id}) or (
+          (select count(*) from transcriptions t2 where t2.status in ('awaiting_upload', 'queued', 'processing')
+            and not (t2.status = 'queued' and exists (select 1 from transcription_provider_blocks b2 where b2.transcription_id = t2.id))) < ${ctx.config.limits.maxActiveJobs}
+          and (select coalesce(sum(t3.byte_size), 0) from transcriptions t3 where t3.status in ('awaiting_upload', 'queued', 'processing')
+            and not (t3.status = 'queued' and exists (select 1 from transcription_provider_blocks b3 where b3.transcription_id = t3.id))) + ${transcriptions.byteSize} <= ${ctx.config.limits.maxReservedBytes}))`,
         sql`not exists (${tx.select({ one: sql`1` }).from(transcriptionProviderBlocks)
           .where(and(eq(transcriptionProviderBlocks.transcriptionId, transcriptions.id),
             sql`least(${transcriptionProviderBlocks.blockedSince}, ${transcriptions.uploadedAt}) <= now() - ${ctx.config.worker.providerBlockMaxSeconds} * interval '1 second'`))})`))
@@ -487,6 +496,7 @@ async function settleDispatch(
         attempts: transcriptionProviderBlocks.attempts,
         lastStatus: transcriptionProviderBlocks.lastStatus,
         uploadedAt: transcriptions.uploadedAt,
+        byteSize: transcriptions.byteSize,
         databaseNow: sql<Date>`now()`.mapWith(transcriptions.uploadedAt),
         deadlineAt: deadlineAt().mapWith(transcriptions.uploadedAt),
         deadlineExpired: sql<boolean>`now() >= ${deadlineAt()}`,
@@ -495,6 +505,16 @@ async function settleDispatch(
       if (!state?.uploadedAt) return "lost" as const;
       if (state.deadlineExpired) {
         return fail("provider_unavailable", "The transcription provider was unavailable for 72 hours, so this recording wasn't transcribed. Upload it again to try again.", "failed");
+      }
+      if (state.blockedSince === null) {
+        // A job entering the wait must fit in the waiting-audio budget (jobs already waiting or being retried hold theirs).
+        // When it does not, the outage fails it as it did before waits existed, and its audio is deleted.
+        const [held] = await tx.select({ bytes: sql<string>`coalesce(sum(${transcriptions.byteSize}), 0)::text` }).from(transcriptions)
+          .innerJoin(transcriptionProviderBlocks, eq(transcriptionProviderBlocks.transcriptionId, transcriptions.id))
+          .where(and(inArray(transcriptions.status, ["queued", "processing"]), ne(transcriptions.id, fence.id)));
+        if (Number(held!.bytes) + state.byteSize > ctx.config.limits.maxWaitingBytes) {
+          return fail("provider_unavailable", "The transcription provider is unavailable", "failed");
+        }
       }
       const schedule = w.providerBlockBackoffSeconds;
       const attempts = state.attempts ?? 0;

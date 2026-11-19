@@ -255,10 +255,12 @@ States: `awaiting_upload → queued → processing → completed`; terminal `fai
   `BATCH_MAX_RESERVED_BYTES` declared bytes → `429 service_busy`. The job row is the reservation; only a terminal
   transition releases it. Since every upload is capped at its declared size and the worker processes one job at a
   time, this also bounds temp + accepted audio on disk.
-- Jobs waiting on a provider outage (a `transcription_provider_blocks` row, retryable for up to 72 h) keep their
-  per-tenant slot but leave the service-wide job and byte reservation above, so one outage does not make every
-  create `service_busy`. The audio they hold is bounded separately: a create whose `byte_size` would push the
-  waiting jobs' declared bytes over `BATCH_MAX_WAITING_BYTES` → `429 service_busy`.
+- Jobs waiting on a provider outage (queued with a `transcription_provider_blocks` row, retryable for up to 72 h) keep
+  their per-tenant slot but hold no slot under the service-wide job and byte reservation above, so one outage does not
+  make every create `service_busy`. When a wait ends, the job queues for a slot again: it is claimed only when it fits
+  under `BATCH_MAX_ACTIVE_JOBS` and `BATCH_MAX_RESERVED_BYTES` with the jobs that hold one. The audio waiting jobs
+  hold is bounded separately: a job that would enter the wait while the waiting jobs' declared bytes plus its own
+  exceed `BATCH_MAX_WAITING_BYTES` fails `provider_unavailable`, and its audio is deleted.
 - Upload volume at or above `BATCH_DISK_HIGH_WATER_PERCENT` → `429 service_busy` for creates and PUTs (alert log).
 - Tenant daily bytes (UTC day), charged at create by a conditional `UPDATE` → `429 quota_exceeded`.
 - No live worker heartbeat (30 s) or no provider credential → `503 service_unavailable`.
