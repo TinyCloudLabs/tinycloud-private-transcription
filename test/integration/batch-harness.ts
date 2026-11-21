@@ -209,11 +209,13 @@ export async function audio(kind: Fixture): Promise<Uint8Array> {
   const args: Record<Fixture, string[]> = {
     stereo: [...STEREO, "-map", "[out]", "-ar", "44100", "-c:a", "libmp3lame", "-b:a", "128k"],
     stereo_m4a: [...STEREO, "-map", "[out]", "-ar", "44100", "-c:a", "aac", "-b:a", "64k"],
-    stereo_webm: [...STEREO, "-map", "[out]", "-ar", "48000", "-c:a", "libopus", "-b:a", "32k"],
+    // 64 kb/s, not 32: libopus 1.6 at 32 kb/s stereo leaks ch0's onset into ch1 (one 100 ms frame near -47 dBFS at
+    // 0.5 s), which the VAD rightly sends as a region, so ch1 would not be silent before 3.5 s (TC-3447).
+    stereo_webm: [...STEREO, "-map", "[out]", "-ar", "48000", "-c:a", "libopus", "-b:a", "64k"],
     // What browser MediaRecorder writes: no Duration element and no Cues, so ffprobe reports duration N/A.
-    stereo_webm_no_duration: [...STEREO, "-map", "[out]", "-ar", "48000", "-c:a", "libopus", "-b:a", "32k", "-live", "1"],
+    stereo_webm_no_duration: [...STEREO, "-map", "[out]", "-ar", "48000", "-c:a", "libopus", "-b:a", "64k", "-live", "1"],
     // No duration either, and timestamps that start at 100 s: the length is 7 s, not 107 s.
-    stereo_webm_offset: [...STEREO, "-map", "[out]", "-ar", "48000", "-c:a", "libopus", "-b:a", "32k", "-output_ts_offset", "100", "-live", "1"],
+    stereo_webm_offset: [...STEREO, "-map", "[out]", "-ar", "48000", "-c:a", "libopus", "-b:a", "64k", "-output_ts_offset", "100", "-live", "1"],
     stereo_flac: [...STEREO, "-map", "[out]", "-ar", "16000", "-c:a", "flac"],
     // A video track next to the audio (screen recordings, phone videos) is ignored.
     stereo_mp4_with_video: [...STEREO, "-f", "lavfi", "-i", "color=c=black:s=64x64:r=5:d=7", "-map", "[out]", "-map", "2:v", "-c:v", "mpeg4",
