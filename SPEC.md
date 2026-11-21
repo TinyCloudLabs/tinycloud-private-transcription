@@ -391,6 +391,8 @@ directories are only ever created by an upload holding a live lease and never re
 recreate deleted artifacts.
 
 ### Retention
+A recording still queued 72 hours after upload expires, even if transcription never started. The cleanup sweep deletes its audio and retries any deletion that fails.
+
 Every terminal transition commits `deletion_state='pending'` together with the terminal state, before any file is unlinked. Failed or cancelled jobs lose partial region text in that transaction (`transcript_deleted_at` is set); partial text may remain while a job waits, but the queued retry deadline is capped at 72 h from the earlier of upload or first provider block. Completed transcript text remains until `DELETE` or 24 h after completion. Audio, PCM and temp files are removed and verified absent (`ENOENT`) before `files_deleted` is recorded. `DELETE` cancels an active job, deletes transcript content and hides the job in the same transaction, and keeps a content-free tombstone (ids, tenant ref, sizes, timings, codes). A sweeper (every 60 s) retries pending deletions, expires unaccepted uploads, times out processing, expires queued provider waits at their hard deadline, recovers dead claims, deletes completed transcripts 24 h after completion, removes artifacts the ledger does not authorize (alerting if one reappears after verified deletion), and purges finished rows 7 days after their files were verified deleted. `/health` reports `retention_lag_seconds` (age of the oldest pending deletion) and is `degraded` past 300 s. Deleted data may remain on storage media until overwritten.
 
 ### Errors and correlation
