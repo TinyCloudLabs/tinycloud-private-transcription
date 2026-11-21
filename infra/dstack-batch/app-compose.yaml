@@ -28,7 +28,7 @@
 # with a shared 186496800-byte cap; the explicit API budgets below reserve ten full-size jobs and three per day.
 services:
   api:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:917498508c992037b046c2cfa9d396de1f7bfb0f@sha256:8cc8f3b7e29e93862f1d3abb207a1d605f90553fe8e051b397d5b84e8d4c6422
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:881413590f689afd659e64ec1c5ab42ac2902066@sha256:1b745e44089720318d74b3019ee80af39aab01ae6e78b7c20cff1f93ba73f759
     restart: unless-stopped
     depends_on:
       postgres:
@@ -77,7 +77,7 @@ services:
         labels: tc.logship
         cache-disabled: "true"
   upload-worker:
-    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:917498508c992037b046c2cfa9d396de1f7bfb0f@sha256:8cc8f3b7e29e93862f1d3abb207a1d605f90553fe8e051b397d5b84e8d4c6422
+    image: ghcr.io/tinycloudlabs/tinycloud-private-transcription/api:881413590f689afd659e64ec1c5ab42ac2902066@sha256:1b745e44089720318d74b3019ee80af39aab01ae6e78b7c20cff1f93ba73f759
     restart: unless-stopped
     command: ["bun", "run", "src/uploads/worker.ts"]
     depends_on:
