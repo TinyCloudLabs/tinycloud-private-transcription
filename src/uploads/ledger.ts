@@ -177,11 +177,12 @@ export async function runSweep(ctx: BatchContext): Promise<void> {
     const row = await terminalize(ctx.db, id, eq(transcriptions.status, "processing"), "failed", { code: "processing_timeout", message: "Processing exceeded the maximum duration" });
     if (row) await cleanupJobFiles(ctx, id);
   }
-  // 4. Every queued job expires 72 h after upload, even without a provider block. Provider waits also
-  //    expire from an earlier first block, including woken waits that are processing. Recheck the same
-  //    predicate at terminalization so a concurrent claim/cancel cannot be overwritten.
+  // 4. Every queued or processing job expires 72 h after upload, even without a provider block, so a job claimed
+  //    just before the deadline cannot keep its audio until the processing ceiling. Provider waits also expire
+  //    from an earlier first block. Recheck the same predicate at terminalization so a concurrent claim/cancel
+  //    cannot be overwritten; the generation bump fences out a worker still processing (TC-3653).
   const retentionExpired = or(
-    and(eq(transcriptions.status, "queued"), sql`${transcriptions.uploadedAt} <= now() - ${ctx.config.worker.providerBlockMaxSeconds} * interval '1 second'`),
+    and(inArray(transcriptions.status, ["queued", "processing"]), sql`${transcriptions.uploadedAt} <= now() - ${ctx.config.worker.providerBlockMaxSeconds} * interval '1 second'`),
     and(inArray(transcriptions.status, ["queued", "processing"]), sql`exists (
       select 1 from transcription_provider_blocks b where b.transcription_id = ${transcriptions.id}
         and least(b.blocked_since, ${transcriptions.uploadedAt}) <= now() - ${ctx.config.worker.providerBlockMaxSeconds} * interval '1 second'

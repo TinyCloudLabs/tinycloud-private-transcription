@@ -73,11 +73,23 @@ test("a woken wait still processing at 72 h after upload is failed and its audio
   expect(await exists(join(jobDir(h.uploadDir, id), audioFile))).toBe(false);
 });
 
-test("a processing job that never waited on the provider is left to the processing ceiling", async () => {
+// TC-3653: a job that never waited on the provider gets no processing-ceiling extension either.
+test("a never-blocked job claimed just before 72 h is failed at 72 h and its audio deleted", async () => {
   h.tinfoil.handler = () => Response.json({ text: "words" });
   const id = await h.submit(await audio("mono_wav"), { contentType: "audio/wav" });
-  expect((await claimNext(h.ctx))?.job.id).toBe(id);
-  await h.ctx.db.update(transcriptions).set({ uploadedAt: sql`now() - interval '73 hours'` }).where(eq(transcriptions.id, id));
+  await h.ctx.db.update(transcriptions).set({ uploadedAt: sql`now() - interval '71 hours 59 minutes'` }).where(eq(transcriptions.id, id));
+  const claim = await claimNext(h.ctx);
+  expect(claim?.job.id).toBe(id);
+  const audioFile = (await h.row(id)).audioFile!;
+
   await runSweep(h.ctx);
   expect(await h.row(id)).toMatchObject({ status: "processing", deletionState: "none" });
+  expect(await exists(join(jobDir(h.uploadDir, id), audioFile))).toBe(true);
+
+  await h.ctx.db.update(transcriptions).set({ uploadedAt: sql`now() - interval '72 hours 1 minute'` }).where(eq(transcriptions.id, id));
+  await runSweep(h.ctx);
+  const row = await h.row(id);
+  expect(row).toMatchObject({ status: "failed", errorCode: "processing_timeout", deletionState: "files_deleted" });
+  expect(row.generation).toBeGreaterThan(claim!.fence.generation);
+  expect(await exists(jobDir(h.uploadDir, id))).toBe(false);
 });
