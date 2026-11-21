@@ -15,9 +15,9 @@ name: Deploy ptx-batch
 #
 # Create order: deploy (a fresh install starts with admission closed) → health gate → admission gate (reports
 # closed) → open admission.
-# Update order: drain admission → wait until no job is active → deploy → sync allowed_envs → health gate →
-# admission gate (reports drain) → reopen admission. A failure after the drain leaves admission in `drain` on
-# purpose (see the runbook); a failed create leaves it closed.
+# Update order: destructive-migration gate → drain admission → wait until no job is active → deploy → sync
+# allowed_envs → health gate → admission gate (reports drain) → reopen admission. A failure after the drain leaves
+# admission in `drain` on purpose (see the runbook); a failed create leaves it closed.
 # Reopen-only order: resolve the existing CVM → running/gateway URL → health → admission gate (drain, no active jobs)
 # → open admission. No deploy, sealed-env write, allowed_envs sync or drain request.
 
@@ -40,6 +40,13 @@ on:
         type: boolean
         required: false
         default: false
+      destructive_migration_ack:
+        description: >-
+          Update only; leave empty. A deploy whose pinned image brings a destructive migration over the live one
+          (scripts/migration-gate.ts) is refused unless this names exactly those migrations, comma-separated
+          (e.g. 0034_drop_x). The only bypass; it needs its own GO.
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -194,6 +201,22 @@ jobs:
             fi
             echo "MODE=create" >> "$GITHUB_ENV"
           fi
+
+      # TC-3490: ptx-batch keeps no backup (it recovers from its sealed config; runbook "Recovering from a lost
+      # database"), so a migration that destroys data is stopped here, before the drain, unless acknowledged.
+      - name: Gate destructive migrations (live image to pinned image)
+        if: ${{ env.MODE == 'update' && !inputs.reopen_only }}
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+          DESTRUCTIVE_MIGRATION_ACK: ${{ inputs.destructive_migration_ack }}
+        run: |
+          set -euo pipefail
+          live="$(PHALA_CVM_ID="$CVM_ID" node .github/scripts/phala-live-image.mjs)"
+          pinned="${IMAGE#"${IMAGE_REPO}:"}"
+          pinned="${pinned%%@*}"
+          echo "live api image commit: $live; pinned: $pinned"
+          env -u PHALA_CLOUD_API_KEY bun scripts/migration-gate.ts deploy "$live" "$pinned" "$DESTRUCTIVE_MIGRATION_ACK" \
+            || { echo "::error title=Destructive migration::refused before the drain; see the log above and infra/dstack-batch/README.md"; exit 1; }
 
       - name: Drain admission and wait for zero active jobs
         if: ${{ env.MODE == 'update' && !inputs.reopen_only }}

@@ -41,6 +41,11 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Destructive-migration gate (TC-3490)
+        # A new migration with DROP, TRUNCATE, DELETE, UPDATE, RENAME, a column type change or SET NOT NULL must carry
+        # `-- destructive: TC-NNNN`. The marker only flags it: deploying it needs destructive_migration_ack.
+        run: bun scripts/migration-gate.ts check
+
       - name: Verify self-contained batch Compose and Vector parity
         run: |
           set -euo pipefail
