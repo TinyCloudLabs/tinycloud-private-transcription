@@ -59,7 +59,7 @@ services:
       TINFOIL_MODEL: ${TINFOIL_MODEL:-whisper-large-v3-turbo}
       # Platforms POST /v1/meetings accepts in the production stack. Keep this explicit so a
       # stale sealed environment cannot silently disable a shipped capture backend.
-      ENABLED_PLATFORMS: jitsi,google_meet,signal
+      ENABLED_PLATFORMS: jitsi,google_meet,signal,zoom
       AUTO_MIGRATE: "true"
       # Sealed JSON array of hashed API keys the API syncs at boot (see README "API-key scopes").
       # Empty = no bootstrap management; keys minted with `create-key` are never touched.
