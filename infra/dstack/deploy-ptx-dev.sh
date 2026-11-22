@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
-# Update the existing ptx-dev CVM from infra/dstack/app-compose.yaml and the operator's sealed env file.
+# Update the existing ptx-dev CVM from infra/dstack/app-compose.yaml and, unless --keep-sealed-env, the operator's
+# sealed env file.
 #
 #   npm ci --ignore-scripts --no-audit --no-fund --prefix .github/scripts   # pinned phala CLI + SDK, once
 #   PHALA_CLOUD_API_KEY=... infra/dstack/deploy-ptx-dev.sh [env-file]          # default infra/dstack/.env
+#   PHALA_CLOUD_API_KEY=... infra/dstack/deploy-ptx-dev.sh --keep-sealed-env   # compose only
+#
+# --keep-sealed-env sends the compose file without `-e`: phala 1.1.22's update request then carries neither
+# encrypted_env nor allowed_envs, so the CVM keeps its sealed variables and allowed_envs as they are, and the
+# allowed_envs sync is skipped. The compose check renders with no env file, so only compose defaults apply. Use
+# it for a compose-only change when nobody holds the env file; a change that needs a new or different sealed
+# value needs the env file.
 #
 # Before any change it refuses an api image whose migrations include a destructive one ptx-dev has not run (TC-3490;
 # scripts/migration-gate.ts), unless DESTRUCTIVE_MIGRATION_ACK names exactly those migrations, comma-separated. That
@@ -13,7 +21,7 @@
 # either failed); any failure exits non-zero. The Phala KMS only releases the app keys to that image. This
 # script never changes the OS: `phala deploy --image/--no-dev-os` is ignored for an existing CVM. To set it
 # by hand:
-#   phala api -X PATCH /cvms/<id>/os-image -F os_image_name=dstack-0.5.12
+#   phala api -X PATCH /cvms/<id>/os-image -F os_image_name=dstack-0.5.15
 #
 # phala 1.1.22's update request (`deploy --cvm-id`) already sends allowed_envs set to the env-file keys, so
 # the allowed_envs sync that follows (the one deploy-batch.yml runs) is normally a no-op. It stays as a check:
@@ -21,17 +29,23 @@
 set -euo pipefail
 
 CVM_NAME=ptx-dev
-PHALA_OS_IMAGE=dstack-0.5.12
-PHALA_OS_IMAGE_HASH=8db40cb23008d6213668b5816702d100b37b859a8a5bfd18d938ae3a1b3715bd
+PHALA_OS_IMAGE=dstack-0.5.15
+PHALA_OS_IMAGE_HASH=4597735f1a38ad8ec9f781356b88737fc052062deb7c9aaa4be89bf1b35643ca
 
 cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 COMPOSE=infra/dstack/app-compose.yaml
-ENV_FILE="${1:-infra/dstack/.env}"
+if [ "${1:-}" = --keep-sealed-env ]; then
+  KEEP_SEALED_ENV=true
+  ENV_FILE=/dev/null
+else
+  KEEP_SEALED_ENV=false
+  ENV_FILE="${1:-infra/dstack/.env}"
+fi
 PHALA="${PHALA:-$PWD/.github/scripts/node_modules/.bin/phala}"
 
 fail() { echo "deploy-ptx-dev: $*" >&2; exit 1; }
 [ -n "${PHALA_CLOUD_API_KEY:-}" ] || fail "PHALA_CLOUD_API_KEY is not set"
-[ -f "$ENV_FILE" ] || fail "env file $ENV_FILE not found"
+[ "$KEEP_SEALED_ENV" = true ] || [ -f "$ENV_FILE" ] || fail "env file $ENV_FILE not found"
 [ -x "$PHALA" ] || fail "phala CLI not found at $PHALA; run: npm ci --ignore-scripts --no-audit --no-fund --prefix .github/scripts"
 
 # require_production_os <name or id> <when>: sets CVM_ID from the checked CVM.
@@ -60,14 +74,18 @@ live="$(PHALA_CVM_ID="$CVM_ID" IMAGE_REPO="$IMAGE_REPO" node .github/scripts/pha
 env -u PHALA_CLOUD_API_KEY bun scripts/migration-gate.ts deploy "$live" "$pinned" "${DESTRUCTIVE_MIGRATION_ACK:-}" \
   || fail "destructive-migration gate refused the deploy (TC-3490); nothing was changed"
 
+env_args=(-e "$ENV_FILE")
+[ "$KEEP_SEALED_ENV" = false ] || env_args=()
 rc=0
-"$PHALA" deploy --cvm-id "$CVM_ID" -c "$COMPOSE" -e "$ENV_FILE" \
+"$PHALA" deploy --cvm-id "$CVM_ID" -c "$COMPOSE" "${env_args[@]}" \
   --no-public-logs --no-public-sysinfo --no-dev-os --image "$PHALA_OS_IMAGE" --wait || rc=$?
 require_production_os "$CVM_ID" "after phala deploy"
 [ "$rc" -eq 0 ] || fail "phala deploy exited $rc"
 
-PHALA_CVM_ID="$CVM_ID" ENV_FILE="$ENV_FILE" node .github/scripts/phala-sync-allowed-envs.mjs || rc=$?
-require_production_os "$CVM_ID" "after the allowed_envs sync"
-[ "$rc" -eq 0 ] || fail "allowed_envs sync exited $rc"
+if [ "$KEEP_SEALED_ENV" = false ]; then
+  PHALA_CVM_ID="$CVM_ID" ENV_FILE="$ENV_FILE" node .github/scripts/phala-sync-allowed-envs.mjs || rc=$?
+  require_production_os "$CVM_ID" "after the allowed_envs sync"
+  [ "$rc" -eq 0 ] || fail "allowed_envs sync exited $rc"
+fi
 
-echo "deploy-ptx-dev: $CVM_NAME ($CVM_ID) updated on $PHALA_OS_IMAGE"
+echo "deploy-ptx-dev: $CVM_NAME ($CVM_ID) updated on $PHALA_OS_IMAGE$([ "$KEEP_SEALED_ENV" = false ] || echo ", sealed env kept")"
