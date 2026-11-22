@@ -146,6 +146,11 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(line).toContain("signal");
   });
 
+  test("the api service accepts Zoom meetings (TC-3782)", () => {
+    const line = serviceEnv("api").split("\n").find((l) => l.trim().startsWith("ENABLED_PLATFORMS:"));
+    expect(line?.split(":")[1]?.trim().split(",")).toContain("zoom");
+  });
+
   test("passes sealed bootstrap API keys to the api service only", () => {
     expect(serviceEnv("api")).toContain(`${BOOTSTRAP_KEYS_ENV}: "\${${BOOTSTRAP_KEYS_ENV}:-}"`);
     expect(serviceEnv("worker")).not.toContain(BOOTSTRAP_KEYS_ENV);
