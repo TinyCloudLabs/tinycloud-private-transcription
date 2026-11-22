@@ -256,10 +256,10 @@ describe("infra/dstack/app-compose.yaml", () => {
     expect(init).toContain(`printf '%s\\n%s\\n' "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" | mc alias set local http://minio:9000`);
     expect(init).not.toMatch(/mc [^\n|]*MINIO_ROOT_PASSWORD/);
     const janitor = serviceEnv("bot-janitor");
-    // The janitor removes finished bot containers after the 1-day retention; image pruning stays opt-in. Details: TC-2181
+    // The janitor removes finished bot containers after the 1-day retention; image pruning is on by default. Details: TC-2181
     expect(janitor).toContain("      BOT_JANITOR_MODE: apply\n");
     expect(janitor).toContain("BOT_CONTAINER_RETENTION_DAYS: ${BOT_CONTAINER_RETENTION_DAYS:-1}");
-    expect(janitor).toContain("BOT_JANITOR_PRUNE_IMAGES: ${BOT_JANITOR_PRUNE_IMAGES:-false}");
+    expect(janitor).toContain("BOT_JANITOR_PRUNE_IMAGES: ${BOT_JANITOR_PRUNE_IMAGES:-true}");
     // Must name the same pinned bot image as the runtime, or it could treat the live pin as superseded.
     expect(janitor).toContain(`BOT_IMAGE: ${serviceEnv("runtime").match(/BROWSER_IMAGE: (\S+)/)![1]}`);
   });

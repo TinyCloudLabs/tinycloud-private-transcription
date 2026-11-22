@@ -391,7 +391,7 @@ services:
   # only if it has runtime.managed=true (generic: agent workers have it too) AND is named vexa-mtg-*
   # (runtime name prefix + meeting-api workload id mtg-<meeting>-<conn>) AND was created from a bot
   # image repository. Bot IMAGES older than the pinned PTX_BOT_IMAGE that no container uses are
-  # removed only when BOT_JANITOR_PRUNE_IMAGES=true (default false); dry-run always logs them. The
+  # removed when BOT_JANITOR_PRUNE_IMAGES=true (the default; false keeps them); dry-run always logs them. The
   # pinned image and anything newer are never touched. BOT_JANITOR_MODE=dry-run (default) only logs;
   # apply removes.
   bot-janitor:
@@ -434,7 +434,7 @@ services:
         while :; do sweep; sleep "$$BOT_JANITOR_INTERVAL_SECONDS"; done
     environment:
       BOT_JANITOR_MODE: apply
-      BOT_JANITOR_PRUNE_IMAGES: ${BOT_JANITOR_PRUNE_IMAGES:-false}
+      BOT_JANITOR_PRUNE_IMAGES: ${BOT_JANITOR_PRUNE_IMAGES:-true}
       BOT_CONTAINER_RETENTION_DAYS: ${BOT_CONTAINER_RETENTION_DAYS:-1}
       BOT_JANITOR_INTERVAL_SECONDS: "21600"
       BOT_IMAGE: ${PTX_BOT_IMAGE:-ghcr.io/tinycloudlabs/vexa/bot:tc-5bd4c13@sha256:8aa1be48c30096a9a1cce0173497f47539ad8cd504a311a773fd1ec87c6a0baf}
