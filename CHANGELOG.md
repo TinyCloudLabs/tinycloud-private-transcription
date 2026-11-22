@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Main
+- `infra/dstack/deploy-ptx-dev.sh` checks for the OS ptx-dev runs, `dstack-0.5.15` (hash `4597735f…`), and takes `--keep-sealed-env` for a compose-only update: the update carries no env, so the CVM keeps its sealed variables and `allowed_envs`, and no env file is needed. Details: TC-3782
 - ptx-dev accepts Zoom meetings: `ENABLED_PLATFORMS` is `jitsi,google_meet,signal,zoom`, so `POST /v1/meetings` with a zoom.us link queues a notetaker instead of answering 400 `unsupported_platform`. The bot joins through the Zoom web client. Details: TC-3782
 - ptx-dev's bot janitor removes old bot images by default (`BOT_JANITOR_PRUNE_IMAGES` defaults to `true`; `false` turns it off). It removes only bot images that are older than the pinned bot image and that no container uses. The pinned image and newer ones are kept. Details: TC-2181
 - TC-3653: A recording still processing 72 hours after upload now expires too, even if it never waited on the provider. A job claimed just before the deadline previously kept its audio until the 4-hour processing ceiling (up to 76 hours after upload). The sweep fails it `processing_timeout`, fences out the worker and deletes the audio.
