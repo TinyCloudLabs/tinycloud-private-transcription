@@ -1,5 +1,9 @@
 import hashlib
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -31,7 +35,7 @@ class ImportTests(unittest.TestCase):
             (source / '._Second take.WAV').touch()
             (source / 'mic.wav').symlink_to(wav)
             (source / 'linked').symlink_to(source / 'nested', target_is_directory=True)
-            self.assertEqual(list(dji_mic.wave_files(source)), [wav])
+            self.assertEqual([path for path, _ in dji_mic.wave_files(source)], [wav])
 
     def test_same_bytes_never_recopy_even_if_renamed_but_reused_name_can_be_new(self):
         with tempfile.TemporaryDirectory() as root:
@@ -56,6 +60,58 @@ class ImportTests(unittest.TestCase):
             self.assertNotEqual(second, first)
             self.assertEqual(first.read_bytes(), b'first recording')
             self.assertEqual(second.read_bytes(), b'new recording')
+
+    def test_source_with_another_hard_link_is_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            original = root / 'original.wav'
+            original.write_bytes(b'a recording')
+            alias = root / 'alias.wav'
+            os.link(original, alias)
+            with self.assertRaisesRegex(ValueError, 'singly linked regular file'):
+                dji_mic.stage_recording(alias, root / 'out')
+            self.assertFalse((root / 'out').exists())
+
+    def test_output_directory_must_be_private_and_not_a_symlink(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            public = root / 'public'
+            public.mkdir()
+            public.chmod(0o755)
+            private = root / 'private'
+            private.mkdir(mode=0o700)
+            alias = root / 'alias'
+            alias.symlink_to(private, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, '0700'):
+                dji_mic.private_directory(public)
+            with self.assertRaises(OSError):
+                dji_mic.private_directory(alias)
+
+    def test_output_in_a_sibling_directory_on_the_source_mount_is_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root).resolve()
+            source = root / 'recordings'
+            source.mkdir()
+            with self.assertRaisesRegex(ValueError, 'different volume'):
+                dji_mic.output_destination(source, root / 'exports' / 'new')
+
+    @unittest.skipUnless(shutil.which('ffmpeg'), 'requires FFmpeg')
+    def test_wav_decoder_rejects_an_inert_playlist(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            source = root / 'playlist.wav'
+            source.write_text('#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-ENDLIST\n', encoding='ascii')
+            destination = root / 'transcript.txt'
+            result = subprocess.run(
+                [sys.executable, '-B', '-c',
+                 'import sys; from pathlib import Path; from dji_mic import transcribe; '
+                 'transcribe(Path(sys.argv[1]), Path(sys.argv[2]), Path("unused"), "en")',
+                 str(source), str(destination)],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('invalid start code', result.stderr)
+            self.assertFalse(destination.exists())
 
     def test_refuses_a_profile_for_another_owner_or_space(self):
         expected = 'did:pkh:eip155:1:0x' + '12' * 20

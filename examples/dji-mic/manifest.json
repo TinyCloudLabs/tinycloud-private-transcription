@@ -13,7 +13,7 @@
       "service": "tinycloud.kv",
       "path": "xyz.tinycloud.dji-mic/recordings/",
       "skipPrefix": true,
-      "actions": ["tinycloud.kv/get", "tinycloud.kv/metadata", "tinycloud.kv/put"]
+      "actions": ["tinycloud.kv/metadata", "tinycloud.kv/put"]
     }
   ]
 }

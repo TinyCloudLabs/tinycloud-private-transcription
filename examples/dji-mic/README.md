@@ -4,7 +4,18 @@ Run this script after recording. It copies finished WAVs from a mounted DJI tran
 
 ## Set up once
 
-1. Install Python 3.10+, FFmpeg, [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (`whisper-cli` on `PATH`), and the [TinyCloud CLI](https://agents.tinycloud.xyz/connect) (`tinycloud`, verified with `@tinycloud/cli` 1.8.0). On macOS, `brew install ffmpeg whisper.cpp` installs the audio tools. On Linux, install FFmpeg with your package manager and follow the whisper.cpp build instructions. Download [the `base.en` model](https://huggingface.co/ggerganov/whisper.cpp/blob/main/ggml-base.en.bin) for English, or use a multilingual model and add `--language auto` (or the language code) to the import command. Transcription runs on your computer and needs no API key.
+1. Install Python 3.10+, FFmpeg, [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (`whisper-cli` on `PATH`), and the [TinyCloud CLI](https://agents.tinycloud.xyz/connect) (`tinycloud`, verified with `@tinycloud/cli` 1.8.0). On macOS, `brew install ffmpeg whisper.cpp` installs the audio tools. On Linux, install FFmpeg with your package manager and follow the whisper.cpp build instructions. Transcription runs on your computer and needs no API key.
+
+   Download the pinned English `base.en` model and verify its SHA-256:
+
+   ```sh
+   mkdir -p "$HOME/models"
+   curl -fL 'https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.en.bin' \
+     -o "$HOME/models/ggml-base.en.bin"
+   (cd "$HOME/models" && printf '%s\n' 'a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002  ggml-base.en.bin' | shasum -a 256 -c)
+   ```
+
+   If you supply a different, multilingual model, add `--language auto` (or the language code) to the import command.
 2. Use the OpenKey owner that already has your TinyCloud `applications` space. Copy its `ownerDid` from `tinycloud --profile YOUR_EXISTING_PROFILE context --json`; if you haven't set up TinyCloud, use the linked setup guide first. Run these commands from this example directory. Use an unused name in place of `dji-mic` if needed, and use that name consistently:
 
    ```sh
@@ -14,7 +25,7 @@ Run this script after recording. It copies finished WAVs from a mounted DJI tran
      --owner "$OWNER_DID" --manifest ./manifest.json --expiry 7d
    ```
 
-   Approve the request with that owner in OpenKey. It requests read, metadata, and write for the recordings folder, plus the capability read required to sign in. The script checks the owner and space before copying or uploading. Use the same login command if the grant expires.
+   Approve the request with that owner in OpenKey. It requests metadata and write for the recordings folder, plus the capability read required to sign in. The script checks the owner and space before copying or uploading. Use the same login command if the grant expires.
 
 ## Import a recording
 
@@ -25,7 +36,7 @@ python3 dji_mic.py --profile dji-mic --owner "$OWNER_DID" \
   --model "$HOME/models/ggml-base.en.bin" --output "$HOME/DJI recordings"
 ```
 
-Use the path where you saved the model. The script looks for a mounted volume named `DJI_MIC` or a DJI Mic model variant on macOS or Linux (`findmnt` on Linux). If it cannot identify the mount or two transmitters are connected, add `--source '/Volumes/DJI_MIC'` (substitute the actual mount). To try it without a mic, add `--source /path/to/test-wavs` containing a short, consented or synthetic WAV. That tests the file workflow, not the physical USB connection. If `tinycloud` is not on `PATH`, use `--tc /path/to/your/tinycloud` (or the TinyCloud `tc` alias).
+Use the path where you saved the model. The script looks for a mounted volume named `DJI_MIC` or a DJI Mic model variant on macOS or Linux (`findmnt` on Linux). If it cannot identify the mount or two transmitters are connected, add `--source '/Volumes/DJI_MIC'` (substitute the actual mount). The output must be on a different volume. The script creates it if needed; an existing directory must belong to you and have permissions `0700`. To try it without a mic, point `--source` at a directory of synthetic WAVs on a separate mounted volume. That tests the file workflow, not the physical USB connection. If `tinycloud` is not on `PATH`, use `--tc /path/to/your/tinycloud` (or the TinyCloud `tc` alias).
 
 The run prints the recording ID and local prompt path for each recording. Under the output directory, `<sha256>/` contains:
 
@@ -38,16 +49,14 @@ The run prints the recording ID and local prompt path for each recording. Under 
 
 Remote keys are `xyz.tinycloud.dji-mic/recordings/<sha256>/audio.wav` and `xyz.tinycloud.dji-mic/recordings/<sha256>/transcript.txt` in the same owner's `applications` space. They are regular KV payloads. No Share links are created. The audio and text count toward your TinyCloud storage quota.
 
-Paste the contents of `prompt.txt` into your agent when you want notes. The agent needs its own authorized read access to that transcript. To read it directly from the import profile:
+Paste the contents of `prompt.txt` into your agent when you want notes. The agent needs its own authorized read access to that transcript; the import profile only checks metadata and writes. You can read your local copy directly:
 
 ```sh
 RECORDING_ID='sha256-printed-by-the-script'
-SPACE="tinycloud:${OWNER_DID#did:}:applications"
-tinycloud --profile dji-mic kv get \
-  "xyz.tinycloud.dji-mic/recordings/$RECORDING_ID/transcript.txt" --space "$SPACE" --raw
+cat "$HOME/DJI recordings/$RECORDING_ID/transcript.txt"
 ```
 
-Rerun the same import command for new recordings. Identical WAV contents reuse the same ID even after renaming. Existing TinyCloud keys are not overwritten; if an upload was interrupted, rerun to complete missing keys. Keep a private output directory, and eject the drive normally when finished.
+Rerun the same import command for new recordings. Identical WAV contents reuse the same ID even after renaming. Existing TinyCloud keys are not overwritten; if an upload was interrupted, rerun to complete missing keys. If the local transcript is missing, the script transcribes it again locally. Eject the drive normally when finished.
 
 For a disposable test, discard the temporary output directory after verifying the two remote keys. To remove test uploads on a hosted account, delete those exact keys using the owner's deletion authority; the import profile cannot delete. Revoke the dedicated login in [TinyCloud account settings](https://account.tinycloud.xyz/delegations) and remove that test profile. Revoking the login does not delete stored recordings.
 
@@ -57,4 +66,4 @@ For a disposable test, discard the temporary output directory after verifying th
 python3 -B -m unittest -v
 ```
 
-The unit tests use temporary files and mount-table inputs and do not need a mic, model, or TinyCloud credentials.
+The tests use temporary files and do not need a mic, model, or TinyCloud credentials. Install FFmpeg to run the WAV decoder test.
