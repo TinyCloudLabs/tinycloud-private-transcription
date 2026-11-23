@@ -195,7 +195,7 @@ GET  /v1/transcriptions/{id}                    <job>
 GET  /v1/transcriptions/{id}/result             202 {id,status} | 200 completed transcript | 200 {id,status:"failed"|"cancelled",error} | 410 transcript_expired
 POST /v1/transcriptions/{id}/cancel             {id,status} (idempotent)
 DELETE /v1/transcriptions/{id}                  204; the job is gone from every read at once
-GET  /v1/transcriptions/capabilities            {max_bytes:186496800,max_duration_seconds:10800,accepted_max_duration_seconds:11101,max_channels:2,content_types,diarization,transcript_ttl_seconds:86400,admission,ready}
+GET  /v1/transcriptions/capabilities            {max_bytes:186496800,max_duration_seconds:10800,accepted_max_duration_seconds:11101,max_channels:2,content_types,diarization,diarization_channel_modes,transcript_ttl_seconds:86400,admission,ready}
 PUT  /uploads/{id}   Authorization: Bearer <capability>   Content-Length = byte_size   Content-Type = content_type
 GET|PUT /v1/admin/admission  (admin:*)          {"mode":"open|drain|closed"} → {mode, active:{awaiting_upload,queued,processing}, retention_lag_seconds}
 ```
@@ -223,9 +223,13 @@ describe the final sent turns, which must satisfy the same coverage bound before
 These six additions are persisted with the regions and retained
 across re-claims; they are absent for jobs detected before TC-1093. Existing saved results are returned unchanged.
 Without `diarize`, `diarized` is false, speakers are `channel_N` (named by `channel_labels`) and
-timestamps are region-level (VAD regions, below). With `diarize`, `diarized` is true, `channels` is 1, speakers are
-`{id:"speaker_N", name:"Speaker N+1", channel:0}` (N 0–31, numbered by first appearance; only speakers with text are
-listed) and every segment is one speaker turn on channel 0, in time order. Recovered audio without speaker evidence
+timestamps are region-level (VAD regions, below). With `diarize` on a mono mix, `diarized` is true, `channels` is 1,
+speakers are `{id:"speaker_N", name:"Speaker N+1", channel:0}` (N 0–31, numbered by first appearance; only speakers
+with text are listed) and every segment is one speaker turn on channel 0, in time order. With `diarize` and
+`channel_mode: "separate"` on a two-channel recording, `diarized` is true and `channels` is 2: channel 0 is one
+speaker, `{id:"channel_0", name:<its label>, channel:0}`, with region-level segments as without `diarize`, and only
+the voices on channel 1 are told apart, `{id:"speaker_N", name:"Speaker N+2", channel:1}`, one speaker turn per
+segment. The channels are never mixed, so a quiet channel is not lost under a loud one. Recovered audio without speaker evidence
 uses the next available `speaker_N` id named `Unknown speaker`, after numbering known speakers by their own first
 appearance. Unknown does not shift known speakers' ids or names. Recovered intervals shorter than 0.4 s that touch a turn
 are absorbed into its nearest speaker (ties to the earlier turn). At the 32-speaker limit, added audio is attributed
@@ -236,7 +240,9 @@ are returned with `diarized: false`.
 
 `content_type` → container: `audio/mpeg` mp3, `audio/wav` WAV, `audio/ogg` Ogg (Vorbis/Opus/FLAC), `audio/mp4`
 MP4/M4A (any `mov,mp4,m4a` demux), `audio/webm` WebM/Matroska, `audio/flac` FLAC. `channel_mode` defaults to `separate`,
-or to `mixed` when `diarize` is true; `diarize: true` with `channel_mode: "separate"` is `400 invalid_request`.
+or to `mixed` when `diarize` is true. `capabilities.diarization_channel_modes` lists the modes `diarize` accepts
+(`["mixed","separate"]`; empty when diarization is off). A service without that field refuses `diarize: true` with
+`channel_mode: "separate"` as `400 invalid_request`. On a one-channel recording `separate` behaves as `mixed`.
 `capabilities.diarization` is true only when the diarization stage is installed and enabled; while it is false,
 `diarize: true` is `400 diarization_unavailable` (nothing is created). `diarize: false` is not part of the idempotency
 hash, so requests from before the field existed replay unchanged.

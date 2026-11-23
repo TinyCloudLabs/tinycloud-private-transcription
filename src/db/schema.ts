@@ -249,7 +249,7 @@ export const transcriptions = pgTable(
     language: text("language"),
     channelMode: text("channel_mode").notNull(),
     channelLabels: jsonb("channel_labels").$type<string[]>().notNull(),
-    /** Downmixed to mono and split into speaker turns by the diarization stage (create `diarize: true`). */
+    /** Split into speaker turns by the diarization stage (create `diarize: true`): the mono downmix, or channel 1 of a `separate` two-channel job. */
     diarize: boolean("diarize").notNull().default(false),
     /** Absolute: an upload that has not been accepted by then fails upload_expired. */
     uploadDeadlineAt: timestamp("upload_deadline_at", { withTimezone: true }).notNull(),
@@ -333,7 +333,7 @@ export const transcriptionRegions = pgTable("transcription_regions", {
   transcriptionId: text("transcription_id").notNull().references(() => transcriptions.id, { onDelete: "cascade" }),
   ordinal: integer("ordinal").notNull(),
   channel: integer("channel").notNull(),
-  /** Diarizer speaker label of a diarized job's turn (renumbered by first appearance at assembly); null otherwise. */
+  /** Diarizer speaker label of a diarized turn (renumbered by first appearance at assembly); null for a region the diarizer did not label. */
   speaker: integer("speaker"),
   startMs: integer("start_ms").notNull(),
   endMs: integer("end_ms").notNull(),

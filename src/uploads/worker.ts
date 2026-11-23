@@ -202,7 +202,9 @@ async function runPipeline(ctx: BatchContext, job: TranscriptionRow, fence: Fenc
   let regions = await ctx.db.select().from(transcriptionRegions).where(eq(transcriptionRegions.transcriptionId, job.id))
     .orderBy(asc(transcriptionRegions.startMs), asc(transcriptionRegions.channel));
   if (regions.length === 0) {
-    const detected = job.diarize ? await diarizeTurns(ctx, job, fence, pcm[0]!, signal) : await vadRegions(ctx, job, fence, pcm);
+    const detected = !job.diarize ? await vadRegions(ctx, job, fence, pcm)
+      : pcm.length === 2 ? await separateDiarizedRegions(ctx, job, fence, pcm, signal)
+      : await diarizeTurns(ctx, job, fence, pcm[0]!, signal);
     if (detected === null) return;
     if (detected.regions.length === 0) {
       if (await failClaim(ctx, ctx.db, fence, "no_speech", "No speech was detected in the recording", {
@@ -315,16 +317,11 @@ async function vadRegions(ctx: BatchContext, job: TranscriptionRow, fence: Fence
   return { regions, droppedAboveFloorPct: percent(dropped, aboveFloor), fallback, stats };
 }
 
-/**
- * Speaker turns of the mono mix (channel 0), extended by the ordinary VAD's selected coverage when needed.
- * Diarization failure or insufficient final coverage fails processing_failed before any dispatch.
- * The fallback flag and coverage stats describe the selected mode and final sent turns.
- */
-async function diarizeTurns(ctx: BatchContext, job: TranscriptionRow, fence: Fence, pcmPath: string, signal: AbortSignal): Promise<DetectedRegions | null> {
-  let segments: SpeakerSegment[];
+/** The diarizer's segments of one PCM file. A failure fails the job processing_failed, fenced, and returns null. */
+async function speakerSegments(ctx: BatchContext, job: TranscriptionRow, fence: Fence, pcmPath: string, signal: AbortSignal): Promise<SpeakerSegment[] | null> {
   try {
     if (!ctx.diarizer) throw new Error("diarization is not available");
-    segments = await ctx.diarizer.diarize(pcmPath, signal);
+    return await ctx.diarizer.diarize(pcmPath, signal);
   } catch (error) {
     if (signal.aborted) throw error;
     // A cancel or delete removes the PCM before the renewal timer notices: that is a lost fence, not an operator fault.
@@ -334,6 +331,16 @@ async function diarizeTurns(ctx: BatchContext, job: TranscriptionRow, fence: Fen
     else throw new LostFence(job.id);
     return null;
   }
+}
+
+/**
+ * Speaker turns of the mono mix (channel 0), extended by the ordinary VAD's selected coverage when needed.
+ * Diarization failure or insufficient final coverage fails processing_failed before any dispatch.
+ * The fallback flag and coverage stats describe the selected mode and final sent turns.
+ */
+async function diarizeTurns(ctx: BatchContext, job: TranscriptionRow, fence: Fence, pcmPath: string, signal: AbortSignal): Promise<DetectedRegions | null> {
+  const segments = await speakerSegments(ctx, job, fence, pcmPath, signal);
+  if (segments === null) return null;
   const energies = await frameEnergies(pcmPath);
   const vad = { ...VAD, quiet: { ...VAD.quiet, enabled: ctx.config.vad.quietMode } };
   const detection = detectDiarizedSpeech(segments, energies, vad);
@@ -343,6 +350,33 @@ async function diarizeTurns(ctx: BatchContext, job: TranscriptionRow, fence: Fen
     droppedAboveFloorPct: percent(detection.droppedFrames, detection.aboveFloorFrames),
     fallback: detection.fallback,
     stats: detection.stats,
+  };
+}
+
+/**
+ * A diarized two-channel job (`channel_mode: "separate"`). The channels stay apart, so a quiet channel is not lost
+ * under a loud one in a mix, and two parties talking at once remain two transcripts. Channel 0 is one party: its
+ * ordinary VAD regions, without a speaker. The voices on channel 1 are told apart: speaker turns of that channel
+ * alone, extended by its VAD coverage exactly as `diarizeTurns` does for a mix. Both channels pass the coverage
+ * guard together; a diarizer failure fails the job before any dispatch.
+ */
+async function separateDiarizedRegions(ctx: BatchContext, job: TranscriptionRow, fence: Fence, pcm: string[], signal: AbortSignal): Promise<DetectedRegions | null> {
+  const segments = await speakerSegments(ctx, job, fence, pcm[1]!, signal);
+  if (segments === null) return null;
+  const energies = await Promise.all(pcm.map((path) => frameEnergies(path)));
+  const vad = { ...VAD, quiet: { ...VAD.quiet, enabled: ctx.config.vad.quietMode } };
+  const own = detectSpeech(energies[0]!, vad);
+  const others = detectDiarizedSpeech(segments, energies[1]!, vad);
+  if (!await guardCoverage(ctx, job, fence, [own, others])) return null;
+  return {
+    regions: [...own.regions.map((region) => ({ ...region, channel: 0, speaker: null })), ...others.turns.map((turn) => ({ ...turn, channel: 1 }))]
+      .sort((a, b) => a.startMs - b.startMs || a.channel - b.channel),
+    droppedAboveFloorPct: percent(own.droppedFrames + others.droppedFrames, own.aboveFloorFrames + others.aboveFloorFrames),
+    fallback: own.fallback || others.fallback,
+    stats: summarizeVad([
+      { energies: energies[0]!, regions: own.regions, mode: own.stats.vad_mode },
+      { energies: energies[1]!, regions: others.turns, mode: others.stats.vad_mode },
+    ], vad),
   };
 }
 
@@ -644,19 +678,23 @@ async function assemble(ctx: BatchContext, job: TranscriptionRow, fence: Fence) 
       .from(transcriptions).where(eq(transcriptions.id, job.id));
     const voicedMs = regions.reduce((sum, region) => sum + region.endMs - region.startMs, 0);
     const channels = job.channelMode === "separate" && job.channels === 2 ? [0, 1] : [0];
+    // The channel whose voices the diarizer told apart: the only one of a mono mix, the second of a two-channel job.
+    const diarizedChannel = job.diarize ? channels.length - 1 : null;
     const spoken = regions.filter((region) => (region.text ?? "").trim() !== "");
     // Known speakers keep their first-appearance ids and names; Unknown takes the next available id.
     const order = new Map<number, number>();
-    if (job.diarize) {
-      for (const region of spoken) if (region.speaker !== UNKNOWN_SPEAKER && !order.has(region.speaker!)) order.set(region.speaker!, order.size);
-      if (spoken.some((region) => region.speaker === UNKNOWN_SPEAKER)) order.set(UNKNOWN_SPEAKER, order.size);
-    }
-    const speakers = job.diarize
-      ? [...order].map(([speaker, n]) => ({ id: `speaker_${n}`, name: speaker === UNKNOWN_SPEAKER ? "Unknown speaker" : `Speaker ${n + 1}`, channel: 0 }))
-      : channels.map((channel) => ({ id: `channel_${channel}`, name: job.channelLabels[channel] ?? `Speaker ${channel + 1}`, channel }));
+    const told = spoken.filter((region) => region.channel === diarizedChannel);
+    for (const region of told) if (region.speaker !== UNKNOWN_SPEAKER && !order.has(region.speaker!)) order.set(region.speaker!, order.size);
+    if (told.some((region) => region.speaker === UNKNOWN_SPEAKER)) order.set(UNKNOWN_SPEAKER, order.size);
+    // A two-channel job's first channel is one speaker named by its label; the told-apart voices are numbered after it.
+    const others = channels.filter((channel) => channel !== diarizedChannel);
+    const speakers = [
+      ...others.map((channel) => ({ id: `channel_${channel}`, name: job.channelLabels[channel] ?? `Speaker ${channel + 1}`, channel })),
+      ...[...order].map(([speaker, n]) => ({ id: `speaker_${n}`, name: speaker === UNKNOWN_SPEAKER ? "Unknown speaker" : `Speaker ${n + 1 + others.length}`, channel: diarizedChannel! })),
+    ];
     const segments = spoken.map((region, index) => ({
       id: `seg_${String(index + 1).padStart(4, "0")}`,
-      speaker_id: job.diarize ? `speaker_${order.get(region.speaker!)}` : `channel_${region.channel}`,
+      speaker_id: region.channel === diarizedChannel ? `speaker_${order.get(region.speaker!)}` : `channel_${region.channel}`,
       channel: region.channel,
       start: region.startMs / 1000,
       end: region.endMs / 1000,
