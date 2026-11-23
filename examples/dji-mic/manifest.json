@@ -1,0 +1,19 @@
+{
+  "app_id": "xyz.tinycloud.dji-mic",
+  "name": "DJI Mic recording import",
+  "space": "applications",
+  "permissions": [
+    {
+      "service": "tinycloud.capabilities",
+      "path": "",
+      "skipPrefix": true,
+      "actions": ["tinycloud.capabilities/read"]
+    },
+    {
+      "service": "tinycloud.kv",
+      "path": "xyz.tinycloud.dji-mic/recordings/",
+      "skipPrefix": true,
+      "actions": ["tinycloud.kv/get", "tinycloud.kv/metadata", "tinycloud.kv/put"]
+    }
+  ]
+}
