@@ -236,6 +236,14 @@ describe("infra/dstack-batch/app-compose.yaml", () => {
     }
     expect(render()["upload-worker"]!.environment.BATCH_CORS_ORIGINS).toBeUndefined();
   });
+
+  test("lets https://tinycloud.one upload, and no lookalike or other scheme of it", () => {
+    const allowed = corsOriginMatcher(parseCorsOrigins(render().api!.environment.BATCH_CORS_ORIGINS ?? ""));
+    expect(allowed("https://tinycloud.one")).toBe(true);
+    for (const origin of ["http://tinycloud.one", "https://www.tinycloud.one", "https://tinycloud.one.evil.example", "https://evil-tinycloud.one", "https://tinycloud.one:8443"]) {
+      expect({ origin, allowed: allowed(origin) }).toEqual({ origin, allowed: false });
+    }
+  });
 });
 
 describe(".github/workflows/deploy-batch.yml", () => {

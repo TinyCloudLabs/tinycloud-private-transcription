@@ -184,7 +184,7 @@ Exo uploads the recording straight from the browser/app to `PUT /uploads/{id}`, 
 mobile app (Android and iOS):
 
 ```
-https://tinycloud.chat,https://home.tinycloud.xyz,https://tinychat-4jq.pages.dev,https://*.tinychat-4jq.pages.dev,tauri://localhost,http://tauri.localhost,capacitor://localhost,https://localhost
+https://tinycloud.chat,https://home.tinycloud.xyz,https://tinycloud.one,https://tinychat-4jq.pages.dev,https://*.tinychat-4jq.pages.dev,tauri://localhost,http://tauri.localhost,capacitor://localhost,https://localhost
 ```
 
 Check after a deploy: `curl -si -X OPTIONS $URL/uploads/trn_01M3PQ71Q9YF7GSEFP6S19ZJPW -H 'Origin: https://tinycloud.chat'
