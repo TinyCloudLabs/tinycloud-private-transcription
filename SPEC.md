@@ -334,6 +334,15 @@ referring to", "could you please provide more context", "as an AI language model
 connectives) completes with empty text, is not published, and is logged as `batch_region_ungrounded` with a count only. Text that
 holds any other word is kept. A job whose regions are all dropped ends `no_speech`.
 
+**Faint-region guard (two-channel jobs, Whisper-class models):** while one party talks, the other channel carries line
+noise or a faint echo of them; short pieces of it pass speech detection and Whisper answers them with stock or invented
+lines ("Thank you.", "See you next time."). Before dispatch the worker measures each channel's speech level: the 90th
+percentile, weighted by duration, of the RMS levels of that channel's regions. A region of at most 3 s whose level is at
+least 20 dB under its channel's speech level completes with empty text whatever came back; from 10 dB under, only when
+the whole text is a bare "thank you" or "thanks". It is sent and counted like any other region, is not published, and is
+logged as `batch_region_ungrounded`. Longer regions, regions near the channel's own level (a quiet microphone is
+measured against itself), mono jobs and other models are not affected.
+
 **Quiet mode:** when the median is below −50 dBFS, p99 is below −30 dBFS, and at least 1 s of 100 ms frames is
 ≥ p10 + 21 dB, build regions at min(−50, max(−65, p10 + 3)) with ±0.5 s padding. Send their exact union with the
 primary/fallback regions above, coalesced and split at 30 s, so quiet mode never removes previously selected audio.
