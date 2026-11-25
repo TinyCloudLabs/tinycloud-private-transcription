@@ -229,7 +229,9 @@ with text are listed) and every segment is one speaker turn on channel 0, in tim
 `channel_mode: "separate"` on a two-channel recording, `diarized` is true and `channels` is 2: channel 0 is one
 speaker, `{id:"channel_0", name:<its label>, channel:0}`, with region-level segments as without `diarize`, and only
 the voices on channel 1 are told apart, `{id:"speaker_N", name:"Speaker N+2", channel:1}`, one speaker turn per
-segment. The channels are never mixed, so a quiet channel is not lost under a loud one. Recovered audio without speaker evidence
+segment. The channels are never mixed, so a quiet channel is not lost under a loud one. When nothing on channel 1 has
+text (it is silent, or every region on it was dropped as no speech), the job still completes with `diarized: true` and
+`channels: 2`; `speakers` then holds `channel_0` alone and no segment is on channel 1. Recovered audio without speaker evidence
 uses the next available `speaker_N` id named `Unknown speaker`, after numbering known speakers by their own first
 appearance. Unknown does not shift known speakers' ids or names. Recovered intervals shorter than 0.4 s that touch a turn
 are absorbed into its nearest speaker (ties to the earlier turn). At the 32-speaker limit, added audio is attributed

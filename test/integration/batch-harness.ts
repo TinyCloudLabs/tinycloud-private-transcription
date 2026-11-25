@@ -188,7 +188,7 @@ const fixtureCache = new Map<string, Uint8Array>();
 
 type Fixture = "stereo" | "mono_wav" | "silent_wav" | "three_channel_wav" | "over_cap_mp3" | "stereo_dense"
   | "stereo_m4a" | "stereo_webm" | "stereo_webm_no_duration" | "stereo_webm_offset" | "stereo_flac" | "stereo_mp4_with_video"
-  | "narration_mp3" | "quiet_narration_mp3" | "short_wav" | "clicks_wav" | "stereo_faint_wav";
+  | "narration_mp3" | "quiet_narration_mp3" | "short_wav" | "clicks_wav" | "stereo_faint_wav" | "stereo_silent_ch1_wav";
 
 /** 30 s of public-domain LibriVox narration over a steady noise floor (TC-1045). */
 const NARRATION = join(import.meta.dir, "../../fixtures/librivox-art-of-war-30s.flac");
@@ -242,6 +242,9 @@ export async function audio(kind: Fixture): Promise<Uint8Array> {
       + "[1]volume='if(between(t,4,8),1,if(between(t,10,11),0.056,if(between(t,13,14),0.22,if(between(t,16,20.5),0.056,0))))':eval=frame[b];"
       + "[a][b]amerge=inputs=2[out]",
       "-map", "[out]", "-ar", "16000", "-c:a", "pcm_s16le"],
+    // ch0 speaks 0.5–2.5 s and 4–6 s; ch1 is digital silence throughout. 7 s.
+    stereo_silent_ch1_wav: ["-f", "lavfi", "-i", "sine=f=440:d=7", "-af", "volume='if(between(t,0.5,2.5)+between(t,4,6),1,0)':eval=frame,pan=stereo|c0=c0|c1=0*c0",
+      "-ar", "16000", "-c:a", "pcm_s16le"],
   };
   const proc = Bun.spawn(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", ...args[kind], out], { stdout: "ignore", stderr: "pipe" });
   const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);

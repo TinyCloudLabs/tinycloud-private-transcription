@@ -564,6 +564,30 @@ describe("diarization", () => {
     expect(body.text.split("\n").slice(0, 2)).toEqual(["Me: words 1", "Speaker 2: words 2"]);
   });
 
+  test("diarize: true with separate channels and a silent channel 1 completes with channel 0 as the only speaker", async () => {
+    // A solo recording: only the microphone side speaks. The diarizer finds no speaker in silence and returns nothing.
+    h.ctx.diarizer = { diarize: async () => [] };
+    const id = await h.submit(await audio("stereo_silent_ch1_wav"), { contentType: "audio/wav", body: { diarize: true, channel_mode: "separate", channel_labels: ["Me", "Them"] } });
+    await h.work();
+    const body = await (await result(id)).json();
+    expect(body).toMatchObject({ status: "completed", diarized: true, channels: 2, stats: { tinfoil_calls: 2 } });
+    expect(body.speakers).toEqual([{ id: "channel_0", name: "Me", channel: 0 }]);
+    expect(body.segments.map((s: { speaker_id: string; channel: number }) => [s.speaker_id, s.channel])).toEqual([["channel_0", 0], ["channel_0", 0]]);
+    expect(body.text).toBe("Me: words 1\nMe: words 2");
+  });
+
+  test("diarize: true with separate channels lists no speaker for a channel 1 whose every region is dropped as no speech", async () => {
+    // stereo: ch0 speaks 0.5–2.5 s, ch1 3.5–5.5 s. Whisper answers ch1's only turn with a stock silence caption.
+    h.ctx.diarizer = { diarize: async () => [{ startMs: 3_500, endMs: 5_500, speaker: 7 }] };
+    h.tinfoil.handler = (call) => Response.json({ text: call === 1 ? "words 1" : " you", language: "en" });
+    const id = await h.submit(await audio("stereo"), { body: { diarize: true, channel_mode: "separate" } });
+    await h.work();
+    const body = await (await result(id)).json();
+    expect(body).toMatchObject({ status: "completed", diarized: true, channels: 2, stats: { tinfoil_calls: 2 } });
+    expect(body.speakers).toEqual([{ id: "channel_0", name: "Speaker 1", channel: 0 }]);
+    expect(body.segments.map((s: { speaker_id: string }) => s.speaker_id)).toEqual(["channel_0"]);
+  });
+
   test("a diarizer failure fails the job before any provider call", async () => {
     h.ctx.diarizer = { diarize: async () => { throw new Error("diarizer exited 134"); } };
     const id = await h.submit(await audio("stereo"), { body: { diarize: true } });
