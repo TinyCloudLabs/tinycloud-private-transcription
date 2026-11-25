@@ -88,6 +88,36 @@ describe("Whisper-class model: silence artifacts are not speech", () => {
   });
 });
 
+describe("Whisper-class model, two channels: a short piece far below a channel's speech level is not that party's speech", () => {
+  // stereo_faint_wav: ch0 speaks 0–3 s; ch1 speaks 4–8 s, then 1 s at -25 dB (10 s), 1 s at -13 dB (13 s), 4.5 s at -25 dB (16 s).
+  const kept = async (id: string) => (await result(id)).segments.map((s: { channel: number; start: number }) => [s.channel, Math.round(s.start)]);
+
+  test("whatever Whisper makes of it, the short piece 25 dB down is dropped; the one 13 dB down and the long one stay", async () => {
+    h.tinfoil.handler = () => reply("See you next time.");
+    const id = await h.submit(await audio("stereo_faint_wav"), wav);
+    await h.work();
+    expect(await kept(id)).toEqual([[0, 0], [1, 4], [1, 13], [1, 16]]);
+    expect(logs.filter((l) => l.message === "batch region ungrounded").map((l) => l.fields.dropped_regions)).toEqual([1]);
+    // Sent and paid for like any dropped region.
+    expect(h.tinfoil.calls.length).toBe(5);
+  });
+
+  test("a bare 'Thank you.' is dropped from 10 dB down, and stays at the channel's speech level and on a long piece", async () => {
+    h.tinfoil.handler = () => reply("Thank you.");
+    const id = await h.submit(await audio("stereo_faint_wav"), wav);
+    await h.work();
+    expect(await kept(id)).toEqual([[0, 0], [1, 4], [1, 16]]);
+  });
+
+  test("voxtral is not covered by the rule", async () => {
+    const voxtral = new BatchTinfoilClient({ ...h.ctx.config.tinfoil, model: "voxtral-small-24b", fetch: h.tinfoil.fetch });
+    h.tinfoil.handler = () => reply("Thank you.");
+    const id = await h.submit(await audio("stereo_faint_wav"), wav);
+    await h.work(h.withContext({ provider: voxtral }));
+    expect((await result(id)).segments).toHaveLength(5);
+  });
+});
+
 describe("voxtral keeps today's behaviour", () => {
   test("a ' you' region is kept as text, not dropped", async () => {
     const voxtral = new BatchTinfoilClient({ ...h.ctx.config.tinfoil, model: "voxtral-small-24b", fetch: h.tinfoil.fetch });

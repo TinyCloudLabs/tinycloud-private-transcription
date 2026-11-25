@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Main
+- ptx-batch, two-channel recordings with a Whisper-class model: a short region far below its channel's own speech level is dropped as no speech. While one party talks, the other channel carries noise or a faint echo, and Whisper answered short pieces of it with invented lines, mostly "Thank you.". A region of at most 3 s is dropped when it is at least 20 dB under the channel's speech level, or at least 10 dB under and its whole text is "thank you" or "thanks". On five call recordings (6 to 20 min, 685 regions) this drops 72 regions; lines that are only "Thank you." go from 41 to 9, against 5 in a second engine's transcript of the same audio. Mono jobs and other models are unchanged.
 - `infra/dstack/deploy-ptx-dev.sh` checks for the OS ptx-dev runs, `dstack-0.5.15` (hash `4597735f…`), and takes `--keep-sealed-env` for a compose-only update: the update carries no env, so the CVM keeps its sealed variables and `allowed_envs`, and no env file is needed. Details: TC-3782
 - ptx-dev accepts Zoom meetings: `ENABLED_PLATFORMS` is `jitsi,google_meet,signal,zoom`, so `POST /v1/meetings` with a zoom.us link queues a notetaker instead of answering 400 `unsupported_platform`. The bot joins through the Zoom web client. Details: TC-3782
 - ptx-dev's bot janitor removes old bot images by default (`BOT_JANITOR_PRUNE_IMAGES` defaults to `true`; `false` turns it off). It removes only bot images that are older than the pinned bot image and that no container uses. The pinned image and newer ones are kept. Details: TC-2181

@@ -2,10 +2,11 @@ import { and, asc, eq, gt, inArray, ne, sql } from "drizzle-orm";
 import { mkdir, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { config as processConfig } from "../config.ts";
-import { isAssistantReply, isWhisperSilenceArtifact, isWhisperSoundCaption } from "../domain/hallucination.ts";
+import { isAssistantReply, isFaintInvention, isWhisperSilenceArtifact, isWhisperSoundCaption, speechLevelDbfs } from "../domain/hallucination.ts";
 import { installFatalLogHandlers } from "../log.ts";
 import { providerDispatchSlots, transcriptionAdmission, transcriptionAttempts, transcriptionProviderBlocks, transcriptionRegions, transcriptionResults, transcriptions, transcriptionWorkers, type TranscriptionRow } from "../db/schema.ts";
 import { pcmToWav } from "../providers/transcription/audio.ts";
+import { sliceDbfs } from "../providers/transcription/tinfoil.ts";
 import { decodeChannelToPcm, PCM_RATE, readPcmRange } from "./audio.ts";
 import type { BatchContext } from "./context.ts";
 import { detectDiarizedSpeech, UNKNOWN_SPEAKER, type SpeakerSegment } from "./diarize.ts";
@@ -227,11 +228,13 @@ async function runPipeline(ctx: BatchContext, job: TranscriptionRow, fence: Fenc
   }
   await ctx.faults.hit("worker.after_regions", { id: job.id });
 
-  // 3. One provider call at a time, through the durable single-slot arbiter.
+  // 3. One provider call at a time, through the durable single-slot arbiter. A two-channel job first measures how loud
+  //    each party speaks on its own channel, so a short faint region can be told from that party's speech (isFaintInvention).
+  const speechLevels = pcm.length === 2 ? await channelSpeechLevels(regions, pcm) : null;
   const state = { rateLimitStreak: 0 };
   for (const region of regions) {
     if (region.status !== "pending") continue;
-    const outcome = await dispatchRegion(ctx, job, fence, region, pcm[region.channel]!, signal, state);
+    const outcome = await dispatchRegion(ctx, job, fence, region, pcm[region.channel]!, signal, state, speechLevels?.[region.channel] ?? null);
     if (outcome === "terminal") {
       await cleanupJobFiles(ctx, job.id);
       return;
@@ -384,6 +387,18 @@ async function admitDispatch(ctx: BatchContext, fence: Fence, regionOrdinal: num
 
 type RegionRow = typeof transcriptionRegions.$inferSelect;
 
+/** Per channel, the level its speech reaches (`speechLevelDbfs` over that channel's regions, measured on its PCM). */
+async function channelSpeechLevels(regions: readonly RegionRow[], pcm: readonly string[]): Promise<number[]> {
+  return Promise.all(pcm.map(async (path, channel) => {
+    const own = regions.filter((region) => region.channel === channel);
+    const levels = await Promise.all(own.map(async (region) => {
+      const samples = await readPcmRange(path, region.startMs, region.endMs);
+      return { durationMs: region.endMs - region.startMs, dbfs: sliceDbfs(samples, 0, samples.length) };
+    }));
+    return speechLevelDbfs(levels);
+  }));
+}
+
 async function dispatchRegion(
   ctx: BatchContext,
   job: TranscriptionRow,
@@ -392,12 +407,16 @@ async function dispatchRegion(
   pcmPath: string,
   signal: AbortSignal,
   state: { rateLimitStreak: number },
+  /** The speech level of the region's channel in a two-channel job; null otherwise. */
+  speechLevel: number | null,
 ): Promise<"done" | "terminal" | "blocked"> {
   const w = ctx.config.worker;
   let notSent = 0;
   for (;;) {
     if (signal.aborted) throw new LostFence(fence.id);
-    const wav = pcmToWav(await readPcmRange(pcmPath, region.startMs, region.endMs), PCM_RATE);
+    const samples = await readPcmRange(pcmPath, region.startMs, region.endMs);
+    const belowSpeechDb = speechLevel === null ? null : speechLevel - sliceDbfs(samples, 0, samples.length);
+    const wav = pcmToWav(samples, PCM_RATE);
     await ctx.faults.hit("worker.before_dispatch", { id: job.id });
     const admission = await admitDispatch(ctx, fence, region.ordinal);
     if (admission.kind === "settled") return "done";
@@ -414,7 +433,7 @@ async function dispatchRegion(
       outcome = { kind: "ambiguous", reason: "client_error" };
     }
     await ctx.faults.hit("worker.after_response", { id: job.id });
-    const settled = await settleDispatch(ctx, fence, region, admission.attemptId, outcome, state, notSent);
+    const settled = await settleDispatch(ctx, fence, region, admission.attemptId, outcome, state, notSent, belowSpeechDb);
     if (settled === "lost") throw new LostFence(fence.id);
     if (settled === "done" || settled === "terminal" || settled === "blocked") return settled;
     if (outcome.kind === "rate_limited") {
@@ -461,6 +480,8 @@ async function settleDispatch(
   outcome: ProviderOutcome,
   state: { rateLimitStreak: number },
   notSent: number,
+  /** How far the region is under its channel's speech level, in a two-channel job; null otherwise. */
+  belowSpeechDb: number | null,
 ): Promise<"done" | "retry" | "terminal" | "blocked" | "lost"> {
   const w = ctx.config.worker;
   const detail = outcome.kind === "ambiguous" || outcome.kind === "not_sent" ? outcome.reason
@@ -550,7 +571,10 @@ async function settleDispatch(
         // An audio LLM can answer the audio like a chat assistant (TC-2119). A region that is wholly such a reply is not speech:
         // it completes with empty text, so assembly never publishes it and a job with nothing else ends no_speech.
         // Whisper also answers silence or noise with stock captions (" you", TC-2128): whole-text matches drop the same way.
-        const ungrounded = isAssistantReply(outcome.text) || (outcome.text.trim() !== "" && isWhisperModel(ctx.provider!.model) && (isWhisperSilenceArtifact(outcome.text) || isWhisperSoundCaption(outcome.text)));
+        // So does what it makes of a short faint piece of the idle channel of a two-channel recording (isFaintInvention).
+        const whisper = outcome.text.trim() !== "" && isWhisperModel(ctx.provider!.model);
+        const ungrounded = isAssistantReply(outcome.text) || (whisper && (isWhisperSilenceArtifact(outcome.text) || isWhisperSoundCaption(outcome.text)
+          || (belowSpeechDb !== null && isFaintInvention(outcome.text, region.endMs - region.startMs, belowSpeechDb))));
         if (ungrounded) seen.droppedRegions = 1;
         await tx.update(transcriptionRegions).set({ status: "completed", text: ungrounded ? "" : outcome.text }).where(regionWhere);
         await tx.update(transcriptions).set({ tinfoilAudioSeconds: sql`${transcriptions.tinfoilAudioSeconds} + ${(region.endMs - region.startMs) / 1000}` }).where(fenceGuard(fence));

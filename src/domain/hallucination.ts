@@ -200,6 +200,41 @@ export function isWhisperSilenceArtifact(text: string): boolean {
 }
 
 /**
+ * Whisper's inventions on the idle side of a two-channel recording. While one party talks, the other channel carries
+ * line noise or a faint echo of them; speech detection passes short pieces of it, and Whisper answers such a piece with
+ * stock or invented words ("Thank you.", "See you next time."). The piece is short and far below the level that party
+ * speaks at on its own channel, which their real speech is not:
+ *   - any text, when the region is at most 3 s long and at least 20 dB below the channel's speech level;
+ *   - a bare "thank you" or "thanks" already from 10 dB below. It is the caption Whisper produces most, and too common
+ *     in real speech to drop on its wording alone (see WHISPER_SILENCE_ARTIFACTS).
+ * A channel on which nobody speaks has no speech level to compare with, so nothing on it is dropped by this rule.
+ */
+export const FAINT_REGION = { maxMs: 3_000, belowDb: 20, thanksBelowDb: 10 };
+const BARE_THANKS = new Set(["thank you", "thank you so much", "thank you very much", "thanks"]);
+
+/** `belowSpeechDb`: how far the region's level is under its channel's speech level (`speechLevelDbfs`), in dB. */
+export function isFaintInvention(text: string, durationMs: number, belowSpeechDb: number): boolean {
+  if (durationMs > FAINT_REGION.maxMs) return false;
+  if (belowSpeechDb >= FAINT_REGION.belowDb) return true;
+  return belowSpeechDb >= FAINT_REGION.thanksBelowDb && BARE_THANKS.has(text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim());
+}
+
+/**
+ * The level a party speaks at on one channel: the 90th percentile, weighted by duration, of the levels of that channel's
+ * regions. The loud end rather than the middle, because the regions include whatever faint pieces detection let through.
+ */
+export function speechLevelDbfs(regions: readonly { durationMs: number; dbfs: number }[]): number {
+  const sorted = [...regions].sort((a, b) => a.dbfs - b.dbfs);
+  const total = sorted.reduce((sum, region) => sum + region.durationMs, 0);
+  let passed = 0;
+  for (const region of sorted) {
+    passed += region.durationMs;
+    if (passed >= total * 0.9) return region.dbfs;
+  }
+  return -120;
+}
+
+/**
  * Whisper's bracketed sound or music captions on non-speech audio ("*Piano music*", "[Music]", "(applause)", "♪ music ♪").
  * Closed list, whole text only, and only when wrapped: arbitrary bracketed text, a caption inside longer text and a bare
  * "music" are real speech and are kept. Used by the batch role for Whisper-class models only, and by hallucinationReason
