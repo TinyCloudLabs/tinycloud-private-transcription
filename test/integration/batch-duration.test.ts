@@ -26,7 +26,7 @@ describe("TC-922 consumer contract", () => {
     expect(await response.json()).toEqual({
       max_bytes: 186_496_800, max_duration_seconds: 10_800, accepted_max_duration_seconds: 11_101,
       max_channels: 2, content_types: ["audio/mpeg", "audio/wav", "audio/ogg", "audio/mp4", "audio/webm", "audio/flac"],
-      diarization: false, transcript_ttl_seconds: 86_400, admission: "open", ready: true,
+      diarization: false, diarization_channel_modes: [], transcript_ttl_seconds: 86_400, admission: "open", ready: true,
     });
   });
 

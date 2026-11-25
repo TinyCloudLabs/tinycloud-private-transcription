@@ -65,9 +65,9 @@ describe("create body", () => {
     expect(() => parseCreateBody([], MAX_UPLOAD_BYTES)).toThrow("JSON object");
   });
 
-  test("diarize defaults to a mono mix and refuses separate channels", () => {
+  test("diarize defaults to a mono mix and also accepts separate channels", () => {
     expect(parseCreateBody({ ...ok, diarize: true }, MAX_UPLOAD_BYTES)).toMatchObject({ diarize: true, channel_mode: "mixed" });
-    expect(() => parseCreateBody({ ...ok, diarize: true, channel_mode: "separate" }, MAX_UPLOAD_BYTES)).toThrow("channel_mode separate");
+    expect(parseCreateBody({ ...ok, diarize: true, channel_mode: "separate" }, MAX_UPLOAD_BYTES)).toMatchObject({ diarize: true, channel_mode: "separate" });
     expect(() => parseCreateBody({ ...ok, diarize: "yes" }, MAX_UPLOAD_BYTES)).toThrow("boolean");
   });
 

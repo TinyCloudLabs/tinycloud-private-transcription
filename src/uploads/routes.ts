@@ -66,6 +66,8 @@ function transcriptionRoutes(ctx: BatchContext) {
       max_channels: ctx.config.limits.maxChannels,
       content_types: CONTENT_TYPES,
       diarization: diarizationAvailable(ctx),
+      // Absent on services that refuse `diarize` with `channel_mode: "separate"`.
+      diarization_channel_modes: diarizationAvailable(ctx) ? ["mixed", "separate"] : [],
       transcript_ttl_seconds: ctx.config.retention.transcriptTtlSeconds,
       admission: await admissionMode(ctx.db),
       ready: ready.ready,

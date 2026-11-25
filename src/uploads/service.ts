@@ -33,7 +33,10 @@ export interface CreateTranscriptionInput {
   language: string | null;
   channel_mode: "separate" | "mixed";
   channel_labels: string[];
-  /** Downmix to mono and label speaker turns (contract C2). Only accepted when `diarizationAvailable`. */
+  /**
+   * Label speaker turns (contract C2). `mixed`: the turns of a mono downmix. `separate` on a two-channel recording:
+   * channel 0 stays one speaker and the voices on channel 1 are told apart. Only accepted when `diarizationAvailable`.
+   */
   diarize: boolean;
 }
 
@@ -58,10 +61,9 @@ export function parseCreateBody(raw: unknown, maxBytes: number): CreateTranscrip
   }
   const diarize = body.diarize ?? false;
   if (typeof diarize !== "boolean") throw new BatchError("invalid_request", "diarize must be a boolean");
-  // Diarization works on a mono downmix, so it defaults to mixed and cannot be combined with separate channels.
+  // Diarization defaults to a mono downmix. With separate channels it tells apart the voices on the second channel only.
   const channelMode = body.channel_mode ?? (diarize ? "mixed" : "separate");
   if (channelMode !== "separate" && channelMode !== "mixed") throw new BatchError("invalid_request", "channel_mode must be separate or mixed");
-  if (diarize && channelMode === "separate") throw new BatchError("invalid_request", "diarize cannot be combined with channel_mode separate");
   const labels = body.channel_labels ?? ["Speaker 1", "Speaker 2"];
   if (!Array.isArray(labels) || labels.length < 1 || labels.length > 2 || !labels.every((label) => typeof label === "string" && LABEL.test(label))) {
     throw new BatchError("invalid_request", "channel_labels must be 1 or 2 strings of 1 to 64 printable characters");

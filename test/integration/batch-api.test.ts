@@ -92,7 +92,7 @@ describe("create and admission", () => {
       [{ channel_labels: ["a", "b", "c"] }, 400, "invalid_request"],
       [{ extra: true }, 400, "invalid_request"],
       [{ diarize: "yes" }, 400, "invalid_request"],
-      [{ diarize: true, channel_mode: "separate" }, 400, "invalid_request"],
+      [{ diarize: true, channel_mode: "separate" }, 400, "diarization_unavailable"],
       [{ diarize: true }, 400, "diarization_unavailable"],
     ] as const;
     for (const [body, status, code] of bad) {
@@ -285,13 +285,14 @@ describe("create and admission", () => {
     expect(await (await h.api("/v1/transcriptions/capabilities")).json()).toMatchObject({
       content_types: ["audio/mpeg", "audio/wav", "audio/ogg", "audio/mp4", "audio/webm", "audio/flac"],
       diarization: false,
+      diarization_channel_modes: [],
     });
   });
 
-  test("with the diarization stage installed, capabilities offer it and diarize: true creates a mixed-mode job", async () => {
+  test("with the diarization stage installed, capabilities offer it for both channel modes and diarize: true creates a mixed-mode job", async () => {
     h.ctx.diarizer = { diarize: async () => [] };
     try {
-      expect(await (await h.api("/v1/transcriptions/capabilities")).json()).toMatchObject({ diarization: true });
+      expect(await (await h.api("/v1/transcriptions/capabilities")).json()).toMatchObject({ diarization: true, diarization_channel_modes: ["mixed", "separate"] });
       const res = await h.create(await audio("stereo"), { body: { diarize: true } });
       expect(res.status).toBe(201);
       expect(await res.json()).toMatchObject({ diarize: true, channel_mode: "mixed" });
